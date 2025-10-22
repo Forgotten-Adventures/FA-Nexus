@@ -8,7 +8,8 @@ FA Nexus is the new all-in-one content hub for Forgotten Adventures inside Found
 
 > ⚠️ **Beta notice:** v0.1.0 is our first public release. Expect occasional rough edges, placeholder copy, and the odd gremlin. Please keep the feedback coming so we can polish the experience quickly.
 
-<img width="2045" height="1187" alt="image" src="https://github.com/user-attachments/assets/fac89a77-4980-4854-b3e7-a34ed56bf6c1" />
+<img width="1998" height="908" alt="image" src="https://github.com/user-attachments/assets/7c292296-b9f4-4ed9-a1bb-c3470fdca7ad" />
+
 
 ---
 
