@@ -14,6 +14,7 @@ const quantizeElevation = (value) => {
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 2.5;
 const MAX_SHADOW_OFFSET = 40;
+const MAX_SHADOW_DILATION = 20;
 const MAX_SHADOW_BLUR = 12;
 const SHADOW_PRESET_COUNT = 5;
 const DEFAULT_SHADOW_SETTINGS = Object.freeze({
@@ -68,7 +69,7 @@ export class AssetPlacementManager {
     this._dropShadowPreference = null;
     this._dropShadowSettingsHook = null;
     this._dropShadowAlpha = this._readShadowSetting('assetDropShadowAlpha', 0.65, 0, 1);
-    this._dropShadowDilation = this._readShadowSetting('assetDropShadowDilation', 1.6, 0, 20);
+    this._dropShadowDilation = this._readShadowSetting('assetDropShadowDilation', 1.6, 0, MAX_SHADOW_DILATION);
     this._dropShadowBlur = this._readShadowSetting('assetDropShadowBlur', 1.8, 0, MAX_SHADOW_BLUR);
     this._dropShadowOffsetDistance = this._readShadowSetting('assetDropShadowOffsetDistance', 0, 0, MAX_SHADOW_OFFSET);
     this._dropShadowOffsetAngle = this._readShadowSetting('assetDropShadowOffsetAngle', 135, 0, 359, { wrapAngle: true });
@@ -739,7 +740,7 @@ export class AssetPlacementManager {
       return Math.min(max, Math.max(min, num));
     };
     const alphaPercent = clamp(this._dropShadowAlpha * 100, 0, 100);
-    const dilation = clamp(this._dropShadowDilation, 0, 20);
+    const dilation = clamp(this._dropShadowDilation, 0, MAX_SHADOW_DILATION);
     const blur = clamp(this._dropShadowBlur, 0, MAX_SHADOW_BLUR);
     const offsetDistance = clamp(this._dropShadowOffsetDistance, 0, MAX_SHADOW_OFFSET);
     const offsetAngle = this._normalizeShadowAngle(this._dropShadowOffsetAngle);
@@ -773,7 +774,7 @@ export class AssetPlacementManager {
         label: 'Spread',
         value: dilation.toFixed(1),
         min: 0,
-        max: 20,
+        max: MAX_SHADOW_DILATION,
         step: 0.1,
         display: `${dilation.toFixed(1)} px`,
         hint: 'Expands the shadow mask before blurring (world pixels).',
@@ -880,7 +881,7 @@ export class AssetPlacementManager {
       }
     };
     assign('_dropShadowAlpha', snapshot.alpha, (v) => Math.min(1, Math.max(0, Number(v))));
-    assign('_dropShadowDilation', snapshot.dilation, (v) => Math.max(0, Number(v)));
+    assign('_dropShadowDilation', snapshot.dilation, (v) => Math.min(MAX_SHADOW_DILATION, Math.max(0, Number(v))));
     assign('_dropShadowBlur', snapshot.blur, (v) => Math.min(MAX_SHADOW_BLUR, Math.max(0, Number(v))));
     assign('_dropShadowOffsetDistance', snapshot.offsetDistance, (v) => Math.min(MAX_SHADOW_OFFSET, Math.max(0, Number(v))));
     assign('_dropShadowOffsetAngle', snapshot.offsetAngle, (v) => this._normalizeShadowAngle(v));
@@ -1058,7 +1059,7 @@ export class AssetPlacementManager {
       this._syncToolOptionsState();
       return false;
     }
-    const clamped = Math.min(MAX_SHADOW_BLUR, Math.max(0, numeric));
+    const clamped = Math.min(MAX_SHADOW_DILATION, Math.max(0, numeric));
     if (Math.abs(clamped - this._dropShadowDilation) < 0.0005 && !commit) {
       this._syncToolOptionsState();
       return true;
@@ -1080,7 +1081,7 @@ export class AssetPlacementManager {
       this._syncToolOptionsState();
       return false;
     }
-    const clamped = Math.min(20, Math.max(0, numeric));
+    const clamped = Math.min(MAX_SHADOW_BLUR, Math.max(0, numeric));
     if (Math.abs(clamped - this._dropShadowBlur) < 0.0005 && !commit) {
       this._syncToolOptionsState();
       return true;
@@ -1254,7 +1255,7 @@ export class AssetPlacementManager {
           this._updatePreviewShadow({ force: true });
           break;
         case 'assetDropShadowDilation':
-          this._dropShadowDilation = this._coerceShadowNumeric(setting.value, 0, 20, this._dropShadowDilation);
+          this._dropShadowDilation = this._coerceShadowNumeric(setting.value, 0, MAX_SHADOW_DILATION, this._dropShadowDilation);
           this._syncToolOptionsState();
           this._updatePreviewShadow({ force: true });
           break;
@@ -2306,7 +2307,7 @@ export class AssetPlacementManager {
     }
     return {
       alpha: Math.min(1, Math.max(0, alpha)),
-      dilation: Math.max(0, dilation),
+      dilation: Math.min(MAX_SHADOW_DILATION, Math.max(0, dilation)),
       blur: Math.min(MAX_SHADOW_BLUR, Math.max(0, blur)),
       offsetDistance: Math.min(MAX_SHADOW_OFFSET, Math.max(0, offsetDistance)),
       offsetAngle: this._normalizeShadowAngle(offsetAngle)

@@ -923,7 +923,13 @@ class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2) {
   _getScrollContainer() {
     const root = this.element;
     if (!root) return null;
-    return root.querySelector('.fa-nexus-tool-options') || root.querySelector('.window-content') || root;
+    return (
+      root.querySelector('[data-fa-nexus-scroll-container]')
+      || root.querySelector('.fa-nexus-tool-options__content')
+      || root.querySelector('.fa-nexus-tool-options')
+      || root.querySelector('.window-content')
+      || root
+    );
   }
 
   _measureContentStyle() {
