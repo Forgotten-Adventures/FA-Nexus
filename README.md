@@ -6,7 +6,7 @@
 
 FA Nexus is the new all-in-one content hub for Forgotten Adventures inside Foundry VTT. It brings tokens, assets, premium texture tools, and path editing into a single streamlined window. Launch the app from the FA Nexus button above the player list and dive straight into the full catalog of free Forgotten Adventures content—no manual setup required.
 
-> ⚠️ **Beta notice:** v0.1.0 is our first public release. Expect occasional rough edges, placeholder copy, and the odd gremlin. Please keep the feedback coming so we can polish the experience quickly.
+⚠️ **Beta notice:** v0.1.0 is our first public release. Expect occasional rough edges, placeholder copy, and the odd gremlin. Please keep the feedback coming so we can polish the experience quickly. We also plan on implementing more features so if you have a specific feature request drop that into issues too!
 
 <img width="1998" height="908" alt="image" src="https://github.com/user-attachments/assets/7c292296-b9f4-4ed9-a1bb-c3470fdca7ad" />
 
@@ -65,7 +65,7 @@ FA Nexus is the new all-in-one content hub for Forgotten Adventures inside Found
 
 ---
 
-## Premium Path Editing *(Adventurer tier $7+)*
+## Premium Path Placement *(Adventurer tier $7+)*
 - **Make it curve:** Drop control points to form smooth curves, adjust tension, support snap to grid.
 - **Path Texture controls:** Set scale, opacity, flip and offsets on the fly.
 - **Feathered endings:** Taper opacity, shrink width on both ends independently for natural blends.
