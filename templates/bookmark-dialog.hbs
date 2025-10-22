@@ -1,0 +1,60 @@
+<div class="fa-nexus-bookmark-save">
+  <div class="form-group">
+    <label for="bookmark-title">Bookmark Title</label>
+    <input id="bookmark-title" type="text" value="{{title}}" placeholder="Enter bookmark name..." />
+  </div>
+
+  {{#if hasSearch}}
+  <div class="bookmark-info">
+    <div class="bookmark-search">
+      <i class="fas fa-search"></i>
+      <span>Search: "{{searchQuery}}"</span>
+    </div>
+  </div>
+  {{/if}}
+
+  {{#if folderInfo.includeText}}
+  <div class="bookmark-info bookmark-include">
+    <div class="bookmark-folders">
+      <i class="fas fa-folder-plus"></i>
+      <span>{{folderInfo.includeText}}</span>
+    </div>
+  </div>
+  {{/if}}
+
+  {{#if folderInfo.excludeText}}
+  <div class="bookmark-info bookmark-exclude">
+    <div class="bookmark-folders">
+      <i class="fas fa-folder-minus"></i>
+      <span>{{folderInfo.excludeText}}</span>
+    </div>
+  </div>
+  {{/if}}
+
+  {{#unless hasSearch}}
+  {{#unless hasFolders}}
+  <div class="bookmark-info">
+    <div class="bookmark-empty">
+      <i class="fas fa-info-circle"></i>
+      <span>No search or folder filters active</span>
+    </div>
+  </div>
+  {{/unless}}
+  {{/unless}}
+
+  <footer class="buttons">
+    <button type="button" class="save">
+      <i class="fas fa-save"></i>
+      {{#if (eq dialogMode "edit")}}Update{{else}}Save{{/if}}
+    </button>
+    {{#if (eq dialogMode "edit")}}
+      <button type="button" class="remove">
+        <i class="fas fa-trash"></i> Delete
+      </button>
+    {{/if}}
+    <button type="button" class="cancel">
+      <i class="fas fa-times"></i> Cancel
+    </button>
+  </footer>
+</div>
+

@@ -1,0 +1,45 @@
+{
+  "id": "fa-nexus",
+  "title": "FA Nexus",
+  "version": "0.1.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "description": "<p>FA Nexus is the all-in-one Forgotten Adventures content hub for Foundry VTT v13+, delivering tokens, assets, textures, and path tools from a single window.</p><p>Browse the full FA catalog alongside your local folders, save custom searches with folder bookmarks, place assets with sticky mode and elevation-aware shadows, and unlock premium texture painting plus path editors by authenticating at the Adventurer ($7) tier.</p>",
+  "authors": [
+    {
+      "name": "Forgotten Adventures"
+    }
+  ],
+  "esmodules": [
+    "scripts/settings.js",
+    "scripts/premium/patreon-auth-service.js",
+    "scripts/core/event-manager.js",
+    "scripts/core/forge-integration.js",
+    "scripts/core/search/search-controller.js",
+    "scripts/core/ui/grid-manager.js",
+    "scripts/core/tab-manager.js",
+    "scripts/core/ui/virtual-grid-manager.js",
+    "scripts/content/cache-index.js",
+    "scripts/tokens/system-detection.js",
+    "scripts/canvas/tile-selection.js",
+    "scripts/canvas/tile-hud-edit.js",
+    "scripts/core/search/search-manager.js",
+    "scripts/content/inventory-utils.js",
+    "scripts/tokens/token-data-service.js",
+    "scripts/tokens/token-preview-manager.js",
+    "scripts/tokens/token-dragdrop-manager.js",
+    "scripts/tokens/actor-factory.js",
+    "scripts/tokens/tokens-content-sources-dialog.js",
+    "scripts/assets/assets-content-sources-dialog.js",
+    "scripts/assets/assets-preview-manager.js",
+    "scripts/textures/texture-paint-manager.js",
+    "scripts/nexus-app.js"
+  ],
+  "styles": [
+    "styles/nexus-app.css"
+  ],
+  "manifest": "https://raw.githubusercontent.com/Forgotten-Adventures/FA-Nexus/main/module.json",
+  "download": "https://github.com/Forgotten-Adventures/FA-Nexus/raw/main/fa-nexus.zip"
+}

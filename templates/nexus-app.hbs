@@ -1,0 +1,68 @@
+<div class="fa-nexus-app">
+  <section class="fa-nexus-body">
+    <nav class="fa-nexus-tabs" role="tablist">
+      <button type="button" class="fa-nexus-tab active" data-nexus-tab="tokens" aria-selected="true">Tokens</button>
+      <button type="button" class="fa-nexus-tab" data-nexus-tab="assets" aria-selected="false">Assets</button>
+      <button type="button" class="fa-nexus-tab" data-nexus-tab="textures" aria-selected="false">Textures</button>
+      <button type="button" class="fa-nexus-tab" data-nexus-tab="paths" aria-selected="false">Paths</button>
+    </nav>
+    <div class="fa-nexus-controls">
+      <div class="fa-nexus-search-input">
+        <input type="text" id="fa-nexus-search" placeholder="Search..." />
+        <button class="clear-folders" type="button" title="Clear folder filters"><i class="fas fa-folder"></i></button>
+        <i class="fas fa-search"></i>
+        <button class="clear-search" type="button" title="Clear"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="fa-nexus-controls-right">
+        <div class="thumb-size">
+          <i class="fas fa-grid-2" title="Thumbnail size"></i>
+          <input id="fa-nexus-thumb-size" type="range" min="92" max="160" step="2" />
+        </div>
+        <button class="fa-nexus-icon-button fa-nexus-bookmark-save" type="button" title="Save bookmark" aria-label="Save bookmark">
+          <i class="fas fa-bookmark"></i>
+        </button>
+        <button class="fa-nexus-icon-button fa-nexus-folder-toggle is-hidden is-collapsed" type="button" title="Toggle folder browser" aria-label="Toggle folder browser" aria-expanded="false">
+          <i class="fas fa-folder-tree"></i>
+        </button>
+      </div>
+    </div>
+    <div class="fa-nexus-bookmarks">
+      <div class="fa-nexus-bookmark-toolbar">
+        <div class="fa-nexus-bookmark-items"></div>
+        <button class="fa-nexus-bookmark-overflow" type="button" title="More bookmarks" aria-label="More bookmarks">
+          <i class="fas fa-ellipsis-h"></i>
+        </button>
+      </div>
+    </div>
+    <div class="fa-nexus-main">
+      <div id="fa-nexus-grid" class="fa-nexus-grid" aria-label="Virtualized Grid"></div>
+    </div>
+    <footer class="fa-nexus-footer">
+      <div class="stats">0</div>
+      <div class="actions">
+        <button class="fa-nexus-tool-options-button" type="button" title="Reopen Tool Options" aria-label="Reopen Tool Options" hidden aria-hidden="true" disabled>
+          <i class="fas fa-sliders-h"></i>
+          <span>Tool Options</span>
+        </button>
+        <div class="fa-nexus-footer-control fa-nexus-maincolor-toggle">
+          <label class="fa-nexus-checkbox-label">
+            <input type="checkbox" id="fa-nexus-maincolor-only" />
+            <span>Color variants on Right Click</span>
+          </label>
+        </div>
+        <div class="fa-nexus-footer-control fa-nexus-randomcolor-toggle" style="display: none;">
+          <label class="fa-nexus-checkbox-label" title="Randomly select a color variant for each placement">
+            <input type="checkbox" id="fa-nexus-random-color-placement" />
+            <span>Random Color on Placement</span>
+          </label>
+        </div>
+        <div class="fa-nexus-footer-control fa-nexus-hide-locked-toggle" style="display: none;">
+          <label class="fa-nexus-checkbox-label">
+            <input type="checkbox" id="fa-nexus-hide-locked" />
+            <span>Hide locked</span>
+          </label>
+        </div>
+      </div>
+    </footer>
+  </section>
+</div>

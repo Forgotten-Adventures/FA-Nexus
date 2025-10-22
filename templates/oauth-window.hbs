@@ -1,0 +1,46 @@
+<div class="patreon-oauth-content">
+  <div class="oauth-header">
+    <i class="fab fa-patreon"></i>
+    <h2>Patreon Authentication</h2>
+  </div>
+
+  <div class="oauth-patreon-requirements">
+    <p>Connecting to Patreon enables premium cloud tokens and assets.</p>
+    <p>Support Forgotten Adventures at Adventurer ($7) tier or higher.</p>
+    <p><a href="https://www.patreon.com/forgottenadventures/join" target="_blank">Join on Patreon</a></p>
+  </div>
+
+  <div class="oauth-controls">
+    <button id="start-auth-btn" class="auth-button">
+      <i class="fas fa-user-shield"></i>
+      🔐 Start Authentication
+    </button>
+  </div>
+
+  <div class="oauth-instructions">
+    <p>We’ll open your browser to authenticate with Patreon.</p>
+  </div>
+
+  <div id="auth-status" class="auth-status">Ready to authenticate</div>
+
+  <div class="oauth-footer">
+    <small><i class="fas fa-shield-alt"></i> Secure via Patreon OAuth.</small>
+  </div>
+
+  <style>
+    .patreon-oauth-content { padding: 10px; text-align: center; font-family: "Signika", sans-serif; }
+    .oauth-header { margin-bottom: 20px; }
+    .oauth-header i { font-size: 2em; color: #ff424d; margin-bottom: 10px; }
+    .oauth-header h2 { margin: 0; }
+    .oauth-controls { margin: 20px 0; display: flex; justify-content: center; }
+    .auth-button { background: #ff424d; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; transition: all 0.2s ease; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+    .auth-button:hover:not(:disabled) { background: #e63946; transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
+    .auth-button:disabled { background: #666; cursor: not-allowed; opacity: 0.7; }
+    .auth-status { padding: 10px; border-radius: 4px; margin-bottom: 15px; font-weight: 500; }
+    .auth-status.waiting { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+    .auth-status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .auth-status.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .oauth-footer i { color: #28a745; margin-right: 5px; }
+  </style>
+</div>
+

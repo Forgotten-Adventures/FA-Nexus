@@ -1,0 +1,61 @@
+<div class="fa-nexus-actor-token-update-dialog">
+  <div class="fa-nexus-dialog-content">
+    <div class="fa-nexus-confirmation-message">
+      <p>Update the prototype token for <strong>{{actor.name}}</strong>?</p>
+    </div>
+    
+    <div class="fa-nexus-token-comparison">
+      <div class="fa-nexus-token-preview">
+        <div class="fa-nexus-token-label">Current Token</div>
+        <img src="{{actor.img}}" class="fa-nexus-token-image" alt="Current token" />
+      </div>
+      <div class="fa-nexus-token-preview">
+        <div class="fa-nexus-token-label">New Token</div>
+        <img src="{{newTokenSrc}}" class="fa-nexus-token-image" alt="New token" />
+      </div>
+    </div>
+    
+    <div class="fa-nexus-options">
+      <label class="fa-nexus-checkbox-label">
+        <input type="checkbox" id="update-actor-image" {{#if updateActorImageDefault}}checked{{/if}} /> 
+        Also update actor portrait image
+      </label>
+      <label class="fa-nexus-checkbox-label{{#unless canUseWildcard}} fa-nexus-disabled{{/unless}}">
+        <input type="checkbox" id="use-wildcard-token" {{#unless canUseWildcard}}disabled{{/unless}} /> 
+        Use wildcard token (random color variant)
+      </label>
+    </div>
+    
+    <div class="fa-nexus-token-details">
+      {{#if displayName}}
+      <div class="fa-nexus-detail-row">
+        <strong>Token:</strong> {{displayName}}
+      </div>
+      {{/if}}
+      {{#if tokenSource}}
+      <div class="fa-nexus-detail-row">
+        <strong>Source:</strong> 
+        {{#if isCloudToken}}
+          Cloud{{#if tier}} ({{tier}}){{/if}}
+        {{else}}
+          Local
+        {{/if}}
+      </div>
+      {{/if}}
+      {{#if tokenSize}}
+      <div class="fa-nexus-detail-row">
+        <strong>Size:</strong> {{tokenSize.gridWidth}}×{{tokenSize.gridHeight}} grid{{#if hasScale}} @ {{tokenSize.scale}}x scale{{/if}}
+      </div>
+      {{/if}}
+    </div>
+    
+    <div class="fa-nexus-dialog-buttons">
+      <button type="button" class="fa-nexus-cancel-btn" data-action="cancel">
+        <i class="fas fa-times"></i> Cancel
+      </button>
+      <button type="button" class="fa-nexus-confirm-btn" data-action="confirm">
+        <i class="fas fa-check"></i> Update Token
+      </button>
+    </div>
+  </div>
+</div>

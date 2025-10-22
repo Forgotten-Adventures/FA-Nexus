@@ -1,0 +1,775 @@
+<div class="fa-nexus-tool-options">
+  <div class="fa-nexus-tool-options__content">
+    <section class="fa-nexus-tool-options__section">
+    <label class="fa-nexus-tool-options__toggle" title="Snap new placements to the active scene grid.">
+      <input type="checkbox" id="fa-nexus-grid-snap-toggle" {{#if gridSnapEnabled}}checked{{/if}} {{#unless gridSnapAvailable}}disabled{{/unless}}>
+      <span>Snap to Grid</span>
+    </label>
+    {{#unless gridSnapAvailable}}
+      <p class="fa-nexus-tool-options__hint">Grid snapping is unavailable in this environment.</p>
+    {{/unless}}
+
+    {{#if showDropShadowToggle}}
+      <label class="fa-nexus-tool-options__toggle" title="{{dropShadowTooltip}}">
+        <input type="checkbox" id="fa-nexus-drop-shadow-toggle" {{#if dropShadowEnabled}}checked{{/if}} {{#if dropShadowDisabled}}disabled{{/if}}>
+        <span>Drop Shadow</span>
+      </label>
+      {{#if dropShadowHint}}
+        <p class="fa-nexus-tool-options__hint">{{dropShadowHint}}</p>
+      {{/if}}
+    {{/if}}
+
+    {{#if dropShadowControls.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-drop-shadow {{#if dropShadowControls.collapsed}}is-collapsed{{/if}}" data-fa-nexus-drop-shadow-root>
+        <div class="fa-nexus-drop-shadow__header">
+          <button type="button"
+                  class="fa-nexus-drop-shadow__collapse"
+                  data-fa-nexus-drop-shadow-toggle
+                  aria-expanded="{{#unless dropShadowControls.collapsed}}true{{else}}false{{/unless}}"
+                  title="{{#if dropShadowControls.collapsed}}Expand shadow settings{{else}}Collapse shadow settings{{/if}}">
+            <i class="fas fa-chevron-down" aria-hidden="true"></i>
+          </button>
+          <span class="fa-nexus-tool-options__label">Shadow Settings</span>
+          {{#if dropShadowControls.context.display}}
+            <span class="fa-nexus-drop-shadow__elevation" data-fa-nexus-drop-shadow-elevation>Elevation {{dropShadowControls.context.display}}</span>
+          {{/if}}
+        </div>
+        <div class="fa-nexus-drop-shadow__context-block">
+          {{#if dropShadowControls.context.status}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-drop-shadow__context" data-fa-nexus-drop-shadow-status>{{dropShadowControls.context.status}}</p>
+          {{/if}}
+          {{#if dropShadowControls.context.note}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-drop-shadow__context" data-fa-nexus-drop-shadow-note>{{dropShadowControls.context.note}}</p>
+          {{/if}}
+          <div class="fa-nexus-drop-shadow__presets" data-fa-nexus-drop-shadow-presets>
+            {{#each dropShadowControls.presets as |preset|}}
+              <button type="button"
+                      class="fa-nexus-drop-shadow__preset{{#if preset.active}} is-active{{/if}}{{#unless preset.saved}} is-empty{{/unless}}"
+                      data-fa-nexus-drop-shadow-preset="{{preset.index}}"
+                      aria-pressed="{{#if preset.active}}true{{else}}false{{/if}}"
+                      title="{{preset.tooltip}}">
+                {{preset.label}}
+              </button>
+            {{/each}}
+            <button type="button" class="fa-nexus-drop-shadow__reset" data-fa-nexus-drop-shadow-reset title="Reset shadow settings to defaults">Reset</button>
+          </div>
+        </div>
+        <div class="fa-nexus-drop-shadow__body" data-fa-nexus-drop-shadow-body>
+          <div class="fa-nexus-drop-shadow__group">
+            <div class="fa-nexus-drop-shadow__row" data-fa-nexus-drop-shadow-alpha-row>
+              <div class="fa-nexus-drop-shadow__row-header">
+                <span class="fa-nexus-drop-shadow__row-label">{{dropShadowControls.alpha.label}}</span>
+                <span class="fa-nexus-drop-shadow__row-value" data-fa-nexus-drop-shadow-alpha-display>{{dropShadowControls.alpha.display}}</span>
+              </div>
+              <input type="range"
+                     min="{{dropShadowControls.alpha.min}}"
+                     max="{{dropShadowControls.alpha.max}}"
+                     step="{{dropShadowControls.alpha.step}}"
+                     value="{{dropShadowControls.alpha.value}}"
+                     aria-label="{{dropShadowControls.alpha.label}}"
+                     data-fa-nexus-drop-shadow-alpha
+                     {{#if dropShadowControls.alpha.disabled}}disabled{{/if}}>
+              {{#if dropShadowControls.alpha.hint}}
+                <p class="fa-nexus-tool-options__hint fa-nexus-drop-shadow__hint">{{dropShadowControls.alpha.hint}}</p>
+              {{/if}}
+            </div>
+
+            <div class="fa-nexus-drop-shadow__row" data-fa-nexus-drop-shadow-dilation-row>
+              <div class="fa-nexus-drop-shadow__row-header">
+                <span class="fa-nexus-drop-shadow__row-label">{{dropShadowControls.dilation.label}}</span>
+                <span class="fa-nexus-drop-shadow__row-value" data-fa-nexus-drop-shadow-dilation-display>{{dropShadowControls.dilation.display}}</span>
+              </div>
+              <input type="range"
+                     min="{{dropShadowControls.dilation.min}}"
+                     max="{{dropShadowControls.dilation.max}}"
+                     step="{{dropShadowControls.dilation.step}}"
+                     value="{{dropShadowControls.dilation.value}}"
+                     aria-label="{{dropShadowControls.dilation.label}}"
+                     data-fa-nexus-drop-shadow-dilation
+                     {{#if dropShadowControls.dilation.disabled}}disabled{{/if}}>
+              {{#if dropShadowControls.dilation.hint}}
+                <p class="fa-nexus-tool-options__hint fa-nexus-drop-shadow__hint">{{dropShadowControls.dilation.hint}}</p>
+              {{/if}}
+            </div>
+
+            <div class="fa-nexus-drop-shadow__row" data-fa-nexus-drop-shadow-blur-row>
+              <div class="fa-nexus-drop-shadow__row-header">
+                <span class="fa-nexus-drop-shadow__row-label">{{dropShadowControls.blur.label}}</span>
+                <span class="fa-nexus-drop-shadow__row-value" data-fa-nexus-drop-shadow-blur-display>{{dropShadowControls.blur.display}}</span>
+              </div>
+              <input type="range"
+                     min="{{dropShadowControls.blur.min}}"
+                     max="{{dropShadowControls.blur.max}}"
+                     step="{{dropShadowControls.blur.step}}"
+                     value="{{dropShadowControls.blur.value}}"
+                     aria-label="{{dropShadowControls.blur.label}}"
+                     data-fa-nexus-drop-shadow-blur
+                     {{#if dropShadowControls.blur.disabled}}disabled{{/if}}>
+              {{#if dropShadowControls.blur.hint}}
+                <p class="fa-nexus-tool-options__hint fa-nexus-drop-shadow__hint">{{dropShadowControls.blur.hint}}</p>
+              {{/if}}
+            </div>
+
+            {{#if dropShadowControls.offset}}
+            <div class="fa-nexus-drop-shadow__row fa-nexus-drop-shadow__offset" data-fa-nexus-drop-shadow-offset-row>
+              <div class="fa-nexus-drop-shadow__row-header">
+                <span class="fa-nexus-drop-shadow__row-label">Offset</span>
+                <div class="fa-nexus-drop-shadow__offset-values">
+                  <span class="fa-nexus-drop-shadow__offset-value">
+                    <span class="fa-nexus-drop-shadow__offset-value-label">Distance</span>
+                    <span class="fa-nexus-drop-shadow__offset-value-text" data-fa-nexus-drop-shadow-offset-distance-display>{{dropShadowControls.offset.displayDistance}}</span>
+                  </span>
+                  <span class="fa-nexus-drop-shadow__offset-value">
+                    <span class="fa-nexus-drop-shadow__offset-value-label">Angle</span>
+                    <span class="fa-nexus-drop-shadow__offset-value-text" data-fa-nexus-drop-shadow-offset-angle-display>{{dropShadowControls.offset.displayAngle}}</span>
+                  </span>
+                </div>
+              </div>
+              <div class="fa-nexus-drop-shadow__offset-control {{#if dropShadowControls.offset.disabled}}is-disabled{{/if}}"
+                   data-fa-nexus-drop-shadow-offset-control
+                   role="application"
+                   aria-label="Shadow offset control"
+                   data-max-distance="{{dropShadowControls.offset.maxDistance}}"
+                   {{#if dropShadowControls.offset.disabled}}data-disabled="true"{{else}}data-disabled="false"{{/if}}>
+                <div class="fa-nexus-drop-shadow__offset-circle" data-fa-nexus-drop-shadow-offset-circle>
+                  <div class="fa-nexus-drop-shadow__offset-crosshair fa-nexus-drop-shadow__offset-crosshair--x"></div>
+                  <div class="fa-nexus-drop-shadow__offset-crosshair fa-nexus-drop-shadow__offset-crosshair--y"></div>
+                  <div class="fa-nexus-drop-shadow__offset-handle" data-fa-nexus-drop-shadow-offset-handle></div>
+                </div>
+              </div>
+              {{#if dropShadowControls.offset.hint}}
+                <p class="fa-nexus-tool-options__hint fa-nexus-drop-shadow__hint">{{dropShadowControls.offset.hint}}</p>
+              {{/if}}
+            </div>
+            {{/if}}
+          </div>
+        </div>
+      </div>
+    {{/if}}
+
+    {{#if texturePaint.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-texture-tools" data-fa-nexus-texture-tools-root>
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Tool Mode</span>
+          <span class="fa-nexus-tool-options__value" data-fa-nexus-texture-mode-label>{{texturePaint.modeLabel}}</span>
+        </div>
+        <div class="fa-nexus-texture-tools__mode-list">
+          {{#each texturePaint.modes as |mode|}}
+            <button type="button"
+                    class="fa-nexus-texture-tools__mode {{#if mode.active}}is-active{{/if}}"
+                    data-fa-nexus-texture-mode="{{mode.id}}"
+                    aria-pressed="{{#if mode.active}}true{{else}}false{{/if}}"
+                    title="{{mode.tooltip}}">
+              {{#if mode.icon}}
+                <i class="{{mode.icon}}" aria-hidden="true"></i>
+              {{/if}}
+              <span>{{mode.label}}</span>
+            </button>
+          {{/each}}
+        </div>
+        {{#if texturePaint.status}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-texture-tools__status" data-fa-nexus-texture-status>{{texturePaint.status}}</p>
+        {{/if}}
+        {{#if texturePaint.actions}}
+          <div class="fa-nexus-texture-tools__actions">
+            {{#each texturePaint.actions as |action|}}
+              <button type="button"
+                      class="fa-nexus-texture-tools__action {{#if action.primary}}is-primary{{/if}}"
+                      data-fa-nexus-texture-action="{{action.id}}"
+                      {{#if action.disabled}}disabled{{/if}}
+                      title="{{action.tooltip}}">
+                <span>{{action.label}}</span>
+              </button>
+            {{/each}}
+          </div>
+        {{/if}}
+        {{#if texturePaint.hint}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-texture-tools__hint" data-fa-nexus-texture-hint>{{texturePaint.hint}}</p>
+        {{/if}}
+      </div>
+      {{#if texturePaint.opacity.available}}
+        <div class="fa-nexus-tool-options__control fa-nexus-texture-opacity" data-fa-nexus-texture-opacity-root>
+          <div class="fa-nexus-tool-options__control-header">
+            <span class="fa-nexus-tool-options__label">Tool Opacity</span>
+            <span class="fa-nexus-tool-options__value" data-fa-nexus-texture-opacity-display>{{texturePaint.opacity.display}}</span>
+          </div>
+          <input type="range"
+                 min="{{texturePaint.opacity.min}}"
+                 max="{{texturePaint.opacity.max}}"
+                 step="{{texturePaint.opacity.step}}"
+                 value="{{texturePaint.opacity.value}}"
+                 aria-label="Texture Fill Opacity"
+                 data-fa-nexus-texture-opacity
+                 {{#if texturePaint.opacity.disabled}}disabled{{/if}}>
+          {{#if texturePaint.opacity.hint}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-texture-opacity__hint">{{texturePaint.opacity.hint}}</p>
+          {{/if}}
+        </div>
+      {{/if}}
+      {{#if layerOpacity.available}}
+        <div class="fa-nexus-tool-options__control fa-nexus-texture-layer" data-fa-nexus-texture-layer-root>
+          <div class="fa-nexus-tool-options__control-header">
+            <span class="fa-nexus-tool-options__label">Texture Opacity</span>
+            <span class="fa-nexus-tool-options__value" data-fa-nexus-texture-layer-display>{{layerOpacity.display}}</span>
+          </div>
+          <input type="range"
+                 min="{{layerOpacity.min}}"
+                 max="{{layerOpacity.max}}"
+                 step="{{layerOpacity.step}}"
+                 value="{{layerOpacity.value}}"
+                 aria-label="Texture Opacity"
+                 data-fa-nexus-texture-layer>
+          {{#if layerOpacity.hint}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-texture-layer__hint">{{layerOpacity.hint}}</p>
+          {{/if}}
+        </div>
+      {{/if}}
+      {{#if textureOffset.available}}
+        <div class="fa-nexus-tool-options__control fa-nexus-texture-offset" data-fa-nexus-texture-offset-root>
+          <div class="fa-nexus-tool-options__control-header">
+            <span class="fa-nexus-tool-options__label">Texture Offset</span>
+          </div>
+          <div class="fa-nexus-texture-offset__row">
+            <span class="fa-nexus-texture-offset__axis">X</span>
+            <input type="range"
+                   min="{{textureOffset.x.min}}"
+                   max="{{textureOffset.x.max}}"
+                   step="{{textureOffset.x.step}}"
+                   value="{{textureOffset.x.value}}"
+                   aria-label="Texture Offset X"
+                   data-fa-nexus-texture-offset-x
+                   {{#if textureOffset.x.disabled}}disabled{{/if}}>
+            <span class="fa-nexus-tool-options__value" data-fa-nexus-texture-offset-x-display>{{textureOffset.x.display}}</span>
+          </div>
+          <div class="fa-nexus-texture-offset__row">
+            <span class="fa-nexus-texture-offset__axis">Y</span>
+            <input type="range"
+                   min="{{textureOffset.y.min}}"
+                   max="{{textureOffset.y.max}}"
+                   step="{{textureOffset.y.step}}"
+                   value="{{textureOffset.y.value}}"
+                   aria-label="Texture Offset Y"
+                   data-fa-nexus-texture-offset-y
+                   {{#if textureOffset.y.disabled}}disabled{{/if}}>
+            <span class="fa-nexus-tool-options__value" data-fa-nexus-texture-offset-y-display>{{textureOffset.y.display}}</span>
+          </div>
+          {{#if textureOffset.hint}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-texture-offset__hint">{{textureOffset.hint}}</p>
+          {{/if}}
+        </div>
+      {{/if}}
+    {{/if}}
+    {{#if pathAppearance.available}}
+      <div class="fa-nexus-tool-options__section">
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Path Appearance</span>
+        </div>
+        {{#if pathAppearance.hint}}
+          <p class="fa-nexus-tool-options__hint">{{pathAppearance.hint}}</p>
+        {{/if}}
+        {{#if pathAppearance.layerOpacity.available}}
+          <div class="fa-nexus-tool-options__control fa-nexus-path-opacity" data-fa-nexus-path-opacity-root>
+            <div class="fa-nexus-tool-options__control-header">
+              <span class="fa-nexus-tool-options__label">Path Opacity</span>
+              <span class="fa-nexus-tool-options__value" data-fa-nexus-path-opacity-display>{{pathAppearance.layerOpacity.display}}</span>
+            </div>
+            <input type="range"
+                   min="{{pathAppearance.layerOpacity.min}}"
+                   max="{{pathAppearance.layerOpacity.max}}"
+                   step="{{pathAppearance.layerOpacity.step}}"
+                   value="{{pathAppearance.layerOpacity.value}}"
+                   aria-label="Path Opacity"
+                   data-fa-nexus-path-opacity
+                   {{#if pathAppearance.layerOpacity.disabled}}disabled{{/if}}>
+            {{#if pathAppearance.layerOpacity.hint}}
+              <p class="fa-nexus-tool-options__hint fa-nexus-texture-layer__hint">{{pathAppearance.layerOpacity.hint}}</p>
+            {{/if}}
+          </div>
+        {{/if}}
+        {{#if pathAppearance.scale.available}}
+          <div class="fa-nexus-tool-options__control fa-nexus-path-scale" data-fa-nexus-path-scale-root>
+            <div class="fa-nexus-tool-options__control-header">
+              <span class="fa-nexus-tool-options__label">Path Scale</span>
+              <span class="fa-nexus-tool-options__value" data-fa-nexus-path-scale-display>{{pathAppearance.scale.display}}</span>
+            </div>
+            <input type="range"
+                   min="{{pathAppearance.scale.min}}"
+                   max="{{pathAppearance.scale.max}}"
+                   step="{{pathAppearance.scale.step}}"
+                   value="{{pathAppearance.scale.value}}"
+                   aria-label="Path Scale"
+                   data-fa-nexus-path-scale
+                   {{#if pathAppearance.scale.disabled}}disabled{{/if}}>
+          </div>
+        {{/if}}
+        {{#if pathAppearance.textureOffset.available}}
+          <div class="fa-nexus-tool-options__control fa-nexus-path-offset" data-fa-nexus-path-offset-root>
+            <div class="fa-nexus-tool-options__control-header">
+              <span class="fa-nexus-tool-options__label">Texture Offset</span>
+            </div>
+            <div class="fa-nexus-texture-offset__row">
+              <span class="fa-nexus-texture-offset__axis">X</span>
+              <input type="range"
+                     min="{{pathAppearance.textureOffset.x.min}}"
+                     max="{{pathAppearance.textureOffset.x.max}}"
+                     step="{{pathAppearance.textureOffset.x.step}}"
+                     value="{{pathAppearance.textureOffset.x.value}}"
+                     aria-label="Texture Offset X"
+                     data-fa-nexus-path-offset-x
+                     {{#if pathAppearance.textureOffset.x.disabled}}disabled{{/if}}>
+              <span class="fa-nexus-tool-options__value" data-fa-nexus-path-offset-x-display>{{pathAppearance.textureOffset.x.display}}</span>
+            </div>
+            <div class="fa-nexus-texture-offset__row">
+              <span class="fa-nexus-texture-offset__axis">Y</span>
+              <input type="range"
+                     min="{{pathAppearance.textureOffset.y.min}}"
+                     max="{{pathAppearance.textureOffset.y.max}}"
+                     step="{{pathAppearance.textureOffset.y.step}}"
+                     value="{{pathAppearance.textureOffset.y.value}}"
+                     aria-label="Texture Offset Y"
+                     data-fa-nexus-path-offset-y
+                     {{#if pathAppearance.textureOffset.y.disabled}}disabled{{/if}}>
+              <span class="fa-nexus-tool-options__value" data-fa-nexus-path-offset-y-display>{{pathAppearance.textureOffset.y.display}}</span>
+            </div>
+            {{#if pathAppearance.textureOffset.hint}}
+              <p class="fa-nexus-tool-options__hint fa-nexus-texture-offset__hint">{{pathAppearance.textureOffset.hint}}</p>
+            {{/if}}
+          </div>
+        {{/if}}
+        {{#if pathAppearance.tension.available}}
+          <div class="fa-nexus-tool-options__control fa-nexus-path-tension" data-fa-nexus-path-tension-root>
+            <div class="fa-nexus-tool-options__control-header">
+              <span class="fa-nexus-tool-options__label">Path Tension</span>
+              <span class="fa-nexus-tool-options__value" data-fa-nexus-path-tension-display>{{pathAppearance.tension.display}}</span>
+            </div>
+            <input type="range"
+                   min="{{pathAppearance.tension.min}}"
+                   max="{{pathAppearance.tension.max}}"
+                   step="{{pathAppearance.tension.step}}"
+                   value="{{pathAppearance.tension.value}}"
+                   aria-label="Path Tension"
+                   data-fa-nexus-path-tension
+                   {{#if pathAppearance.tension.disabled}}disabled{{/if}}>
+          </div>
+        {{/if}}
+      </div>
+    {{/if}}
+
+    {{#if pathFeather.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-path-feather" data-fa-nexus-path-feather>
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Shrink Start &amp; End</span>
+          <span class="fa-nexus-tool-options__value">{{pathFeather.unitLabel}}</span>
+        </div>
+        <div class="fa-nexus-path-feather__section">
+          <span class="fa-nexus-path-feather__title">Start</span>
+          <label class="fa-nexus-path-feather__toggle">
+            <input type="checkbox"
+                   data-fa-nexus-feather-start-toggle
+                   {{#if pathFeather.start.enabled}}checked{{/if}}>
+            <span>Shrink Start</span>
+          </label>
+          <div class="fa-nexus-path-feather__slider">
+            <span class="fa-nexus-path-feather__slider-label">Length</span>
+            <input type="range"
+                   min="{{pathFeather.start.length.min}}"
+                   max="{{pathFeather.start.length.max}}"
+                   step="{{pathFeather.start.length.step}}"
+                   value="{{pathFeather.start.length.value}}"
+                   data-fa-nexus-feather-start-length
+                   {{#if pathFeather.start.length.disabled}}disabled{{/if}}>
+            <span class="fa-nexus-path-feather__value" data-fa-nexus-feather-start-display>{{pathFeather.start.length.display}}</span>
+          </div>
+        </div>
+        <div class="fa-nexus-path-feather__section">
+          <span class="fa-nexus-path-feather__title">End</span>
+          <label class="fa-nexus-path-feather__toggle">
+            <input type="checkbox"
+                   data-fa-nexus-feather-end-toggle
+                   {{#if pathFeather.end.enabled}}checked{{/if}}>
+            <span>Shrink End</span>
+          </label>
+          <div class="fa-nexus-path-feather__slider">
+            <span class="fa-nexus-path-feather__slider-label">Length</span>
+            <input type="range"
+                   min="{{pathFeather.end.length.min}}"
+                   max="{{pathFeather.end.length.max}}"
+                   step="{{pathFeather.end.length.step}}"
+                   value="{{pathFeather.end.length.value}}"
+                   data-fa-nexus-feather-end-length
+                   {{#if pathFeather.end.length.disabled}}disabled{{/if}}>
+            <span class="fa-nexus-path-feather__value" data-fa-nexus-feather-end-display>{{pathFeather.end.length.display}}</span>
+          </div>
+        </div>
+        {{#if pathFeather.hint}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-path-feather__hint" data-fa-nexus-feather-hint>{{pathFeather.hint}}</p>
+        {{/if}}
+      </div>
+    {{/if}}
+
+    {{#if opacityFeather.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-opacity-feather" data-fa-nexus-opacity-feather>
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Opacity Feather</span>
+          <span class="fa-nexus-tool-options__value">{{opacityFeather.unitLabel}}</span>
+        </div>
+        <div class="fa-nexus-opacity-feather__section">
+          <label class="fa-nexus-opacity-feather__toggle">
+            <input type="checkbox" data-fa-nexus-opacity-start-toggle {{#if opacityFeather.start.enabled}}checked{{/if}}>
+            <span>Fade In</span>
+          </label>
+          <div class="fa-nexus-opacity-feather__slider">
+            <span class="fa-nexus-opacity-feather__slider-label">Length</span>
+            <input type="range"
+                   min="{{opacityFeather.start.length.min}}"
+                   max="{{opacityFeather.start.length.max}}"
+                   step="{{opacityFeather.start.length.step}}"
+                   value="{{opacityFeather.start.length.value}}"
+                   data-fa-nexus-opacity-start-length
+                   {{#if opacityFeather.start.length.disabled}}disabled{{/if}}>
+            <span class="fa-nexus-opacity-feather__value" data-fa-nexus-opacity-start-display>{{opacityFeather.start.length.display}}</span>
+          </div>
+        </div>
+        <div class="fa-nexus-opacity-feather__section">
+          <label class="fa-nexus-opacity-feather__toggle">
+            <input type="checkbox" data-fa-nexus-opacity-end-toggle {{#if opacityFeather.end.enabled}}checked{{/if}}>
+            <span>Fade Out</span>
+          </label>
+          <div class="fa-nexus-opacity-feather__slider">
+            <span class="fa-nexus-opacity-feather__slider-label">Length</span>
+            <input type="range"
+                   min="{{opacityFeather.end.length.min}}"
+                   max="{{opacityFeather.end.length.max}}"
+                   step="{{opacityFeather.end.length.step}}"
+                   value="{{opacityFeather.end.length.value}}"
+                   data-fa-nexus-opacity-end-length
+                   {{#if opacityFeather.end.length.disabled}}disabled{{/if}}>
+            <span class="fa-nexus-opacity-feather__value" data-fa-nexus-opacity-end-display>{{opacityFeather.end.length.display}}</span>
+          </div>
+        </div>
+        {{#if opacityFeather.hint}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-opacity-feather__hint" data-fa-nexus-opacity-hint>{{opacityFeather.hint}}</p>
+        {{/if}}
+      </div>
+    {{/if}}
+
+    {{#if flip.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-flip" data-fa-nexus-flip-root>
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Flip / Mirror</span>
+          <span class="fa-nexus-flip__status">
+            <span class="fa-nexus-tool-options__value" data-fa-nexus-flip-display>{{flip.display}}</span>
+            {{#if flip.previewDisplay}}
+              <span class="fa-nexus-flip__preview" data-fa-nexus-flip-preview>{{flip.previewDisplay}}</span>
+            {{/if}}
+          </span>
+        </div>
+        <div class="fa-nexus-flip__body">
+          <div class="fa-nexus-flip__axes">
+            <div class="fa-nexus-flip__axis">
+              <button type="button"
+                      class="fa-nexus-flip__button {{#if flip.horizontal.active}}is-active{{/if}} {{#if flip.horizontal.previewDiff}}has-preview-diff{{/if}}"
+                      data-fa-nexus-flip-horizontal
+                      aria-pressed="{{flip.horizontal.active}}"
+                      aria-label="{{flip.horizontal.aria}}"
+                      title="{{flip.horizontal.tooltip}}"
+                      {{#if flip.horizontal.disabled}}disabled{{/if}}>
+                <span>{{flip.horizontal.label}}</span>
+              </button>
+              {{#if flip.horizontal.randomButtonVisible}}
+                <button type="button"
+                        class="fa-nexus-flip__random {{#if flip.horizontal.randomEnabled}}is-active{{/if}} {{#if flip.horizontal.randomPreviewDiff}}has-preview-diff{{/if}}"
+                        data-fa-nexus-flip-horizontal-random
+                        aria-pressed="{{flip.horizontal.randomEnabled}}"
+                        aria-label="{{flip.horizontal.randomAria}}"
+                        title="{{flip.horizontal.randomTooltip}}"
+                        {{#if flip.horizontal.randomDisabled}}disabled{{/if}}>
+                  <i class="fas fa-random" aria-hidden="true"></i>
+                  <span>{{flip.horizontal.randomLabel}}</span>
+                </button>
+              {{/if}}
+            </div>
+            <div class="fa-nexus-flip__axis">
+              <button type="button"
+                      class="fa-nexus-flip__button {{#if flip.vertical.active}}is-active{{/if}} {{#if flip.vertical.previewDiff}}has-preview-diff{{/if}}"
+                      data-fa-nexus-flip-vertical
+                      aria-pressed="{{flip.vertical.active}}"
+                      aria-label="{{flip.vertical.aria}}"
+                      title="{{flip.vertical.tooltip}}"
+                      {{#if flip.vertical.disabled}}disabled{{/if}}>
+                <span>{{flip.vertical.label}}</span>
+              </button>
+              {{#if flip.vertical.randomButtonVisible}}
+                <button type="button"
+                        class="fa-nexus-flip__random {{#if flip.vertical.randomEnabled}}is-active{{/if}} {{#if flip.vertical.randomPreviewDiff}}has-preview-diff{{/if}}"
+                        data-fa-nexus-flip-vertical-random
+                        aria-pressed="{{flip.vertical.randomEnabled}}"
+                        aria-label="{{flip.vertical.randomAria}}"
+                        title="{{flip.vertical.randomTooltip}}"
+                        {{#if flip.vertical.randomDisabled}}disabled{{/if}}>
+                  <i class="fas fa-random" aria-hidden="true"></i>
+                  <span>{{flip.vertical.randomLabel}}</span>
+                </button>
+              {{/if}}
+            </div>
+          </div>
+        </div>
+        {{#if flip.randomHint}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-flip__hint">{{flip.randomHint}}</p>
+        {{/if}}
+      </div>
+    {{/if}}
+
+    {{#if scale.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-scale" data-fa-nexus-scale-root>
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Scale</span>
+          <span class="fa-nexus-tool-options__value" data-fa-nexus-scale-display>{{scale.display}}</span>
+        </div>
+        <div class="fa-nexus-scale__body">
+          <input type="range"
+                 min="{{scale.min}}"
+                 max="{{scale.max}}"
+                 step="{{scale.step}}"
+                 value="{{scale.value}}"
+                 aria-label="Scale"
+                 data-fa-nexus-scale-base>
+          {{#if scale.randomButtonVisible}}
+            <button type="button"
+                    class="fa-nexus-scale__random {{#if scale.randomEnabled}}is-active{{/if}}"
+                    data-fa-nexus-scale-random
+                    aria-pressed="{{scale.randomEnabled}}"
+                    title="{{scale.randomTooltip}}">
+              <i class="fas fa-random" aria-hidden="true"></i>
+              <span>{{scale.randomLabel}}</span>
+            </button>
+          {{/if}}
+        </div>
+        {{#if scale.randomEnabled}}
+          <div class="fa-nexus-scale__strength" data-fa-nexus-scale-strength-row>
+            <span class="fa-nexus-scale__strength-label">Strength</span>
+            <input type="range"
+                   min="{{scale.strengthMin}}"
+                   max="{{scale.strengthMax}}"
+                   step="{{scale.strengthStep}}"
+                   value="{{scale.strength}}"
+                   aria-label="Random scale strength"
+                   data-fa-nexus-scale-strength>
+            <span class="fa-nexus-scale__strength-value" data-fa-nexus-scale-strength-label>{{scale.strengthDisplay}}</span>
+          </div>
+        {{/if}}
+        {{#if scale.randomHint}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-scale__hint">{{scale.randomHint}}</p>
+        {{/if}}
+      </div>
+    {{/if}}
+
+    {{#if rotation.available}}
+      <div class="fa-nexus-tool-options__control fa-nexus-rotation" data-fa-nexus-rotation-root>
+        <div class="fa-nexus-tool-options__control-header">
+          <span class="fa-nexus-tool-options__label">Rotation</span>
+          <span class="fa-nexus-tool-options__value" data-fa-nexus-rotation-display>{{rotation.display}}</span>
+        </div>
+        <div class="fa-nexus-rotation__body">
+          <input type="range"
+                 min="{{rotation.min}}"
+                 max="{{rotation.max}}"
+                 step="{{rotation.step}}"
+                 value="{{rotation.value}}"
+                 aria-label="Rotation"
+                 data-fa-nexus-rotation-base>
+          {{#if rotation.randomButtonVisible}}
+            <button type="button"
+                    class="fa-nexus-rotation__random {{#if rotation.randomEnabled}}is-active{{/if}}"
+                    data-fa-nexus-rotation-random
+                    aria-pressed="{{rotation.randomEnabled}}"
+                    title="{{rotation.randomTooltip}}">
+              <i class="fas fa-random" aria-hidden="true"></i>
+              <span>{{rotation.randomLabel}}</span>
+            </button>
+          {{/if}}
+        </div>
+        {{#if rotation.randomEnabled}}
+          <div class="fa-nexus-rotation__strength" data-fa-nexus-rotation-strength-row>
+            <span class="fa-nexus-rotation__strength-label">Strength</span>
+            <input type="range"
+                   min="{{rotation.strengthMin}}"
+                   max="{{rotation.strengthMax}}"
+                   step="{{rotation.strengthStep}}"
+                   value="{{rotation.strength}}"
+                   aria-label="Random rotation strength"
+                   data-fa-nexus-rotation-strength>
+            <span class="fa-nexus-rotation__strength-value" data-fa-nexus-rotation-strength-label>{{rotation.strengthDisplay}}</span>
+          </div>
+        {{/if}}
+        {{#if rotation.randomHint}}
+          <p class="fa-nexus-tool-options__hint fa-nexus-rotation__hint">{{rotation.randomHint}}</p>
+        {{/if}}
+      </div>
+    {{/if}}
+
+    {{#if hasCustomToggles}}
+      {{#each customToggles as |toggle|}}
+        <label class="fa-nexus-tool-options__toggle" title="{{toggle.tooltip}}">
+          <input type="checkbox" data-fa-nexus-custom-toggle="{{toggle.id}}" {{#if toggle.enabled}}checked{{/if}} {{#if toggle.disabled}}disabled{{/if}}>
+          <span>{{toggle.label}}</span>
+        </label>
+      {{/each}}
+    {{/if}}
+  </section>
+
+  {{#if placeAs.available}}
+    <section class="fa-nexus-tool-options__section fa-nexus-place-as {{#if placeAs.open}}is-open{{/if}}">
+      <div class="fa-nexus-place-as__header">
+        <span class="fa-nexus-tool-options__label">Place Tokens As</span>
+      </div>
+      <button type="button"
+              class="fa-nexus-place-as__selection"
+              data-place-as-toggle
+              aria-expanded="{{placeAs.open}}"
+              aria-controls="fa-nexus-place-as-panel">
+        <span class="fa-nexus-place-as__selection-text">
+          <span class="fa-nexus-place-as__selection-label">{{placeAs.selectedLabel}}</span>
+          {{#if placeAs.selectedSubtitle}}
+            <span class="fa-nexus-place-as__selection-subtitle">{{placeAs.selectedSubtitle}}</span>
+          {{/if}}
+        </span>
+        <span class="fa-nexus-place-as__chevron" aria-hidden="true"></span>
+      </button>
+      {{#if placeAs.open}}
+        <div class="fa-nexus-place-as__panel" id="fa-nexus-place-as-panel">
+          <div class="fa-nexus-place-as__search-wrapper">
+            <input type="search"
+                   id="fa-nexus-place-as-search"
+                   class="fa-nexus-place-as__search"
+                   placeholder="Search actors…"
+                   value="{{placeAs.searchValue}}">
+          </div>
+          {{#if placeAs.isLoading}}
+            <p class="fa-nexus-tool-options__hint">Loading compendium actors…</p>
+          {{/if}}
+          {{#if placeAs.loadError}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-place-as__error">{{placeAs.loadError}}</p>
+          {{/if}}
+          <div class="fa-nexus-place-as__list" data-fa-nexus-place-as-list>
+            {{#if placeAs.hasOptions}}
+              {{#each placeAs.options as |entry|}}
+                {{#if entry.isHeader}}
+                  <div class="fa-nexus-place-as__group">{{entry.label}}</div>
+                {{else}}
+                  <button type="button"
+                          class="fa-nexus-place-as__option {{#if entry.selected}}is-selected{{/if}}"
+                          data-place-as-option="{{entry.id}}">
+                    <span class="fa-nexus-place-as__option-label">{{entry.label}}</span>
+                    {{#if entry.subtitle}}
+                      <span class="fa-nexus-place-as__option-subtitle">{{entry.subtitle}}</span>
+                    {{/if}}
+                  </button>
+                {{/if}}
+              {{/each}}
+            {{/if}}
+          </div>
+          {{#if placeAs.emptyMessage}}
+            <div class="fa-nexus-place-as__empty">{{placeAs.emptyMessage}}</div>
+          {{/if}}
+        </div>
+      {{/if}}
+      {{#if placeAs.hp}}
+        <div class="fa-nexus-place-as__hp" data-place-as-hp>
+          <label for="fa-nexus-place-as-hp-mode" class="fa-nexus-place-as__hp-label">Hit Points</label>
+          <select id="fa-nexus-place-as-hp-mode"
+                  class="fa-nexus-place-as__hp-mode"
+                  data-place-as-hp-mode>
+            {{#each placeAs.hp.modeOptions as |option|}}
+              <option value="{{option.id}}"
+                      {{#if option.selected}}selected{{/if}}
+                      {{#if option.disabled}}disabled{{/if}}>
+                {{option.label}}
+              </option>
+            {{/each}}
+          </select>
+          {{#if placeAs.hp.modeHint}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-place-as__hp-hint" data-place-as-hp-mode-hint>{{placeAs.hp.modeHint}}</p>
+          {{/if}}
+          <label class="fa-nexus-place-as__hp-row"
+                 data-place-as-hp-percent-row
+                 for="fa-nexus-place-as-hp-percent"
+                 {{#unless placeAs.hp.showPercent}}hidden{{/unless}}>
+            <span class="fa-nexus-place-as__hp-row-label">Deviation</span>
+            <input type="number"
+                   id="fa-nexus-place-as-hp-percent"
+                   class="fa-nexus-place-as__hp-input"
+                   min="{{placeAs.hp.percentMin}}"
+                   max="{{placeAs.hp.percentMax}}"
+                   step="1"
+                   value="{{placeAs.hp.percentValue}}"
+                   data-place-as-hp-percent>
+            <span class="fa-nexus-place-as__hp-row-suffix">%</span>
+          </label>
+          {{#if placeAs.hp.percentHint}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-place-as__hp-hint"
+               data-place-as-hp-percent-hint
+               {{#unless placeAs.hp.showPercent}}hidden{{/unless}}>{{placeAs.hp.percentHint}}</p>
+          {{/if}}
+          <label class="fa-nexus-place-as__hp-row"
+                 data-place-as-hp-static-row
+                 for="fa-nexus-place-as-hp-static"
+                 {{#unless placeAs.hp.showStatic}}hidden{{/unless}}>
+            <span class="fa-nexus-place-as__hp-row-label">Value / Range</span>
+            <input type="text"
+                   id="fa-nexus-place-as-hp-static"
+                   class="fa-nexus-place-as__hp-input {{#if placeAs.hp.staticError}}has-error{{/if}}"
+                   value="{{placeAs.hp.staticValue}}"
+                   placeholder="e.g. 40 or 20-85"
+                   data-place-as-hp-static
+                   {{#if placeAs.hp.staticError}}aria-invalid="true"{{/if}}>
+          </label>
+          {{#if placeAs.hp.staticHint}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-place-as__hp-hint"
+               data-place-as-hp-static-hint
+               {{#unless placeAs.hp.showStatic}}hidden{{/unless}}>{{placeAs.hp.staticHint}}</p>
+          {{/if}}
+          {{#if placeAs.hp.staticError}}
+            <p class="fa-nexus-tool-options__hint fa-nexus-place-as__error" data-place-as-hp-static-error>{{placeAs.hp.staticError}}</p>
+          {{/if}}
+        </div>
+      {{/if}}
+      <label class="fa-nexus-tool-options__toggle fa-nexus-place-as__linked" title="{{placeAs.linkedTooltip}}">
+        <input type="checkbox" data-place-as-linked {{#if placeAs.linked}}checked{{/if}} {{#if placeAs.linkedDisabled}}disabled{{/if}}>
+        <span>{{placeAs.linkedLabel}}</span>
+      </label>
+    </section>
+  {{/if}}
+
+    {{#unless hasActiveTool}}
+      <section class="fa-nexus-tool-options__section">
+        <div class="fa-nexus-tool-options__empty">
+          <span>No tool is currently active.</span>
+        </div>
+      </section>
+    {{/unless}}
+  </div>
+
+  {{#if shortcuts.available}}
+    <footer class="fa-nexus-tool-options__footer{{#if shortcuts.collapsed}} is-collapsed{{/if}}" data-fa-nexus-shortcuts-root>
+      <button type="button"
+              class="fa-nexus-tool-options__footer-toggle"
+              data-fa-nexus-shortcuts-toggle
+              aria-expanded="{{#unless shortcuts.collapsed}}true{{else}}false{{/unless}}"
+              aria-controls="fa-nexus-tool-options-shortcuts">
+        <span class="fa-nexus-tool-options__footer-label">Shortcuts</span>
+        <i class="fas fa-chevron-down fa-nexus-tool-options__footer-icon" aria-hidden="true"></i>
+      </button>
+      <div class="fa-nexus-tool-options__footer-content"
+           id="fa-nexus-tool-options-shortcuts"
+           data-fa-nexus-shortcuts-content
+           {{#if shortcuts.collapsed}}hidden{{/if}}>
+        <ul class="fa-nexus-tool-options__hints">
+          {{#each shortcuts.lines as |hint|}}
+            <li class="fa-nexus-tool-options__hint-item">{{hint}}</li>
+          {{/each}}
+        </ul>
+      </div>
+    </footer>
+  {{/if}}
+</div>

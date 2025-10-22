@@ -1,0 +1,15 @@
+<div class="fa-nexus-cache-manager" style="padding: 10px; display: grid; gap: 8px;">
+  {{#if entries.length}}
+    {{#each entries}}
+      <div class="fa-nexus-cache-row" data-folder="{{folder}}" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+        <code style="word-break: break-all;">{{folder}} — {{count}} items</code>
+        <button type="button" data-action="clear-folder">Clear</button>
+      </div>
+    {{/each}}
+    <button type="button" data-action="clear-all" style="margin-top: 8px; justify-self: end;">Clear All</button>
+  {{else}}
+    <div>No cached indexes.</div>
+  {{/if}}
+</div>
+
+

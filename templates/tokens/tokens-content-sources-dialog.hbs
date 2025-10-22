@@ -1,0 +1,136 @@
+<div class="fa-nexus-content-sources-dialog">
+  <div class="fa-nexus-content-sources-header">
+    <p>Select one or more root folders that contain your local tokens.</p>
+    <div class="fa-nexus-content-sources-actions">
+      {{#if cacheType}}
+        {{#if hasAnyCache}}
+          <button id="fa-nexus-clear-all-cache-btn" type="button" class="fa-nexus-clear-cache-all-button"><i class="fas fa-broom"></i> Clear Local Cached Indexes</button>
+        {{/if}}
+        {{#if hasOrphanCaches}}
+          <button id="fa-nexus-clear-orphan-cache-btn" type="button" class="fa-nexus-clear-cache-all-button"><i class="fas fa-eraser"></i> Clear Unlisted Indexes ({{orphanCacheCount}})</button>
+        {{/if}}
+      {{/if}}
+      <button id="fa-nexus-add-folder-btn" type="button" class="fa-nexus-add-folder-button"><i class="fas fa-folder-plus"></i> Add Folder</button>
+    </div>
+  </div>
+
+  <div class="fa-nexus-content-sources-list">
+    <div class="fa-nexus-content-sources-list-header">
+      <span class="fa-nexus-folder-count">{{enabledCount}} enabled / {{totalCount}} total</span>
+      {{#if cacheType}}
+        <span class="fa-nexus-cache-summary {{#if hasAnyCache}}has-cache{{/if}}">
+          {{#if hasAnyCache}}
+            Cached indexes: {{cacheFolderCount}} folder(s), {{cacheTotalCount}} item(s)
+          {{else}}
+            No local cached indexes yet
+          {{/if}}
+        </span>
+      {{/if}}
+    </div>
+    <div class="fa-nexus-content-sources-items">
+      {{#if hasCloud}}
+        <div class="fa-nexus-folder-item fa-nexus-cloud-row {{#unless cloud.enabled}}fa-nexus-folder-disabled{{/unless}}" data-folder-key="{{cloud.folderKey}}">
+          <div class="fa-nexus-folder-enable">
+            <input id="{{cloud.toggleId}}" type="checkbox" {{#if cloud.enabled}}checked{{/if}} />
+          </div>
+          <div class="fa-nexus-folder-content">
+            <div class="fa-nexus-folder-info">
+              <div class="fa-nexus-folder-label">{{cloud.label}}</div>
+              {{#if cloud.description}}
+                <div class="fa-nexus-folder-description">{{cloud.description}}</div>
+              {{/if}}
+              <div class="fa-nexus-folder-path">Version: {{#if cloud.version}}{{cloud.version}}{{else}}—{{/if}}</div>
+              <div class="fa-nexus-folder-cache {{#if cloud.hasCache}}is-present{{else}}is-empty{{/if}}">
+                <i class="fas fa-cloud"></i>
+                <span>{{cloud.cacheCount}} item(s)</span>
+              </div>
+              {{#if cloud.indexState.text}}
+                <div class="fa-nexus-folder-index-status {{cloud.indexState.css}}">
+                  <i class="fas {{cloud.indexState.icon}}"></i>
+                  <span>{{cloud.indexState.text}}</span>
+                </div>
+              {{/if}}
+            </div>
+            <div class="fa-nexus-folder-actions fa-nexus-cloud-actions">
+              <span class="fa-nexus-cloud-badge"><i class="fas fa-cloud"></i> Cloud</span>
+              {{#if canIndex}}
+                <button type="button" class="fa-nexus-index-folder-btn fa-nexus-cloud-index-btn" data-folder="cloud-tokens" data-action="start" title="Rebuild cloud index"><i class="fas fa-sync-alt"></i></button>
+              {{/if}}
+              <button type="button" class="fa-nexus-cloud-clear-btn" title="Clear cloud index"><i class="fas fa-broom"></i></button>
+            </div>
+          </div>
+        </div>
+      {{/if}}
+      {{#if hasFolders}}
+        {{#each folders}}
+          <div class="fa-nexus-folder-item {{#unless enabled}}fa-nexus-folder-disabled{{/unless}}" data-folder-key="{{folderKey}}">
+            <div class="fa-nexus-folder-enable">
+              <input class="fa-nexus-folder-checkbox" type="checkbox" data-index="{{@index}}" {{#if enabled}}checked{{/if}} />
+            </div>
+            <div class="fa-nexus-folder-content">
+              <div class="fa-nexus-folder-info">
+                <div class="fa-nexus-folder-label" data-index="{{@index}}">{{#if customLabel}}{{customLabel}}{{else}}{{label}}{{/if}}</div>
+                <div class="fa-nexus-folder-path">{{path}}</div>
+                {{#if @root.cacheType}}
+                  <div class="fa-nexus-folder-cache {{#if hasCache}}is-present{{else}}is-empty{{/if}}">
+                    <i class="fas fa-database"></i>
+                    {{#if hasCache}}
+                      <span>{{cacheCount}} cached item(s)</span>
+                    {{else}}
+                      <span>No cached index</span>
+                    {{/if}}
+                  </div>
+                {{/if}}
+                {{#if indexState.text}}
+                  <div class="fa-nexus-folder-index-status {{indexState.css}}">
+                    <i class="fas {{indexState.icon}}"></i>
+                    <span>{{indexState.text}}</span>
+                  </div>
+                {{/if}}
+              </div>
+              <div class="fa-nexus-folder-actions">
+                <button class="fa-nexus-edit-folder-btn" data-index="{{@index}}" title="Edit"><i class="fas fa-pen"></i></button>
+                <button class="fa-nexus-remove-folder-btn" data-index="{{@index}}" title="Remove"><i class="fas fa-trash"></i></button>
+                {{#if @root.canIndex}}
+                  <button type="button" class="fa-nexus-index-folder-btn{{#if isIndexing}} is-cancel{{/if}}" data-index="{{@index}}" data-folder="{{path}}" data-action="{{#if isIndexing}}cancel{{else}}start{{/if}}" title="{{#if isIndexing}}Cancel indexing{{else}}Rebuild index{{/if}}">
+                    <i class="fas {{#if isIndexing}}fa-ban{{else}}fa-sync-alt{{/if}}"></i>
+                  </button>
+                {{/if}}
+                {{#if @root.cacheType}}
+                  <button type="button" class="fa-nexus-clear-cache-btn" data-index="{{@index}}" data-folder="{{path}}" title="Clear cached index" {{#unless hasCache}}disabled{{/unless}}>
+                    <i class="fas fa-broom"></i>
+                  </button>
+                {{/if}}
+              </div>
+            </div>
+          </div>
+        {{/each}}
+      {{else}}
+        <div class="fa-nexus-no-folders-message">
+          <i class="fas fa-folder-open"></i>
+          <p>No folders added yet.</p>
+          <p>Click “Add Folder” to select a local token folder.</p>
+        </div>
+      {{/if}}
+    </div>
+  </div>
+
+  {{#if cacheType}}
+    {{#if hasOrphanCaches}}
+      <div class="fa-nexus-orphan-cache-list">
+        <div class="fa-nexus-orphan-cache-title"><i class="fas fa-info-circle"></i> Cached folders not listed above:</div>
+        {{#each orphanCaches}}
+          <div class="fa-nexus-orphan-cache-row">
+            <code>{{folder}} — {{count}} item(s)</code>
+            <button type="button" data-action="clear-orphan-cache" data-folder="{{folder}}"><i class="fas fa-broom"></i> Clear</button>
+          </div>
+        {{/each}}
+      </div>
+    {{/if}}
+  {{/if}}
+
+  <div class="fa-nexus-content-sources-footer">
+    <button id="fa-nexus-cancel-folders-btn" type="button" class="fa-nexus-cancel-button">Cancel</button>
+    <button id="fa-nexus-save-folders-btn" type="button" class="fa-nexus-save-button">Save</button>
+  </div>
+</div>
