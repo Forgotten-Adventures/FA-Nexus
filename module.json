@@ -1,7 +1,7 @@
 {
   "id": "fa-nexus",
   "title": "FA Nexus",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "compatibility": {
     "minimum": "13",
     "verified": "13"
