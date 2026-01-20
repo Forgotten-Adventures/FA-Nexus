@@ -1,7 +1,7 @@
 {
   "id": "fa-nexus",
   "title": "FA Nexus",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "compatibility": {
     "minimum": "13",
     "verified": "13"
@@ -41,6 +41,6 @@
   "styles": [
     "styles/nexus-app.css"
   ],
-  "manifest": "https://raw.githubusercontent.com/Forgotten-Adventures/FA-Nexus/main/module.json",
-  "download": "https://github.com/Forgotten-Adventures/FA-Nexus/raw/main/fa-nexus.zip"
+  "manifest": "https://raw.githubusercontent.com/matteobarbieri/FA-Nexus/feat/support-tokens-shadowdark/module.json",
+  "download": "https://raw.githubusercontent.com/matteobarbieri/FA-Nexus/feat/support-tokens-shadowdark/fa-nexus.zip"
 }
