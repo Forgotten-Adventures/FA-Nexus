@@ -143,10 +143,19 @@ const ACTOR_TYPE_MAPPINGS = {
     description: 'Vampire: The Masquerade 5th Edition'
   },
 
+  // Vampire: The Masquerade 5th Edition
+  'shadowdark': {
+    defaultType: 'Player',
+    supportedTypes: ['Player', 'NPC'],
+    requiredFields: ['name', 'type'],
+    optionalFields: ['img'],
+    description: 'Shadowdark'
+  },
+
   // Generic fallback for unknown systems
   'generic': {
     defaultType: 'character',
-    supportedTypes: ['Player'],
+    supportedTypes: ['character', 'npc'],
     requiredFields: ['name'],
     optionalFields: ['type', 'img'],
     description: 'Generic System'
