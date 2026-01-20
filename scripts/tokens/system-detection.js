@@ -146,7 +146,7 @@ const ACTOR_TYPE_MAPPINGS = {
   // Generic fallback for unknown systems
   'generic': {
     defaultType: 'character',
-    supportedTypes: ['character', 'npc'],
+    supportedTypes: ['Player'],
     requiredFields: ['name'],
     optionalFields: ['type', 'img'],
     description: 'Generic System'
