@@ -159,6 +159,18 @@ export class TokenPlacementManager {
       if (!payload) return;
       payload.url = this._resolveCurrentUrl(cardElement, payload);
 
+      // Copy to clipboard
+      let isCopied = false;
+      try {
+        const fp = cardElement.getAttribute('data-file-path') || cardElement.getAttribute('data-url');
+        if (fp) {
+          game.clipboard.copyPlainText(fp);
+          isCopied = true;
+        }
+      } catch (_) {
+          ui.notifications?.error?.('Unable to copy path to clipboard.');
+      }
+
       this._ensureActorOptionsLoaded();
       this._placeAsOpen = false;
       this._placeAsSearch = '';
@@ -200,7 +212,7 @@ export class TokenPlacementManager {
       this._applyRotationToPreview();
       this._hoveredActorEl = null;
       this._setupEvents();
-      this._announceStart(sticky);
+      this._announceStart(sticky, isCopied);
     } catch (error) {
       Logger.warn('TokenPlacement.start.failed', { error: String(error?.message || error) });
       ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
@@ -230,6 +242,18 @@ export class TokenPlacementManager {
         .map((entry) => this._normalizeEntry(entry))
         .filter((entry) => !!entry);
       if (!normalized.length) return;
+
+      // Copy to clipboard
+      let isCopied = false;
+      try {
+        const fp = list[0].file_path;
+        if (fp) {
+          game.clipboard.copyPlainText(fp);
+          isCopied = true;
+        }
+      } catch (_) {
+          ui.notifications?.error?.('Unable to copy path to clipboard.');
+      }
 
       this.isPlacementActive = true;
       this._stickyMode = sticky !== false;
@@ -280,7 +304,7 @@ export class TokenPlacementManager {
 
       this._hoveredActorEl = null;
       this._setupEvents();
-      this._announceStart(true);
+      this._announceStart(true, isCopied);
     } catch (error) {
       Logger.warn('TokenPlacement.random.start.failed', { error: String(error?.message || error) });
       ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
@@ -3362,10 +3386,9 @@ export class TokenPlacementManager {
     };
   }
 
-  _announceStart(isSticky) {
-    const message = isSticky
-      ? 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, hold Shift to keep placing, press ESC to cancel.'
-      : 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, hold Shift to keep placing, press ESC to cancel.';
+  _announceStart(isSticky, isCopied) {
+    let message = 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, hold Shift to keep placing, press ESC to cancel.';
+    if (isCopied) message += ' Path copied to clipboard.';
     announceChange('token-placement-start', message, { level: 'info', throttleMs: 500 });
   }
 }
