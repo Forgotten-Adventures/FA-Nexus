@@ -102,7 +102,7 @@ export function parseTokenDisplayName(filename = '') {
   let variant = '';
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
-    if (/^[A-Z]{1,3}\d{1,3}$/.test(p) || /^\d{3}[A-Z]$/.test(p)) {
+    if (/^([A-Z]{1,3}\d+|\d{3}[A-Z])$/.test(p)) {
       variantIndex = i;
       variant = p;
       break;
