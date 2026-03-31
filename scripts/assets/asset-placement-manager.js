@@ -5182,7 +5182,9 @@ export class AssetPlacementManager {
           event.stopPropagation();
           event.stopImmediatePropagation?.();
           const step = 1.05;
-          const dir = event.deltaY < 0 ? 1 : -1;
+          // macOS converts Shift+Wheel to horizontal scroll, zeroing deltaY
+          const delta = event.deltaY || event.deltaX;
+          const dir = delta < 0 ? 1 : -1;
           if (this._scatterMode === ASSET_SCATTER_MODE_BRUSH) {
             const current = this._getScatterBrushSize();
             let next = current * Math.pow(step, dir);
