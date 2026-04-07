@@ -112,7 +112,7 @@ Single placement preview:
 - **Context menus:** Layers and groups expose rename, elevation change, lock/unlock, flatten, Foundry `Edit`, and FA `Nexus Edit` actions where applicable.
 - **Help and diagnostics:** Built-in help, per-group counts, persistent collapse state, and precise elevation formatting make dense scenes easier to manage.
 
-<img width="863" height="852" alt="image" src="https://github.com/user-attachments/assets/56364fea-7db8-449d-b012-62b1139cb287" />
+![20260407_1257_Foundry_Virtual_Tabletop_fwgxaoXMRZ](https://github.com/user-attachments/assets/a2d69bd7-5f01-4042-a7ef-b92a183fc4ec)
 
 ---
 
@@ -136,6 +136,8 @@ Single placement preview:
 ## Generated Cleanup
 - **Generated Cleanup tool:** Scan FA Nexus generated masks and flattened outputs for unused or missing files from module settings.
 - **Manual cleanup workflow:** Foundry does not allow automatic deletions here, so Nexus can only back up and mark unused files for manual removal.
+
+![20260330_0210_Foundry_Virtual_Tabletop_t9jh6MmUWM](https://github.com/user-attachments/assets/ad8c03e1-344c-4e7c-ae40-3ef653033da1)
 
 ---
 
