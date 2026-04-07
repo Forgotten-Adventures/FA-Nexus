@@ -1,6 +1,12 @@
 import { BookmarkDialog } from './bookmark-dialog.js';
 import { NexusLogger as Logger } from '../nexus-logger.js';
 
+function createBookmarkLabel(title) {
+  const span = document.createElement('span');
+  span.textContent = String(title ?? '');
+  return span;
+}
+
 /**
  * BookmarkToolbar
  * Handles bookmark rendering, overflow, and drag interactions for FA Nexus.
@@ -167,7 +173,7 @@ export class BookmarkToolbar {
         const item = document.createElement('div');
         item.className = 'fa-nexus-bookmark-item';
         item.title = bookmark.title;
-        item.innerHTML = `<span>${bookmark.title}</span>`;
+        item.replaceChildren(createBookmarkLabel(bookmark.title));
 
         wrapper.appendChild(item);
 

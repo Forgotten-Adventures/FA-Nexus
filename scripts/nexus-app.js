@@ -17,7 +17,12 @@ import { TabManager } from './core/tab-manager.js';
 import { FolderFilterController } from './core/folder-filter/folder-filter-controller.js';
 import { initializeNexusLauncher, applyThemeToElement } from './core/nexus-launcher.js';
 import { renderPatreonAuthHeader } from './premium/patreon-auth-header.js';
+import {
+  setPremiumDevBridgeEnabled,
+  shouldRefreshPremiumHeaderForSetting
+} from './premium/premium-runtime-config.js';
 import { FooterController } from './core/footer-controller.js';
+import { scheduleAssetCloudWarmup } from './assets/assets-tab-controller.js';
 import './tokens/token-elevation-offset.js';
 
 /**
@@ -158,7 +163,7 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     try {
       if (!this._authSettingHook) {
         this._authSettingHook = (setting) => {
-          if (!setting || setting.namespace !== 'fa-nexus' || setting.key !== 'patreon_auth_data') return;
+          if (!shouldRefreshPremiumHeaderForSetting(setting)) return;
           try {
             renderPatreonAuthHeader({
               app: this,
@@ -374,6 +379,21 @@ function renderFaNexus() {
 
 initializeNexusLauncher({ onOpen: renderFaNexus });
 
+async function enablePremiumDevBridge(options = {}) {
+  const enabled = await setPremiumDevBridgeEnabled(true, options);
+  if (!enabled) return false;
+  try {
+    await warmPremiumFeatureBundles({ reason: 'dev-bridge-enable' });
+  } catch (error) {
+    Logger.warn('FaNexusApp.enablePremiumDevBridge.warmFailed', { error: String(error?.message || error) });
+  }
+  return true;
+}
+
+async function disablePremiumDevBridge(options = {}) {
+  return await setPremiumDevBridgeEnabled(false, options);
+}
+
 Hooks.once('ready', () => {
   // Register drag/drop globally via TokensTab (tokens-only feature)
   try { TokensTab.registerGlobalDragDrop?.(); } catch (e) {}
@@ -395,9 +415,17 @@ Hooks.once('ready', () => {
       Logger.warn('FaNexusApp.premiumWarmup.failed', { error: String(error?.message || error) });
     });
   } catch (_) {}
+
+  try {
+    scheduleAssetCloudWarmup({ reason: 'startup' });
+  } catch (error) {
+    Logger.warn('FaNexusApp.assetWarmup.scheduleFailed', { error: String(error?.message || error) });
+  }
 });
 
 // Expose a small API for macros/console if needed later
 window.faNexus = Object.assign(window.faNexus || {}, {
-  open: renderFaNexus
+  open: renderFaNexus,
+  enablePremiumDevBridge,
+  disablePremiumDevBridge
 });

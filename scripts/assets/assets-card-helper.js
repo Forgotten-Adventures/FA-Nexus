@@ -96,6 +96,26 @@ export class AssetsTabCardHelper {
     return src;
   }
 
+  _bindAssetCardClick(cardElement) {
+    if (!cardElement) return;
+    this._unbindAssetCardClick(cardElement);
+    try {
+      const handler = (ev) => this.handleAssetCardClick(ev, cardElement, cardElement._assetItem || null);
+      cardElement._faNexusAssetClickHandler = handler;
+      cardElement.addEventListener('click', handler);
+    } catch (_) {}
+  }
+
+  _unbindAssetCardClick(cardElement) {
+    try {
+      const handler = cardElement?._faNexusAssetClickHandler;
+      if (handler) {
+        cardElement.removeEventListener('click', handler);
+        delete cardElement._faNexusAssetClickHandler;
+      }
+    } catch (_) {}
+  }
+
   async _requirePremiumFeature(featureId, { label }) {
     ensurePremiumFeaturesRegistered();
     try {
@@ -387,7 +407,7 @@ export class AssetsTabCardHelper {
     const key = tab._keyFromCard(cardElement);
     const selected = key && tab._selection.selectedKeys.has(key);
     tab._setCardSelectionUI(cardElement, !!selected);
-    cardElement.addEventListener('click', (ev) => this.handleAssetCardClick(ev, cardElement, resolvedItem));
+    this._bindAssetCardClick(cardElement);
   }
 
   async mountCard(cardElement, item) {
@@ -556,13 +576,14 @@ export class AssetsTabCardHelper {
       const key = tab._keyFromCard(cardElement);
       const selected = key && tab._selection.selectedKeys.has(key);
       tab._setCardSelectionUI(cardElement, !!selected);
-      cardElement.addEventListener('click', (ev) => this.handleAssetCardClick(ev, cardElement, item));
+      this._bindAssetCardClick(cardElement);
     } catch (e) {
       Logger.warn('AssetsTab.mount.error', { error: String(e?.message || e) });
     }
   }
 
   unmountCard(cardElement) {
+    this._unbindAssetCardClick(cardElement);
     try {
       const img = cardElement.querySelector('img');
       if (img) {

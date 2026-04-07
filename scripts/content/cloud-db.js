@@ -365,6 +365,148 @@ export class CloudDB {
   }
 
   /**
+   * Incrementally stream all items for a kind in stable key order.
+   * Uses chunked storage when fresh, otherwise falls back to batched cursor reads
+   * from the per-item store and schedules a chunk rebuild in the background.
+   * @param {'tokens'|'assets'} kind
+   * @param {{onChunk?:(records:Array<object>,info:{kind:string,mode:string,batch:number,totalHint:number})=>Promise<void>|void,preferChunks?:boolean,chunkSize?:number,signal?:AbortSignal}} [options]
+   * @returns {Promise<{items:Array<object>,total:number,latest:string|null,mode:'chunks'|'cursor'}>}
+   */
+  async streamAll(kind, options = {}) {
+    const db = await this._open();
+    const signal = options.signal || null;
+    const onChunk = typeof options.onChunk === 'function' ? options.onChunk : null;
+    const preferChunks = options.preferChunks !== false;
+    const chunkSize = Math.max(100, Number(options.chunkSize) || this.CHUNK_SIZE);
+    const meta = await this.getMeta(kind).catch(() => null);
+    const latest = meta?.latest || null;
+    const chunksLatest = meta?.chunksLatest || null;
+    const totalHint = Math.max(0, Number(meta?.count) || 0);
+    const useChunks = !!preferChunks && !!latest && !!chunksLatest && latest === chunksLatest;
+    const items = onChunk ? null : [];
+    let total = 0;
+    let batch = 0;
+
+    const checkAbort = () => {
+      if (signal?.aborted) throw abortError();
+    };
+
+    const emitChunk = async (records, mode) => {
+      const arr = Array.isArray(records) ? records : [];
+      if (!arr.length) return;
+      checkAbort();
+      if (items) items.push(...arr);
+      total += arr.length;
+      batch += 1;
+      if (onChunk) {
+        await onChunk(arr, { kind, mode, batch, totalHint });
+      }
+    };
+
+    const countChunkRecords = async () => new Promise((resolve) => {
+      try {
+        const tx = db.transaction([`items2_${kind}`], 'readonly');
+        const store = tx.objectStore(`items2_${kind}`);
+        const req = store.count();
+        req.onsuccess = () => resolve(Math.max(0, Number(req.result) || 0));
+        req.onerror = () => resolve(0);
+      } catch (_) { resolve(0); }
+    });
+
+    const readChunkRecord = async (chunkIndex) => new Promise((resolve) => {
+      try {
+        const tx = db.transaction([`items2_${kind}`], 'readonly');
+        const store = tx.objectStore(`items2_${kind}`);
+        const req = store.get(chunkIndex);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      } catch (_) { resolve(null); }
+    });
+
+    const readCursorBatch = async (afterKey = null) => new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (value, callback = resolve) => {
+        if (settled) return;
+        settled = true;
+        callback(value);
+      };
+      try {
+        const tx = db.transaction([`items_${kind}`], 'readonly');
+        const store = tx.objectStore(`items_${kind}`);
+        const range = afterKey ? IDBKeyRange.lowerBound(afterKey, true) : undefined;
+        const out = [];
+        let lastKey = afterKey;
+        const req = store.openCursor(range);
+        req.onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (!cursor) {
+            finish({ records: out, lastKey });
+            return;
+          }
+          out.push(cursor.value);
+          lastKey = cursor.primaryKey ?? cursor.key ?? cursor.value?.file_path ?? lastKey;
+          if (out.length >= chunkSize) {
+            finish({ records: out, lastKey });
+            return;
+          }
+          cursor.continue();
+        };
+        req.onerror = () => finish(req.error, reject);
+      } catch (error) {
+        finish(error, reject);
+      }
+    });
+
+    Logger.time(`CloudDB.streamAll:${kind}`);
+    Logger.info('CloudDB.streamAll:start', {
+      kind,
+      mode: useChunks ? 'chunks' : 'cursor',
+      totalHint,
+      latest
+    });
+
+    try {
+      checkAbort();
+      if (useChunks) {
+        const chunkCount = await countChunkRecords();
+        Logger.info('CloudDB.streamAll:mode', { kind, mode: 'chunks', chunks: chunkCount });
+        for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+          checkAbort();
+          const record = await readChunkRecord(chunkIndex);
+          const records = Array.isArray(record?.records) ? record.records : [];
+          await emitChunk(records, 'chunks');
+        }
+      } else {
+        if (preferChunks) {
+          Logger.info('CloudDB.streamAll:chunks.stale', { kind, latest, chunksLatest });
+          this.rebuildChunks(kind).catch(() => {});
+        }
+        Logger.info('CloudDB.streamAll:mode', { kind, mode: 'cursor', chunkSize });
+        let afterKey = null;
+        while (true) {
+          checkAbort();
+          const result = await readCursorBatch(afterKey);
+          const records = Array.isArray(result?.records) ? result.records : [];
+          if (!records.length) break;
+          afterKey = result?.lastKey ?? afterKey;
+          await emitChunk(records, 'cursor');
+          if (!afterKey) break;
+        }
+      }
+    } finally {
+      Logger.info('CloudDB.streamAll:done', { kind, total, mode: useChunks ? 'chunks' : 'cursor' });
+      Logger.timeEnd(`CloudDB.streamAll:${kind}`);
+    }
+
+    return {
+      items: items || [],
+      total,
+      latest,
+      mode: useChunks ? 'chunks' : 'cursor'
+    };
+  }
+
+  /**
    * Query items with simple client-side filtering and pagination
    * @param {'tokens'|'assets'} kind
    * @param {{text?:string,tier?:string,pathPrefix?:string,offset?:number,limit?:number,onProgress?:(count:number,total:number)=>void,progressBatch?:number,signal?:AbortSignal}} [opts]
@@ -550,7 +692,8 @@ export class CloudDB {
           if (needsPostFilterTier) ok = ok && String(v.tier || '') === tier;
           if (needsPostFilterPath) ok = ok && String(v.path || '').startsWith(pathPrefix);
           if (ok && text) {
-            const fields = [v.display_name, v.filename, v.path, ...(Array.isArray(v.tags) ? v.tags.join(' ') : [])];
+            const tagsText = Array.isArray(v.tags) ? v.tags.join(' ') : v.tags;
+            const fields = [v.display_name, v.filename, v.path, tagsText];
             ok = fields.some(val => String(val || '').toLowerCase().includes(text));
           }
           if (ok) {

@@ -2,6 +2,10 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { gatherBuildingLoops } from '../buildings/building-shape-helpers.js';
 import { BuildingWallMesher } from '../buildings/building-wall-mesher.js';
 import { getTileRenderElevation } from '../canvas/elevation-band-utils.js';
+import { cloneDisplayObjectForCustomTileProxy } from '../canvas/custom-tile-overhead.js';
+import { getOrCreatePixiTexture } from '../core/foundry-texture-loader-patch.js';
+import { applyStandardTileMaskToTile, getFlattenedChunkEntries } from '../textures/texture-render.js';
+import { readShadowQualityConfig } from './shadow-quality.js';
 import {
   computeSamplesFromPoints as computePathSamples,
   computeBoundsFromSamples as computePathBounds,
@@ -18,6 +22,7 @@ const SHADOW_BLUR_QUALITY_MAX = 9;
 const MODULE_ID = 'fa-nexus';
 const LAYER_HIDDEN_FLAG = 'layerHidden';
 const SCATTER_FLAG_KEY = 'assetScatter';
+const STANDARD_TILE_MASK_FLAG = 'standardTileMask';
 const SCATTER_VERSION = 1;
 
 let _singleton = null;
@@ -25,7 +30,17 @@ let _singleton = null;
 const MAX_OFFSET_DISTANCE = 1200;
 const SCATTER_SHADOW_MAX_SPRITES = 60000;
 const SCATTER_SHADOW_MAX_INSTANCES = 8000;
-const SCATTER_SHADOW_MAX_DIMENSION = 4096;
+// Scatter stamps use the active quality ceiling; this guard only prevents runaway sizes above the
+// current highest experimental tier and still respects the detected GPU cap.
+const SCATTER_SHADOW_MAX_DIMENSION = 8192;
+
+function normalizeLayerOpacity(value, fallback = 1) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return Math.min(1, Math.max(0, numeric));
+  const fallbackNumeric = Number(fallback);
+  if (Number.isFinite(fallbackNumeric)) return Math.min(1, Math.max(0, fallbackNumeric));
+  return 1;
+}
 
 /**
  * Manages aggregated drop-shadow render layers for FA Nexus asset tiles.
@@ -43,6 +58,7 @@ export class AssetShadowManager {
     this._tileIndex = new Map(); // tile id -> elevation key
     this._textureCache = new Map();
     this._scatterShadowCache = new Map();
+    this._standardMaskShadowCache = new Map();
     this._rebuildTimers = new Map();
     this._renderer = null;
     this._hooksBound = false;
@@ -167,6 +183,7 @@ export class AssetShadowManager {
     const tileId = doc.id;
     const prevElevation = this._tileIndex.get(tileId);
     const suspendedEntry = tileId ? this._suspendedTiles.get(tileId) : null;
+    this._clearStandardMaskShadowCache(tileId);
 
     if (!hasShadow) {
       if (suspendedEntry) {
@@ -231,6 +248,7 @@ export class AssetShadowManager {
       this._tileIndex.delete(tileId);
       this._suspendedTiles.delete(tileId);
       this._clearScatterShadowCache(tileId);
+      this._clearStandardMaskShadowCache(tileId);
       const layer = this._layers.get(elevation);
       if (!layer) return;
       layer.tiles.delete(tileId);
@@ -408,17 +426,6 @@ export class AssetShadowManager {
 
       if (!Number.isFinite(texWidth) || !Number.isFinite(texHeight)) return;
 
-      let rt = layer.renderTexture;
-      if (!rt || rt.destroyed || rt.width !== texWidth || rt.height !== texHeight) {
-        if (rt && !rt.destroyed) {
-          try { rt.destroy(true); } catch (_) {}
-        }
-        rt = PIXI.RenderTexture.create({ width: texWidth, height: texHeight, scaleMode: PIXI.SCALE_MODES.LINEAR });
-        layer.renderTexture = rt;
-      } else {
-        renderer.render(new PIXI.Container(), { renderTexture: rt, clear: true });
-      }
-
       const drawContainer = new PIXI.Container();
       const tempDisplayObjects = [];
       const dilationCache = new Map();
@@ -476,30 +483,42 @@ export class AssetShadowManager {
 
           const scatterStamp = await this._getScatterShadowStamp(doc, cfg, scale, renderer);
           if (scatterStamp?.texture) {
-            const tileX = Number(doc?.x) || 0;
-            const tileY = Number(doc?.y) || 0;
-            const docWidth = Math.max(1, Number(doc?.width || 0));
-            const docHeight = Math.max(1, Number(doc?.height || 0));
-            const stampScale = Number(scatterStamp.scale || scale) || scale;
-            const centerX = (tileX + (docWidth / 2) + Number(cfg?.offsetX || 0) - sr.x) * scale;
-            const centerY = (tileY + (docHeight / 2) + Number(cfg?.offsetY || 0) - sr.y) * scale;
-            const pivotX = ((docWidth / 2) - scatterStamp.bounds.x) * stampScale;
-            const pivotY = ((docHeight / 2) - scatterStamp.bounds.y) * stampScale;
-            const rotationDeg = Number(doc?.rotation || 0) * (Math.PI / 180);
-
-            const sprite = new PIXI.Sprite(scatterStamp.texture);
-            sprite.anchor.set(0, 0);
-            sprite.pivot.set(pivotX, pivotY);
-            sprite.position.set(centerX, centerY);
-            sprite.rotation = rotationDeg;
-            sprite.alpha = 1;
-            sprite.eventMode = 'none';
-            if (stampScale !== scale) {
-              const ratio = scale / stampScale;
-              sprite.scale.set(ratio, ratio);
+            const sprite = this._createDocShadowSprite(scatterStamp.texture, doc, scatterStamp.bounds, {
+              scale,
+              sceneRect: sr,
+              offsetX: applyOffsetX,
+              offsetY: applyOffsetY,
+              anchorMode: 'doc'
+            });
+            if (sprite) {
+              drawContainer.addChild(sprite);
+              tempDisplayObjects.push(sprite);
             }
-            drawContainer.addChild(sprite);
-            tempDisplayObjects.push(sprite);
+            continue;
+          }
+
+          const standardMaskFlags = this._readStandardTileMask(doc);
+          if (standardMaskFlags) {
+            const standardStamp = await this._getStandardMaskShadowStamp(doc, renderer);
+            if (!standardStamp?.texture) {
+              Logger.error('AssetShadow.standardTileMask.shadowStampFailed', {
+                tileId: doc?.id,
+                src: doc?.texture?.src || null
+              });
+              continue;
+            }
+            for (const offset of offsets) {
+              const sprite = this._createDocShadowSprite(standardStamp.texture, doc, standardStamp.bounds, {
+                scale,
+                sceneRect: sr,
+                offsetX: offset.x + applyOffsetX,
+                offsetY: offset.y + applyOffsetY,
+                anchorMode: 'doc'
+              });
+              if (!sprite) continue;
+              drawContainer.addChild(sprite);
+              tempDisplayObjects.push(sprite);
+            }
             continue;
           }
 
@@ -512,26 +531,24 @@ export class AssetShadowManager {
           if (!tex) continue;
           const texScaleX = Number(doc?.texture?.scaleX ?? 1) || 1;
           const texScaleY = Number(doc?.texture?.scaleY ?? 1) || 1;
-          const flipX = texScaleX < 0 ? -1 : 1;
-          const flipY = texScaleY < 0 ? -1 : 1;
-          const baseWidth = Math.max(1, Number(doc.width || doc.shape?.width || 0)) * scale;
-          const baseHeight = Math.max(1, Number(doc.height || doc.shape?.height || 0)) * scale;
-          const dx = ((Number(doc.x) || 0) - sr.x) + (Number(doc.width) || 0) / 2;
-          const dy = ((Number(doc.y) || 0) - sr.y) + (Number(doc.height) || 0) / 2;
-          const baseX = dx * scale;
-          const baseY = dy * scale;
-          const rotationDeg = Number(doc.rotation || 0) * (Math.PI / 180);
+          const { width: docWidth, height: docHeight } = this._getDocDimensions(doc);
 
           for (const offset of offsets) {
-            const sprite = new PIXI.Sprite(tex);
-            sprite.anchor.set(0.5, 0.5);
-            sprite.width = baseWidth;
-            sprite.height = baseHeight;
-            if (flipX < 0) sprite.scale.x *= -1;
-            if (flipY < 0) sprite.scale.y *= -1;
-            sprite.position.set(baseX + offset.x + applyOffsetX, baseY + offset.y + applyOffsetY);
-            sprite.rotation = rotationDeg;
-            sprite.alpha = 1;
+            const sprite = this._createDocShadowSprite(tex, doc, {
+              x: 0,
+              y: 0,
+              width: docWidth,
+              height: docHeight
+            }, {
+              scale,
+              sceneRect: sr,
+              offsetX: offset.x + applyOffsetX,
+              offsetY: offset.y + applyOffsetY,
+              flipX: texScaleX,
+              flipY: texScaleY,
+              anchorMode: 'doc'
+            });
+            if (!sprite) continue;
             drawContainer.addChild(sprite);
             tempDisplayObjects.push(sprite);
           }
@@ -540,20 +557,49 @@ export class AssetShadowManager {
         }
       }
 
-      renderer.render(drawContainer, { renderTexture: rt, clear: true });
+      const renderTexture = this._renderLayerToTexture(layer, drawContainer, renderer, texWidth, texHeight);
+      if (renderTexture) this._applyLayerTexture(layer, sr, renderTexture, scale);
 
       for (const displayObject of tempDisplayObjects) {
         try { displayObject.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
       }
       try { drawContainer.destroy({ children: false }); } catch (_) {}
 
-      this._applyLayerTexture(layer, sr, rt, scale);
       this._syncLayerOrdering(layer);
     } catch (e) {
       Logger.warn('AssetShadow.rebuild.failed', String(e?.message || e));
     } finally {
       layer.rebuilding = false;
       if (layer.dirty) this._scheduleRebuild(elevation, true);
+    }
+  }
+
+  _getShadowQualityConfig() {
+    return readShadowQualityConfig();
+  }
+
+  _renderLayerToTexture(layer, drawContainer, renderer, texWidth, texHeight) {
+    try {
+      if (layer?.container) layer.container.filters = null;
+
+      let renderTexture = layer.renderTexture || null;
+      if (!renderTexture || renderTexture.destroyed || renderTexture.width !== texWidth || renderTexture.height !== texHeight) {
+        if (renderTexture && !renderTexture.destroyed) {
+          try { renderTexture.destroy(true); } catch (_) {}
+        }
+        renderTexture = PIXI.RenderTexture.create({
+          width: texWidth,
+          height: texHeight,
+          scaleMode: PIXI.SCALE_MODES.LINEAR
+        });
+        layer.renderTexture = renderTexture;
+      }
+
+      renderer.render(drawContainer, { renderTexture, clear: true });
+      return renderTexture;
+    } catch (error) {
+      Logger.warn('AssetShadow.renderTexture.failed', String(error?.message || error));
+      return null;
     }
   }
 
@@ -570,6 +616,7 @@ export class AssetShadowManager {
       sprite.visible = true;
 
       this._ensureBlurFilter(layer);
+      if (layer.container) layer.container.filters = null;
       sprite.filters = layer.blurFilter ? [layer.blurFilter] : null;
     } catch (e) {
       Logger.warn('AssetShadow.applyTexture.failed', String(e?.message || e));
@@ -799,8 +846,10 @@ export class AssetShadowManager {
     const pixelWidth = width * safeScale;
     const pixelHeight = height * safeScale;
     const maxDim = Math.max(pixelWidth, pixelHeight);
-    if (maxDim <= SCATTER_SHADOW_MAX_DIMENSION) return safeScale;
-    const factor = SCATTER_SHADOW_MAX_DIMENSION / maxDim;
+    const maxTextureSize = this._getMaxTextureSize();
+    const scatterCap = Math.max(1024, Math.min(SCATTER_SHADOW_MAX_DIMENSION, maxTextureSize));
+    if (maxDim <= scatterCap) return safeScale;
+    const factor = scatterCap / maxDim;
     return Math.max(0.01, safeScale * factor);
   }
 
@@ -923,6 +972,160 @@ export class AssetShadowManager {
     } catch (_) {}
   }
 
+  _clearStandardMaskShadowCache(tileId = null) {
+    try {
+      if (!tileId) {
+        for (const entry of this._standardMaskShadowCache.values()) {
+          if (entry?.texture && !entry.texture.destroyed) {
+            try { entry.texture.destroy(true); } catch (_) {}
+          }
+        }
+        this._standardMaskShadowCache.clear();
+        return;
+      }
+      const entry = this._standardMaskShadowCache.get(tileId);
+      if (!entry) return;
+      if (entry.texture && !entry.texture.destroyed) {
+        try { entry.texture.destroy(true); } catch (_) {}
+      }
+      this._standardMaskShadowCache.delete(tileId);
+    } catch (_) {}
+  }
+
+  _readStandardTileMask(doc) {
+    try {
+      const direct = doc?.getFlag?.('fa-nexus', STANDARD_TILE_MASK_FLAG);
+      if (direct !== undefined) return direct;
+    } catch (_) {}
+    const flags = doc?.flags?.['fa-nexus'] || doc?._source?.flags?.['fa-nexus'];
+    return flags ? flags[STANDARD_TILE_MASK_FLAG] : null;
+  }
+
+  _buildStandardMaskShadowSignature(doc, flags) {
+    try {
+      const anchor = this._getDocAnchor(doc, { anchorMode: 'doc' });
+      const chunkKey = (() => {
+        const chunks = Array.isArray(getFlattenedChunkEntries?.(doc)) ? getFlattenedChunkEntries(doc) : [];
+        if (!chunks.length) return null;
+        return chunks.map((chunk) => `${chunk.src}|${chunk.x}|${chunk.y}|${chunk.width}|${chunk.height}`).join(';');
+      })();
+      const payload = {
+        src: String(doc?.texture?.src || ''),
+        mask: String(flags?.maskShapeKey || flags?.maskSrc || ''),
+        maskVersion: Number(flags?.maskVersion || 1),
+        maskCrop: flags?.maskCrop || null,
+        maskOriginalSize: flags?.maskOriginalSize || null,
+        width: Math.round(Number(doc?.width || 0)),
+        height: Math.round(Number(doc?.height || 0)),
+        rotation: Math.round((Number(doc?.rotation || 0) || 0) * 1000) / 1000,
+        anchorX: Math.round((Number(anchor?.x || 0) || 0) * 1000) / 1000,
+        anchorY: Math.round((Number(anchor?.y || 0) || 0) * 1000) / 1000,
+        flipX: Number(doc?.texture?.scaleX ?? 1) < 0 ? -1 : 1,
+        flipY: Number(doc?.texture?.scaleY ?? 1) < 0 ? -1 : 1,
+        flattenedChunks: chunkKey
+      };
+      return JSON.stringify(payload);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  async _getStandardMaskShadowStamp(doc, renderer) {
+    try {
+      const tileId = doc?.id;
+      if (!tileId || !renderer) return null;
+      const flags = this._readStandardTileMask(doc);
+      if (!flags) {
+        this._clearStandardMaskShadowCache(tileId);
+        return null;
+      }
+
+      const signature = this._buildStandardMaskShadowSignature(doc, flags);
+      const cached = this._standardMaskShadowCache.get(tileId);
+      if (cached && cached.signature === signature && cached.texture && !cached.texture.destroyed) {
+        return cached;
+      }
+      if (cached) this._clearStandardMaskShadowCache(tileId);
+
+      const tile = canvas?.tiles?.placeables?.find?.((entry) => entry?.document?.id === tileId) || null;
+      if (!tile) {
+        Logger.error('AssetShadow.standardTileMask.tileMissing', { tileId });
+        return null;
+      }
+
+      await applyStandardTileMaskToTile(tile);
+      const sourceContainer = tile?.mesh?.faNexusStandardMaskContainer
+        || tile?.faNexusStandardMaskContainer
+        || null;
+      const sourceBase = sourceContainer?.faNexusBaseDisplayObject
+        || sourceContainer?.faNexusBaseSprite
+        || null;
+      const sourceMask = sourceContainer?.faNexusMaskSprite || null;
+      if (!sourceContainer || sourceContainer.destroyed || !sourceBase || sourceBase.destroyed || !sourceMask || sourceMask.destroyed) {
+        Logger.error('AssetShadow.standardTileMask.overlayMissing', { tileId });
+        return null;
+      }
+
+      const proxyBase = cloneDisplayObjectForCustomTileProxy(sourceBase);
+      const proxyMask = cloneDisplayObjectForCustomTileProxy(sourceMask);
+      if (!proxyBase || proxyBase.destroyed || !proxyMask || proxyMask.destroyed) {
+        try { proxyBase?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+        try { proxyMask?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+        Logger.error('AssetShadow.standardTileMask.proxyCloneFailed', { tileId });
+        return null;
+      }
+      try { proxyMask.visible = true; } catch (_) {}
+      try { proxyMask.renderable = false; } catch (_) {}
+      try { proxyMask.alpha = 1; } catch (_) {}
+      try { proxyBase.mask = proxyMask; } catch (_) {}
+
+      const { width: docWidth, height: docHeight } = this._getDocDimensions(doc);
+      const maxTex = this._getMaxTextureSize();
+      const renderScale = Math.min(1, maxTex / Math.max(docWidth, docHeight));
+      const pixelWidth = Math.max(4, Math.ceil(docWidth * renderScale));
+      const pixelHeight = Math.max(4, Math.ceil(docHeight * renderScale));
+      if (!Number.isFinite(pixelWidth) || !Number.isFinite(pixelHeight)) {
+        try { proxyBase.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+        try { proxyMask.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+        return null;
+      }
+
+      const renderTexture = PIXI.RenderTexture.create({
+        width: pixelWidth,
+        height: pixelHeight,
+        scaleMode: PIXI.SCALE_MODES.LINEAR
+      });
+      const stage = new PIXI.Container();
+      stage.eventMode = 'none';
+      stage.sortableChildren = false;
+      stage.interactiveChildren = false;
+      stage.scale.set(renderScale, renderScale);
+      stage.addChild(proxyBase);
+      stage.addChild(proxyMask);
+
+      renderer.render(stage, { renderTexture, clear: true });
+
+      try { proxyBase.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      try { proxyMask.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      try { stage.destroy({ children: false }); } catch (_) {}
+
+      const entry = {
+        signature,
+        texture: renderTexture,
+        bounds: { x: 0, y: 0, width: docWidth, height: docHeight },
+        scale: renderScale
+      };
+      this._standardMaskShadowCache.set(tileId, entry);
+      return entry;
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.shadowStamp.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      return null;
+    }
+  }
+
   async _getScatterShadowStamp(doc, cfg, scale, renderer) {
     try {
       const tileId = doc?.id;
@@ -1038,12 +1241,10 @@ export class AssetShadowManager {
   _resolvePathShadowDescriptorsFromPath(doc) {
     const descriptors = [];
     try {
-      const tileX = Number(doc?.x) || 0;
-      const tileY = Number(doc?.y) || 0;
       const payloads = this._collectPathShadowPayloads(doc);
       if (!payloads.length) return descriptors;
       for (const pathFlags of payloads) {
-        const descriptor = this._resolvePathShadowDescriptorFromFlags(pathFlags, doc, tileX, tileY);
+        const descriptor = this._resolvePathShadowDescriptorFromFlags(pathFlags, doc);
         if (descriptor) descriptors.push(descriptor);
       }
     } catch (error) {
@@ -1075,7 +1276,7 @@ export class AssetShadowManager {
     return [];
   }
 
-  _resolvePathShadowDescriptorFromFlags(pathFlags, doc, tileX, tileY) {
+  _resolvePathShadowDescriptorFromFlags(pathFlags, doc) {
     try {
       const shadow = pathFlags?.shadow;
       if (!shadow || !shadow.enabled) return null;
@@ -1084,12 +1285,14 @@ export class AssetShadowManager {
       const points = [];
       for (const raw of pointsRaw) {
         if (!raw) continue;
-        const px = tileX + (Number(raw.x) || 0);
-        const py = tileY + (Number(raw.y) || 0);
-        if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+        const worldPoint = this._transformDocLocalPoint(doc, {
+          x: Number(raw.x) || 0,
+          y: Number(raw.y) || 0
+        }, { anchorMode: 'center' });
+        if (!worldPoint) continue;
         points.push({
-          x: px,
-          y: py,
+          x: worldPoint.x,
+          y: worldPoint.y,
           widthLeft: Number.isFinite(raw.widthLeft) ? Number(raw.widthLeft) : 1,
           widthRight: Number.isFinite(raw.widthRight) ? Number(raw.widthRight) : 1
         });
@@ -1140,10 +1343,98 @@ export class AssetShadowManager {
       const data = doc?.getFlag?.('fa-nexus', 'building');
       const shadowState = data?.wall?.pathShadow;
       if (!data || !shadowState || !shadowState.enabled) return [];
+      const descriptors = [];
+      const renderSegments = Array.isArray(data?.wall?.renderSegments) ? data.wall.renderSegments : [];
+      for (const segment of renderSegments) {
+        const shadow = segment?.pathShadow || shadowState;
+        if (!shadow?.enabled) continue;
+        const closed = segment?.closed !== false;
+        const minPoints = closed ? 3 : 2;
+        const localLoop = Array.isArray(segment?.points)
+          ? segment.points.map((point) => ({
+            x: Number(point?.x) || 0,
+            y: Number(point?.y) || 0
+          }))
+          : [];
+        if (localLoop.length < minPoints) continue;
+        const alphaMultiplier = normalizeLayerOpacity(segment?.layerOpacity, data?.wall?.layerOpacity);
+        if (alphaMultiplier <= 0.001) continue;
+        const baseWidth = Math.max(1, Number(segment?.width) || Number(data?.wall?.width) || Number(doc?.width) || 1);
+        const repeatBase = Math.max(1e-3, Number(segment?.repeatDistance) || baseWidth);
+        const shadowScale = Math.max(0.05, Number(shadow?.scale) || 1);
+        const dilation = Math.max(0, Number(shadow?.dilation) || 0);
+        const scaledWidth = Math.max(2, baseWidth * shadowScale);
+        const effectiveWidth = Math.max(2, scaledWidth + (dilation * 2));
+        const repeatSpacing = Math.max(1, repeatBase * shadowScale);
+        const segmentOffsetX = Number(segment?.textureOffset?.x);
+        const segmentOffsetY = Number(segment?.textureOffset?.y);
+        const textureOffset = {
+          x: Number.isFinite(segmentOffsetX) ? segmentOffsetX : (Number(data?.wall?.textureOffset?.x) || 0),
+          y: Number.isFinite(segmentOffsetY) ? segmentOffsetY : (Number(data?.wall?.textureOffset?.y) || 0)
+        };
+        const shadowOffset = Number(shadow?.offset) || 0;
+        const centerOffset = textureOffset.y + shadowOffset;
+        const geometryTextureOffset = {
+          x: textureOffset.x,
+          y: 0
+        };
+        const textureFlip = {
+          horizontal: segment?.textureFlip && Object.prototype.hasOwnProperty.call(segment.textureFlip, 'horizontal')
+            ? !!segment.textureFlip.horizontal
+            : !!data?.wall?.textureFlip?.horizontal,
+          vertical: segment?.textureFlip && Object.prototype.hasOwnProperty.call(segment.textureFlip, 'vertical')
+            ? !!segment.textureFlip.vertical
+            : !!data?.wall?.textureFlip?.vertical
+        };
+        const worldLoop = localLoop
+          .map((point) => this._transformDocLocalPoint(doc, point, { anchorMode: 'center' }))
+          .filter(Boolean);
+        if (worldLoop.length < minPoints) continue;
+        worldLoop.closed = closed;
+        const centerline = BuildingWallMesher.buildCenterline(localLoop, {
+          width: effectiveWidth,
+          closed,
+          centerOffset,
+          textureRepeatDistance: repeatSpacing,
+          textureOffset: geometryTextureOffset,
+          textureFlip
+        });
+        const samples = Array.isArray(centerline?.samples) ? centerline.samples : [];
+        const worldSamples = samples
+          .map((sample) => {
+            const worldPoint = this._transformDocLocalPoint(doc, sample, { anchorMode: 'center' });
+            if (!worldPoint) return null;
+            return {
+              ...sample,
+              x: worldPoint.x,
+              y: worldPoint.y
+            };
+          })
+          .filter(Boolean);
+        const bounds = worldSamples.length
+          ? computePathBounds(worldSamples, effectiveWidth)
+          : this._computeLoopBounds(worldLoop, effectiveWidth);
+        descriptors.push({
+          kind: 'building',
+          loop: worldLoop,
+          closed,
+          width: effectiveWidth,
+          centerOffset,
+          textureOffset: { ...geometryTextureOffset },
+          textureFlip: { ...textureFlip },
+          textureRepeatDistance: repeatSpacing,
+          bounds,
+          textureSrc: segment?.texture || segment?.pathLocal || data?.wall?.texture || null,
+          textureKey: segment?.pathKey || data?.wall?.pathKey || null,
+          alphaMultiplier,
+          startJoinDir: this._rotateDirection(segment?.startJoinDir, doc),
+          endJoinDir: this._rotateDirection(segment?.endJoinDir, doc)
+        });
+      }
+      if (renderSegments.length) return descriptors;
+
       const loops = gatherBuildingLoops(data);
       if (!loops.length) return [];
-      const tileX = Number(doc?.x) || 0;
-      const tileY = Number(doc?.y) || 0;
       const baseWidth = Math.max(1, Number(data?.wall?.width) || Number(doc?.width) || 1);
       const repeatBase = Math.max(1e-3, Number(data?.wall?.repeatDistance) || baseWidth);
       const shadowScale = Math.max(0.05, Number(shadowState?.scale) || 1);
@@ -1156,9 +1447,10 @@ export class AssetShadowManager {
         y: Number(data?.wall?.textureOffset?.y) || 0
       };
       const shadowOffset = Number(shadowState?.offset) || 0;
-      const combinedTextureOffset = {
+      const centerOffset = textureOffset.y + shadowOffset;
+      const geometryTextureOffset = {
         x: textureOffset.x,
-        y: textureOffset.y + shadowOffset
+        y: 0
       };
       const textureFlip = {
         horizontal: !!data?.wall?.textureFlip?.horizontal,
@@ -1166,30 +1458,38 @@ export class AssetShadowManager {
       };
       const textureSrc = data?.wall?.texture || null;
       const textureKey = data?.wall?.pathKey || null;
-      const descriptors = [];
+      const alphaMultiplier = normalizeLayerOpacity(data?.wall?.layerOpacity, 1);
+      if (alphaMultiplier <= 0.001) return [];
       for (const loop of loops) {
         if (!Array.isArray(loop)) continue;
         const closed = loop?.closed !== false;
         const minPoints = closed ? 3 : 2;
         if (loop.length < minPoints) continue;
-        const worldLoop = loop.map((point) => ({
-          x: tileX + (Number(point?.x) || 0),
-          y: tileY + (Number(point?.y) || 0)
-        }));
+        const worldLoop = loop
+          .map((point) => this._transformDocLocalPoint(doc, point, { anchorMode: 'center' }))
+          .filter(Boolean);
+        if (worldLoop.length < minPoints) continue;
         worldLoop.closed = closed;
         const centerline = BuildingWallMesher.buildCenterline(loop, {
           width: effectiveWidth,
           closed,
+          centerOffset,
           textureRepeatDistance: repeatSpacing,
-          textureOffset: combinedTextureOffset,
+          textureOffset: geometryTextureOffset,
           textureFlip
         });
         const samples = Array.isArray(centerline?.samples) ? centerline.samples : [];
-        const worldSamples = samples.map((sample) => ({
-          ...sample,
-          x: tileX + (Number(sample?.x) || 0),
-          y: tileY + (Number(sample?.y) || 0)
-        }));
+        const worldSamples = samples
+          .map((sample) => {
+            const worldPoint = this._transformDocLocalPoint(doc, sample, { anchorMode: 'center' });
+            if (!worldPoint) return null;
+            return {
+              ...sample,
+              x: worldPoint.x,
+              y: worldPoint.y
+            };
+          })
+          .filter(Boolean);
         const bounds = worldSamples.length
           ? computePathBounds(worldSamples, effectiveWidth)
           : this._computeLoopBounds(worldLoop, effectiveWidth);
@@ -1198,12 +1498,14 @@ export class AssetShadowManager {
           loop: worldLoop,
           closed,
           width: effectiveWidth,
-          textureOffset: { ...combinedTextureOffset },
+          centerOffset,
+          textureOffset: { ...geometryTextureOffset },
           textureFlip: { ...textureFlip },
           textureRepeatDistance: repeatSpacing,
           bounds,
           textureSrc,
-          textureKey
+          textureKey,
+          alphaMultiplier
         });
       }
       return descriptors;
@@ -1327,6 +1629,116 @@ export class AssetShadowManager {
     expanded.width = expanded.maxX - expanded.minX;
     expanded.height = expanded.maxY - expanded.minY;
     return expanded;
+  }
+
+  _getDocDimensions(doc) {
+    return {
+      width: Math.max(1, Number(doc?.width || doc?.shape?.width || 0) || 1),
+      height: Math.max(1, Number(doc?.height || doc?.shape?.height || 0) || 1)
+    };
+  }
+
+  _getDocAnchor(doc, { anchorMode = 'doc' } = {}) {
+    if (anchorMode === 'center') return { x: 0.5, y: 0.5 };
+    const anchorX = Number(doc?.texture?.anchorX);
+    const anchorY = Number(doc?.texture?.anchorY);
+    return {
+      x: Number.isFinite(anchorX) ? anchorX : 0.5,
+      y: Number.isFinite(anchorY) ? anchorY : 0.5
+    };
+  }
+
+  _getDocPivotLocal(doc, options = {}) {
+    const { width, height } = this._getDocDimensions(doc);
+    const anchor = this._getDocAnchor(doc, options);
+    return {
+      x: width * anchor.x,
+      y: height * anchor.y
+    };
+  }
+
+  _getDocPivotWorld(doc, options = {}) {
+    const pivotLocal = this._getDocPivotLocal(doc, options);
+    return {
+      x: (Number(doc?.x) || 0) + pivotLocal.x,
+      y: (Number(doc?.y) || 0) + pivotLocal.y
+    };
+  }
+
+  _transformDocLocalPoint(doc, point, options = {}) {
+    try {
+      if (!point) return null;
+      const localX = Number(point.x);
+      const localY = Number(point.y);
+      if (!Number.isFinite(localX) || !Number.isFinite(localY)) return null;
+      const pivotLocal = this._getDocPivotLocal(doc, options);
+      const pivotWorld = this._getDocPivotWorld(doc, options);
+      const rotation = (Number(doc?.rotation || 0) * Math.PI) / 180;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      const dx = localX - pivotLocal.x;
+      const dy = localY - pivotLocal.y;
+      return {
+        x: pivotWorld.x + (dx * cos) - (dy * sin),
+        y: pivotWorld.y + (dx * sin) + (dy * cos)
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _rotateDirection(direction, doc) {
+    try {
+      if (!direction) return null;
+      const dx = Number(direction.x);
+      const dy = Number(direction.y);
+      if (!Number.isFinite(dx) || !Number.isFinite(dy)) return null;
+      const rotation = (Number(doc?.rotation || 0) * Math.PI) / 180;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      return {
+        x: (dx * cos) - (dy * sin),
+        y: (dx * sin) + (dy * cos)
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _createDocShadowSprite(texture, doc, localBounds, context = {}) {
+    try {
+      if (!texture || !localBounds) return null;
+      const width = Math.max(1, Number(localBounds.width || 0));
+      const height = Math.max(1, Number(localBounds.height || 0));
+      const scale = Number(context.scale) || 1;
+      const sceneRect = context.sceneRect || { x: 0, y: 0 };
+      const offsetX = Number(context.offsetX || 0);
+      const offsetY = Number(context.offsetY || 0);
+      const flipX = Number(context.flipX) < 0 ? -1 : 1;
+      const flipY = Number(context.flipY) < 0 ? -1 : 1;
+      const anchorMode = context.anchorMode || 'doc';
+      const pivotLocal = this._getDocPivotLocal(doc, { anchorMode });
+      const pivotWorld = this._getDocPivotWorld(doc, { anchorMode });
+      const sprite = new PIXI.Sprite(texture);
+      sprite.anchor.set(
+        (pivotLocal.x - Number(localBounds.x || 0)) / width,
+        (pivotLocal.y - Number(localBounds.y || 0)) / height
+      );
+      sprite.width = width * scale;
+      sprite.height = height * scale;
+      if (flipX < 0) sprite.scale.x *= -1;
+      if (flipY < 0) sprite.scale.y *= -1;
+      sprite.position.set(
+        ((pivotWorld.x - sceneRect.x) * scale) + offsetX,
+        ((pivotWorld.y - sceneRect.y) * scale) + offsetY
+      );
+      sprite.rotation = (Number(doc?.rotation || 0) * Math.PI) / 180;
+      sprite.alpha = 1;
+      sprite.eventMode = 'none';
+      return sprite;
+    } catch (_) {
+      return null;
+    }
   }
 
   _computeBlurQuality(blurPixels) {
@@ -1457,8 +1869,11 @@ export class AssetShadowManager {
         joinStyle: 'mitre',
         mitreLimit: 4,
         textureRepeatDistance: Math.max(1e-3, Number(descriptor.textureRepeatDistance) || Number(descriptor.width) || 1),
+        centerOffset: Number(descriptor.centerOffset) || 0,
         textureOffset: descriptor.textureOffset || { x: 0, y: 0 },
-        textureFlip: descriptor.textureFlip || { horizontal: false, vertical: false }
+        textureFlip: descriptor.textureFlip || { horizontal: false, vertical: false },
+        startJoinDir: descriptor.startJoinDir || null,
+        endJoinDir: descriptor.endJoinDir || null
       };
       const geometryResult = BuildingWallMesher.buildGeometry(descriptor.loop, options);
       const geometry = geometryResult?.geometry;
@@ -1504,7 +1919,7 @@ export class AssetShadowManager {
         (-sceneRect.x * scale) + offset.x + offsetX,
         (-sceneRect.y * scale) + offset.y + offsetY
       );
-      mesh.alpha = 1;
+      mesh.alpha = normalizeLayerOpacity(descriptor?.alphaMultiplier, 1);
       return mesh;
     } catch (error) {
       Logger.warn('AssetShadow.buildingMesh.failed', String(error?.message || error));
@@ -1660,6 +2075,7 @@ export class AssetShadowManager {
     this._layers.clear();
     this._tileIndex.clear();
     this._clearScatterShadowCache();
+    this._clearStandardMaskShadowCache();
   }
 
   _destroyLayer(elevation) {
@@ -1672,6 +2088,9 @@ export class AssetShadowManager {
     }
     if (layer.sprite) {
       try { layer.sprite.filters = null; } catch (_) {}
+    }
+    if (layer.container) {
+      try { layer.container.filters = null; } catch (_) {}
     }
     if (layer.renderTexture && !layer.renderTexture.destroyed) {
       try { layer.renderTexture.destroy(true); } catch (_) {}
@@ -1943,21 +2362,22 @@ export class AssetShadowManager {
   }
 
   _expandSceneRectForDocs(baseRect, docs) {
-    const rect = baseRect && Number.isFinite(baseRect.width) && Number.isFinite(baseRect.height)
-      ? { x: baseRect.x, y: baseRect.y, width: baseRect.width, height: baseRect.height }
-      : { x: 0, y: 0, width: 0, height: 0 };
-
-    let minX = Number.isFinite(rect.x) ? rect.x : Infinity;
-    let minY = Number.isFinite(rect.y) ? rect.y : Infinity;
-    let maxX = Number.isFinite(rect.x + rect.width) ? rect.x + rect.width : -Infinity;
-    let maxY = Number.isFinite(rect.y + rect.height) ? rect.y + rect.height : -Infinity;
-
-    if (!Array.isArray(docs) || !docs.length) {
-      if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
-        return { x: 0, y: 0, width: 4096, height: 4096 };
+    const fallbackRect = baseRect && Number.isFinite(baseRect.width) && Number.isFinite(baseRect.height)
+      ? {
+        x: Number(baseRect.x || 0) || 0,
+        y: Number(baseRect.y || 0) || 0,
+        width: Math.max(1, Number(baseRect.width || 0)),
+        height: Math.max(1, Number(baseRect.height || 0))
       }
-      return { x: minX, y: minY, width: Math.max(1, maxX - minX), height: Math.max(1, maxY - minY) };
-    }
+      : { x: 0, y: 0, width: 4096, height: 4096 };
+
+    if (!Array.isArray(docs) || !docs.length) return fallbackRect;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let foundBounds = false;
 
     for (const doc of docs) {
       const bounds = this._computeTileBounds(doc);
@@ -1966,10 +2386,11 @@ export class AssetShadowManager {
       minY = Math.min(minY, bounds.minY);
       maxX = Math.max(maxX, bounds.maxX);
       maxY = Math.max(maxY, bounds.maxY);
+      foundBounds = true;
     }
 
-    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
-      return rect;
+    if (!foundBounds || !Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+      return fallbackRect;
     }
 
     const pad = 8; // soften edges slightly to avoid clipping due to rotation rounding
@@ -1988,32 +2409,22 @@ export class AssetShadowManager {
 
   _computeTileBounds(doc) {
     try {
-      const width = Number(doc?.width || doc?.shape?.width || 0) || 0;
-      const height = Number(doc?.height || doc?.shape?.height || 0) || 0;
+      const { width, height } = this._getDocDimensions(doc);
       if (width <= 0 || height <= 0) return null;
-      const x = Number(doc?.x || 0) || 0;
-      const y = Number(doc?.y || 0) || 0;
-      const rotation = Number(doc?.rotation || 0) * (Math.PI / 180);
-      const cos = Math.cos(rotation);
-      const sin = Math.sin(rotation);
-      const hw = width / 2;
-      const hh = height / 2;
-      const cx = x + hw;
-      const cy = y + hh;
       const corners = [
-        { x: -hw, y: -hh },
-        { x: hw, y: -hh },
-        { x: hw, y: hh },
-        { x: -hw, y: hh }
+        { x: 0, y: 0 },
+        { x: width, y: 0 },
+        { x: width, y: height },
+        { x: 0, y: height }
       ];
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (const corner of corners) {
-        const px = cx + corner.x * cos - corner.y * sin;
-        const py = cy + corner.x * sin + corner.y * cos;
-        if (px < minX) minX = px;
-        if (py < minY) minY = py;
-        if (px > maxX) maxX = px;
-        if (py > maxY) maxY = py;
+        const world = this._transformDocLocalPoint(doc, corner, { anchorMode: 'doc' });
+        if (!world) continue;
+        if (world.x < minX) minX = world.x;
+        if (world.y < minY) minY = world.y;
+        if (world.x > maxX) maxX = world.x;
+        if (world.y > maxY) maxY = world.y;
       }
       return { minX, minY, maxX, maxY };
     } catch (_) { return null; }
@@ -2059,14 +2470,25 @@ export class AssetShadowManager {
     return scale <= 0 ? 1 : scale;
   }
 
+  _getShadowQualityCap() {
+    try {
+      return Math.max(1024, Number(this._getShadowQualityConfig()?.maxTextureSize || 4096) || 4096);
+    } catch (_) {
+      return 4096;
+    }
+  }
+
   _getMaxTextureSize() {
     try {
+      const qualityCap = this._getShadowQualityCap();
       const gl = this._renderer?.gl || this._renderer?.context?.gl || canvas?.app?.renderer?.gl;
-      if (!gl) return 4096;
+      if (!gl) return Math.max(1024, Math.min(4096, qualityCap));
       const val = gl.getParameter(gl.MAX_TEXTURE_SIZE);
       const max = Number(val || 4096) || 4096;
-      return Math.max(1024, Math.min(max, 8192));
-    } catch (_) { return 4096; }
+      return Math.max(1024, Math.min(max, qualityCap));
+    } catch (_) {
+      return Math.max(1024, Math.min(4096, this._getShadowQualityCap()));
+    }
   }
 
   async _obtainTexture(src) {
@@ -2077,7 +2499,7 @@ export class AssetShadowManager {
     if (cached && cached.texture && !cached.texture.baseTexture?.destroyed) {
       return cached.texture;
     }
-    const texture = PIXI.Texture.from(key);
+    const texture = getOrCreatePixiTexture(key);
     const ok = await AssetShadowManager._waitForBaseTexture(texture?.baseTexture, 5000);
     if (!ok) return null;
     this._textureCache.set(key, { texture, ts: Date.now() });
@@ -2139,13 +2561,21 @@ try {
 
   Hooks.on('updateSetting', (setting) => {
     try {
-      if (!setting || setting.namespace !== 'fa-nexus' || setting.key !== 'assetDropShadow') return;
-      if (setting.value) {
-        const mgr = AssetShadowManager.getInstance();
+      if (!setting || setting.namespace !== MODULE_ID) return;
+      if (setting.key === 'assetDropShadow') {
+        if (setting.value) {
+          const mgr = AssetShadowManager.getInstance();
+          mgr?.refreshAll?.();
+        } else {
+          const mgr = AssetShadowManager.peek();
+          mgr?._clearAllLayers?.();
+        }
+        return;
+      }
+      if (setting.key === 'assetDropShadowQuality') {
+        if (!game?.settings?.get?.(MODULE_ID, 'assetDropShadow')) return;
+        const mgr = AssetShadowManager.peek() ?? AssetShadowManager.getInstance();
         mgr?.refreshAll?.();
-      } else {
-        const mgr = AssetShadowManager.peek();
-        mgr?._clearAllLayers?.();
       }
     } catch (_) {}
   });

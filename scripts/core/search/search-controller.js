@@ -10,6 +10,7 @@ export class SearchController {
     this._searchDebounceId = null;
     this._tabSearch = {};
     this._events = null;
+    this._renderCleanup = [];
   }
 
   /**
@@ -19,6 +20,7 @@ export class SearchController {
   initialize(events) {
     this._events = events;
     this._ensureTabSearchStore();
+    this._cleanupRenderBindings();
     this._wireSearchInput();
   }
 
@@ -66,16 +68,14 @@ export class SearchController {
     } catch (_) {}
     updateSearchUI();
 
-    let debounceId = null;
-
     // Handle input with debouncing
-    this._events.on(searchInput, 'input', () => {
+    const onInput = () => {
       updateSearchUI();
-      if (debounceId) this._events.clearTimeout(debounceId);
+      if (this._searchDebounceId) this._events.clearTimeout(this._searchDebounceId);
 
       // Capture tab at the time of input to avoid cross-tab application on fast switches
       const tabAtInput = this.app._activeTab || 'tokens';
-      debounceId = this._events.setTimeout(() => {
+      this._searchDebounceId = this._events.setTimeout(() => {
         const query = searchInput.value.trim();
         // Save per-tab using the tab where the input originated
         this._ensureTabSearchStore();
@@ -85,12 +85,17 @@ export class SearchController {
           const applyOptions = tabAtInput === 'buildings' ? { refreshTextures: false } : undefined;
           try { this.app._activeTabObj?.applySearch?.(query, applyOptions); } catch (_) {}
         }
+        this._searchDebounceId = null;
       }, 250);
+    };
+    searchInput.addEventListener('input', onInput);
+    this._renderCleanup.push(() => {
+      try { searchInput.removeEventListener('input', onInput); } catch (_) {}
     });
 
     // Handle clear search button
     if (clearBtn) {
-      this._events.on(clearBtn, 'click', (ev) => {
+      const onClear = (ev) => {
         ev.preventDefault();
         searchInput.value = '';
         updateSearchUI();
@@ -103,14 +108,22 @@ export class SearchController {
           try { this.app._activeTabObj?.applySearch?.('', applyOptions); } catch (_) {}
         }
         try { searchInput.focus(); } catch (_) {}
+      };
+      clearBtn.addEventListener('click', onClear);
+      this._renderCleanup.push(() => {
+        try { clearBtn.removeEventListener('click', onClear); } catch (_) {}
       });
     }
 
     // Handle clear folders button
     if (clearFoldersBtn) {
-      this._events.on(clearFoldersBtn, 'click', (ev) => {
+      const onClearFolders = (ev) => {
         ev.preventDefault();
         this.app.clearFolderSelections?.(this.app._activeTab || 'tokens');
+      };
+      clearFoldersBtn.addEventListener('click', onClearFolders);
+      this._renderCleanup.push(() => {
+        try { clearFoldersBtn.removeEventListener('click', onClearFolders); } catch (_) {}
       });
     }
   }
@@ -224,10 +237,18 @@ export class SearchController {
    * Cleanup event handlers
    */
   cleanup() {
+    this._cleanupRenderBindings();
+    this._events = null;
+  }
+
+  _cleanupRenderBindings() {
     if (this._searchDebounceId) {
       try { this._events?.clearTimeout?.(this._searchDebounceId); } catch (_) {}
       this._searchDebounceId = null;
     }
-    // Event cleanup is handled by the shared EventManager
+    while (this._renderCleanup.length) {
+      const off = this._renderCleanup.pop();
+      try { off?.(); } catch (_) {}
+    }
   }
 }

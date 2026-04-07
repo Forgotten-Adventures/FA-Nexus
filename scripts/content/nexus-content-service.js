@@ -43,27 +43,6 @@ export class ProgressEmitter {
 }
 
 /**
- * Check if the client appears to be offline
- * @returns {boolean}
- */
-function isOffline() {
-  try {
-    return !navigator.onLine;
-  } catch (_) {
-    // navigator.onLine not available, try a simple fetch
-    try {
-      const testUrl = 'https://www.google.com/favicon.ico';
-      fetch(testUrl, { method: 'HEAD', mode: 'no-cors', cache: 'no-cache' })
-        .then(() => false)
-        .catch(() => true);
-      return false; // Assume online if fetch doesn't immediately fail
-    } catch (_) {
-      return false;
-    }
-  }
-}
-
-/**
  * Retry a function with exponential backoff
  * @param {Function} fn - Function to retry
  * @param {Object} options
@@ -91,10 +70,6 @@ async function retryWithBackoff(fn, {
         throw new DOMException('Operation aborted', 'AbortError');
       }
 
-      if (isOffline()) {
-        throw new Error('Network appears to be offline');
-      }
-
       return await fn();
     } catch (error) {
       lastError = error;
@@ -112,7 +87,8 @@ async function retryWithBackoff(fn, {
       }
 
       const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
-      Logger.info('Service.retry', { attempt: attempt + 1, maxRetries, delay, error: String(error?.message || error) });
+      const offlineHint = typeof navigator !== 'undefined' && navigator?.onLine === false;
+      Logger.info('Service.retry', { attempt: attempt + 1, maxRetries, delay, offlineHint, error: String(error?.message || error) });
 
       try {
         onRetry?.({ attempt: attempt + 1, maxRetries, delay, error });
@@ -120,10 +96,12 @@ async function retryWithBackoff(fn, {
 
       await new Promise(resolve => {
         const timeout = setTimeout(resolve, delay);
-        signal?.addEventListener('abort', () => {
+        const onAbort = () => {
           clearTimeout(timeout);
+          signal?.removeEventListener?.('abort', onAbort);
           resolve();
-        });
+        };
+        signal?.addEventListener?.('abort', onAbort, { once: true });
       });
 
       if (signal?.aborted) {
@@ -382,6 +360,11 @@ export class NexusContentService {
       throw new Error('Unexpected update response');
     } catch (error) {
       const errorMsg = String(error?.message || error);
+      if (error?.name === 'AbortError' || signal?.aborted) {
+        Logger.info('ContentService.sync:aborted', { kind, error: errorMsg });
+        this.progressEmitter.emit('sync:aborted', { kind, error: errorMsg });
+        throw error;
+      }
       Logger.error('ContentService.sync:error', { kind, error: errorMsg });
       this.progressEmitter.emit('sync:error', { kind, error: errorMsg });
       throw error;

@@ -19,11 +19,6 @@ async function retryWithBackoff(fn, {
         throw new DOMException('Operation aborted', 'AbortError');
       }
 
-      const res = await fetch('https://www.google.com/favicon.ico', { method: 'HEAD', mode: 'no-cors', cache: 'no-cache' });
-      if (!res.ok && res.type !== 'opaque') {
-        throw new Error('Network appears to be offline');
-      }
-
       return await fn();
     } catch (error) {
       lastError = error;
@@ -37,7 +32,8 @@ async function retryWithBackoff(fn, {
       }
 
       const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
-      Logger.info('DownloadManager.retry', { attempt: attempt + 1, maxRetries, delay, error: String(error?.message || error) });
+      const offlineHint = typeof navigator !== 'undefined' && navigator?.onLine === false;
+      Logger.info('DownloadManager.retry', { attempt: attempt + 1, maxRetries, delay, offlineHint, error: String(error?.message || error) });
 
       try {
         onRetry?.({ attempt: attempt + 1, maxRetries, delay, error });
@@ -45,10 +41,12 @@ async function retryWithBackoff(fn, {
 
       await new Promise(resolve => {
         const timeout = setTimeout(resolve, delay);
-        signal?.addEventListener('abort', () => {
+        const onAbort = () => {
           clearTimeout(timeout);
+          signal?.removeEventListener?.('abort', onAbort);
           resolve();
-        });
+        };
+        signal?.addEventListener?.('abort', onAbort, { once: true });
       });
 
       if (signal?.aborted) {
@@ -172,11 +170,11 @@ export class NexusDownloadManager {
       for (const filePath of res.files || []) {
         const name = String(filePath.split('/').pop() || '');
         const rel = this._relativePathFromFilePath(filePath, baseDir, name);
-        this._registerInventoryEntry([name, rel], filePath);
+        this._registerInventoryEntry(context?.kind, [name, rel], filePath);
       }
       for (const subdir of res.dirs || []) {
         const normalized = this._normalizeBrowseTarget({ source }, subdir);
-        await this._scanDirRecursive(normalized, baseDir, { source, options });
+        await this._scanDirRecursive(normalized, baseDir, { kind: context?.kind, source, options });
       }
     } catch (e) {
       Logger.warn('DownloadManager.scan:failed', { dir, error: String(e?.message||e) });
@@ -215,7 +213,7 @@ export class NexusDownloadManager {
           for (const filePath of res.files || []) {
             const name = String(filePath.split('/').pop() || '');
             const rel = this._relativePathFromFilePath(filePath, next.base, name);
-            this._registerInventoryEntry([name, rel], filePath);
+            this._registerInventoryEntry(next.storage?.kind, [name, rel], filePath);
             if (this._inventory.size >= this._maxIndexEntries) break;
           }
           if (this._inventory.size < this._maxIndexEntries) {
@@ -327,7 +325,7 @@ export class NexusDownloadManager {
    * @returns {string|null}
    */
   getLocalPath(kind, item) {
-    for (const key of this._candidateKeysForItem(item)) {
+    for (const key of this._candidateInventoryKeys(kind, item)) {
       const hit = this._inventory.get(key);
       if (hit) return forgeIntegration.optimizeCacheURL(hit);
     }
@@ -363,7 +361,7 @@ export class NexusDownloadManager {
     const filename = String(item.filename || '').trim();
     if (!filename) throw new Error('Missing filename');
     let existing = null;
-    for (const key of this._candidateKeysForItem({ filename, path: item?.file_path || item?.path })) {
+    for (const key of this._candidateInventoryKeys(kind, { filename, path: item?.file_path || item?.path })) {
       existing = this._inventory.get(key);
       if (existing) break;
     }
@@ -381,7 +379,7 @@ export class NexusDownloadManager {
       const foundPath = (res.files || []).find((p) => this._pathEndsWithFilename(p, filename)) || null;
       if (foundPath) {
         const path = this._resolveStoredFilePath(storage, targetDir, filename, foundPath);
-        this._registerInventoryEntry([filename, relSanitized], path);
+        this._registerInventoryEntry(kind, [filename, relSanitized], path);
         Logger.info('DownloadManager.ensureLocal:foundExisting', { path });
         return forgeIntegration.optimizeCacheURL(path);
       }
@@ -446,7 +444,7 @@ export class NexusDownloadManager {
       const uploadResult = await FilePickerImpl.upload(storage.source, targetDir, file, { ...storage.options }, { notify: false, filename });
 
       const path = this._resolveStoredFilePath(storage, targetDir, filename, uploadResult);
-      this._registerInventoryEntry([filename, relSanitized], path);
+      this._registerInventoryEntry(kind, [filename, relSanitized], path);
       Logger.info('DownloadManager.download:done', { path });
       this.progressEmitter.emit('download:complete', { kind, filename, path });
       return forgeIntegration.optimizeCacheURL(path);
@@ -471,7 +469,7 @@ export class NexusDownloadManager {
       const filename = String(item?.filename || '').trim();
       if (!filename) return null;
       // Quick inventory lookup first
-      for (const key of this._candidateKeysForItem(item || { filename })) {
+      for (const key of this._candidateInventoryKeys(kind, item || { filename })) {
         const hit = this._inventory.get(key);
         if (hit) return forgeIntegration.optimizeCacheURL(hit);
       }
@@ -489,7 +487,7 @@ export class NexusDownloadManager {
       const foundPath = (res.files || []).find((p) => this._pathEndsWithFilename(p, filename)) || null;
       if (!foundPath) return null;
       const path = this._resolveStoredFilePath(storage, targetDir, filename, foundPath);
-      this._registerInventoryEntry([filename, relSanitized], path);
+      this._registerInventoryEntry(kind, [filename, relSanitized], path);
       Logger.info('DownloadManager.probeLocal:found', { path });
       return forgeIntegration.optimizeCacheURL(path);
     } catch (_) {
@@ -497,14 +495,24 @@ export class NexusDownloadManager {
     }
   }
 
-  _registerInventoryEntry(nameOrNames, path) {
+  _registerInventoryEntry(kind, nameOrNames, path) {
     if (!nameOrNames || !path) return;
     const names = Array.isArray(nameOrNames) ? nameOrNames : [nameOrNames];
     for (const n of names) {
       for (const key of this._generateInventoryKeys(n)) {
-        this._inventory.set(key, path);
+        const inventoryKey = this._inventoryLookupKey(kind, key);
+        if (inventoryKey) this._inventory.set(inventoryKey, path);
       }
     }
+  }
+
+  _candidateInventoryKeys(kind, item) {
+    const keys = [];
+    for (const key of this._candidateKeysForItem(item)) {
+      const inventoryKey = this._inventoryLookupKey(kind, key);
+      if (inventoryKey) keys.push(inventoryKey);
+    }
+    return keys;
   }
 
   _candidateKeysForItem(item) {
@@ -533,6 +541,13 @@ export class NexusDownloadManager {
       for (const k of this._generateInventoryKeys(name)) keys.add(k);
     }
     return Array.from(keys);
+  }
+
+  _inventoryLookupKey(kind, key) {
+    const normalizedKind = String(kind || '').trim().toLowerCase();
+    const normalizedKey = String(key || '').trim().toLowerCase();
+    if (!normalizedKind || !normalizedKey) return '';
+    return `${normalizedKind}:${normalizedKey}`;
   }
 
   _generateInventoryKeys(name) {

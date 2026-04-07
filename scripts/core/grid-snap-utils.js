@@ -1,4 +1,5 @@
 export const GRID_SNAP_DIVISORS = Object.freeze([1, 2, 3, 4, 5]);
+export const GRID_SNAP_SUBDIV_LABELS = Object.freeze(['Full', '1/2', '1/3', '1/4', '1/5']);
 export const GRID_SNAP_SUBDIV_SETTING_KEY = 'gridSnapSubdivisions';
 export const GRID_SNAP_SUBDIV_MIN = 0;
 export const GRID_SNAP_SUBDIV_MAX = GRID_SNAP_DIVISORS.length - 1;
@@ -38,9 +39,8 @@ export function getGridSnapStep(gridSize, subdivisions = undefined) {
 }
 
 export function formatGridSnapSubdivisionLabel(value) {
-  const divisor = getGridSnapDivisor(value);
-  if (divisor <= 1) return 'Full grid';
-  return `1/${divisor} grid`;
+  const index = normalizeGridSnapSubdivision(value);
+  return GRID_SNAP_SUBDIV_LABELS[index] ?? GRID_SNAP_SUBDIV_LABELS[0];
 }
 
 export function snapPointToSubgrid(point, gridSize, subdivisions = undefined) {

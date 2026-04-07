@@ -180,7 +180,10 @@ export class TilePixelSelection {
       const mesh = tile?.mesh;
       if (!mesh || mesh.destroyed) return true;
 
-      const maskContainer = mesh.faNexusMaskContainer || tile.faNexusMaskContainer;
+      const maskContainer = mesh.faNexusMaskContainer
+        || tile.faNexusMaskContainer
+        || mesh.faNexusStandardMaskContainer
+        || tile.faNexusStandardMaskContainer;
       if (maskContainer?.faNexusMaskSprite) {
         const maskSprite = maskContainer.faNexusMaskSprite;
         const maskAlpha = this._sampleSpriteAlpha(maskSprite, worldX, worldY, { useLumaWhenOpaque: true });
@@ -340,12 +343,57 @@ export class TilePixelSelection {
     }
   }
 
+  static _readFaNexusFlag(doc, key) {
+    if (!doc || !key) return undefined;
+    try {
+      const value = doc.getFlag?.(MODULE_ID, key);
+      if (value !== undefined) return value;
+    } catch (_) {}
+    try {
+      const flags = doc?.flags?.[MODULE_ID] || doc?._source?.flags?.[MODULE_ID];
+      if (flags && Object.prototype.hasOwnProperty.call(flags, key)) return flags[key];
+    } catch (_) {}
+    return undefined;
+  }
+
+  static _isFaNexusCustomRenderTile(tile) {
+    try {
+      const doc = tile?.document;
+      if (!doc) return false;
+      const mergedPaths = this._readFaNexusFlag(doc, 'pathsV2');
+      const scatter = this._readFaNexusFlag(doc, 'assetScatter');
+      if (this._readFaNexusFlag(doc, 'path')) return true;
+      if (this._readFaNexusFlag(doc, 'pathV2')) return true;
+      if (mergedPaths && typeof mergedPaths === 'object' && Array.isArray(mergedPaths.paths)) return true;
+      if (this._readFaNexusFlag(doc, 'maskedTiling')) return true;
+      if (this._readFaNexusFlag(doc, 'standardTileMask')) return true;
+      if (scatter && typeof scatter === 'object' && Array.isArray(scatter.instances)) return true;
+      if (this._readFaNexusFlag(doc, 'building')) return true;
+
+      const mesh = tile?.mesh;
+      return !!(
+        mesh?.faNexusMaskContainer
+        || tile?.faNexusMaskContainer
+        || mesh?.faNexusStandardMaskContainer
+        || tile?.faNexusStandardMaskContainer
+        || mesh?.faNexusPathContainer
+        || tile?.faNexusPathContainer
+        || mesh?.faNexusAssetScatterContainer
+        || tile?.faNexusAssetScatterContainer
+        || mesh?.faNexusBuildingContainer
+        || tile?.faNexusBuildingContainer
+      );
+    } catch (err) {
+      Logger.debug('TilePixelSelection._isFaNexusCustomRenderTile failed', err);
+      return false;
+    }
+  }
+
   static _tileSupportsResizeHandle(tile) {
     try {
       const doc = tile?.document;
       if (!doc) return true;
-      if (doc.getFlag?.('fa-nexus', 'path')) return false;
-      if (doc.getFlag?.('fa-nexus', 'maskedTiling')) return false;
+      if (this._isFaNexusCustomRenderTile(tile)) return false;
     } catch (err) {
       Logger.debug('TilePixelSelection._tileSupportsResizeHandle failed', err);
     }

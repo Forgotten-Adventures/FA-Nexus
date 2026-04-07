@@ -2,9 +2,101 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-04-07
+
+### Added
+- **Re-coloring for Assets, Paths, Textures, and Buildings:** 
+    - Added Hue, Saturation, Brightness & Contrast color grading controls for Asset placement/scatter, Paths, Texture Painting, and Building walls/fills/portals.
+
+- **Tool Options Panel Re-styling:**
+    - Added collapsible panel sections with remembered collapse state per tool, so recurring workflows can stay compact.
+    - Added a contextual help button/window for active tools, including a quick summary, panel areas, notes, and shortcuts.
+    - Moved shared session controls such as `Snap to Grid` and snap density into a denser footer layout, freeing more room for actual tool settings.
+    - Sliders, toggles, numeric inputs, and tooltips now use a cleaner and more consistent presentation, including better hover/focus treatment and clearer inline labels across specialized controls such as shadows, offsets, and flip/random settings.
+    - Scale/rotation randomization now uses explicit `Min`/`Max` range controls in the panel instead of a single strength value, and Portal options were rebuilt to match the new grouped/collapsible panel style.
+
+- **Layer Manager v2:** Significant expansion of the Layer Manager with stronger organization, editing, and navigation tools.
+    - Rows can now be renamed inline with `F2`; the override is stored as a display-only tile name and falls back to the computed label when cleared.
+    - Layers now support search and chip filtering. Search supports `OR` and `NOT`; `NOT` can also be used as `-` before a word, for example `-scatter` filters out all `scatter` tiles from the layer list.
+    - All elevations (foreground/non-foreground) are selectable by default when Layer Manager is open; `Ignore Foreground Toggle` was removed.
+    - Added `Skip Filtered` selection option (on by default), meaning only layers matching the current filter/search can be selected on the canvas.
+    - Added type/status chips, bulk lock/delete actions, drag-and-drop reordering between elevation groups, and inline badges for special layer states such as HSBC.
+    - Elevation groups can now be collapsed, given custom names, and moved to a new elevation.
+    - Added optional nested elevation grouping with recursive subgroups (on by default), persistent collapse state, and automatic expansion to reveal selected canvas layers.
+    - Added a context menu for layers and groups with rename, elevation change, lock/unlock, flatten, Foundry `Edit`, and FA `Nexus Edit` actions where applicable.
+    - Added a help button and contextual help window in the header.
+    - Added collapsible `Selection Options` section, per-group counts, and four-decimal elevation formatting for more precise layer organization.
+
+- **Flatten Improvements & Scene Export:** 
+    - Flatten and scene export dialogs now let you set an output name and pick the upload folder before saving generated images, while remembering the last-used flatten and export folders separately. [Feature Request #35](https://github.com/Forgotten-Adventures/FA-Nexus/issues/35)
+    - Generated flatten/export filenames are sanitized to `.webp`, and split/chunked outputs now use deterministic suffixes for foreground/background and row/column chunks.
+    - Flattened tile outputs now default to `fa-nexus-assets/__generated/flattened/<world>/<scene>`; `<world>/<scene>` is prepended even for custom output folders, and the flatten dialog shows the effective upload folder so scene-owned generated files land in predictable locations.
+    - Deconstructing a flattened tile now preserves nested flattened metadata, so restored child flattened tiles keep their own deconstruct data.
+
+- **Flatten & Mask File Cleanup Tool:** 
+    - Added `Generated Cleanup` tool in module settings to scan FA Nexus generated outputs (Masks & Flattened images), report unused or missing files, and optionally back up then mark unused files for manual cleanup. Foundry blocks automatic file deletions so deleting has to be done manually.
+    - Similarly to flattened tiles, masks are now generated into `fa-nexus-assets/__generated/masks/<world>/<scene>` so scene-owned generated files land in predictable locations.
+
+- **Overhead Proxy Pipeline:**
+    - FA-rendered tiles set as `Overhead` now use a shared custom overhead proxy pipeline so masked textures, paths, building overlays, scatter tiles, and chunked flatten tiles can participate in native overhead occlusion handling. (Use sparingly, as this can consume more VRAM/GPU.)
+
+- **Shadow Quality Controls:** 
+    - Added a new world-level `Shadow Quality` setting for FA asset drop shadows, with `Low`, `Medium`, `High`, and `Ultra` caps for shadow render textures.
+    - The drop-shadow offset max for asset placement can now be adjusted (Max 512px, was hard set to 40px before).
+
+- **Asset Placement & Scatter Preview Improvements:** 
+    - Scatter brush now shows live ghost stamps inside the brush plus spacing markers, so density, deviation, spacing, and random transforms can be previewed before painting.
+    - Hovering or focusing the Asset Placement tool-options panel now temporarily anchors the preview to the viewport center so slider adjustments stay visible without freezing the preview manually. (You can still manually freeze the preview in a desired spot with `Space`.)
+
+- **Path Splitting:**
+    - Paths can now be split in 'Edit Shapes' mode by hovering a point and hitting 'X' shortcut. 
+
+- **Building Tool Improvements:**
+    - Building tool now shows a width/height grid measurement of the drawn shape next to the cursor. [Feature Request #34](https://github.com/Forgotten-Adventures/FA-Nexus/issues/34)
+    - `Edit Shapes` now supports `per-segment` editing of outer/inner walls. Left click selects the whole shape, right click selects a specific segment for editing, and you can now adjust texture, wall transforms, color, and shadow on a per-segment basis. You can `Reset Segment` with a button at the bottom of the `Wall Transform` section. [Feature Request #38](https://github.com/Forgotten-Adventures/FA-Nexus/issues/38)
+
+- **Token Placement Actor Type Detection:**
+    - `Place Token As -> Create New` now detects the available actor types for the active game system and surfaces them directly in Tool Options.
+    - Added an `Auto` actor type choice plus a manual `New Actor Type` override when creating actors from token drops.
+    - Actor creation now tries the selected/detected system-appropriate type first, then falls back through other valid actor types before using the minimal actor-creation path. This should improve compatibility with systems that are not explicitly added yet.
+    - Added `Rolemaster Unified` system detection [Based on PR #36](https://github.com/Forgotten-Adventures/FA-Nexus/pull/36)
+
+### Changed
+- Streamlined local/cloud catalog orchestration.
+- Updated local folder index persistence so large asset and token libraries can be reindexed safely as content changes.
+- Simplified cloud sync and download retry handling and tightened asset tab reload/cancellation behavior.
+- Cloud Assets catalog now preloads in the background after startup, so Nexus opens without showing the cloud loading overlay if the preload finishes before the first opening of the Nexus.
+- Token cloud catalog loading now uses abortable requests, keeps loader state in sync with known cloud totals, and preserves local results when cloud refresh only partially fails.
+- Asset Placement now stores separate scale, rotation, and flip/random transform presets for single placement versus Scatter mode, migrating existing placement transforms into scatter defaults on first use.
+- Elevation controls across Asset Placement, Paths, Texture Painting, and Building editing no longer rely on `Alt+Scroll` alone. All four tools and Layer Manager now support direct elevation nudging with `Alt+[ / ]` and `Alt+Up / Down`, and use finer step sizes of `0.01` by default, `0.001` with `Ctrl/Cmd`, and `0.1` with `Shift`.  Tools also include manual `Elevation` numeric inputs in `Transform` section of the options panel.
+
+### Fixed
+- Premium entitlement refreshes now ignore stale responses so an older auth result cannot overwrite a newer ready or error state.
+- Token cloud sync/list failures no longer collapse into a silent empty-success path during Nexus browsing.
+- Building and path tile deletion now queue linked Foundry wall cleanup per scene so cascade deletes no longer race each other and spam transient `Wall "... does not exist!"` errors.
+- Outer building wall tiles now restore hover/selection state correctly after exiting Edit mode without requiring the tile to be nudged first.
+- Creating FA custom tiles no longer re-triggers duplicate PIXI `BaseTexture` and `Texture` cache-id warnings when the source art is already cached.
+- Texture commits now avoid the extra Canvas2D crop readback that triggered Chrome `willReadFrequently` warnings during mask saves.
+- Rotated building, path, scatter, and generic tile shadows now stay aligned to the source tile instead of drifting when the source art is rotated.
+- Texture editor undo history now stores alpha-only region patches with byte-budget trimming instead of full extracted mask canvases, reducing memory pressure on large file-mask sessions.
+- Texture Painting now remembers brush/fill opacity plus texture scale, rotation, and offset settings between editing sessions.
+- Tile flattening now allows a single visible tile, and both tile flatten and scene flatten/export skip tiles hidden via Foundry or the FA Nexus Layer Manager. [Issue #33](https://github.com/Forgotten-Adventures/FA-Nexus/issues/33)
+- Building wall meshing no longer throws on degenerate centerline inputs that short-circuit before full geometry creation.
+- Masked texture overlay teardown now fully restores the original mesh texture, material texture, and shader sampler bindings.
+- Reused asset cards no longer accumulate duplicate click handlers.
+- Token drag preview failures now restore hover suppression, actor highlighting, and window transparency instead of leaving the UI in a stuck state.
+- Content source keys now normalize single trailing slashes, cloud text search now matches tags correctly, and content source dialog saves no longer leave folder/cloud settings partially persisted on failure.
+- Token and asset local-download inventory lookups no longer collide on identical filenames across separate storage roots.
+- Patreon OAuth polling now tolerates initial `400` and `401` auth-check responses for the first five polling attempts so newly authorized or newly upgraded users are not failed before backend state propagates.
+- Shadow-layer scene-rectangle expansion now uses safer fallback bounds and avoids invalid/empty-doc extents, reducing unnecessary oversized render targets and stabilizing shadow rebuild performance on large scenes.
+- Layer Manager selection filtering and tile interactivity now refresh correctly after exiting Path, Texture Painting, and Building edit sessions or after editor interaction locks are released.
+- Numeric tool-option inputs now resync cleanly on Enter/invalid commits, and Asset Scatter numeric fields no longer treat empty or boolean values as valid input.
+- Asset placement `Shift+Wheel` scaling now respects scroll direction on macOS external mice by falling back to `deltaX` when the OS remaps wheel input. [Issue #42](https://github.com/Forgotten-Adventures/FA-Nexus/issues/42) [PR #44](https://github.com/Forgotten-Adventures/FA-Nexus/pull/44)
+
+
 ## [0.3.38] - 2026-01-29
 ### Fixed
-- Layer Manager panel si now only visible to GMs
+- Layer Manager panel is now only visible to GMs
 - 'Inner Wall' scale in 'Building tool' being set to '25'
 
 ## [0.3.1 - 0.3.37] - 2026-01-27

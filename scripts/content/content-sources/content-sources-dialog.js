@@ -9,6 +9,25 @@ import {
   serializeContentSourcesSetting
 } from './content-sources-service.js';
 
+function createFaIcon(iconClass) {
+  const icon = document.createElement('i');
+  icon.className = `fas ${iconClass}`;
+  icon.setAttribute('aria-hidden', 'true');
+  return icon;
+}
+
+function setIconOnlyContent(element, iconClass) {
+  if (!element) return;
+  element.replaceChildren(createFaIcon(iconClass));
+}
+
+function setIconTextContent(element, iconClass, text) {
+  if (!element) return;
+  const label = document.createElement('span');
+  label.textContent = String(text ?? '');
+  element.replaceChildren(createFaIcon(iconClass), document.createTextNode(' '), label);
+}
+
 /**
  * BaseContentSourcesDialog
  * - Generic multi-folder selector with enable/disable, edit, remove, and custom label support
@@ -124,6 +143,8 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   /** Unbind events on close */
   _onClose(options = {}) {
     this._cancelAllIndexing('close');
+    try { this._indexManager?.dispose?.(); } catch (error) { Logger.warn('ContentSources.close:dispose-failed', { error }); }
+    this._indexManager = null;
     this._clearRenderTimer();
     this._unbindEvents();
     this._cloudPendingEnabled = null;
@@ -721,7 +742,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
       if (view.css) classes.push(view.css);
       statusEl.className = classes.join(' ');
       const icon = view.icon || 'fa-info-circle';
-      statusEl.innerHTML = `<i class="fas ${icon}"></i> <span>${view.text}</span>`;
+      setIconTextContent(statusEl, icon, view.text);
     }
 
     const indexBtn = row.querySelector('.fa-nexus-index-folder-btn');
@@ -730,13 +751,13 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
         indexBtn.disabled = false;
         indexBtn.dataset.action = 'cancel';
         indexBtn.classList.add('is-cancel');
-        indexBtn.innerHTML = '<i class="fas fa-ban"></i>';
+        setIconOnlyContent(indexBtn, 'fa-ban');
         indexBtn.title = 'Cancel indexing';
       } else {
         indexBtn.disabled = false;
         indexBtn.dataset.action = 'start';
         indexBtn.classList.remove('is-cancel');
-        indexBtn.innerHTML = '<i class="fas fa-sync-alt"></i>';
+        setIconOnlyContent(indexBtn, 'fa-sync-alt');
         indexBtn.title = 'Rebuild index';
       }
     }
@@ -1114,22 +1135,25 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
 
   /** Persist current folders to the configured settings key */
   async _save() {
+    let previousPayload;
+    let shouldUpdateCloud = false;
+    let settingsSaved = false;
+    let cloudConfig = null;
     try {
       await this._ensureInitialized();
       const payload = serializeContentSourcesSetting(this.folders, { normalizePath: (value) => this._normalizePath(value) });
-      const tasks = [game.settings.set('fa-nexus', this._settingsKey, payload)];
-      const cloudConfig = this._getCloudConfig();
+      previousPayload = game.settings.get('fa-nexus', this._settingsKey);
+      cloudConfig = this._getCloudConfig();
       const pending = this._cloudPendingEnabled;
-      if (cloudConfig?.setting) {
-        const initial = this._cloudInitialEnabled;
-        const desired = (pending != null) ? pending : initial;
-        if (desired != null && desired !== initial) {
-          tasks.push(this._setCloudEnabled(desired));
-        }
+      const initial = this._cloudInitialEnabled;
+      const desired = (pending != null) ? pending : initial;
+      shouldUpdateCloud = !!(cloudConfig?.setting && desired != null && desired !== initial);
+      await game.settings.set('fa-nexus', this._settingsKey, payload);
+      settingsSaved = true;
+      if (shouldUpdateCloud) {
+        await this._setCloudEnabled(desired);
       }
-      if (tasks.length > 0) await Promise.all(tasks);
       if (cloudConfig?.setting) {
-        const desired = (pending != null) ? pending : this._getCloudEnabled(cloudConfig);
         this._cloudInitialEnabled = desired;
         this._cloudPendingEnabled = null;
         if (this._cloudContext) {
@@ -1141,6 +1165,13 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
       ui.notifications.info(`Saved ${this.folders.length} folder(s)`);
       this.close();
     } catch (e) {
+      if (settingsSaved && shouldUpdateCloud) {
+        try {
+          await game.settings.set('fa-nexus', this._settingsKey, previousPayload);
+        } catch (rollbackError) {
+          Logger.error('Folders.save:rollback-failed', { key: this._settingsKey, setting: cloudConfig?.setting, error: rollbackError });
+        }
+      }
       Logger.error('Folders.save:failed', e);
       ui.notifications.error('Failed to save folder configuration');
     }

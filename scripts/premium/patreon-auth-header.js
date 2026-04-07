@@ -1,4 +1,19 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { getPremiumHeaderBadge } from './premium-runtime-config.js';
+
+function createFaIcon(iconClass) {
+  const icon = document.createElement('i');
+  icon.className = `fas ${iconClass}`;
+  icon.setAttribute('aria-hidden', 'true');
+  return icon;
+}
+
+function createTextSpan(className, text) {
+  const span = document.createElement('span');
+  span.className = className;
+  span.textContent = String(text ?? '');
+  return span;
+}
 
 function ensureHeaderContent(header) {
   let headerContent = header.querySelector('.header-content');
@@ -37,7 +52,7 @@ function addCustomIcon(titleElement) {
 function updateTitleWithText(titleElement) {
   if (!titleElement) return;
   const customIcon = titleElement.querySelector('.custom-fa-icon');
-  titleElement.innerHTML = '';
+  titleElement.replaceChildren();
   if (customIcon) titleElement.appendChild(customIcon);
   const span = document.createElement('span');
   span.textContent = 'Nexus';
@@ -63,13 +78,28 @@ export function renderPatreonAuthHeader({ app, headerElement, getAuthService }) 
 
     const auth = game.settings.get('fa-nexus', 'patreon_auth_data');
     const authService = getAuthService ? getAuthService() : null;
+    const premiumHeaderBadge = getPremiumHeaderBadge();
+
+    if (premiumHeaderBadge) {
+      const devStatus = document.createElement('div');
+      devStatus.className = premiumHeaderBadge.className;
+      devStatus.appendChild(createFaIcon(premiumHeaderBadge.iconClass));
+      devStatus.appendChild(createTextSpan('auth-tier-text', premiumHeaderBadge.text));
+      devStatus.title = premiumHeaderBadge.title;
+      devStatus.style.pointerEvents = 'auto';
+      devStatus.addEventListener('mousedown', preventDrag);
+      devStatus.addEventListener('pointerdown', preventDrag);
+      authContainer.appendChild(devStatus);
+    }
 
     if (auth && auth.authenticated) {
       const status = document.createElement('div');
       status.className = 'auth-status-display';
       const tier = String(auth.tier || 'vip');
       const src = String(auth.source || 'patreon:main');
-      status.innerHTML = `<i class="fas fa-check-circle"></i><span class="auth-tier-text">${tier} supporter</span><span class="auth-source-text">(${src})</span>`;
+      status.appendChild(createFaIcon('fa-check-circle'));
+      status.appendChild(createTextSpan('auth-tier-text', `${tier} supporter`));
+      status.appendChild(createTextSpan('auth-source-text', `(${src})`));
       status.title = 'Click to disconnect';
       status.setAttribute('data-disconnect-handler', 'true');
       status.style.pointerEvents = 'auto';
@@ -85,7 +115,8 @@ export function renderPatreonAuthHeader({ app, headerElement, getAuthService }) 
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'patreon-connect-button';
-      button.innerHTML = '<i class="fas fa-user-shield"></i><span>Connect Patreon</span>';
+      button.appendChild(createFaIcon('fa-user-shield'));
+      button.appendChild(document.createElement('span')).textContent = 'Connect Patreon';
       button.style.pointerEvents = 'auto';
       button.addEventListener('click', (event) => {
         event.preventDefault();

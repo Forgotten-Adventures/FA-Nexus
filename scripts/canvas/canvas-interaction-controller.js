@@ -1,3 +1,6 @@
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { requestSelectionFilterRefresh } from './selection-filter-refresh.js';
+
 const GRID_BASE_PX = 200;
 
 const defaultTarget = typeof window !== 'undefined' ? window : globalThis;
@@ -101,6 +104,45 @@ function getGridScaleFactor(basePx = GRID_BASE_PX) {
   return sceneSize / base;
 }
 
+function isTilesLayer(layer) {
+  try {
+    return !!layer && layer === canvas?.tiles;
+  } catch (_) {
+    return false;
+  }
+}
+
+function requestTileInteractionRefresh(reason = 'unknown') {
+  const refresh = () => {
+    try {
+      const layer = canvas?.tiles;
+      if (!canvas?.ready || !layer) return;
+      if (typeof layer.setAllRenderFlags === 'function') {
+        layer.setAllRenderFlags({ refreshState: true });
+      } else {
+        const placeables = Array.isArray(layer.placeables) ? layer.placeables : [];
+        for (const tile of placeables) {
+          try { tile?.renderFlags?.set?.({ refreshState: true }); } catch (_) {}
+        }
+      }
+      const mouseManager = globalThis?.foundry?.canvas?.interaction?.MouseInteractionManager || globalThis?.MouseInteractionManager;
+      try { mouseManager?.emulateMoveEvent?.(); } catch (_) {}
+      Logger.debug('CanvasInteractionController.tiles.refreshState', { reason });
+    } catch (error) {
+      Logger.error('CanvasInteractionController.tiles.refreshState.failed', error);
+    }
+  };
+
+  refresh();
+  try { queueMicrotask(() => refresh()); } catch (_) {}
+  try {
+    const root = globalThis?.window ?? globalThis;
+    root?.requestAnimationFrame?.(() => refresh());
+  } catch (_) {}
+  try { setTimeout(() => refresh(), 80); } catch (_) {}
+  try { setTimeout(() => refresh(), 180); } catch (_) {}
+}
+
 function lockLayerInteractivity(layerName = 'tiles') {
   try {
     const canvasRef = canvas || null;
@@ -141,18 +183,47 @@ function lockLayerInteractivity(layerName = 'tiles') {
         released = true;
         try {
           if (layer && 'interactiveChildren' in layer && state.interactiveChildren !== undefined) {
-            layer.interactiveChildren = state.interactiveChildren;
+            try {
+              layer.interactiveChildren = state.interactiveChildren;
+            } catch (error) {
+              Logger.error('CanvasInteractionController.layerLock.release.restoreLayerChildren.failed', {
+                layer: key,
+                error: String(error?.message || error)
+              });
+            }
           }
           if (layer && 'eventMode' in layer && state.eventMode !== undefined) {
-            layer.eventMode = state.eventMode;
+            try {
+              layer.eventMode = state.eventMode;
+            } catch (error) {
+              Logger.error('CanvasInteractionController.layerLock.release.restoreLayerMode.failed', {
+                layer: key,
+                error: String(error?.message || error)
+              });
+            }
           }
           for (const saved of state.placeables || []) {
             const obj = saved?.obj;
             if (!obj) continue;
-            if (saved.eventMode !== undefined && 'eventMode' in obj) obj.eventMode = saved.eventMode;
-            if (saved.interactive !== undefined && 'interactive' in obj) obj.interactive = saved.interactive;
+            try {
+              if (saved.eventMode !== undefined && 'eventMode' in obj) obj.eventMode = saved.eventMode;
+              if (saved.interactive !== undefined && 'interactive' in obj) obj.interactive = saved.interactive;
+            } catch (error) {
+              Logger.error('CanvasInteractionController.layerLock.release.restorePlaceable.failed', {
+                layer: key,
+                id: obj?.document?.id || obj?.id || null,
+                error: String(error?.message || error)
+              });
+            }
           }
         } catch (_) { /* no-op */ }
+        if (isTilesLayer(layer)) {
+          requestTileInteractionRefresh('layer-lock-release');
+          requestSelectionFilterRefresh({
+            reason: 'layer-lock-release',
+            source: 'canvas-interaction-controller'
+          });
+        }
       }
     };
   } catch (_) {

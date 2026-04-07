@@ -15,7 +15,7 @@ export function normalizeContentSourcePath(path) {
   if (isWindowsDrive) prefix = prefix.toLowerCase();
   let normalized = str.replace(/\\/g, '/');
   if (isWindowsDrive) normalized = normalized.toLowerCase();
-  if (normalized.length > 1) normalized = normalized.replace(/\/\/+$/, '');
+  if (normalized.length > 1) normalized = normalized.replace(/\/+$/, '');
   return `${prefix}${normalized}`;
 }
 

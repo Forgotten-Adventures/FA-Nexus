@@ -2,15 +2,55 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import BuildingWallMesher from './building-wall-mesher.js';
 import { gatherBuildingLoops } from './building-shape-helpers.js';
 import {
+  attachCustomTileOverhead,
+  createDisplayProxyFactory,
+  detachCustomTileOverhead,
+  invalidateCustomTileOverhead
+} from '../canvas/custom-tile-overhead.js';
+import {
   loadTexture,
   getTransparentTexture
 } from '../textures/texture-render.js';
+import {
+  applyHsbcToDisplayObject,
+  normalizeHsbc,
+  readDocumentHsbc
+} from '../core/hsbc.js';
 
 const EDITING_TILE_SET_KEY = '__faNexusBuildingEditingTileIds';
+const BUILDING_WALL_DELETE_QUEUE = new Map();
+const PRESERVE_LINKED_TILE_CLEANUP_OPTION = 'faNexusPreserveLinkedTileCleanup';
+const SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION = 'faNexusSuppressFillTriggeredBuildingCleanup';
+const SKIP_LINKED_BUILDING_FILL_DELETE_OPTION = 'faNexusSkipLinkedBuildingFillDelete';
 
-function shouldSkipLinkedBuildingDeletes() {
-  try { return !!globalThis?.FA_NEXUS_SUPPRESS_BUILDING_TILE_DELETE; }
-  catch (_) { return false; }
+function isBuildingTileDocument(doc = null) {
+  try {
+    return !!doc?.getFlag?.('fa-nexus', 'building');
+  } catch (_) {
+    return false;
+  }
+}
+
+function isBuildingFillDocument(doc = null) {
+  try {
+    return !!doc?.getFlag?.('fa-nexus', 'buildingFill');
+  } catch (_) {
+    return false;
+  }
+}
+
+function shouldSkipLinkedBuildingDeletes(doc = null, options = {}) {
+  try {
+    if (isBuildingFillDocument(doc) && options?.[SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION]) return true;
+    if (options?.[PRESERVE_LINKED_TILE_CLEANUP_OPTION]) return true;
+    if (globalThis?.FA_NEXUS_SUPPRESS_LINKED_TILE_DELETE) return true;
+    if (globalThis?.FA_NEXUS_SUPPRESS_BUILDING_TILE_DELETE) return true;
+    const suppressedIds = globalThis?.FA_NEXUS_SUPPRESS_LINKED_TILE_DELETE_IDS;
+    const docId = doc?.id || doc?._id || null;
+    return !!(docId && suppressedIds instanceof Set && suppressedIds.has(docId));
+  } catch (_) {
+    return false;
+  }
 }
 
 function getEditingTileSet() {
@@ -64,6 +104,104 @@ function sleep(ms = 60) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getSceneQueueKey(scene) {
+  if (!scene) return null;
+  return scene.uuid || scene.id || null;
+}
+
+async function deleteWallsRobustly(scene, wallIds = [], logCode = 'BuildingTiles.delete.walls') {
+  if (!scene || !Array.isArray(wallIds) || !wallIds.length) return;
+  const collection = scene.walls;
+  const errors = [];
+  // Tile delete hooks can fire while Foundry is still reconciling document collections.
+  // Yield once so linked wall cleanup runs against settled scene state.
+  await sleep(75);
+  for (const wallId of wallIds) {
+    if (!wallId) continue;
+    try {
+      const doc = collection?.get?.(wallId);
+      if (!doc || doc._destroyed) continue;
+      await scene.deleteEmbeddedDocuments('Wall', [wallId]);
+      await sleep(25);
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (message.includes('does not exist')) continue;
+      errors.push({ wallId, error: message });
+    }
+  }
+  if (errors.length) {
+    Logger.warn?.(`${logCode}.failed`, { errors, wallIds: wallIds.filter(Boolean) });
+  }
+}
+
+function queueWallDeletes(scene, wallIds = [], logCode = 'BuildingTiles.delete.walls') {
+  const uniqueIds = Array.from(new Set(
+    (Array.isArray(wallIds) ? wallIds : []).filter(Boolean)
+  ));
+  if (!scene || !uniqueIds.length) return Promise.resolve();
+  const queueKey = getSceneQueueKey(scene);
+  if (!queueKey) return deleteWallsRobustly(scene, uniqueIds, logCode);
+  let entry = BUILDING_WALL_DELETE_QUEUE.get(queueKey);
+  if (!entry) {
+    entry = {
+      scene,
+      wallIds: new Set(),
+      logCode,
+      task: null
+    };
+    BUILDING_WALL_DELETE_QUEUE.set(queueKey, entry);
+  }
+  entry.scene = scene;
+  entry.logCode = logCode || entry.logCode;
+  for (const wallId of uniqueIds) entry.wallIds.add(wallId);
+  if (entry.task) return entry.task;
+  entry.task = (async () => {
+    await sleep(150);
+    while (entry.wallIds.size) {
+      const pendingIds = Array.from(entry.wallIds);
+      entry.wallIds.clear();
+      await deleteWallsRobustly(entry.scene, pendingIds, entry.logCode);
+      if (entry.wallIds.size) await sleep(75);
+    }
+  })().finally(() => {
+    BUILDING_WALL_DELETE_QUEUE.delete(queueKey);
+  });
+  return entry.task;
+}
+
+function resolveBuildingCleanupTargets(doc, scene = null) {
+  try {
+    if (!doc?.getFlag) return [];
+    const buildingData = doc.getFlag('fa-nexus', 'building');
+    if (buildingData) return [{ doc, data: buildingData }];
+    if (!doc.getFlag('fa-nexus', 'buildingFill')) return [];
+    const resolvedScene = scene || doc.parent || canvas?.scene;
+    if (!resolvedScene?.tiles?.size) return [];
+    const targets = [];
+    for (const tileDoc of resolvedScene.tiles) {
+      if (!tileDoc || tileDoc.id === doc.id) continue;
+      const data = tileDoc.getFlag?.('fa-nexus', 'building');
+      if (!data) continue;
+      const fillTileId = data?.meta?.fillTileId || null;
+      if (fillTileId !== doc.id) continue;
+      targets.push({ doc: tileDoc, data });
+    }
+    return targets;
+  } catch (_) {
+    return [];
+  }
+}
+
+function resolveBuildingWallTileGroupId(tileDoc) {
+  try {
+    const building = tileDoc?.getFlag?.('fa-nexus', 'building');
+    if (!building) return null;
+    return building?.meta?.wallGroupId || building?.wall?.wallGroupId || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function cleanupContainerChildren(container) {
   if (!container) return;
   const children = container.children ? [...container.children] : [];
@@ -80,6 +218,7 @@ function cleanupDoorFrameOverlay(tile) {
     if (!tile) return;
     const mesh = tile.mesh;
     const container = tile.faNexusDoorFrameContainer || mesh?.faNexusDoorFrameContainer;
+    detachCustomTileOverhead(tile, { kind: 'building-door-frame' });
     if (container) {
       cleanupContainerChildren(container);
       try { container.parent?.removeChild?.(container); } catch (_) {}
@@ -120,12 +259,153 @@ function normalizeTextureFlip(flip) {
   };
 }
 
+function normalizeLayerOpacity(value, fallback = 1) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return Math.min(1, Math.max(0, numeric));
+  const fallbackNumeric = Number(fallback);
+  if (Number.isFinite(fallbackNumeric)) return Math.min(1, Math.max(0, fallbackNumeric));
+  return 1;
+}
+
+function hsbcValuesEqual(a = null, b = null) {
+  const left = normalizeHsbc(a, null);
+  const right = normalizeHsbc(b, null);
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  return Math.abs(left.hue - right.hue) < 0.001
+    && Math.abs(left.saturation - right.saturation) < 0.001
+    && Math.abs(left.brightness - right.brightness) < 0.001
+    && Math.abs(left.contrast - right.contrast) < 0.001;
+}
+
+function getBuildingWallTextureSrc(data) {
+  return data?.wall?.texture || data?.meta?.wallTexture?.src || null;
+}
+
+function collectBuildingRenderSections(data) {
+  const fallbackTextureSrc = getBuildingWallTextureSrc(data);
+  const rootHsbc = normalizeHsbc(data?.wall?.hsbc || null, null);
+  const innerFallbackHsbc = normalizeHsbc(data?.meta?.innerDefaults?.hsbc || rootHsbc, null);
+  const renderSegments = Array.isArray(data?.wall?.renderSegments) ? data.wall.renderSegments : [];
+  const normalizedSegments = renderSegments
+    .filter((segment) => segment && Array.isArray(segment.points))
+    .map((segment, index) => {
+      const closed = segment?.closed !== false;
+      const points = segment.points
+        .map((point) => ({
+          x: Number(point?.x) || 0,
+          y: Number(point?.y) || 0
+        }))
+        .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+      return {
+        order: Number.isFinite(Number(segment?.order)) ? Number(segment.order) : index,
+        closed,
+        points,
+        textureSrc: segment?.texture || segment?.pathLocal || fallbackTextureSrc,
+        textureKey: segment?.pathKey || data?.wall?.pathKey || null,
+        width: Number(segment?.width),
+        repeatDistance: Number(segment?.repeatDistance),
+        scalePercent: Number(segment?.scalePercent) || 100,
+        textureOffset: normalizeTextureOffset(segment?.textureOffset),
+        textureFlip: normalizeTextureFlip(segment?.textureFlip),
+        startJoinDir: segment?.startJoinDir ? {
+          x: Number(segment.startJoinDir.x) || 0,
+          y: Number(segment.startJoinDir.y) || 0
+        } : null,
+        endJoinDir: segment?.endJoinDir ? {
+          x: Number(segment.endJoinDir.x) || 0,
+          y: Number(segment.endJoinDir.y) || 0
+        } : null,
+        layerOpacity: normalizeLayerOpacity(segment?.layerOpacity, data?.wall?.layerOpacity),
+        hsbc: normalizeHsbc(
+          segment?.appearance?.hsbc
+          || segment?.hsbc
+          || (segment?.wallType === 'inner' ? innerFallbackHsbc : rootHsbc),
+          null
+        ),
+        wallType: segment?.wallType || segment?.loopRef?.wallType || data?.meta?.wallType || data?.wall?.mode || 'outer',
+        pathShadow: segment?.pathShadow || null
+      };
+    })
+    .filter((segment) => segment.points.length >= (segment.closed ? 3 : 2));
+  if (normalizedSegments.length) return normalizedSegments;
+
+  const loops = gatherBuildingLoops(data);
+  if (!loops.length) return [];
+
+  const wallWidth = Math.max(10, Number(data?.wall?.width) || DEFAULT_GRID_SCALE / 2);
+  const wallOpacity = normalizeLayerOpacity(data?.wall?.layerOpacity, 1);
+  const textureOffset = normalizeTextureOffset(data?.wall?.textureOffset);
+  const textureFlip = normalizeTextureFlip(data?.wall?.textureFlip);
+  return loops
+    .filter((loop) => Array.isArray(loop) && loop.length >= (loop?.closed === false ? 2 : 3))
+    .map((loop, index) => {
+      const wallType = loop?.wallType || data?.meta?.wallType || data?.wall?.mode || 'outer';
+      return {
+        order: index,
+        closed: loop?.closed !== false,
+        points: loop.map((point) => ({
+          x: Number(point?.x) || 0,
+          y: Number(point?.y) || 0
+        })),
+        textureSrc: fallbackTextureSrc,
+        textureKey: data?.wall?.pathKey || null,
+        width: wallWidth,
+        repeatDistance: Number(data?.wall?.repeatDistance),
+        scalePercent: Number(data?.wall?.scalePercent) || 100,
+        textureOffset: { ...textureOffset },
+        textureFlip: { ...textureFlip },
+        layerOpacity: wallOpacity,
+        hsbc: wallType === 'inner' ? innerFallbackHsbc : rootHsbc,
+        wallType,
+        pathShadow: data?.wall?.pathShadow || null
+      };
+    });
+}
+
+async function loadBuildingTextureEntry(textureSrc) {
+  if (!textureSrc) return null;
+  const texture = await loadTexture(textureSrc);
+  const base = texture?.baseTexture;
+  if (base) {
+    base.wrapMode = PIXI.WRAP_MODES.REPEAT;
+    base.mipmap = PIXI.MIPMAP_MODES.OFF;
+  }
+  const visibleData = await detectVisibleRows(texture);
+  return { texture, visibleData };
+}
+
+function applyTransparentPlaceholder(mesh) {
+  try {
+    const placeholder = getTransparentTexture();
+    mesh.texture = placeholder;
+    if (mesh.material) mesh.material.texture = placeholder;
+    if (mesh.shader?.uniforms) {
+      if ('uSampler' in mesh.shader.uniforms) mesh.shader.uniforms.uSampler = placeholder;
+      if ('texture' in mesh.shader.uniforms) mesh.shader.uniforms.texture = placeholder;
+    }
+  } catch (_) { }
+}
+
+function resetBuildingOverlayToTransparent(tile, mesh, doc) {
+  ensureBuildingMeshTransparent(mesh);
+  applyTransparentPlaceholder(mesh);
+  const container = ensureBuildingContainer(tile, mesh);
+  cleanupContainerChildren(container);
+  container.faNexusBuildingMeshes = [];
+  container.alpha = 1;
+  setContainerTransform(container, mesh, doc);
+  detachCustomTileOverhead(tile, { kind: 'building' });
+  return container;
+}
+
 export function cleanupBuildingOverlay(tile, options = {}) {
   try {
     const preserveTexture = !!options.preserveTexture;
     if (!tile) return;
     const mesh = tile.mesh;
     const container = tile.faNexusBuildingContainer || mesh?.faNexusBuildingContainer;
+    detachCustomTileOverhead(tile, { kind: 'building' });
     if (container) {
       cleanupContainerChildren(container);
       try { container.parent?.removeChild?.(container); } catch (_) {}
@@ -177,8 +457,7 @@ function ensureBuildingContainer(tile, mesh) {
     container.sortableChildren = false;
     tile.faNexusBuildingContainer = container;
     mesh.addChild(container);
-  } else if (container.parent !== mesh) {
-    try { container.parent?.removeChild?.(container); } catch (_) {}
+  } else if (!container.parent) {
     mesh.addChild(container);
   }
   mesh.faNexusBuildingContainer = container;
@@ -193,8 +472,7 @@ function ensureDoorFrameContainer(tile, mesh) {
     container.sortableChildren = false;
     tile.faNexusDoorFrameContainer = container;
     mesh.addChild(container);
-  } else if (container.parent !== mesh) {
-    try { container.parent?.removeChild?.(container); } catch (_) {}
+  } else if (!container.parent) {
     mesh.addChild(container);
   }
   mesh.faNexusDoorFrameContainer = container;
@@ -225,8 +503,10 @@ function setContainerTransform(container, mesh, doc) {
   if (!container || !mesh || mesh.destroyed) return;
   const docWidth = Math.max(1, Number(doc?.width) || Number(mesh?.width) || 1);
   const docHeight = Math.max(1, Number(doc?.height) || Number(mesh?.height) || 1);
-  const sx = Number(mesh.scale?.x ?? 1) || 1;
-  const sy = Number(mesh.scale?.y ?? 1) || 1;
+  const rawSx = Number(mesh.scale?.x ?? 1) || 1;
+  const rawSy = Number(mesh.scale?.y ?? 1) || 1;
+  const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
+  const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
   container.scale.set(1 / sx, 1 / sy);
   container.position.set(-(docWidth / 2) / (sx || 1), -(docHeight / 2) / (sy || 1));
 }
@@ -366,121 +646,120 @@ export async function applyBuildingTile(tile) {
       cleanupBuildingOverlay(tile);
       return;
     }
-    const loops = gatherBuildingLoops(data);
-    if (!loops.length) {
-      // A building tile can legitimately have no drawable wall geometry after portals (gaps)
-      // remove 100% of an open polyline (e.g. freestanding portal walls). In that case we
-      // still must keep the base mesh transparent so the tile doesn't render as an
-      // unmasked rectangle of the wall texture.
-      let mesh = tile.mesh;
-      if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
-      if (!mesh || mesh.destroyed) return;
-      ensureBuildingMeshTransparent(mesh);
-      try {
-        const placeholder = getTransparentTexture();
-        mesh.texture = placeholder;
-        if (mesh.material) mesh.material.texture = placeholder;
-        if (mesh.shader?.uniforms) {
-          if ('uSampler' in mesh.shader.uniforms) mesh.shader.uniforms.uSampler = placeholder;
-          if ('texture' in mesh.shader.uniforms) mesh.shader.uniforms.texture = placeholder;
-        }
-      } catch (_) { }
-      const container = ensureBuildingContainer(tile, mesh);
-      cleanupContainerChildren(container);
-      container.faNexusBuildingMeshes = [];
-      const docAlpha = Number(doc?.alpha);
-      const containerAlpha = Number.isFinite(docAlpha) ? Math.min(1, Math.max(0, docAlpha)) : 1;
-      container.alpha = containerAlpha;
-      setContainerTransform(container, mesh, doc);
-      return;
-    }
+    const renderSections = collectBuildingRenderSections(data);
     let mesh = tile.mesh;
     if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
     if (!mesh || mesh.destroyed) return;
+    if (!renderSections.length) {
+      resetBuildingOverlayToTransparent(tile, mesh, doc);
+      return;
+    }
     ensureBuildingMeshTransparent(mesh);
-    // Some tile meshes keep their own material/texture refs; force all to the transparent
-    // placeholder so the doc's base texture doesn't render while overlays do.
-    try {
-      const placeholder = getTransparentTexture();
-      mesh.texture = placeholder;
-      if (mesh.material) mesh.material.texture = placeholder;
-      if (mesh.shader?.uniforms) {
-        if ('uSampler' in mesh.shader.uniforms) mesh.shader.uniforms.uSampler = placeholder;
-        if ('texture' in mesh.shader.uniforms) mesh.shader.uniforms.texture = placeholder;
+    applyTransparentPlaceholder(mesh);
+
+    const visibleSections = renderSections.filter((section) => normalizeLayerOpacity(section?.layerOpacity, 1) > 0.001);
+    const textureSources = Array.from(new Set(visibleSections.map((section) => section.textureSrc).filter(Boolean)));
+    const textureEntries = new Map();
+    await Promise.all(textureSources.map(async (textureSrc) => {
+      try {
+        const entry = await loadBuildingTextureEntry(textureSrc);
+        if (entry?.texture) textureEntries.set(textureSrc, entry);
+      } catch (error) {
+        Logger.warn?.('BuildingTiles.texture.loadFailed', {
+          error: String(error?.message || error),
+          tileId: doc?.id,
+          textureSrc
+        });
       }
-    } catch (_) { }
+    }));
 
-    const textureSrc = data?.wall?.texture || data?.meta?.wallTexture?.src;
-    if (!textureSrc) {
-      cleanupBuildingOverlay(tile);
-      return;
-    }
-    let texture = null;
-    try {
-      texture = await loadTexture(textureSrc);
-      const base = texture?.baseTexture;
-      if (base) {
-        base.wrapMode = PIXI.WRAP_MODES.REPEAT;
-        base.mipmap = PIXI.MIPMAP_MODES.OFF;
-      }
-    } catch (error) {
-      Logger.warn?.('BuildingTiles.texture.loadFailed', { error: String(error?.message || error), tileId: doc?.id });
-      return;
-    }
-    if (!texture) return;
+	    const container = ensureBuildingContainer(tile, mesh);
+	    const rootHsbc = normalizeHsbc(readDocumentHsbc(doc, { nullIfMissing: true, nullIfNeutral: true }), null);
+	    cleanupContainerChildren(container);
+	    container.faNexusBuildingMeshes = [];
+	    const sectionMeshes = [];
+	    let useContainerHsbc = true;
 
-    const repeatDistance = (() => {
-      const stored = Number(data?.wall?.repeatDistance);
-      if (Number.isFinite(stored) && stored > 0) return stored;
-      return computeTextureRepeatDistance(texture, data);
-    })();
-    const visibleData = await detectVisibleRows(texture);
-    const container = ensureBuildingContainer(tile, mesh);
-    cleanupContainerChildren(container);
-    container.faNexusBuildingMeshes = [];
-
-    let loopIndex = 0;
-    const wallWidth = Math.max(10, Number(data?.wall?.width) || DEFAULT_GRID_SCALE / 2);
-    const textureOffset = normalizeTextureOffset(data?.wall?.textureOffset);
-    const textureFlip = normalizeTextureFlip(data?.wall?.textureFlip);
-    for (const loop of loops) {
-      if (!Array.isArray(loop)) continue;
-      const closed = loop?.closed !== false;
+	    const orderedSections = renderSections
+	      .map((section, renderIndex) => ({ ...section, renderIndex }))
+	      .sort((a, b) => {
+	        const orderDelta = (Number(a?.order) || 0) - (Number(b?.order) || 0);
+	        if (Math.abs(orderDelta) > 1e-6) return orderDelta;
+	        return (Number(a?.renderIndex) || 0) - (Number(b?.renderIndex) || 0);
+	      });
+	    let meshIndex = 0;
+	    for (const section of orderedSections) {
+	      const layerOpacity = normalizeLayerOpacity(section?.layerOpacity, 1);
+	      if (layerOpacity <= 0.001) continue;
+      const textureSrc = section?.textureSrc || getBuildingWallTextureSrc(data);
+      const textureEntry = textureSources.length ? textureEntries.get(textureSrc) : null;
+      const texture = textureEntry?.texture || null;
+      if (!texture) continue;
+      const closed = section?.closed !== false;
+      const points = Array.isArray(section?.points) ? section.points : [];
       const minPoints = closed ? 3 : 2;
-      if (loop.length < minPoints) continue;
-      const geometryResult = BuildingWallMesher.buildGeometry(loop, {
-        width: wallWidth,
-        closed,
+      if (points.length < minPoints) continue;
+      const wallWidth = Math.max(10, Number(section?.width) || Number(data?.wall?.width) || DEFAULT_GRID_SCALE / 2);
+      const repeatDistance = (() => {
+        const stored = Number(section?.repeatDistance);
+        if (Number.isFinite(stored) && stored > 0) return stored;
+        return computeTextureRepeatDistance(texture, data);
+      })();
+	      const geometryResult = BuildingWallMesher.buildGeometry(points, {
+	        width: wallWidth,
+	        closed,
         joinStyle: 'mitre',
         mitreLimit: 4,
         textureRepeatDistance: repeatDistance,
-        textureOffset,
-        textureFlip
+        textureOffset: normalizeTextureOffset(section?.textureOffset),
+        textureFlip: normalizeTextureFlip(section?.textureFlip),
+        startJoinDir: section?.startJoinDir || null,
+        endJoinDir: section?.endJoinDir || null
       });
-      const geometry = geometryResult?.geometry;
-      if (!geometry || !geometryResult?.data?.positions?.length) continue;
-      remapVisibleRows(geometry, visibleData);
-      const shader = createWallShader(texture);
-      if (!shader) continue;
-      const loopMesh = new PIXI.Mesh(geometry, shader);
-      loopMesh.name = `fa-nexus-building-wall-${doc?.id || 'tile'}-${loopIndex}`;
-      loopMesh.eventMode = 'none';
-      loopMesh.interactiveChildren = false;
-      container.addChild(loopMesh);
-      container.faNexusBuildingMeshes.push(loopMesh);
-      applyMeshAlpha(loopMesh, Number(doc?.alpha ?? 1) || 1);
-      loopIndex += 1;
-    }
+	      const geometry = geometryResult?.geometry;
+	      if (!geometry || !geometryResult?.data?.positions?.length) continue;
+	      remapVisibleRows(geometry, textureEntry?.visibleData);
+	      const shader = createWallShader(texture);
+	      if (!shader) continue;
+	      const sectionMesh = new PIXI.Mesh(geometry, shader);
+	      sectionMesh.name = `fa-nexus-building-wall-${doc?.id || 'tile'}-${meshIndex}`;
+	      sectionMesh.eventMode = 'none';
+	      sectionMesh.interactiveChildren = false;
+	      container.addChild(sectionMesh);
+	      container.faNexusBuildingMeshes.push(sectionMesh);
+	      applyMeshAlpha(sectionMesh, layerOpacity);
+	      const sectionHsbc = normalizeHsbc(section?.hsbc ?? rootHsbc, null);
+	      if (!hsbcValuesEqual(sectionHsbc, rootHsbc)) useContainerHsbc = false;
+	      sectionMeshes.push({ mesh: sectionMesh, hsbc: sectionHsbc });
+	      meshIndex += 1;
+	    }
 
-    if (!container.children?.length) {
-      cleanupBuildingOverlay(tile);
+	    if (!container.children?.length) {
+	      resetBuildingOverlayToTransparent(tile, mesh, doc);
       return;
     }
 
-    const docAlpha = Number(doc?.alpha);
-    const containerAlpha = Number.isFinite(docAlpha) ? Math.min(1, Math.max(0, docAlpha)) : 1;
-    container.alpha = containerAlpha;
+    container.alpha = 1;
+    applyHsbcToDisplayObject(container, useContainerHsbc ? rootHsbc : null);
+    if (useContainerHsbc) {
+      for (const { mesh: sectionMesh } of sectionMeshes) {
+        applyHsbcToDisplayObject(sectionMesh, null);
+      }
+    } else {
+      for (const { mesh: sectionMesh, hsbc } of sectionMeshes) {
+        applyHsbcToDisplayObject(sectionMesh, hsbc);
+      }
+    }
     setContainerTransform(container, mesh, doc);
+    attachCustomTileOverhead(tile, {
+      kind: 'building',
+      contentContainer: container,
+      proxyFactory: createDisplayProxyFactory(container),
+      syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
+        setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+      }
+    });
+    invalidateCustomTileOverhead(tile, 'building-refresh');
   } catch (error) {
     Logger.warn?.('BuildingTiles.apply.failed', { error: String(error?.message || error) });
   }
@@ -607,12 +886,36 @@ export async function applyDoorFrameTile(tile) {
       container.addChild(left, right);
     }
 
-    const docAlpha = Number(doc?.alpha);
-    const containerAlpha = Number.isFinite(docAlpha) ? Math.min(1, Math.max(0, docAlpha)) : 1;
-    container.alpha = containerAlpha;
+    container.alpha = 1;
+    applyHsbcToDisplayObject(container, readDocumentHsbc(doc));
     setContainerTransform(container, mesh, doc);
+    attachCustomTileOverhead(tile, {
+      kind: 'building-door-frame',
+      contentContainer: container,
+      proxyFactory: createDisplayProxyFactory(container),
+      syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
+        setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+      }
+    });
+    invalidateCustomTileOverhead(tile, 'building-door-frame-refresh');
   } catch (error) {
     Logger.warn?.('BuildingTiles.doorFrame.apply.failed', { error: String(error?.message || error) });
+  }
+}
+
+function shouldHandleLinkedBuildingDelete(userId) {
+  try {
+    const currentUserId = game?.user?.id || null;
+    if (!currentUserId) return false;
+    if (userId) return userId === currentUserId;
+    const activeGmIds = Array.from(game?.users || [])
+      .filter((user) => user?.active && user?.isGM && user?.id)
+      .map((user) => user.id)
+      .sort();
+    if (!activeGmIds.length) return true;
+    return activeGmIds[0] === currentUserId;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -639,18 +942,20 @@ export function clearBuildingTileMeshWaiters() {
   catch (_) {}
 }
 
-async function deleteLinkedFillAndWalls(doc) {
+async function deleteLinkedFillAndWalls(doc, { scene = null, data = null, options = null } = {}) {
   try {
     if (!doc || !game?.user?.isGM) return;
-    const data = typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null;
-    if (!data) return;
-    const scene = doc.parent || canvas?.scene;
-    if (!scene) return;
-    const meta = data?.meta || {};
+    const buildingData = data ?? (typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null);
+    if (!buildingData) return;
+    const resolvedScene = scene || doc.parent || canvas?.scene;
+    if (!resolvedScene) return;
+    const meta = buildingData?.meta || {};
     const fillTileId = meta?.fillTileId;
-    if (fillTileId && fillTileId !== doc.id) {
+    if (fillTileId && fillTileId !== doc.id && !options?.[SKIP_LINKED_BUILDING_FILL_DELETE_OPTION]) {
       try {
-        await scene.deleteEmbeddedDocuments('Tile', [fillTileId]);
+        await resolvedScene.deleteEmbeddedDocuments('Tile', [fillTileId], {
+          [SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION]: true
+        });
       } catch (error) {
         Logger.warn?.('BuildingTiles.delete.fill.failed', { error: String(error?.message || error), fillTileId });
       }
@@ -662,8 +967,9 @@ async function deleteLinkedFillAndWalls(doc) {
     // Instead, we rely exclusively on the wall's actual flag.tileId and flag.groupId
     // which are the authoritative sources after commit.
     const wallIds = new Set();
+    const staleWallLinks = [];
     const groupId = meta?.wallGroupId || null;
-    const collection = scene.walls;
+    const collection = resolvedScene.walls;
     if (collection?.size) {
       for (const wall of collection) {
         if (!wall) continue;
@@ -672,36 +978,56 @@ async function deleteLinkedFillAndWalls(doc) {
         // Only delete walls where the flag actually points to this tile
         if (flag.tileId === doc.id) {
           wallIds.add(wall.id);
-        } else if (groupId && flag.groupId === groupId && !flag.tileId) {
+          continue;
+        }
+        if (!groupId || flag.groupId !== groupId) continue;
+        if (!flag.tileId) {
           // Also catch walls that have our groupId but no specific tileId
           // (e.g., from interrupted commits or legacy data)
           wallIds.add(wall.id);
+          continue;
+        }
+
+        const linkedTile = resolvedScene.tiles?.get?.(flag.tileId) || null;
+        const linkedGroupId = resolveBuildingWallTileGroupId(linkedTile);
+        if (!linkedTile || linkedTile?._destroyed || linkedGroupId !== groupId) {
+          wallIds.add(wall.id);
+          staleWallLinks.push({
+            wallId: wall.id,
+            staleTileId: flag.tileId,
+            flagGroupId: flag.groupId || null,
+            linkedGroupId: linkedGroupId || null,
+            deletingTileId: doc.id
+          });
         }
       }
     }
-    if (!wallIds.size) return;
-    try {
-      await scene.deleteEmbeddedDocuments('Wall', [...wallIds]);
-    } catch (error) {
-      Logger.warn?.('BuildingTiles.delete.walls.failed', { error: String(error?.message || error), wallIds: [...wallIds] });
+    if (staleWallLinks.length) {
+      Logger.warn?.('BuildingTiles.delete.walls.staleTileLinks', {
+        tileId: doc.id,
+        wallGroupId: groupId,
+        staleWallLinks
+      });
     }
+    if (!wallIds.size) return;
+    await queueWallDeletes(resolvedScene, [...wallIds], 'BuildingTiles.delete.walls');
   } catch (error) {
     Logger.warn?.('BuildingTiles.delete.cleanup.failed', { error: String(error?.message || error) });
   }
 }
 
-async function deleteLinkedDoorFrameTiles(doc) {
+async function deleteLinkedDoorFrameTiles(doc, { scene = null, data = null } = {}) {
   try {
     if (!doc || !game?.user?.isGM) return;
-    const data = typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null;
-    if (!data) return;
-    const scene = doc.parent || canvas?.scene;
-    if (!scene?.tiles?.size) return;
-    const meta = data?.meta || {};
+    const buildingData = data ?? (typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null);
+    if (!buildingData) return;
+    const resolvedScene = scene || doc.parent || canvas?.scene;
+    if (!resolvedScene?.tiles?.size) return;
+    const meta = buildingData?.meta || {};
     const wallGroupId = meta?.wallGroupId || null;
     if (!wallGroupId) return;
     const frameTileIds = [];
-    for (const tileDoc of scene.tiles) {
+    for (const tileDoc of resolvedScene.tiles) {
       if (!tileDoc || tileDoc.id === doc.id) continue;
       const flag = tileDoc.getFlag?.('fa-nexus', 'buildingDoorFrame');
       if (flag?.wallGroupId === wallGroupId) {
@@ -710,7 +1036,7 @@ async function deleteLinkedDoorFrameTiles(doc) {
     }
     if (!frameTileIds.length) return;
     try {
-      await scene.deleteEmbeddedDocuments('Tile', frameTileIds);
+      await resolvedScene.deleteEmbeddedDocuments('Tile', frameTileIds);
     } catch (error) {
       Logger.warn?.('BuildingTiles.delete.doorFrames.failed', { error: String(error?.message || error), frameTileIds });
     }
@@ -719,18 +1045,18 @@ async function deleteLinkedDoorFrameTiles(doc) {
   }
 }
 
-async function deleteLinkedWindowTiles(doc) {
+async function deleteLinkedWindowTiles(doc, { scene = null, data = null } = {}) {
   try {
     if (!doc || !game?.user?.isGM) return;
-    const data = typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null;
-    if (!data) return;
-    const scene = doc.parent || canvas?.scene;
-    if (!scene?.tiles?.size) return;
-    const meta = data?.meta || {};
+    const buildingData = data ?? (typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null);
+    if (!buildingData) return;
+    const resolvedScene = scene || doc.parent || canvas?.scene;
+    if (!resolvedScene?.tiles?.size) return;
+    const meta = buildingData?.meta || {};
     const wallGroupId = meta?.wallGroupId || null;
     if (!wallGroupId) return;
     const windowTileIds = [];
-    for (const tileDoc of scene.tiles) {
+    for (const tileDoc of resolvedScene.tiles) {
       if (!tileDoc || tileDoc.id === doc.id) continue;
       // Check for window sill, window texture, or window frame tiles
       const sillFlag = tileDoc.getFlag?.('fa-nexus', 'buildingWindowSill');
@@ -743,7 +1069,7 @@ async function deleteLinkedWindowTiles(doc) {
     }
     if (!windowTileIds.length) return;
     try {
-      await scene.deleteEmbeddedDocuments('Tile', windowTileIds);
+      await resolvedScene.deleteEmbeddedDocuments('Tile', windowTileIds);
     } catch (error) {
       Logger.warn?.('BuildingTiles.delete.windowTiles.failed', { error: String(error?.message || error), windowTileIds });
     }
@@ -752,20 +1078,20 @@ async function deleteLinkedWindowTiles(doc) {
   }
 }
 
-async function deleteLinkedInnerWallTiles(doc) {
+async function deleteLinkedInnerWallTiles(doc, { scene = null, data = null } = {}) {
   try {
     if (!doc || !game?.user?.isGM) return;
-    const data = typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null;
-    if (!data) return;
-    const scene = doc.parent || canvas?.scene;
-    if (!scene?.tiles?.size) return;
-    const meta = data?.meta || {};
+    const buildingData = data ?? (typeof doc.getFlag === 'function' ? doc.getFlag('fa-nexus', 'building') : null);
+    if (!buildingData) return;
+    const resolvedScene = scene || doc.parent || canvas?.scene;
+    if (!resolvedScene?.tiles?.size) return;
+    const meta = buildingData?.meta || {};
     // Only outer wall tiles should cascade delete their inner walls
-    const wallType = meta?.wallType || data?.wall?.mode;
+    const wallType = meta?.wallType || buildingData?.wall?.mode;
     if (wallType === 'inner') return;
     const wallGroupId = meta?.wallGroupId || null;
     const innerWallTileIds = [];
-    for (const tileDoc of scene.tiles) {
+    for (const tileDoc of resolvedScene.tiles) {
       if (!tileDoc || tileDoc.id === doc.id) continue;
       const innerData = tileDoc.getFlag?.('fa-nexus', 'building');
       if (!innerData) continue;
@@ -782,7 +1108,7 @@ async function deleteLinkedInnerWallTiles(doc) {
     }
     if (!innerWallTileIds.length) return;
     try {
-      await scene.deleteEmbeddedDocuments('Tile', innerWallTileIds);
+      await resolvedScene.deleteEmbeddedDocuments('Tile', innerWallTileIds);
     } catch (error) {
       Logger.warn?.('BuildingTiles.delete.innerWallTiles.failed', { error: String(error?.message || error), innerWallTileIds });
     }
@@ -791,22 +1117,49 @@ async function deleteLinkedInnerWallTiles(doc) {
   }
 }
 
+async function cleanupLinkedBuildingTiles(doc, options = {}) {
+  try {
+    if (!doc || !game?.user?.isGM) return;
+    const scene = doc.parent || canvas?.scene;
+    if (!scene) return;
+    const targets = resolveBuildingCleanupTargets(doc, scene);
+    if (!targets.length) return;
+    const isFillTrigger = !isBuildingTileDocument(doc) && isBuildingFillDocument(doc);
+    if (isFillTrigger) {
+      const ownerTileIds = Array.from(new Set(
+        targets.map((target) => target?.doc?.id).filter(Boolean)
+      ));
+      if (!ownerTileIds.length) return;
+      try {
+        await scene.deleteEmbeddedDocuments('Tile', ownerTileIds, {
+          [SKIP_LINKED_BUILDING_FILL_DELETE_OPTION]: true
+        });
+      } catch (error) {
+        Logger.warn?.('BuildingTiles.delete.fillOwners.failed', {
+          error: String(error?.message || error),
+          fillTileId: doc.id,
+          ownerTileIds
+        });
+      }
+      return;
+    }
+    for (const target of targets) {
+      if (!target?.doc || !target?.data) continue;
+      await deleteLinkedFillAndWalls(target.doc, { scene, data: target.data, options });
+      await deleteLinkedDoorFrameTiles(target.doc, { scene, data: target.data });
+      await deleteLinkedWindowTiles(target.doc, { scene, data: target.data });
+      await deleteLinkedInnerWallTiles(target.doc, { scene, data: target.data });
+    }
+  } catch (error) {
+    Logger.warn?.('BuildingTiles.delete.linked.cleanup.failed', { error: String(error?.message || error) });
+  }
+}
+
 try {
   Hooks.on('canvasReady', () => {
     try { rehydrateBuildingTiles(); } catch (_) {}
   });
   Hooks.on('drawTile', (tile) => {
-    try { applyBuildingTile(tile); } catch (_) {}
-    try { applyDoorFrameTile(tile); } catch (_) {}
-  });
-  Hooks.on('refreshTile', (tile) => {
-    try { applyBuildingTile(tile); } catch (_) {}
-    try { applyDoorFrameTile(tile); } catch (_) {}
-  });
-  Hooks.on('activateTilesLayer', () => {
-    try { rehydrateBuildingTiles(); } catch (_) {}
-  });
-  Hooks.on('controlTile', (tile) => {
     try { applyBuildingTile(tile); } catch (_) {}
     try { applyDoorFrameTile(tile); } catch (_) {}
   });
@@ -819,7 +1172,7 @@ try {
       }
     } catch (_) {}
   });
-  Hooks.on('deleteTile', (doc) => {
+  Hooks.on('deleteTile', (doc, options, userId) => {
     try {
       const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
       if (tile) {
@@ -827,11 +1180,8 @@ try {
         cleanupDoorFrameOverlay(tile);
       }
     } catch (_) {}
-    if (!shouldSkipLinkedBuildingDeletes() && doc?.getFlag) {
-      Promise.resolve(deleteLinkedFillAndWalls(doc)).catch(() => {});
-      Promise.resolve(deleteLinkedDoorFrameTiles(doc)).catch(() => {});
-      Promise.resolve(deleteLinkedWindowTiles(doc)).catch(() => {});
-      Promise.resolve(deleteLinkedInnerWallTiles(doc)).catch(() => {});
+    if (shouldHandleLinkedBuildingDelete(userId) && !shouldSkipLinkedBuildingDeletes(doc, options) && doc?.getFlag) {
+      Promise.resolve(cleanupLinkedBuildingTiles(doc, options)).catch(() => {});
     }
   });
   Hooks.on('canvasTearDown', () => {

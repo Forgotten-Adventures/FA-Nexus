@@ -1,7 +1,7 @@
 {
   "id": "fa-nexus",
   "title": "FA Nexus",
-  "version": "0.3.38",
+  "version": "0.4.0",
   "compatibility": {
     "minimum": "13",
     "verified": "13"
@@ -24,6 +24,7 @@
     "scripts/content/cache-index.js",
     "scripts/tokens/system-detection.js",
     "scripts/canvas/tile-selection.js",
+    "scripts/canvas/custom-tile-overhead.js",
     "scripts/canvas/tile-flatten-chunks.js",
     "scripts/canvas/tile-hud-edit.js",
     "scripts/core/search/search-manager.js",

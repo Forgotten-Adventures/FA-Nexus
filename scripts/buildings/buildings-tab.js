@@ -63,6 +63,11 @@ function saveSetting(key, value) {
   }
 }
 
+function isBenignBuildingCommitError(error) {
+  const message = String(error?.message || error || '').trim();
+  return message === 'No geometry to commit' || message === 'Missing wall texture';
+}
+
 export class BuildingsTab extends AssetsTab {
   constructor(app) {
     super(app, { mode: 'assets' });
@@ -133,8 +138,8 @@ export class BuildingsTab extends AssetsTab {
   }
 
   _loadInitialSubtab() {
-    const stored = loadSetting(SETTING_ACTIVE_SUBTAB, DEFAULT_SUBTAB);
-    return SUBTABS.includes(stored) ? stored : DEFAULT_SUBTAB;
+    // Opening the Building Tool should always land on Walls.
+    return DEFAULT_SUBTAB;
   }
 
   _loadSubtabSearch() {
@@ -152,7 +157,7 @@ export class BuildingsTab extends AssetsTab {
   async onActivate() {
     await super.onActivate();
     if (!this.app || this.app._activeTab !== this.id) return;
-    this._setActiveSubtab(this._activeSubtab, { silent: true });
+    this._setActiveSubtab(DEFAULT_SUBTAB, { silent: true });
     this._syncSearchField({ apply: false });
   }
 
@@ -2672,13 +2677,7 @@ export class BuildingsTab extends AssetsTab {
     const manager = this._buildingManager;
     if (!manager) return;
     if (!manager.isActive) {
-      try {
-        // Still issue deactivate in case the proxy kept tool options open
-        manager.stop?.({ reason });
-      } catch (error) {
-        Logger.warn?.('BuildingsTab.building.stop.failed', { reason, error: String(error?.message || error) });
-      }
-      this._detachEscapeListener();
+      this._stopBuildingManager(manager, { reason });
       return;
     }
     if (reason === 'tab-deactivate') {
@@ -2686,22 +2685,34 @@ export class BuildingsTab extends AssetsTab {
         ? manager.hasSessionChanges()
         : true;
       if (!hasChanges) {
-        try { manager.stop?.({ reason }); } catch (error) {
-          Logger.warn?.('BuildingsTab.building.stop.failed', { reason, error: String(error?.message || error) });
-        }
-        this._detachEscapeListener();
+        this._stopBuildingManager(manager, { reason });
+        return;
+      }
+      const canCommit = typeof manager.canCommitSession === 'function'
+        ? manager.canCommitSession()
+        : true;
+      if (!canCommit) {
+        Logger.info?.('BuildingsTab.building.commit.skipped', { reason, cause: 'session-not-committable' });
+        this._stopBuildingManager(manager, { reason: `${reason}-discard` });
         return;
       }
       if (typeof manager.commitBuilding === 'function') {
-        const commitPromise = manager.commitBuilding({ reason });
-        if (commitPromise?.catch) {
-          commitPromise.catch((error) => {
+        Promise.resolve()
+          .then(() => manager.commitBuilding({ reason }))
+          .catch((error) => {
+            if (isBenignBuildingCommitError(error)) {
+              Logger.info?.('BuildingsTab.building.commit.discarded', {
+                reason,
+                error: String(error?.message || error)
+              });
+              return this._stopBuildingManager(manager, { reason: `${reason}-discard` });
+            }
             Logger.warn?.('BuildingsTab.building.commit.failed', { reason, error: String(error?.message || error) });
+            return null;
+          })
+          .finally(() => {
+            if (!manager.isActive) this._detachEscapeListener();
           });
-        }
-        Promise.resolve(commitPromise).finally(() => {
-          if (!manager.isActive) this._detachEscapeListener();
-        });
         return;
       }
     }
@@ -2719,12 +2730,25 @@ export class BuildingsTab extends AssetsTab {
         return;
       }
     }
+    this._stopBuildingManager(manager, { reason });
+  }
+
+  _stopBuildingManager(manager, { reason = 'manual' } = {}) {
     try {
-      manager.stop?.({ reason });
+      const stopPromise = manager?.stop?.({ reason });
+      Promise.resolve(stopPromise)
+        .catch((error) => {
+          Logger.warn?.('BuildingsTab.building.stop.failed', { reason, error: String(error?.message || error) });
+        })
+        .finally(() => {
+          this._detachEscapeListener();
+        });
+      return stopPromise;
     } catch (error) {
       Logger.warn?.('BuildingsTab.building.stop.failed', { reason, error: String(error?.message || error) });
+      this._detachEscapeListener();
+      return null;
     }
-    this._detachEscapeListener();
   }
 
   _attachEscapeListener() {

@@ -1,5 +1,6 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { gatherBuildingLoops } from '../buildings/building-shape-helpers.js';
+import { applyHsbcToDisplayObject } from '../core/hsbc.js';
 
 const SHADOW_BLUR_QUALITY_MIN = 3;
 const SHADOW_BLUR_QUALITY_STEP = 4;
@@ -154,6 +155,32 @@ function normalizeShadowConfig(raw = {}) {
   return { enabled: true, alpha, blur, dilation, offset };
 }
 
+function normalizeTrackedShadowConfig(raw = {}) {
+  if (raw?.enabled === false) {
+    return {
+      enabled: false,
+      alpha: clamp(Number(raw.alpha ?? FALLBACK_ALPHA), 0, 1),
+      blur: Math.max(0, Number(raw.blur ?? FALLBACK_BLUR)),
+      dilation: Math.max(0, Number(raw.dilation ?? FALLBACK_DILATION)),
+      offset: clamp(Number(raw.offset ?? FALLBACK_OFFSET), -MAX_OFFSET_DISTANCE, MAX_OFFSET_DISTANCE)
+    };
+  }
+  return normalizeShadowConfig(raw || {});
+}
+
+function readPortalHsbc(doc) {
+  const faFlags = doc?.flags?.['fa-nexus'] || null;
+  const buildingDoor = doc?.getFlag?.('fa-nexus', 'buildingDoor') || faFlags?.buildingDoor || null;
+  if (buildingDoor && typeof buildingDoor === 'object' && Object.prototype.hasOwnProperty.call(buildingDoor, 'hsbc')) {
+    return buildingDoor.hsbc || null;
+  }
+  const buildingWindow = doc?.getFlag?.('fa-nexus', 'buildingWindow') || faFlags?.buildingWindow || null;
+  if (buildingWindow && typeof buildingWindow === 'object' && Object.prototype.hasOwnProperty.call(buildingWindow, 'hsbc')) {
+    return buildingWindow.hsbc || null;
+  }
+  return null;
+}
+
 function resolveDocumentElevation(doc) {
   try {
     const directElevation = doc?.elevation;
@@ -260,6 +287,7 @@ export class DoorShadowManager {
     this._hooksBound = false;
     this._tickerBound = false;
     this._enabled = true;
+    this._shadowsEnabled = true;
     this._readyRan = false;
     this._canvasReadyRan = false;
     this._noMeshSkip = new Set(); // wallIds that permanently skipped due to missing meshes
@@ -294,25 +322,23 @@ export class DoorShadowManager {
   _onReady() {
     this._readyRan = true;
     try {
-      this._enabled = !!game.settings.get('fa-nexus', 'assetDropShadow');
+      this._shadowsEnabled = !!game.settings.get('fa-nexus', 'assetDropShadow');
     } catch (_) {
-      this._enabled = true;
+      this._shadowsEnabled = true;
     }
-    if (this._enabled) this._onCanvasReady();
-    else this._clearAll();
+    this._onCanvasReady();
   }
 
   _onSetting(setting) {
     if (!setting || setting.namespace !== 'fa-nexus' || setting.key !== 'assetDropShadow') return;
-    this._enabled = !!setting.value;
-    if (this._enabled) this._onCanvasReady();
-    else this._clearAll();
+    this._shadowsEnabled = !!setting.value;
+    this._onCanvasReady();
   }
 
   async _onCanvasReady() {
     this._canvasReadyRan = true;
     this._clearAll();
-    if (!this._enabled || !canvas?.ready) return;
+    if (!canvas?.ready) return;
     this._ensureRoot();
     const walls = Array.isArray(canvas?.walls?.placeables) ? canvas.walls.placeables : [];
     for (const wall of walls) {
@@ -384,7 +410,7 @@ export class DoorShadowManager {
   _trackWall(doc, { force = false } = {}) {
     const id = doc?.id;
     if (!id || !canvas?.ready) return;
-    if (this._noMeshSkip.has(id)) return;
+    if (this._noMeshSkip.has(id) && !force) return;
     if (force) this._removeEntry(id);
     const config = this._getShadowConfig(doc);
     if (!config) {
@@ -413,7 +439,11 @@ export class DoorShadowManager {
       const rawShadow = buildingWindow
         ? doc.getFlag?.('fa-nexus', 'windowShadow')
         : doc.getFlag?.('fa-nexus', 'doorShadow');
-      const cfg = normalizeShadowConfig(rawShadow || {});
+      const trackedShadow = this._shadowsEnabled !== false
+        ? (rawShadow || {})
+        : { ...(rawShadow && typeof rawShadow === 'object' ? rawShadow : {}), enabled: false };
+      // Keep tracking portal meshes even when shadows are disabled so HSBC stays applied.
+      const cfg = normalizeTrackedShadowConfig(trackedShadow);
       return cfg;
     } catch (error) {
       Logger.warn('DoorShadow.config.failed', String(error?.message || error));
@@ -488,7 +518,7 @@ export class DoorShadowManager {
     this._startTicker();
   }
 
-  async _waitForDoorMeshes(doc, attempts = 12, delay = 80) {
+  async _waitForDoorMeshes(doc, attempts = 60, delay = 100) {
     for (let i = 0; i < attempts; i++) {
       const wall = canvas?.walls?.get?.(doc?.id);
       const meshes = wall?.doorMeshes ? Array.from(wall.doorMeshes) : [];
@@ -503,6 +533,7 @@ export class DoorShadowManager {
     if (!entry) return;
     if (!preserveState) this._noMeshSkip.delete(id);
     for (const sub of entry.subs || []) {
+      try { applyHsbcToDisplayObject(sub?.mesh, null, { slot: 'fa-nexus-wall-portal' }); } catch (_) { }
       try { sub?.container?.removeChildren?.(); } catch (_) { }
       try { sub?.container?.parent?.removeChild?.(sub.container); } catch (_) { }
       try { sub?.container?.destroy?.({ children: true }); } catch (_) { }
@@ -557,6 +588,7 @@ export class DoorShadowManager {
       if (!entry?.subs?.length) continue;
       const cfg = entry.config || {};
       const blurEnabled = cfg.blur > 0;
+      const portalHsbc = readPortalHsbc(entry.doc);
       for (const sub of entry.subs) {
         const mesh = sub.mesh;
         const sprite = sub.sprite;
@@ -566,6 +598,7 @@ export class DoorShadowManager {
         const renderer = canvas?.app?.renderer;
         if (!mesh || mesh.destroyed || !sprite || sprite.destroyed || !container || container.destroyed) continue;
         if (!renderer || renderer.destroyed || !baseSprite || baseSprite.destroyed || !offscreen || offscreen.destroyed) continue;
+        try { applyHsbcToDisplayObject(mesh, portalHsbc, { slot: 'fa-nexus-wall-portal' }); } catch (_) { }
 
         const baseTexture = mesh.texture || PIXI.Texture.WHITE;
         if (baseSprite.texture !== baseTexture) {

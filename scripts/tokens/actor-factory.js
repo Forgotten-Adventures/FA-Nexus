@@ -60,7 +60,7 @@ export class ActorFactory {
       const actorName = generateActorName(dragData.filename);
       
       // Create actor with system-specific logic
-      const actor = await this._createActorWithFallback(actorName, dragData);
+      const actor = await this._createActorWithFallback(actorName, dragData, options);
       
       if (!actor) {
         throw new Error('Failed to create actor with all fallback strategies');
@@ -95,11 +95,34 @@ export class ActorFactory {
    * @param {Object} dragData - Drag data containing token information
    * @returns {Promise<Actor>} Created actor or null if all strategies fail
    */
-  static async _createActorWithFallback(actorName, dragData) {
-    const fallbackTypes = SystemDetection.getFallbackActorTypes();
+  static async _createActorWithFallback(actorName, dragData, options = {}) {
+    const systemId = SystemDetection.getCurrentSystemId();
+    const availableTypes = Array.isArray(SystemDetection.getAvailableActorTypes?.())
+      ? SystemDetection.getAvailableActorTypes()
+      : [];
+    const requestedActorType = typeof options?.actorTypeOverride === 'string'
+      ? options.actorTypeOverride.trim()
+      : '';
+    const fallbackTypes = await SystemDetection.getFallbackActorTypes(systemId);
+    const actorTypeOverride = requestedActorType && (!availableTypes.length || availableTypes.includes(requestedActorType))
+      ? requestedActorType
+      : '';
+    const orderedTypes = actorTypeOverride
+      ? [actorTypeOverride, ...fallbackTypes.filter((actorType) => actorType !== actorTypeOverride)]
+      : fallbackTypes;
+    const failures = [];
+
+    console.info('fa-nexus | ActorFactory: Resolved actor creation fallback order', {
+      systemId,
+      actorName,
+      filename: dragData?.filename,
+      actorTypeOverride: actorTypeOverride || null,
+      detectedFallbackTypes: fallbackTypes,
+      fallbackTypes: orderedTypes
+    });
     
     // Try each fallback type in sequence
-    for (const actorType of fallbackTypes) {
+    for (const actorType of orderedTypes) {
       try {
         // Get actor data for this type
         const actorData = this._buildActorData(actorName, actorType, dragData);
@@ -118,20 +141,33 @@ export class ActorFactory {
         }
         
       } catch (error) {
+        failures.push({
+          actorType,
+          error: error?.message || String(error)
+        });
         console.warn(`fa-nexus | ActorFactory: Failed to create actor with type "${actorType}":`, error.message);
         // Continue to next fallback type
       }
     }
     
     // If all typed attempts failed, try minimal data approach
-    console.warn('fa-nexus | ActorFactory: All typed actor creation attempts failed, trying minimal data approach');
+    console.warn('fa-nexus | ActorFactory: All typed actor creation attempts failed, trying minimal data approach', {
+      systemId,
+      actorName,
+      actorTypeOverride: actorTypeOverride || null,
+      fallbackTypes: orderedTypes,
+      failures
+    });
     
     try {
-      const minimalData = SystemDetection.getMinimalActorData(actorName, dragData.url);
+      const minimalData = SystemDetection.getMinimalActorData(actorName, dragData.url, actorTypeOverride || orderedTypes[0] || null);
       const actor = await ActorFactory._createActorInTargetFolder(minimalData);
       
       if (actor) {
-        console.log(`fa-nexus | ActorFactory: Created minimal actor: ${actorName}`);
+        console.log(`fa-nexus | ActorFactory: Created minimal actor: ${actorName}`, {
+          systemId,
+          actorType: minimalData.type
+        });
         return actor;
       }
       

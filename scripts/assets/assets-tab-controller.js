@@ -6,6 +6,7 @@ import { PathManagerV2 } from '../paths/path-manager-v2.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { collectLocalInventory, getEnabledFolders, mergeLocalAndCloudRecords, NexusContentService } from '../content/nexus-content-service.js';
 import { NexusDownloadManager } from '../content/nexus-download-manager.js';
+import { abortError, formatCatalogLoaderText, isAbortError, loadAndMergeCloudRecords } from '../content/catalog-pipeline.js';
 import {
   normalizeFolderSelection,
   enforceFolderSelectionAvailability,
@@ -19,25 +20,119 @@ const SHARED_ASSET_CATALOG = {
   items: null,
   loadPromise: null,
   dirty: false,
+  status: 'idle',
   version: 0,
   folderStats: new Map()
+};
+
+const SHARED_ASSET_CLOUD_WARM_CACHE = {
+  items: null,
+  latest: null,
+  loadPromise: null,
+  status: 'idle',
+  error: null,
+  mode: 'idle',
+  abortController: null,
+  timer: null,
+  generation: 0
 };
 
 const SETTINGS_TRIGGERING_RELOAD = new Set(['assetFolders', 'cloudAssetsEnabled']);
 const ASSET_TAB_INSTANCES = new Set();
 let sharedSettingsHookInstalled = false;
+let sharedWarmupContentService = null;
 
 function normalizeMode(requested) {
   const mode = String(requested || 'assets').toLowerCase();
   return ['textures', 'paths'].includes(mode) ? mode : 'assets';
 }
 
-function abortError() {
-  return new DOMException('Operation aborted', 'AbortError');
+function clearWarmCloudAssetTimer() {
+  if (!SHARED_ASSET_CLOUD_WARM_CACHE.timer) return;
+  try { clearTimeout(SHARED_ASSET_CLOUD_WARM_CACHE.timer); } catch (_) {}
+  SHARED_ASSET_CLOUD_WARM_CACHE.timer = null;
+}
+
+function shouldWarmAssetCloud() {
+  if (!game?.user?.isGM) return false;
+  try {
+    if (!game?.settings?.get?.('fa-nexus', 'cloudAssetsEnabled')) return false;
+  } catch (_) {
+    return false;
+  }
+  if (typeof navigator !== 'undefined' && navigator?.onLine === false) return false;
+  return true;
+}
+
+function getSharedWarmupContentService() {
+  if (!(sharedWarmupContentService instanceof NexusContentService)) {
+    sharedWarmupContentService = new NexusContentService();
+  }
+  return sharedWarmupContentService;
+}
+
+function awaitWithAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      if (!signal) return;
+      try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(abortError());
+    };
+    try { signal.addEventListener('abort', onAbort, { once: true }); } catch (_) {}
+    Promise.resolve(promise).then((value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    }).catch((error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+  });
+}
+
+function scheduleWarmCloudYield(mode = 'idle') {
+  return new Promise((resolve) => {
+    if (mode === 'interactive') {
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => resolve());
+        return;
+      }
+      setTimeout(resolve, 0);
+      return;
+    }
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(() => resolve(), { timeout: 50 });
+      return;
+    }
+    setTimeout(resolve, 16);
+  });
+}
+
+function getWarmCloudReuseState(latest = null) {
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  const expectedLatest = String(latest || '').trim();
+  if (!expectedLatest) return { ready: false, loading: false, latest: null };
+  return {
+    ready: cache.status === 'ready' && cache.latest === expectedLatest && Array.isArray(cache.items),
+    loading: cache.latest === expectedLatest && !!cache.loadPromise,
+    latest: cache.latest
+  };
 }
 
 function invalidateSharedAssetCatalog(reason = 'unknown') {
   SHARED_ASSET_CATALOG.dirty = true;
+  SHARED_ASSET_CATALOG.status = 'stale';
   SHARED_ASSET_CATALOG.items = null;
   SHARED_ASSET_CATALOG.version += 1;
   SHARED_ASSET_CATALOG.loadPromise = null;
@@ -45,6 +140,350 @@ function invalidateSharedAssetCatalog(reason = 'unknown') {
   for (const tab of ASSET_TAB_INSTANCES) {
     try { tab?._markNeedsReload?.(`settings:${reason}`); } catch (_) {}
   }
+}
+
+export function invalidateWarmCloudAssetCache(reason = 'unknown') {
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  clearWarmCloudAssetTimer();
+  cache.generation += 1;
+  const controller = cache.abortController;
+  cache.abortController = null;
+  cache.loadPromise = null;
+  cache.items = null;
+  cache.latest = null;
+  cache.error = null;
+  cache.mode = 'idle';
+  cache.status = 'stale';
+  if (controller) {
+    try { controller.abort(`invalidate:${reason}`); } catch (_) {}
+  }
+  Logger.info('AssetsWarmup.invalidate', { reason });
+}
+
+function normalizeCloudAssetRecord(record) {
+  if (!record) return null;
+  const file_path = String(record.file_path || '').trim();
+  if (!file_path) return null;
+  const filename = String(record.filename || file_path.split('/').pop() || '').trim();
+  const path = resolveFolderPath(null, { ...record, file_path, filename });
+  return {
+    ...record,
+    filename,
+    file_path,
+    path,
+    source: 'cloud',
+    tier: (record.tier === 'premium' || record.tier === 'free') ? record.tier : 'free'
+  };
+}
+
+async function materializeWarmCloudAssetRecords(cache, { latest, service, controller, generation }) {
+  const svc = service || getSharedWarmupContentService();
+  const db = svc?._dbAssets;
+  if (!db?.streamAll) throw new Error('Cloud asset database unavailable');
+  const items = [];
+  let processed = 0;
+  let lastLogged = 0;
+  const signal = controller?.signal || null;
+  const now = () => (globalThis.performance?.now?.() ?? Date.now());
+
+  await db.streamAll('assets', {
+    signal,
+    preferChunks: true,
+    onChunk: async (records, info = {}) => {
+      let index = 0;
+      while (index < records.length) {
+        if (signal?.aborted) throw abortError();
+        const sliceStart = now();
+        let sliceCount = 0;
+        while (index < records.length && sliceCount < 500) {
+          if (sliceCount > 0 && (now() - sliceStart) >= 8) break;
+          const normalized = normalizeCloudAssetRecord(records[index]);
+          index += 1;
+          if (!normalized) continue;
+          items.push(normalized);
+          processed += 1;
+          sliceCount += 1;
+        }
+        if ((processed - lastLogged) >= 5000) {
+          lastLogged = processed;
+          Logger.info('AssetsWarmup.records.processed', {
+            latest,
+            count: processed,
+            mode: cache.mode,
+            sourceMode: info.mode || 'unknown'
+          });
+        }
+        if (index < records.length) {
+          await scheduleWarmCloudYield(cache.mode);
+        }
+      }
+    }
+  });
+
+  Logger.info('AssetsWarmup.records.processed', {
+    latest,
+    count: processed,
+    mode: cache.mode,
+    complete: true
+  });
+
+  if (cache.generation !== generation) {
+    return Array.isArray(cache.items) ? cache.items : items;
+  }
+  return items;
+}
+
+async function startWarmCloudAssetMaterialization({
+  expectedLatest,
+  priority = 'idle',
+  signal = null,
+  service = null,
+  controller = null,
+  generation = null
+} = {}) {
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  if (signal?.aborted) throw abortError();
+  if (!expectedLatest) return null;
+  const safePriority = priority === 'interactive' ? 'interactive' : 'idle';
+  const nextGeneration = Number.isFinite(generation) ? generation : (cache.generation + 1);
+  if (!Number.isFinite(generation)) cache.generation = nextGeneration;
+  const activeController = controller || new AbortController();
+
+  cache.items = null;
+  cache.latest = expectedLatest;
+  cache.error = null;
+  cache.mode = safePriority;
+  cache.status = 'loading';
+  cache.abortController = activeController;
+
+  let loadPromise = null;
+  loadPromise = (async () => {
+    Logger.time(`AssetsWarmup.materialize:${expectedLatest}`);
+    try {
+      const items = await materializeWarmCloudAssetRecords(cache, {
+        latest: expectedLatest,
+        service,
+        controller: activeController,
+        generation: nextGeneration
+      });
+      if (cache.generation === nextGeneration) {
+        cache.items = items;
+        cache.error = null;
+        cache.status = 'ready';
+      }
+      return items;
+    } catch (error) {
+      if (cache.generation === nextGeneration) {
+        if (isAbortError(error)) {
+          cache.status = 'aborted';
+          cache.error = null;
+        } else {
+          cache.status = 'error';
+          cache.items = null;
+          cache.error = String(error?.message || error);
+        }
+      }
+      if (isAbortError(error)) {
+        Logger.info('AssetsWarmup.aborted', { latest: expectedLatest, mode: safePriority });
+      } else {
+        Logger.warn('AssetsWarmup.failed', { latest: expectedLatest, error: String(error?.message || error) });
+      }
+      throw error;
+    } finally {
+      if (cache.generation === nextGeneration) {
+        cache.mode = 'idle';
+        if (cache.abortController === activeController) cache.abortController = null;
+        if (cache.loadPromise === loadPromise) cache.loadPromise = null;
+      }
+      Logger.timeEnd(`AssetsWarmup.materialize:${expectedLatest}`);
+    }
+  })();
+
+  cache.loadPromise = loadPromise;
+  return awaitWithAbort(loadPromise, signal);
+}
+
+export async function getWarmCloudAssetRecords({
+  signal = null,
+  priority = 'idle',
+  expectedLatest = null,
+  createIfMissing = true,
+  service = null
+} = {}) {
+  ensureSharedSettingsHook();
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  const safePriority = priority === 'interactive' ? 'interactive' : 'idle';
+  if (safePriority === 'interactive') {
+    clearWarmCloudAssetTimer();
+  }
+  if (signal?.aborted) throw abortError();
+
+  if (expectedLatest && cache.status === 'ready' && cache.latest === expectedLatest && Array.isArray(cache.items)) {
+    Logger.info('AssetsWarmup.cache.hit', {
+      latest: expectedLatest,
+      count: cache.items.length,
+      priority: safePriority
+    });
+    return cache.items;
+  }
+
+  if (expectedLatest && cache.loadPromise && cache.latest === expectedLatest) {
+    if (safePriority === 'interactive' && cache.mode !== 'interactive') {
+      const previousMode = cache.mode;
+      cache.mode = 'interactive';
+      Logger.info('AssetsWarmup.promoted', { latest: expectedLatest, from: previousMode, to: 'interactive' });
+    }
+    return awaitWithAbort(cache.loadPromise, signal);
+  }
+
+  if (!createIfMissing) {
+    Logger.info('AssetsWarmup.cache.miss', {
+      latest: expectedLatest,
+      cacheLatest: cache.latest,
+      status: cache.status,
+      priority: safePriority
+    });
+    return null;
+  }
+
+  return startWarmCloudAssetMaterialization({
+    expectedLatest,
+    priority: safePriority,
+    signal,
+    service
+  });
+}
+
+async function runAssetCloudWarmup({ reason = 'startup' } = {}) {
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  clearWarmCloudAssetTimer();
+  if (!shouldWarmAssetCloud()) {
+    Logger.info('AssetsWarmup.skip', {
+      reason,
+      isGM: !!game?.user?.isGM,
+      cloudEnabled: (() => {
+        try { return !!game?.settings?.get?.('fa-nexus', 'cloudAssetsEnabled'); }
+        catch (_) { return false; }
+      })(),
+      online: !(typeof navigator !== 'undefined' && navigator?.onLine === false)
+    });
+    return null;
+  }
+  if (cache.status === 'syncing' || cache.status === 'loading') {
+    return cache.loadPromise || null;
+  }
+
+  const generation = cache.generation + 1;
+  cache.generation = generation;
+  const controller = new AbortController();
+  cache.abortController = controller;
+  cache.status = 'syncing';
+  cache.mode = 'idle';
+  cache.error = null;
+
+  const svc = getSharedWarmupContentService();
+  let syncError = null;
+  try {
+    Logger.time('AssetsWarmup.sync:assets');
+    try {
+      await svc.sync('assets', {
+        signal: controller.signal,
+        progressBatch: 500
+      });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      syncError = String(error?.message || error);
+      Logger.warn('AssetsWarmup.sync.failed', { reason, error: syncError });
+    } finally {
+      Logger.timeEnd('AssetsWarmup.sync:assets');
+    }
+
+    const meta = await svc.getMeta?.('assets');
+    const latest = meta?.latest || null;
+    Logger.info('AssetsWarmup.sync.done', {
+      reason,
+      latest,
+      count: Number(meta?.count) || 0,
+      error: syncError
+    });
+
+    if (!latest) {
+      if (syncError) throw new Error(syncError);
+      cache.status = 'idle';
+      cache.abortController = null;
+      return null;
+    }
+
+    if (cache.latest === latest && Array.isArray(cache.items)) {
+      Logger.info('AssetsWarmup.cache.hit', {
+        latest,
+        count: cache.items.length,
+        priority: 'idle',
+        reason
+      });
+      cache.abortController = null;
+      return cache.items;
+    }
+
+    const items = await startWarmCloudAssetMaterialization({
+      expectedLatest: latest,
+      priority: 'idle',
+      service: svc,
+      controller,
+      generation
+    });
+    if (cache.generation === generation && syncError && Array.isArray(items)) {
+      cache.error = syncError;
+    }
+    return items;
+  } catch (error) {
+    if (cache.generation === generation) {
+      if (isAbortError(error)) {
+        cache.status = 'aborted';
+      } else {
+        cache.status = 'error';
+        cache.error = String(error?.message || error);
+      }
+      if (cache.abortController === controller) cache.abortController = null;
+    }
+    if (isAbortError(error)) {
+      Logger.info('AssetsWarmup.aborted', { reason, latest: cache.latest || null, stage: 'sync' });
+      return null;
+    }
+    Logger.warn('AssetsWarmup.failed', { reason, error: String(error?.message || error) });
+    return null;
+  }
+}
+
+export function scheduleAssetCloudWarmup({ reason = 'startup' } = {}) {
+  ensureSharedSettingsHook();
+  clearWarmCloudAssetTimer();
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  const delayMs = reason === 'startup' ? 2000 : 0;
+  if (!shouldWarmAssetCloud()) {
+    Logger.info('AssetsWarmup.skip', {
+      reason,
+      isGM: !!game?.user?.isGM,
+      cloudEnabled: (() => {
+        try { return !!game?.settings?.get?.('fa-nexus', 'cloudAssetsEnabled'); }
+        catch (_) { return false; }
+      })(),
+      online: !(typeof navigator !== 'undefined' && navigator?.onLine === false)
+    });
+    return null;
+  }
+  if (cache.status === 'syncing' || cache.status === 'loading') {
+    return cache.loadPromise || null;
+  }
+  cache.status = 'scheduled';
+  Logger.info('AssetsWarmup.startup.scheduled', { reason, delayMs });
+  cache.timer = setTimeout(() => {
+    SHARED_ASSET_CLOUD_WARM_CACHE.timer = null;
+    runAssetCloudWarmup({ reason }).catch((error) => {
+      Logger.warn('AssetsWarmup.failed', { reason, error: String(error?.message || error) });
+    });
+  }, delayMs);
+  return cache.timer;
 }
 
 function ensureSharedSettingsHook() {
@@ -55,6 +494,12 @@ function ensureSharedSettingsHook() {
     try {
       if (!setting || setting.namespace !== 'fa-nexus') return;
       if (!SETTINGS_TRIGGERING_RELOAD.has(setting.key)) return;
+      if (setting.key === 'cloudAssetsEnabled') {
+        invalidateWarmCloudAssetCache(setting.key);
+        if (setting.value === true) {
+          scheduleAssetCloudWarmup({ reason: 'setting-enabled' });
+        }
+      }
       invalidateSharedAssetCatalog(setting.key);
     } catch (_) {}
   });
@@ -280,7 +725,7 @@ async function loadAssets(tab, options = {}) {
   const shared = SHARED_ASSET_CATALOG;
   const forceReload = !!options.forceReload;
 
-  if (!forceReload && !shared.dirty && Array.isArray(shared.items)) {
+  if (!forceReload && !shared.dirty && shared.status === 'ready' && Array.isArray(shared.items)) {
     tab._items = shared.items;
     if (typeof tab._injectSolidTextureItem === 'function') {
       tab._items = tab._injectSolidTextureItem(tab._items);
@@ -307,6 +752,7 @@ async function loadAssets(tab, options = {}) {
     try {
       result = await shared.loadPromise;
     } catch (e) {
+      shared.status = isAbortError(e) ? 'aborted' : 'error';
       Logger.warn('AssetsTab.loadAssets.shared.await.failed', { error: String(e?.message || e) });
       // Reset the promise on failure so future calls can retry
       if (shared.loadPromise) {
@@ -335,17 +781,32 @@ async function loadAssets(tab, options = {}) {
     if (tab.app?._activeTab === tab.id) {
       try { updateFolderFilter(tab); } catch (_) {}
     }
-    if (!forceReload || !shared.dirty) return result || { items, error: null, partial: false };
+    if (result?.aborted) {
+      shared.dirty = true;
+      shared.status = 'aborted';
+    }
+    if (!result?.aborted && (!forceReload || !shared.dirty)) return result || { items, error: null, partial: false };
   }
 
   shared.dirty = true;
+  shared.status = 'loading';
   shared.folderStats.clear();
   const loadPromise = (async () => {
     try {
-      await loadAssetsInternal(tab, options);
+      const loadDetail = await loadAssetsInternal(tab, options);
       const items = Array.isArray(tab._items) ? tab._items : [];
-      return { items, error: null, partial: false };
+      return {
+        items,
+        error: null,
+        partial: false,
+        uiReady: !!loadDetail?.uiReady
+      };
     } catch (error) {
+      if (isAbortError(error)) {
+        Logger.info('AssetsTab.loadAssetsInternal.aborted', { mode: tab._mode });
+        const fallbackItems = Array.isArray(shared.items) ? shared.items : [];
+        return { items: fallbackItems, error: null, partial: false, aborted: true };
+      }
       Logger.warn('AssetsTab.loadAssetsInternal.failed', { error: String(error?.message || error) });
       return { items: [], error: String(error?.message || error), partial: false };
     }
@@ -355,16 +816,22 @@ async function loadAssets(tab, options = {}) {
   let result = null;
   try {
     result = await loadPromise;
-    if (result.error) {
+    if (result?.aborted) {
       shared.dirty = true;
+      shared.status = 'aborted';
+    } else if (result.error) {
+      shared.dirty = true;
+      shared.status = 'error';
     } else {
       shared.items = result.items;
       shared.dirty = false;
+      shared.status = 'ready';
       shared.version += 1;
     }
   } catch (e) {
     result = { items: [], error: String(e?.message || e), partial: false };
     shared.dirty = true;
+    shared.status = isAbortError(e) ? 'aborted' : 'error';
     Logger.warn('AssetsTab.loadAssets.shared.failed', { error: String(e?.message || e) });
   } finally {
     if (shared.loadPromise === loadPromise) shared.loadPromise = null;
@@ -376,13 +843,15 @@ async function loadAssets(tab, options = {}) {
     tab._items = tab._injectSolidTextureItem(tab._items);
     if (shared.items === finalItems && shared.items !== tab._items) shared.items = tab._items;
   }
-  computeFolderStats(tab, tab._items);
-  shared.folderStats.set(tab._mode, tab._folderStats);
-  if (tab.app?._activeTab === tab.id && tab.app?._grid) {
-    await tab.applySearchAsync(tab.getCurrentSearchValue());
-  }
-  if (tab.app?._activeTab === tab.id) {
-    try { updateFolderFilter(tab); } catch (_) {}
+  if (!result?.uiReady) {
+    computeFolderStats(tab, tab._items);
+    shared.folderStats.set(tab._mode, tab._folderStats);
+    if (tab.app?._activeTab === tab.id && tab.app?._grid) {
+      await tab.applySearchAsync(tab.getCurrentSearchValue());
+    }
+    if (tab.app?._activeTab === tab.id) {
+      try { updateFolderFilter(tab); } catch (_) {}
+    }
   }
   return result;
 }
@@ -391,7 +860,7 @@ async function loadAssetsInternal(tab, _options = {}) {
   const app = tab.app;
   const shared = SHARED_ASSET_CATALOG;
   Logger.info('AssetsTab.loadAssets:start');
-  if (!app.rendered || !app.element || !app._grid) return;
+  if (!app.rendered || !app.element || !app._grid) throw abortError();
 
   cancelInFlight(tab, 'restart');
 
@@ -411,21 +880,19 @@ async function loadAssetsInternal(tab, _options = {}) {
     try { tab.app?.updateGridLoader?.(message, { owner: tab.id }); } catch (_) {}
   };
 
-  const formatCloudLoaderText = (label, count, total) => {
-    const safeLabel = String(label || '').trim() || 'Loading Cloud Assets...';
-    const safeTotal = Number.isFinite(total) && total > 0 ? Math.max(0, Math.floor(total)) : null;
-    const safeCount = Number.isFinite(count) && count >= 0 ? Math.max(0, Math.floor(count)) : null;
-
-    if (safeTotal == null) return safeLabel;
-    if (safeCount != null && safeCount > 0) {
-      return `${safeLabel} (${safeCount} / ${safeTotal})`;
-    }
-    return `${safeLabel} (${safeTotal})`;
-  };
   const startCloudLoader = async () => {
     const cloudState = await getCloudLoaderState(tab);
     if (!cloudState) return null;
-    showGridLoader(formatCloudLoaderText(cloudState.label, cloudState.count, cloudState.total));
+    if (cloudState.warmReady && !cloudState.indexing) {
+      Logger.info('AssetsTab.cloud.loader.skip', {
+        mode: tab._mode,
+        latest: cloudState.latest,
+        total: cloudState.total,
+        reason: 'warm-cache-ready'
+      });
+      return null;
+    }
+    showGridLoader(formatCatalogLoaderText(cloudState.label, cloudState.count, cloudState.total, 'Loading Cloud Assets...'));
     return {
       state: cloudState,
       update: (_count, total) => {
@@ -435,7 +902,7 @@ async function loadAssetsInternal(tab, _options = {}) {
         if (Number.isFinite(_count) && _count >= 0) {
           cloudState.count = Math.max(0, Math.floor(_count));
         }
-        const message = formatCloudLoaderText(cloudState.label, cloudState.count, cloudState.total);
+        const message = formatCatalogLoaderText(cloudState.label, cloudState.count, cloudState.total, 'Loading Cloud Assets...');
         updateGridLoader(message);
       }
     };
@@ -507,7 +974,7 @@ async function loadAssetsInternal(tab, _options = {}) {
     if (localResult.cancelled || isCancelled()) {
       hideGridLoader();
       if (localLockActive) setIndexingLock(tab, false);
-      return;
+      throw abortError();
     }
 
     tab._items = localResult.localItems;
@@ -532,6 +999,9 @@ async function loadAssetsInternal(tab, _options = {}) {
           onProgress: (count, total) => cloudLoader?.update?.(count, total),
           onTotal: (total) => cloudLoader?.update?.(cloudLoader.state?.count ?? 0, total)
         });
+        if (result?.error && !result.partial) {
+          throw new Error(result.error);
+        }
         if (!isCancelled() && result && Array.isArray(result.items)) {
           hideGridLoader();
           tab._items = result.items;
@@ -554,13 +1024,16 @@ async function loadAssetsInternal(tab, _options = {}) {
         } else {
           hideGridLoader();
         }
+        return { uiReady: !tab.isTexturesMode };
       } catch (e) {
-        if (e?.name === 'AbortError') {
+        hideGridLoader();
+        if (isAbortError(e)) {
           Logger.info('AssetsTab.loadAssets:aborted');
+          throw e;
         } else {
           Logger.warn('AssetsTab.cloud.load.error', String(e?.message || e));
+          throw e;
         }
-        hideGridLoader();
       } finally {
         if (shouldLock) setIndexingLock(tab, false);
       }
@@ -569,6 +1042,7 @@ async function loadAssetsInternal(tab, _options = {}) {
       computeFolderStats(tab, tab._items);
       SHARED_ASSET_CATALOG.folderStats.set(tab._mode, tab._folderStats);
       await tab.applySearchAsync(tab.getCurrentSearchValue());
+      return { uiReady: !tab.isTexturesMode };
     }
   } finally {
     if (tab._cloudAbort === controller) tab._cloudAbort = null;
@@ -582,58 +1056,47 @@ async function getCloudLoaderState(tab) {
     const db = svc?._dbAssets;
     let total = null;
     let indexing = true;
+    let latest = null;
     if (db?.getMeta) {
       const meta = await db.getMeta('assets');
       if (meta) {
         const count = Number(meta.count);
         if (Number.isFinite(count) && count > 0) total = Math.max(0, Math.floor(count));
-        if (meta.latest) indexing = false;
+        latest = meta.latest || null;
+        if (latest) indexing = false;
       }
     }
+    const warm = getWarmCloudReuseState(latest);
     const label = indexing ? 'Indexing cloud assets...' : 'Loading Cloud Assets...';
-    return { label, count: null, total, indexing };
+    return { label, count: null, total, indexing, latest, warmReady: warm.ready, warmLoading: warm.loading };
   } catch (_) {
-    return { label: 'Loading Cloud Assets...', count: null, total: null, indexing: false };
+    return { label: 'Loading Cloud Assets...', count: null, total: null, indexing: false, latest: null, warmReady: false, warmLoading: false };
   }
 }
 
 async function loadAndMergeCloud(tab, includeLocal, options = {}) {
-  if (!isCloudEnabled(tab)) {
-    const localItems = includeLocal ? (Array.isArray(tab._items) ? tab._items.slice() : []) : [];
-    return { items: localItems, error: null, partial: false };
-  }
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const signal = options.signal || null;
-  if (signal?.aborted) throw abortError();
-
   const localItems = includeLocal ? (Array.isArray(tab._items) ? tab._items.slice() : []) : [];
-  let cloudItems = [];
-  let cloudError = null;
-  let partial = false;
-
-  try {
-    cloudItems = await loadCloudAssetsSafe(tab, onProgress, signal);
-    try { options.onTotal?.(Array.isArray(cloudItems) ? cloudItems.length : 0); } catch (_) {}
-    Logger.info('AssetsTab.cloud.items', {
-      mode: tab._mode,
-      count: Array.isArray(cloudItems) ? cloudItems.length : 0
-    });
-  } catch (e) {
-    if (e?.name === 'AbortError') throw e;
-    cloudError = String(e?.message || e);
-    partial = true;
-    Logger.warn('AssetsTab.cloud.load.error', cloudError);
-  }
-
-  if (signal?.aborted) throw abortError();
-
   const svc = tab._controller?.contentService || tab._content || tab.app?._contentService;
   const kind = 'assets';
-  const normalizePathKey = (value) => String(value || '')
-    .trim()
-    .replace(/\\/g, '/')
-    .replace(/\/+/g, '/')
-    .replace(/^\/+/, '');
+  const normalizePathKey = (value) => {
+    let raw = String(value || '').trim();
+    if (!raw) return '';
+    for (let i = 0; i < 3; i += 1) {
+      try {
+        const decoded = decodeURIComponent(raw);
+        if (!decoded || decoded === raw) break;
+        raw = decoded;
+      } catch (_) {
+        break;
+      }
+    }
+    return raw
+      .replace(/\\/g, '/')
+      .replace(/\/+/g, '/')
+      .replace(/^\/+/, '');
+  };
   const baseNameKey = (rec) => {
     if (!rec) return '';
     const filename = String(rec?.filename || '').trim();
@@ -653,108 +1116,262 @@ async function loadAndMergeCloud(tab, includeLocal, options = {}) {
     if (!raw) return '';
     return raw.replace(/\.[^/.]+$/, '').toLowerCase();
   };
-  const localBaseNames = new Set(localItems.map((rec) => baseNameKey(rec)).filter(Boolean));
-  const merged = mergeLocalAndCloudRecords({
-    kind,
-    local: localItems,
-    cloud: cloudItems,
-    // Keep local/cloud filename matching, but don't collapse cloud-only items that differ by path.
-    keySelector: (rec) => {
-      const base = baseNameKey(rec);
-      if (!base) return '';
-      const source = String(rec?.source || '').toLowerCase();
-      if (source === 'cloud') {
-        if (localBaseNames.has(base)) return `local:${base}`;
-        const pKey = pathKey(rec);
-        return pKey ? `cloud:${pKey}` : `cloud:${base}`;
+  const enhanceLocalRecord = (localRecord, cloudRecord) => {
+    if (!svc || !cloudRecord?.filename) return localRecord;
+    try {
+      const thumb = svc.getThumbnailURL?.(kind, cloudRecord);
+      if (!thumb) return localRecord;
+      if (String(localRecord.thumbnail_url || localRecord.file_path || '').includes(thumb)) return localRecord;
+      return {
+        ...localRecord,
+        original_thumbnail: localRecord.file_path || localRecord.thumbnail_url,
+        thumbnail_url: thumb,
+        enhanced_thumbnail: true,
+        cloud_tier: cloudRecord.tier
+      };
+    } catch (_) {
+      return localRecord;
+    }
+  };
+  const resolvePathMatchedCloud = (localRecord, candidates) => {
+    if (!Array.isArray(candidates) || !candidates.length) return null;
+    const localPath = pathKey(localRecord);
+    if (!localPath) return null;
+    const exact = [];
+    const suffix = [];
+    for (const candidate of candidates) {
+      const candidatePath = pathKey(candidate);
+      if (!candidatePath) continue;
+      if (localPath === candidatePath) {
+        exact.push(candidate);
+        continue;
       }
-      return `local:${base}`;
+      if (localPath.endsWith(`/${candidatePath}`)) {
+        suffix.push(candidate);
+      }
+    }
+    const selectBest = (matches) => {
+      if (!matches.length) return null;
+      if (matches.length === 1) return matches[0];
+      const ranked = matches
+        .map((record) => ({ record, key: pathKey(record) }))
+        .filter((entry) => !!entry.key)
+        .sort((a, b) => b.key.length - a.key.length);
+      if (!ranked.length) return null;
+      if (ranked.length === 1) return ranked[0].record;
+      return ranked[0].key.length > ranked[1].key.length ? ranked[0].record : null;
+    };
+    return selectBest(exact) || selectBest(suffix);
+  };
+  const matchedCloudKeys = new Set();
+  let matchedLocalCount = 0;
+  let enhancedLocalCount = 0;
+  let cloudSource = 'unknown';
+  let usedWarmCache = false;
+  let latest = null;
+  const result = await loadAndMergeCloudRecords({
+    cloudEnabled: isCloudEnabled(tab),
+    localItems,
+    signal,
+    fetchCloud: () => fetchCloudAssets(tab, onProgress, signal),
+    onTotal: options.onTotal,
+    onCloudItems: (cloudItems, cloudResult) => {
+      cloudSource = String(cloudResult?.source || 'unknown');
+      usedWarmCache = !!cloudResult?.usedWarmCache;
+      latest = cloudResult?.latest || null;
+      Logger.info('AssetsTab.cloud.items', {
+        mode: tab._mode,
+        count: Array.isArray(cloudItems) ? cloudItems.length : 0,
+        source: cloudSource,
+        usedWarmCache
+      });
     },
-    choosePreferred: (existing, incoming) => {
-      const rank = (it) => {
-        if (!it) return 0;
-        if (it.source === 'local') return 3;
-        if (it.source === 'cloud' && (it.cachedLocalPath || it.cached || it.isCached)) return 2;
-        return 1;
-      };
-      const extRank = (name) => {
-        const lower = String(name || '').toLowerCase();
-        if (lower.endsWith('.webp')) return 3;
-        if (lower.endsWith('.png')) return 2;
-        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 1;
-        return 0;
-      };
-      const rExisting = rank(existing);
-      const rIncoming = rank(incoming);
-      if (rIncoming > rExisting) return incoming;
-      if (rIncoming < rExisting) return existing;
-      const eExisting = extRank(existing?.filename || existing?.file_path);
-      const eIncoming = extRank(incoming?.filename || incoming?.file_path);
-      if (eIncoming > eExisting) return incoming;
-      if (eIncoming < eExisting) return existing;
-      const lmExisting = Date.parse(existing?.last_modified || existing?.lastModified || '') || 0;
-      const lmIncoming = Date.parse(incoming?.last_modified || incoming?.lastModified || '') || 0;
-      return lmIncoming >= lmExisting ? incoming : existing;
+    onCloudError: (cloudError) => {
+      Logger.warn('AssetsTab.cloud.load.error', cloudError);
     },
-    onEnhanceLocal: ({ localRecord, cloudRecord }) => {
-      if (!svc || !cloudRecord?.filename) return null;
-      try {
-        const thumb = svc.getThumbnailURL?.(kind, cloudRecord);
-        if (!thumb) return null;
-        if (String(localRecord.thumbnail_url || localRecord.file_path || '').includes(thumb)) return null;
-        return {
-          ...localRecord,
-          original_thumbnail: localRecord.file_path || localRecord.thumbnail_url,
-          thumbnail_url: thumb,
-          enhanced_thumbnail: true,
-          cloud_tier: cloudRecord.tier
-        };
-      } catch (_) { return null; }
+    mergeItems: ({ localItems: nextLocalItems, cloudItems }) => {
+      if (!Array.isArray(nextLocalItems) || !nextLocalItems.length) {
+        Logger.info('AssetsTab.merge.cloudOnly', {
+          mode: tab._mode,
+          cloud: Array.isArray(cloudItems) ? cloudItems.length : 0,
+          source: cloudSource,
+          usedWarmCache
+        });
+        return Array.isArray(cloudItems) ? cloudItems : [];
+      }
+      const cloudByBase = new Map();
+      for (const rec of cloudItems) {
+        const base = baseNameKey(rec);
+        if (!base) continue;
+        const list = cloudByBase.get(base) || [];
+        list.push(rec);
+        cloudByBase.set(base, list);
+      }
+      const enhancedLocalItems = nextLocalItems.map((localRecord) => {
+        const base = baseNameKey(localRecord);
+        if (!base) return localRecord;
+        const cloudRecord = resolvePathMatchedCloud(localRecord, cloudByBase.get(base) || []);
+        if (!cloudRecord) return localRecord;
+        const cloudPath = pathKey(cloudRecord);
+        if (cloudPath) matchedCloudKeys.add(cloudPath);
+        matchedLocalCount += 1;
+        const enhanced = enhanceLocalRecord(localRecord, cloudRecord);
+        if (enhanced !== localRecord) enhancedLocalCount += 1;
+        return enhanced;
+      });
+      const remainingCloudItems = cloudItems.filter((cloudRecord) => {
+        const cloudPath = pathKey(cloudRecord);
+        if (!cloudPath) return true;
+        return !matchedCloudKeys.has(cloudPath);
+      });
+      return mergeLocalAndCloudRecords({
+        kind,
+        local: enhancedLocalItems,
+        cloud: remainingCloudItems,
+        keySelector: (rec) => {
+          const base = baseNameKey(rec);
+          const source = String(rec?.source || '').toLowerCase();
+          const pKey = pathKey(rec);
+          if (source === 'local') {
+            if (pKey) return `local:${pKey}`;
+            return base ? `local:${base}` : '';
+          }
+          if (pKey) return `cloud:${pKey}`;
+          return base ? `cloud:${base}` : '';
+        },
+        choosePreferred: (existing, incoming) => {
+          const rank = (it) => {
+            if (!it) return 0;
+            if (it.source === 'local') return 3;
+            if (it.source === 'cloud' && (it.cachedLocalPath || it.cached || it.isCached)) return 2;
+            return 1;
+          };
+          const extRank = (name) => {
+            const lower = String(name || '').toLowerCase();
+            if (lower.endsWith('.webp')) return 3;
+            if (lower.endsWith('.png')) return 2;
+            if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 1;
+            return 0;
+          };
+          const rExisting = rank(existing);
+          const rIncoming = rank(incoming);
+          if (rIncoming > rExisting) return incoming;
+          if (rIncoming < rExisting) return existing;
+          const eExisting = extRank(existing?.filename || existing?.file_path);
+          const eIncoming = extRank(incoming?.filename || incoming?.file_path);
+          if (eIncoming > eExisting) return incoming;
+          if (eIncoming < eExisting) return existing;
+          const lmExisting = Date.parse(existing?.last_modified || existing?.lastModified || '') || 0;
+          const lmIncoming = Date.parse(incoming?.last_modified || incoming?.lastModified || '') || 0;
+          return lmIncoming >= lmExisting ? incoming : existing;
+        },
+        onStats: ({ collisions, preferLocal, preferCloud, enhanced, localCount, cloudCount, mergedCount }) => {
+          try {
+            Logger.info('AssetsTab.merge', {
+              collisions,
+              preferLocal,
+              preferCloud,
+              enhanced,
+              matchedLocalCount,
+              shadowedCloudItems: matchedCloudKeys.size,
+              enhancedLocalCount,
+              local: localCount,
+              cloud: cloudCount,
+              merged: mergedCount
+            });
+          } catch (_) {}
+        }
+      });
     },
-    onStats: ({ collisions, preferLocal, preferCloud, enhanced, localCount, cloudCount, mergedCount }) => {
-      try {
-        Logger.info('AssetsTab.merge', { collisions, preferLocal, preferCloud, enhanced, local: localCount, cloud: cloudCount, merged: mergedCount });
-      } catch (_) {}
+    onResult: (result, detail) => {
+      Logger.info('AssetsTab.cloud.merge', {
+        mode: tab._mode,
+        local: detail.localItems.length,
+        cloud: detail.cloudItems.length,
+        merged: result.items.length,
+        partial: result.partial,
+        error: result.error
+      });
     }
   });
-
-  Logger.info('AssetsTab.cloud.merge', {
-    mode: tab._mode,
-    local: localItems.length,
-    cloud: cloudItems.length,
-    merged: merged.length,
-    partial,
-    error: cloudError
-  });
-
   return {
-    items: merged,
-    error: cloudError,
-    partial
+    ...result,
+    cloudSource,
+    usedWarmCache,
+    latest
   };
 }
 
-async function loadCloudAssetsSafe(tab, onProgress, signal) {
+async function fetchCloudAssets(tab, onProgress, signal) {
   if (signal?.aborted) throw abortError();
-  try {
-    await ensureServices(tab);
-    const controller = tab._controller;
-    let svc = controller?.contentService || tab._content;
-    if (!svc) {
+  clearWarmCloudAssetTimer();
+  await ensureServices(tab);
+  const controller = tab._controller;
+  let svc = controller?.contentService || tab._content;
+  if (!svc) {
+    const app = tab.app || null;
+    const authProvider = (app && typeof app._getAuthService === 'function') ? () => app._getAuthService() : undefined;
+    svc = new NexusContentService({ app, authService: authProvider });
+    if (controller) controller._content = svc;
+    tab._content = svc;
+  } else {
+    try {
       const app = tab.app || null;
       const authProvider = (app && typeof app._getAuthService === 'function') ? () => app._getAuthService() : undefined;
-      svc = new NexusContentService({ app, authService: authProvider });
-      if (controller) controller._content = svc;
-      tab._content = svc;
-    } else {
+      svc?.setAuthContext?.({ app, authService: authProvider });
+    } catch (_) {}
+  }
+
+  const kind = 'assets';
+  let hadCachedIndex = false;
+  let syncError = null;
+  let latest = null;
+  try {
+    const meta = await svc.getMeta?.(kind);
+    hadCachedIndex = !!meta?.latest;
+    latest = meta?.latest || null;
+  } catch (_) {}
+
+  if (latest) {
+    const warm = getWarmCloudReuseState(latest);
+    if (warm.ready || warm.loading) {
       try {
-        const app = tab.app || null;
-        const authProvider = (app && typeof app._getAuthService === 'function') ? () => app._getAuthService() : undefined;
-        svc?.setAuthContext?.({ app, authService: authProvider });
-      } catch (_) {}
+        const warmItems = await getWarmCloudAssetRecords({
+          signal,
+          priority: 'interactive',
+          expectedLatest: latest,
+          createIfMissing: false,
+          service: svc
+        });
+        if (Array.isArray(warmItems)) {
+          Logger.info('AssetsWarmup.cache.hit', {
+            latest,
+            count: warmItems.length,
+            priority: 'interactive',
+            stage: 'pre-sync'
+          });
+          return {
+            items: warmItems,
+            error: null,
+            partial: false,
+            source: 'warm-cache',
+            usedWarmCache: true,
+            latest
+          };
+        }
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        Logger.warn('AssetsWarmup.cache.reuse.failed', {
+          latest,
+          stage: 'pre-sync',
+          error: String(error?.message || error)
+        });
+      }
     }
-    const kind = 'assets';
-    Logger.info('AssetsTab.cloud.sync', { mode: tab._mode, kind });
+  }
+
+  Logger.info('AssetsTab.cloud.sync', { mode: tab._mode, kind, hadCachedIndex });
+  try {
     await svc.sync(kind, {
       signal,
       onManifestProgress: ({ count, total }) => {
@@ -763,7 +1380,48 @@ async function loadCloudAssetsSafe(tab, onProgress, signal) {
       },
       progressBatch: 500
     });
-    const { items } = await svc.list(kind, {
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error;
+    syncError = String(error?.message || error);
+    Logger.warn('AssetsTab.cloud.sync.failed', { error: syncError, hadCachedIndex });
+  }
+
+  try {
+    const meta = await svc.getMeta?.(kind);
+    latest = meta?.latest || null;
+  } catch (_) {}
+
+  if (latest && SHARED_ASSET_CLOUD_WARM_CACHE.latest && SHARED_ASSET_CLOUD_WARM_CACHE.latest !== latest) {
+    invalidateWarmCloudAssetCache(`latest:${SHARED_ASSET_CLOUD_WARM_CACHE.latest}->${latest}`);
+  }
+
+  if (signal?.aborted) throw abortError();
+  try {
+    const warmItems = latest ? await getWarmCloudAssetRecords({
+      signal,
+      priority: 'interactive',
+      expectedLatest: latest,
+      createIfMissing: true,
+      service: svc
+    }) : null;
+    if (Array.isArray(warmItems)) {
+      return {
+        items: warmItems,
+        error: syncError,
+        partial: !!syncError && (hadCachedIndex || warmItems.length > 0),
+        source: 'warm-cache',
+        usedWarmCache: true,
+        latest
+      };
+    }
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    Logger.warn('AssetsWarmup.cache.reuse.failed', { latest, error: String(error?.message || error) });
+  }
+
+  let items = [];
+  try {
+    const result = await svc.list(kind, {
       signal,
       onProgress: (count, total) => {
         if (signal?.aborted) return;
@@ -771,36 +1429,43 @@ async function loadCloudAssetsSafe(tab, onProgress, signal) {
       },
       progressBatch: 500
     });
-    if (signal?.aborted) throw abortError();
-    if (!Array.isArray(items)) return [];
-    const out = [];
-    for (const it of items) {
-      const file_path = String(it.file_path || '');
-      if (!file_path) continue;
-      const filename = String(it.filename || file_path.split('/').pop() || '');
-      const folderPath = resolveFolderPath(tab, { ...it, file_path, filename });
-      const rec = {
-        ...it,
-        filename,
-        file_path,
-        path: folderPath,
-        source: 'cloud',
-        tier: (it.tier === 'premium' || it.tier === 'free') ? it.tier : 'free'
-      };
-      try {
-        const download = controller?.downloadManager || tab._download;
-        const local = download?.getLocalPath?.('assets', rec);
-        if (local) rec.cachedLocalPath = local;
-      } catch (_) {}
-      out.push(rec);
-      if (signal?.aborted) throw abortError();
-    }
-    return out;
+    items = Array.isArray(result?.items) ? result.items : [];
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
-    Logger.warn('AssetsTab.cloud.sync.failed', { error: String(error?.message || error) });
-    return [];
+    const listError = String(error?.message || error);
+    if (syncError) {
+      throw new Error(`Cloud asset sync failed (${syncError}); cached index unavailable (${listError})`);
+    }
+    throw error;
   }
+
+  if (signal?.aborted) throw abortError();
+  const out = [];
+  for (const it of items) {
+    const rec = normalizeCloudAssetRecord(it);
+    if (!rec) continue;
+    try {
+      const download = controller?.downloadManager || tab._download;
+      const local = download?.getLocalPath?.('assets', rec);
+      if (local) rec.cachedLocalPath = local;
+    } catch (_) {}
+    out.push(rec);
+    if (signal?.aborted) throw abortError();
+  }
+
+  return {
+    items: out,
+    error: syncError,
+    partial: !!syncError && (hadCachedIndex || out.length > 0),
+    source: 'cloud-list',
+    usedWarmCache: false,
+    latest
+  };
+}
+
+async function loadCloudAssetsSafe(tab, onProgress, signal) {
+  const result = await fetchCloudAssets(tab, onProgress, signal);
+  return Array.isArray(result?.items) ? result.items : [];
 }
 
 function matchesMode(tab, item) {

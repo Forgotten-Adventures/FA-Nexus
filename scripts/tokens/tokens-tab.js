@@ -1,5 +1,6 @@
 import { GridBrowseTab } from '../core/ui/grid-browse-tab.js';
 import { collectLocalInventory, getEnabledFolders, mergeLocalAndCloudRecords } from '../content/nexus-content-service.js';
+import { abortError, formatCatalogLoaderText, isAbortError, loadAndMergeCloudRecords } from '../content/catalog-pipeline.js';
 import { TokenDataService } from './token-data-service.js';
 import { TokenPreviewManager } from './token-preview-manager.js';
 import { FaNexusTokensFolderSelectionDialog } from './tokens-content-sources-dialog.js';
@@ -27,6 +28,18 @@ function applyThemeToElement(el) {
   const theme = getHostTheme();
   el.classList.toggle('fa-theme-dark', theme === 'dark');
   el.classList.toggle('fa-theme-light', theme !== 'dark');
+}
+
+function createFaIcon(iconClass) {
+  const icon = document.createElement('i');
+  icon.className = `fas ${iconClass}`;
+  icon.setAttribute('aria-hidden', 'true');
+  return icon;
+}
+
+function setIconOnlyContent(element, iconClass) {
+  if (!element) return;
+  element.replaceChildren(createFaIcon(iconClass));
 }
 
 export class TokensTab extends GridBrowseTab {
@@ -60,6 +73,7 @@ export class TokensTab extends GridBrowseTab {
     };
     this._deferredActivationTimeout = null;
     this._didDeactivate = false;
+    this._cloudAbort = null;
   }
 
   get id() { return 'tokens'; }
@@ -170,6 +184,7 @@ export class TokensTab extends GridBrowseTab {
     if (!this._placement) {
       this._placement = new TokenPlacementManager(this.app);
     }
+    try { this._placement?.primeActorTypeChoices?.(); } catch (_) {}
 
     await super.onActivate();
     try { this._installProbeScrollHandler(); } catch (_) {}
@@ -255,7 +270,7 @@ export class TokensTab extends GridBrowseTab {
 
   onDeactivate() {
     this._didDeactivate = true;
-    this._loadId = (this._loadId || 0) + 1;
+    this._cancelInFlight('tab-deactivate');
     if (this._deferredActivationTimeout) {
       try { clearTimeout(this._deferredActivationTimeout); } catch (_) {}
       this._deferredActivationTimeout = null;
@@ -303,6 +318,17 @@ export class TokensTab extends GridBrowseTab {
         try { this.app?.setTabsLocked?.(false); } catch (_) {}
       }
     }
+  }
+
+  _cancelInFlight(reason = 'cancelled') {
+    this._loadId = (this._loadId || 0) + 1;
+    if (this._cloudAbort) {
+      try { this._cloudAbort.abort(reason); } catch (_) {}
+      this._cloudAbort = null;
+    }
+    this._indexingLocks = 0;
+    try { this.app?.setTabsLocked?.(false); } catch (_) {}
+    try { this.app?.hideGridLoader?.(this.id); } catch (_) {}
   }
 
   filterItems(items, query) {
@@ -565,9 +591,13 @@ export class TokensTab extends GridBrowseTab {
     const app = this.app;
     Logger.info('TokensTab.loadTokens:start');
     if (!app?.rendered || !app?.element) return;
+    this._cancelInFlight('restart');
     const loadId = (++this._loadId);
+    const controller = new AbortController();
+    this._cloudAbort = controller;
+    const { signal } = controller;
     const isUiActive = () => !!(app?.rendered && app?.element && app?._grid && app?._activeTab === this.id && !this._didDeactivate);
-    const isCancelled = () => (loadId !== this._loadId) || !app?.rendered || !app?.element;
+    const isCancelled = () => signal.aborted || (loadId !== this._loadId) || !app?.rendered || !app?.element;
 
     const folders = getEnabledFolders('tokenFolders');
     Logger.info('TokensTab.loadTokens:folders', { count: folders.length, folders });
@@ -583,30 +613,38 @@ export class TokensTab extends GridBrowseTab {
       if (!isUiActive()) return;
       try { this.app?.updateGridLoader?.(message, { owner: this.id }); } catch (_) {}
     };
-
-    // Decide cloud loader message based on whether a cached cloud index exists
-    const cloudLoaderMessage = async () => {
-      try {
-        const svc = this.app?._contentService;
-        if (!svc) return 'Loading cloud tokens…';
-        const latest = await svc.getLatest('tokens');
-        return latest ? 'Loading cloud tokens…' : 'Indexing cloud tokens…';
-      } catch (_) { return 'Loading cloud tokens…'; }
-    };
-
     const cloudEnabled = this._isCloudEnabled();
     const getCloudIndexingState = async () => {
       try {
         const svc = this.app?._contentService;
-        if (!svc) return { indexing: false, label: 'Loading cloud tokens…' };
+        if (!svc) return { indexing: false, label: 'Loading cloud tokens…', count: null, total: null };
         if (typeof svc.getMeta === 'function') {
           const meta = await svc.getMeta('tokens');
           const hasIndex = !!meta?.latest;
-          return { indexing: !hasIndex, label: hasIndex ? 'Loading cloud tokens…' : 'Indexing cloud tokens…' };
+          const totalCount = Number(meta?.count);
+          const total = Number.isFinite(totalCount) && totalCount > 0 ? Math.max(0, Math.floor(totalCount)) : null;
+          return {
+            indexing: !hasIndex,
+            label: hasIndex ? 'Loading cloud tokens…' : 'Indexing cloud tokens…',
+            count: null,
+            total
+          };
         }
         const latest = await svc.getLatest?.('tokens');
-        return { indexing: !latest, label: latest ? 'Loading cloud tokens…' : 'Indexing cloud tokens…' };
-      } catch (_) { return { indexing: false, label: 'Loading cloud tokens…' }; }
+        return { indexing: !latest, label: latest ? 'Loading cloud tokens…' : 'Indexing cloud tokens…', count: null, total: null };
+      } catch (_) { return { indexing: false, label: 'Loading cloud tokens…', count: null, total: null }; }
+    };
+    const startCloudLoader = async () => {
+      const state = await getCloudIndexingState();
+      showGridLoader(formatCatalogLoaderText(state?.label, state?.count, state?.total, 'Loading cloud tokens...'));
+      return {
+        state,
+        update: (count, total) => {
+          if (Number.isFinite(total) && total > 0) state.total = Math.max(0, Math.floor(total));
+          if (Number.isFinite(count) && count >= 0) state.count = Math.max(0, Math.floor(count));
+          updateGridLoader(formatCatalogLoaderText(state?.label, state?.count, state?.total, 'Loading cloud tokens...'));
+        }
+      };
     };
     const withCloudLock = async (fn) => {
       let locked = false; let label = 'Indexing cloud tokens…';
@@ -617,29 +655,138 @@ export class TokensTab extends GridBrowseTab {
       try { return await fn(); } finally { if (locked) this._setIndexingLock(false); }
     };
 
-    if (!folders.length) {
-      // No local folders: show cloud only. Clear current locals immediately and show a loader.
-      this._items = [];
-      this._computeFolderStats(this._items);
-      if (isUiActive()) {
-        try { app._grid.setData([]); } catch (_) {}
-      }
-      if (cloudEnabled) {
-        if (isUiActive()) showGridLoader(await cloudLoaderMessage());
-        await withCloudLock(async () => {
-          if (isCancelled()) return;
-          await this._loadAndMergeCloud(false, async (collected) => {
-            if (isCancelled()) return;
+    try {
+      if (!folders.length) {
+        // No local folders: show cloud only. Clear current locals immediately and show a loader.
+        this._items = [];
+        this._computeFolderStats(this._items);
+        if (isUiActive()) {
+          try { app._grid.setData([]); } catch (_) {}
+        }
+        if (cloudEnabled) {
+          const cloudLoader = isUiActive() ? await startCloudLoader() : null;
+          await withCloudLock(async () => {
+            if (isCancelled()) throw abortError();
+            const result = await this._loadAndMergeCloud(false, {
+              signal,
+              onProgress: (count, total) => cloudLoader?.update?.(count, total),
+              onTotal: (total) => {
+                const count = Number.isFinite(cloudLoader?.state?.count) && cloudLoader.state.count > 0
+                  ? cloudLoader.state.count
+                  : total;
+                cloudLoader?.update?.(count, total);
+              }
+            });
+            if (result?.error && !result.partial) {
+              throw new Error(result.error);
+            }
+            if (isCancelled()) throw abortError();
             hideGridLoader();
-            this._items = collected;
+            this._items = Array.isArray(result?.items) ? result.items : [];
             this._computeFolderStats(this._items);
             if (isUiActive()) {
               await this.applySearchAsync(this.getCurrentSearchValue());
+            }
+            Logger.info('TokensTab.cloud.only:done', {
+              total: this._items.length,
+              partial: !!result?.partial,
+              error: result?.error || null
+            });
+            if (result?.partial && result?.error) {
+              Logger.warn('TokensTab.cloud.partial', { error: result.error, localCount: this._items.length });
             }
             if (this.app?._activeTab === this.id) {
               try { this._updateFolderFilter(); } catch (_) {}
             }
           });
+        } else {
+          hideGridLoader();
+          this._computeFolderStats(this._items);
+          if (isUiActive()) {
+            await this.applySearchAsync(this.getCurrentSearchValue());
+          }
+          if (this.app?._activeTab === this.id) {
+            try { this._updateFolderFilter(); } catch (_) {}
+          }
+        }
+        return;
+      }
+
+      let localLockActive = false;
+      const localResult = await collectLocalInventory({
+        loggerTag: 'TokensTab.local',
+        folders,
+        loadCached: (folder) => this._tokenData.loadCachedTokens(folder),
+        saveIndex: (folder, records) => this._tokenData.saveTokensIndex(folder, records),
+        streamFolder: (folder, onBatch, options) => this._tokenData.streamLocalTokens(folder, onBatch, options),
+        streamOptions: { batchSize: 1500, sleepMs: 8 },
+        isCancelled,
+        keySelector: (rec) => String(rec?.file_path || rec?.path || rec?.url || ''),
+        onCachedReady: (cachedItems) => {
+          if (isCancelled()) return;
+          this._items = cachedItems;
+          if (cachedItems.length) {
+            showGridLoader(`Loading tokens… (cached ${cachedItems.length})`);
+            Logger.info('TokensTab.cache.ready', { cached: cachedItems.length });
+          } else {
+            showGridLoader('Indexing local tokens… 0');
+          }
+        },
+        onStreamProgress: (count) => {
+          if (isCancelled()) return;
+          updateGridLoader(`Indexing local tokens… ${count}`);
+          if (!localLockActive && isUiActive()) { this._setIndexingLock(true, 'Indexing local tokens...'); localLockActive = true; }
+        }
+      });
+
+      if (localResult.cancelled || isCancelled()) {
+        hideGridLoader();
+        if (localLockActive) this._setIndexingLock(false);
+        throw abortError();
+      }
+
+      this._items = localResult.localItems;
+      this._computeFolderStats(this._items);
+      Logger.info('TokensTab.local.complete', { cached: localResult.cachedItems.length, streamed: localResult.streamedCount });
+
+      if (localLockActive) this._setIndexingLock(false);
+
+      if (cloudEnabled) {
+        const cloudLoader = isUiActive() ? await startCloudLoader() : null;
+        await withCloudLock(async () => {
+          if (isCancelled()) throw abortError();
+          const result = await this._loadAndMergeCloud(true, {
+            signal,
+            onProgress: (count, total) => cloudLoader?.update?.(count, total),
+            onTotal: (total) => {
+              const count = Number.isFinite(cloudLoader?.state?.count) && cloudLoader.state.count > 0
+                ? cloudLoader.state.count
+                : total;
+              cloudLoader?.update?.(count, total);
+            }
+          });
+          if (result?.error && !result.partial) {
+            throw new Error(result.error);
+          }
+          if (isCancelled()) throw abortError();
+          hideGridLoader();
+          this._items = Array.isArray(result?.items) ? result.items : [];
+          this._computeFolderStats(this._items);
+          if (isUiActive()) {
+            await this.applySearchAsync(this.getCurrentSearchValue());
+          }
+          Logger.info('TokensTab.streaming:done', {
+            total: this._items.length,
+            streamed: localResult.streamedCount,
+            partial: !!result?.partial,
+            error: result?.error || null
+          });
+          if (result?.partial && result?.error) {
+            Logger.warn('TokensTab.cloud.partial', { error: result.error, localCount: this._items.length });
+          }
+          if (this.app?._activeTab === this.id) {
+            try { this._updateFolderFilter(); } catch (_) {}
+          }
         });
       } else {
         hideGridLoader();
@@ -651,155 +798,240 @@ export class TokensTab extends GridBrowseTab {
           try { this._updateFolderFilter(); } catch (_) {}
         }
       }
-      return;
-    }
-
-    let localLockActive = false;
-    const localResult = await collectLocalInventory({
-      loggerTag: 'TokensTab.local',
-      folders,
-      loadCached: (folder) => this._tokenData.loadCachedTokens(folder),
-      saveIndex: (folder, records) => this._tokenData.saveTokensIndex(folder, records),
-      streamFolder: (folder, onBatch, options) => this._tokenData.streamLocalTokens(folder, onBatch, options),
-      streamOptions: { batchSize: 1500, sleepMs: 8 },
-      isCancelled,
-      keySelector: (rec) => String(rec?.file_path || rec?.path || rec?.url || ''),
-      onCachedReady: (cachedItems) => {
-        if (isCancelled()) return;
-        this._items = cachedItems;
-        if (cachedItems.length) {
-          showGridLoader(`Loading tokens… (cached ${cachedItems.length})`);
-          Logger.info('TokensTab.cache.ready', { cached: cachedItems.length });
-        } else {
-          showGridLoader('Indexing local tokens… 0');
-        }
-      },
-      onStreamProgress: (count) => {
-        if (isCancelled()) return;
-        updateGridLoader(`Indexing local tokens… ${count}`);
-        if (!localLockActive && isUiActive()) { this._setIndexingLock(true, 'Indexing local tokens...'); localLockActive = true; }
-      }
-    });
-
-    if (localResult.cancelled || isCancelled()) { hideGridLoader(); if (localLockActive) this._setIndexingLock(false); return; }
-
-    this._items = localResult.localItems;
-    this._computeFolderStats(this._items);
-    Logger.info('TokensTab.local.complete', { cached: localResult.cachedItems.length, streamed: localResult.streamedCount });
-
-    if (localLockActive) this._setIndexingLock(false);
-
-    if (cloudEnabled) {
-      if (isUiActive()) showGridLoader(await cloudLoaderMessage());
-      await withCloudLock(async () => {
-        if (isCancelled()) return;
-        await this._loadAndMergeCloud(true, async (merged) => {
-          if (isCancelled()) return;
-          hideGridLoader();
-          this._items = merged;
-          this._computeFolderStats(this._items);
-          if (isUiActive()) {
-            await this.applySearchAsync(this.getCurrentSearchValue());
-          }
-          Logger.info('TokensTab.streaming:done', { total: this._items.length, streamed: localResult.streamedCount });
-          if (this.app?._activeTab === this.id) {
-            try { this._updateFolderFilter(); } catch (_) {}
-          }
-        });
-      });
-    } else {
+    } catch (error) {
       hideGridLoader();
-      this._computeFolderStats(this._items);
-      if (isUiActive()) {
-        await this.applySearchAsync(this.getCurrentSearchValue());
+      if (isAbortError(error) || isCancelled()) {
+        Logger.info('TokensTab.loadTokens:aborted');
+        return;
       }
-      if (this.app?._activeTab === this.id) {
-        try { this._updateFolderFilter(); } catch (_) {}
-      }
+      Logger.warn('TokensTab.loadTokens:failed', String(error?.message || error));
+    } finally {
+      if (this._cloudAbort === controller) this._cloudAbort = null;
+      if (signal.aborted) hideGridLoader();
     }
   }
 
-  async _loadAndMergeCloud(includeLocal, applyFn) {
-    const app = this.app;
-    const collectedLocal = includeLocal ? (Array.isArray(this._items) ? this._items.slice() : []) : [];
-    if (!this._isCloudEnabled()) {
-      try { await applyFn?.(collectedLocal); } catch (_) {}
-      return;
-    }
-    let cloudItems = [];
-    try {
-      const svc = app?._contentService;
-      if (svc) {
-        try { Logger.info('TokensTab.cloud.sync:start'); 
-          await svc.sync('tokens'); 
-          Logger.info('TokensTab.cloud.sync:done'); 
-        } catch (e) { Logger.warn('TokensTab.cloud.sync:error', String(e?.message||e)); }
-        const { items, total } = await svc.list('tokens');
-        cloudItems = Array.isArray(items) ? items : [];
-        Logger.info('TokensTab.cloud.list', { count: cloudItems.length, total });
-      }
-    } catch (e) { Logger.warn('TokensTab.cloud.load.error', String(e?.message||e)); }
+  async _fetchCloudTokens(options = {}) {
+    const signal = options.signal || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    if (signal?.aborted) throw abortError();
 
     const svc = this.app?._contentService;
-    const merged = mergeLocalAndCloudRecords({
-      kind: 'tokens',
-      local: collectedLocal,
-      cloud: cloudItems,
-      keySelector: (rec) => {
-        const base = String(rec?.base_name_no_variant || '').toLowerCase();
-        const color = String(rec?.color_variant ?? '').toLowerCase();
-        if (base && color) return `${base}_${color}`;
-        return String(rec?.filename || rec?.file_path || '').replace(/\.[^/.]+$/, '').toLowerCase();
+    if (!svc) throw new Error('Cloud token content service unavailable');
+
+    let hadCachedIndex = false;
+    let syncError = null;
+    try {
+      const meta = await svc.getMeta?.('tokens');
+      hadCachedIndex = !!meta?.latest;
+    } catch (_) {}
+
+    Logger.info('TokensTab.cloud.sync', { hadCachedIndex });
+    try {
+      await svc.sync('tokens', {
+        signal,
+        onManifestProgress: ({ count, total }) => {
+          if (signal?.aborted) return;
+          try { onProgress?.(count, total); } catch (_) {}
+        },
+        progressBatch: 500
+      });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      syncError = String(error?.message || error);
+      Logger.warn('TokensTab.cloud.sync.failed', { error: syncError, hadCachedIndex });
+    }
+
+    let items = [];
+    try {
+      const result = await svc.list('tokens', {
+        signal,
+        onProgress: (count, total) => {
+          if (signal?.aborted) return;
+          try { onProgress?.(count, total); } catch (_) {}
+        },
+        progressBatch: 500
+      });
+      items = Array.isArray(result?.items) ? result.items : [];
+      Logger.info('TokensTab.cloud.list', { count: items.length, total: result?.total ?? items.length });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      const listError = String(error?.message || error);
+      if (syncError) {
+        throw new Error(`Cloud token sync failed (${syncError}); cached index unavailable (${listError})`);
+      }
+      throw error;
+    }
+
+    if (signal?.aborted) throw abortError();
+
+    const downloadManager = this.app?._downloadManager;
+    const out = [];
+    for (const item of items) {
+      const filePath = String(item?.file_path || item?.path || '');
+      if (!filePath) continue;
+      const filename = String(item?.filename || filePath.split('/').pop() || '');
+      let folderPath = String(item?.path || '');
+      if (folderPath && filename && folderPath.endsWith(`/${filename}`)) {
+        folderPath = folderPath.slice(0, folderPath.length - (filename.length + 1));
+      } else if (!folderPath) {
+        const lastSlash = filePath.lastIndexOf('/');
+        folderPath = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
+      }
+      const record = {
+        ...item,
+        filename,
+        file_path: filePath,
+        path: folderPath,
+        source: 'cloud',
+        tier: item?.tier === 'premium' || item?.tier === 'free' ? item.tier : 'free'
+      };
+      try {
+        const local = downloadManager?.getLocalPath?.('tokens', record);
+        if (local) record.cachedLocalPath = local;
+      } catch (_) {}
+      out.push(record);
+      if (signal?.aborted) throw abortError();
+    }
+
+    return {
+      items: out,
+      error: syncError,
+      partial: !!syncError && (hadCachedIndex || out.length > 0)
+    };
+  }
+
+  async _loadAndMergeCloud(includeLocal, options = {}) {
+    const collectedLocal = includeLocal ? (Array.isArray(this._items) ? this._items.slice() : []) : [];
+    const signal = options.signal || null;
+    const svc = this.app?._contentService;
+    const normalizePathKey = (value) => String(value || '')
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/\/+/g, '/')
+      .replace(/^\/+/, '');
+    const tokenMatchKey = (rec) => {
+      const base = String(rec?.base_name_no_variant || '').trim().toLowerCase();
+      const color = String(rec?.color_variant ?? '').trim().toLowerCase();
+      if (base) return `${base}::${color || 'default'}`;
+      const fallback = String(rec?.filename || rec?.file_path || '').trim();
+      if (!fallback) return '';
+      return fallback.replace(/\.[^/.]+$/, '').toLowerCase();
+    };
+    const pathKey = (rec) => {
+      const raw = normalizePathKey(rec?.file_path || rec?.path || '');
+      if (!raw) return '';
+      return raw.replace(/\.[^/.]+$/, '').toLowerCase();
+    };
+    return loadAndMergeCloudRecords({
+      cloudEnabled: this._isCloudEnabled(),
+      localItems: collectedLocal,
+      signal,
+      fetchCloud: () => this._fetchCloudTokens(options),
+      onTotal: options.onTotal,
+      onCloudItems: (cloudItems) => {
+        Logger.info('TokensTab.cloud.items', { count: cloudItems.length });
       },
-      choosePreferred: (existing, incoming) => {
-        const rank = (it) => {
-          if (!it) return 0;
-          if (String(it.source || '').toLowerCase() === 'local') return 3;
-          if (String(it.source || '').toLowerCase() === 'cloud' && it.cachedLocalPath) return 2;
-          return 1;
+      onCloudError: (cloudError) => {
+        Logger.warn('TokensTab.cloud.load.error', cloudError);
+      },
+      mergeItems: ({ localItems: nextLocalItems, cloudItems }) => {
+        const localMatchCounts = new Map();
+        for (const rec of nextLocalItems) {
+          const match = tokenMatchKey(rec);
+          if (!match) continue;
+          localMatchCounts.set(match, (localMatchCounts.get(match) || 0) + 1);
+        }
+        const cloudMatchCounts = new Map();
+        for (const rec of cloudItems) {
+          const match = tokenMatchKey(rec);
+          if (!match) continue;
+          cloudMatchCounts.set(match, (cloudMatchCounts.get(match) || 0) + 1);
+        }
+        const sharedLocalCloudKey = (rec) => {
+          const match = tokenMatchKey(rec);
+          if (!match) return '';
+          if ((localMatchCounts.get(match) || 0) !== 1) return '';
+          if ((cloudMatchCounts.get(match) || 0) !== 1) return '';
+          return `match:${match}`;
         };
-        const extRank = (name) => {
-          const lower = String(name || '').toLowerCase();
-          if (lower.endsWith('.webp')) return 3;
-          if (lower.endsWith('.png')) return 2;
-          if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 1;
-          return 0;
-        };
-        const rExisting = rank(existing);
-        const rIncoming = rank(incoming);
-        if (rIncoming > rExisting) return incoming;
-        if (rIncoming < rExisting) return existing;
-        const eExisting = extRank(existing?.filename);
-        const eIncoming = extRank(incoming?.filename);
-        if (eIncoming > eExisting) return incoming;
-        if (eIncoming < eExisting) return existing;
-        const lmExisting = Date.parse(existing?.last_modified || '') || 0;
-        const lmIncoming = Date.parse(incoming?.last_modified || '') || 0;
-        return lmIncoming >= lmExisting ? incoming : existing;
+
+        return mergeLocalAndCloudRecords({
+          kind: 'tokens',
+          local: nextLocalItems,
+          cloud: cloudItems,
+          keySelector: (rec) => {
+            const source = String(rec?.source || '').toLowerCase();
+            const sharedKey = sharedLocalCloudKey(rec);
+            const pKey = pathKey(rec);
+            const match = tokenMatchKey(rec);
+            if (source === 'local') {
+              if (sharedKey) return sharedKey;
+              if (pKey) return `local:${pKey}`;
+              return match ? `local:${match}` : '';
+            }
+            if (sharedKey) return sharedKey;
+            if (pKey) return `cloud:${pKey}`;
+            return match ? `cloud:${match}` : '';
+          },
+          choosePreferred: (existing, incoming) => {
+            const rank = (it) => {
+              if (!it) return 0;
+              if (String(it.source || '').toLowerCase() === 'local') return 3;
+              if (String(it.source || '').toLowerCase() === 'cloud' && it.cachedLocalPath) return 2;
+              return 1;
+            };
+            const extRank = (name) => {
+              const lower = String(name || '').toLowerCase();
+              if (lower.endsWith('.webp')) return 3;
+              if (lower.endsWith('.png')) return 2;
+              if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 1;
+              return 0;
+            };
+            const rExisting = rank(existing);
+            const rIncoming = rank(incoming);
+            if (rIncoming > rExisting) return incoming;
+            if (rIncoming < rExisting) return existing;
+            const eExisting = extRank(existing?.filename);
+            const eIncoming = extRank(incoming?.filename);
+            if (eIncoming > eExisting) return incoming;
+            if (eIncoming < eExisting) return existing;
+            const lmExisting = Date.parse(existing?.last_modified || '') || 0;
+            const lmIncoming = Date.parse(incoming?.last_modified || '') || 0;
+            return lmIncoming >= lmExisting ? incoming : existing;
+          },
+          onEnhanceLocal: ({ localRecord, cloudRecord }) => {
+            if (!svc || !cloudRecord?.filename) return null;
+            try {
+              const thumb = svc.getThumbnailURL?.('tokens', cloudRecord);
+              if (!thumb) return null;
+              if (String(localRecord.thumbnail_url || localRecord.file_path || '').includes(thumb)) return null;
+              return {
+                ...localRecord,
+                original_thumbnail: localRecord.file_path || localRecord.thumbnail_url,
+                thumbnail_url: thumb,
+                enhanced_thumbnail: true,
+                cloud_tier: cloudRecord.tier
+              };
+            } catch (_) { return null; }
+          },
+          onStats: ({ collisions, preferLocal, preferCloud, enhanced, localCount, cloudCount, mergedCount }) => {
+            try {
+              Logger.info('TokensTab.merge', { collisions, preferLocal, preferCloud, enhanced, local: localCount, cloud: cloudCount, merged: mergedCount });
+            } catch (_) {}
+          }
+        });
       },
-      onEnhanceLocal: ({ localRecord, cloudRecord }) => {
-        if (!svc || !cloudRecord?.filename) return null;
-        try {
-          const thumb = svc.getThumbnailURL?.('tokens', cloudRecord);
-          if (!thumb) return null;
-          if (String(localRecord.thumbnail_url || localRecord.file_path || '').includes(thumb)) return null;
-          return {
-            ...localRecord,
-            original_thumbnail: localRecord.file_path || localRecord.thumbnail_url,
-            thumbnail_url: thumb,
-            enhanced_thumbnail: true,
-            cloud_tier: cloudRecord.tier
-          };
-        } catch (_) { return null; }
-      },
-      onStats: ({ collisions, preferLocal, preferCloud, enhanced, localCount, cloudCount, mergedCount }) => {
-        try {
-          Logger.info('TokensTab.merge', { collisions, preferLocal, preferCloud, enhanced, local: localCount, cloud: cloudCount, merged: mergedCount });
-        } catch (_) {}
+      onResult: (result, detail) => {
+        Logger.info('TokensTab.cloud.merge', {
+          local: detail.localItems.length,
+          cloud: detail.cloudItems.length,
+          merged: result.items.length,
+          partial: result.partial,
+          error: result.error
+        });
       }
     });
-
-    try { await applyFn?.(merged); } catch (_) {}
   }
 
   _normalizeFolderPath(path) {
@@ -1546,13 +1778,20 @@ export class TokensTab extends GridBrowseTab {
       });
       this._variantThemeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
     } catch (_) {}
-    panel.innerHTML = `
-      <div class=\"fa-nexus-variant-header\">
-        <span class=\"fa-nexus-variant-title\">${baseName}</span>
-        <button class=\"fa-nexus-variant-close\" title=\"Close\">×</button>
-      </div>
-      <div class=\"fa-nexus-variant-grid\"></div>`;
-    const grid = panel.querySelector('.fa-nexus-variant-grid');
+    const header = document.createElement('div');
+    header.className = 'fa-nexus-variant-header';
+    const title = document.createElement('span');
+    title.className = 'fa-nexus-variant-title';
+    title.textContent = String(baseName ?? '');
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'fa-nexus-variant-close';
+    closeButton.title = 'Close';
+    closeButton.textContent = '×';
+    header.append(title, closeButton);
+    const grid = document.createElement('div');
+    grid.className = 'fa-nexus-variant-grid';
+    panel.replaceChildren(header, grid);
     for (const it of variants) {
       const item = document.createElement('div');
       item.className = 'fa-nexus-variant-item';
@@ -1584,21 +1823,30 @@ export class TokensTab extends GridBrowseTab {
       const isLocal = String(it.source||'').toLowerCase() === 'local';
       const isCloud = String(it.source||'').toLowerCase() === 'cloud';
       const isPremium = it.tier === 'premium';
-      const iconHTML = (() => {
-        if (isLocal) return '<i class="fas fa-folder"></i>';
+      const iconClass = (() => {
+        if (isLocal) return 'fa-folder';
         if (isCloud) {
-          if (cachedLocalPath) return '<i class="fas fa-cloud-check"></i>';
-          if (isPremium && !authed) return '<i class="fas fa-lock"></i>';
-          if (isPremium) return '<i class="fas fa-cloud-plus"></i>';
-          return '<i class="fas fa-cloud"></i>';
+          if (cachedLocalPath) return 'fa-cloud-check';
+          if (isPremium && !authed) return 'fa-lock';
+          if (isPremium) return 'fa-cloud-plus';
+          return 'fa-cloud';
         }
-        return '<i class="fas fa-cloud"></i>';
+        return 'fa-cloud';
       })();
       const cv = (it.color_variant || '').toString().padStart(2,'0');
-      item.innerHTML = `
-        <div class="thumb"><img alt="${it.filename || ''}"/></div>
-        <div class="fa-nexus-variant-number">${cv}</div>
-        <div class="fa-nexus-token-status-icon" title="${isLocal ? 'Local storage' : (isPremium ? (authed || cachedLocalPath ? 'Premium (unlocked)' : 'Premium (locked)') : (cachedLocalPath ? 'Downloaded' : 'Cloud'))}">${iconHTML}</div>`;
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      const img = document.createElement('img');
+      img.alt = String(it.filename || '');
+      thumb.appendChild(img);
+      const variantNumber = document.createElement('div');
+      variantNumber.className = 'fa-nexus-variant-number';
+      variantNumber.textContent = cv;
+      const statusIcon = document.createElement('div');
+      statusIcon.className = 'fa-nexus-token-status-icon';
+      statusIcon.title = isLocal ? 'Local storage' : (isPremium ? (authed || cachedLocalPath ? 'Premium (unlocked)' : 'Premium (locked)') : (cachedLocalPath ? 'Downloaded' : 'Cloud'));
+      setIconOnlyContent(statusIcon, iconClass);
+      item.replaceChildren(thumb, variantNumber, statusIcon);
       try {
         const iconEl = item.querySelector('.fa-nexus-token-status-icon');
         if (iconEl) {

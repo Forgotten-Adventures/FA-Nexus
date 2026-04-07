@@ -1,0 +1,290 @@
+<section class="fa-nexus-generated-cleanup" autocomplete="off">
+  <header class="fa-nexus-dialog-header">
+    <h2>Generated File Cleanup</h2>
+    <p>Scan FA Nexus generated masks and flattened outputs for the current world, then optionally overwrite unused files with a visible red marker for manual deletion.</p>
+  </header>
+
+  <section class="fa-nexus-dialog-body">
+    <div class="fa-nexus-generated-cleanup__toolbar">
+      <label class="fa-nexus-checkbox-label fa-nexus-generated-cleanup__backup-toggle">
+        <input type="checkbox" data-backup-first {{#if backupFirst}}checked{{/if}} {{#if busy}}disabled{{/if}}>
+        <span>Backup first</span>
+      </label>
+      <div class="fa-nexus-generated-cleanup__actions">
+        <button type="button" class="btn" data-action="scan" {{#if busy}}disabled{{/if}}>
+          <i class="fas fa-magnifying-glass"></i>
+          <span>Scan</span>
+        </button>
+        <button type="button" class="btn" data-action="copy-unused" {{#unless canCopy}}disabled{{/unless}}>
+          <i class="fas fa-copy"></i>
+          <span>Copy Unused Paths</span>
+        </button>
+        <button type="button" class="btn btn-primary" data-action="mark-unused" {{#unless canMark}}disabled{{/unless}}>
+          <i class="fas fa-highlighter"></i>
+          <span>Mark Unused</span>
+        </button>
+      </div>
+    </div>
+
+    <p class="hint fa-nexus-generated-cleanup__hint">Marking overwrites unused `.webp` and `.png` files with an opaque red placeholder. Delete and rename are not performed by this tool.</p>
+
+    {{#if hasScopeWarning}}
+    <div class="fa-nexus-generated-cleanup__status is-warning">
+      <i class="fas fa-shield-halved"></i>
+      <span>{{scopeWarning}}</span>
+    </div>
+    {{/if}}
+
+    {{#if busy}}
+    <div class="fa-nexus-generated-cleanup__status is-busy">
+      <i class="fas fa-spinner fa-spin"></i>
+      <span>{{busyLabel}}</span>
+    </div>
+    {{/if}}
+
+    {{#if hasError}}
+    <div class="fa-nexus-generated-cleanup__status is-error">
+      <i class="fas fa-triangle-exclamation"></i>
+      <span>{{error}}</span>
+    </div>
+    {{/if}}
+
+    {{#if hasReport}}
+    <section class="fa-nexus-generated-cleanup__summary">
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Direct Live Refs</span>
+        <strong>{{summary.directLiveRefs}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Deconstruct Refs</span>
+        <strong>{{summary.deconstructLiveRefs}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Unique Live Files</span>
+        <strong>{{summary.uniqueLiveFiles}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Roots Scanned</span>
+        <strong>{{summary.rootsScanned}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Scanned Files</span>
+        <strong>{{summary.scannedFiles}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">{{unusedMasksMetricLabel}}</span>
+        <strong>{{summary.unusedMasks}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">{{unusedFlattenedMetricLabel}}</span>
+        <strong>{{summary.unusedFlattened}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Missing Refs</span>
+        <strong>{{summary.missingRefs}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Skipped</span>
+        <strong>{{summary.skipped}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Marked</span>
+        <strong>{{summary.markedCount}}</strong>
+      </article>
+      <article class="fa-nexus-generated-cleanup__metric">
+        <span class="fa-nexus-generated-cleanup__metric-label">Mark Skipped</span>
+        <strong>{{summary.markSkippedCount}}</strong>
+      </article>
+    </section>
+
+    {{#if hasRoots}}
+    <section class="fa-nexus-generated-cleanup__panel">
+      <div class="fa-nexus-generated-cleanup__panel-header">
+        <h3>Scan Roots</h3>
+      </div>
+      <div class="fa-nexus-generated-cleanup__root-list">
+        {{#each roots}}
+        <div class="fa-nexus-generated-cleanup__root-row">
+          <code>{{target}}</code>
+          <span>{{source}}</span>
+          <span>{{categoriesLabel}}</span>
+          <span>{{reasonsLabel}}</span>
+        </div>
+        {{/each}}
+      </div>
+    </section>
+    {{/if}}
+
+    <section class="fa-nexus-generated-cleanup__panel">
+      <div class="fa-nexus-generated-cleanup__panel-header">
+        <h3>{{unusedMasksTitle}}</h3>
+        <span>{{summary.unusedMasks}}</span>
+      </div>
+      {{#if hasUnusedMasks}}
+      <div class="fa-nexus-generated-cleanup__table-wrap">
+        <table class="fa-nexus-generated-cleanup__table">
+          <thead>
+            <tr>
+              <th>Path</th>
+              <th>Status</th>
+              <th>Backup</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{#each unusedMasks}}
+            <tr>
+              <td>
+                <code>{{path}}</code>
+              </td>
+              <td>
+                {{#if hasMarkStatus}}
+                <span class="fa-nexus-generated-cleanup__pill {{statusClass}}">{{statusLabel}}</span>
+                {{#if markError}}
+                <div class="fa-nexus-generated-cleanup__error">{{markError}}</div>
+                {{/if}}
+                {{else}}
+                <span class="fa-nexus-generated-cleanup__pill is-pending">Pending</span>
+                {{/if}}
+              </td>
+              <td>
+                {{#if hasBackupPath}}
+                <code>{{backupPath}}</code>
+                {{else}}
+                <span class="fa-nexus-generated-cleanup__muted">None</span>
+                {{/if}}
+              </td>
+            </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <p class="fa-nexus-generated-cleanup__empty">No matching mask files found for this scan scope.</p>
+      {{/if}}
+    </section>
+
+    <section class="fa-nexus-generated-cleanup__panel">
+      <div class="fa-nexus-generated-cleanup__panel-header">
+        <h3>{{unusedFlattenedTitle}}</h3>
+        <span>{{summary.unusedFlattened}}</span>
+      </div>
+      {{#if hasUnusedFlattened}}
+      <div class="fa-nexus-generated-cleanup__table-wrap">
+        <table class="fa-nexus-generated-cleanup__table">
+          <thead>
+            <tr>
+              <th>Path</th>
+              <th>Status</th>
+              <th>Backup</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{#each unusedFlattened}}
+            <tr>
+              <td>
+                <code>{{path}}</code>
+              </td>
+              <td>
+                {{#if hasMarkStatus}}
+                <span class="fa-nexus-generated-cleanup__pill {{statusClass}}">{{statusLabel}}</span>
+                {{#if markError}}
+                <div class="fa-nexus-generated-cleanup__error">{{markError}}</div>
+                {{/if}}
+                {{else}}
+                <span class="fa-nexus-generated-cleanup__pill is-pending">Pending</span>
+                {{/if}}
+              </td>
+              <td>
+                {{#if hasBackupPath}}
+                <code>{{backupPath}}</code>
+                {{else}}
+                <span class="fa-nexus-generated-cleanup__muted">None</span>
+                {{/if}}
+              </td>
+            </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <p class="fa-nexus-generated-cleanup__empty">No matching flattened outputs found for this scan scope.</p>
+      {{/if}}
+    </section>
+
+    <section class="fa-nexus-generated-cleanup__panel">
+      <div class="fa-nexus-generated-cleanup__panel-header">
+        <h3>Missing References</h3>
+        <span>{{summary.missingRefs}}</span>
+      </div>
+      {{#if hasMissingRefs}}
+      <div class="fa-nexus-generated-cleanup__table-wrap">
+        <table class="fa-nexus-generated-cleanup__table">
+          <thead>
+            <tr>
+              <th>Path</th>
+              <th>Origin</th>
+              <th>Usage</th>
+              <th>Scenes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{#each missingRefs}}
+            <tr>
+              <td><code>{{path}}</code></td>
+              <td>{{originsLabel}}</td>
+              <td>{{refKindsLabel}} ({{count}})</td>
+              <td>{{sceneNamesLabel}}</td>
+            </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <p class="fa-nexus-generated-cleanup__empty">No missing generated-file references found.</p>
+      {{/if}}
+    </section>
+
+    <section class="fa-nexus-generated-cleanup__panel">
+      <div class="fa-nexus-generated-cleanup__panel-header">
+        <h3>Skipped Items</h3>
+        <span>{{summary.skipped}}</span>
+      </div>
+      {{#if hasSkipped}}
+      <div class="fa-nexus-generated-cleanup__table-wrap">
+        <table class="fa-nexus-generated-cleanup__table">
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Reason</th>
+              <th>Path</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{#each skipped}}
+            <tr>
+              <td>{{stage}}</td>
+              <td>{{reason}}</td>
+              <td><code>{{path}}</code></td>
+              <td>{{error}}</td>
+            </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <p class="fa-nexus-generated-cleanup__empty">No skipped items.</p>
+      {{/if}}
+    </section>
+    {{else}}
+    <div class="fa-nexus-generated-cleanup__empty-state">
+      <i class="fas fa-broom"></i>
+      <p>Run a scan to inspect generated masks and flattened outputs.</p>
+    </div>
+    {{/if}}
+  </section>
+
+  <footer class="fa-nexus-dialog-footer">
+    <button type="button" class="btn" data-action="close">Close</button>
+  </footer>
+</section>

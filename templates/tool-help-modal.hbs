@@ -1,0 +1,59 @@
+<div class="fa-nexus-tool-help">
+  <section class="fa-nexus-tool-help__hero">
+    {{#if toolLabel}}
+      <p class="fa-nexus-tool-help__eyebrow">{{toolLabel}}</p>
+    {{/if}}
+    {{#if summary}}
+      <p class="fa-nexus-tool-help__summary">{{summary}}</p>
+    {{/if}}
+    <div class="fa-nexus-tool-help__meta">
+      {{#if dirty}}
+        <span class="fa-nexus-tool-help__pill is-dirty">Unsaved session</span>
+      {{/if}}
+      {{#if selectionSummary}}
+        <span class="fa-nexus-tool-help__pill">{{selectionSummary}}</span>
+      {{/if}}
+    </div>
+  </section>
+
+  {{#if shortcuts.length}}
+    <section class="fa-nexus-tool-help__section">
+      <h3 class="fa-nexus-tool-help__heading">Shortcuts</h3>
+      <div class="fa-nexus-tool-help__shortcut-list">
+        {{#each shortcuts as |shortcut|}}
+          <div class="fa-nexus-tool-help__shortcut">
+            <div class="fa-nexus-tool-help__shortcut-main">
+              <span class="fa-nexus-tool-help__shortcut-label">{{shortcut.label}}</span>
+              {{#if shortcut.description}}
+                <span class="fa-nexus-tool-help__shortcut-description">{{shortcut.description}}</span>
+              {{/if}}
+            </div>
+            <kbd class="fa-nexus-tool-help__shortcut-binding">{{shortcut.binding}}</kbd>
+          </div>
+        {{/each}}
+      </div>
+    </section>
+  {{/if}}
+
+  {{#if sections.length}}
+    <section class="fa-nexus-tool-help__section">
+      <h3 class="fa-nexus-tool-help__heading">Panel Areas</h3>
+      <div class="fa-nexus-tool-help__chip-list">
+        {{#each sections as |section|}}
+          <span class="fa-nexus-tool-help__chip">{{section.label}}</span>
+        {{/each}}
+      </div>
+    </section>
+  {{/if}}
+
+  {{#if notes.length}}
+    <section class="fa-nexus-tool-help__section">
+      <h3 class="fa-nexus-tool-help__heading">Notes</h3>
+      <ul class="fa-nexus-tool-help__notes">
+        {{#each notes as |note|}}
+          <li class="fa-nexus-tool-help__note">{{note}}</li>
+        {{/each}}
+      </ul>
+    </section>
+  {{/if}}
+</div>

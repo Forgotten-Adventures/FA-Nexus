@@ -1,5 +1,18 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import BuildingWallMesher from '../buildings/building-wall-mesher.js';
+import { getOrCreatePixiTexture } from '../core/foundry-texture-loader-patch.js';
+import {
+  applyHsbcToDisplayObject,
+  cloneHsbc,
+  normalizeHsbc,
+  readDocumentHsbc
+} from '../core/hsbc.js';
+import {
+  attachCustomTileOverhead,
+  createDisplayProxyFactory,
+  detachCustomTileOverhead,
+  invalidateCustomTileOverhead
+} from '../canvas/custom-tile-overhead.js';
 
 export const DEFAULT_SEGMENT_SAMPLES = 200;
 export const MIN_POINTS_TO_RENDER = 2;
@@ -16,6 +29,9 @@ const VISIBLE_ALPHA_THRESHOLD = 10;
 const LINEAR_TENSION_THRESHOLD = 0.999;
 const WIDTH_MULTIPLIER_EPSILON = 1e-3;
 const EDITING_TILES_KEY = '__faNexusPathEditingTiles';
+const PATH_WALL_DELETE_QUEUE = new Map();
+const SHARED_PATH_TEXTURE_CACHE = new Map();
+const PATH_HSBC_SLOT = 'path-runtime';
 
 function isEditingTile(doc) {
   try {
@@ -127,6 +143,7 @@ function createWallMesherPathMesh(controlPoints, data, texture, options = {}) {
     try { mesh.state.blendMode = PIXI.BLEND_MODES.NORMAL; }
     catch (_) {}
     mesh.eventMode = 'none';
+    applyHsbcToDisplayObject(mesh, cloneHsbc(options?.hsbc), { slot: PATH_HSBC_SLOT });
     return mesh;
   } catch (error) {
     Logger.warn('PathGeometry.createWallMesh.failed', { error: String(error?.message || error) });
@@ -588,6 +605,7 @@ export function createMeshFromSamples(samples, pathWidth, repeatSpacing, texture
     try { mesh.state.blendMode = PIXI.BLEND_MODES.NORMAL; }
     catch (_) {}
     mesh.eventMode = 'none';
+    applyHsbcToDisplayObject(mesh, cloneHsbc(options?.hsbc), { slot: PATH_HSBC_SLOT });
     return mesh;
   } catch (error) {
     Logger.warn('PathGeometry.createMesh.failed', { error: String(error?.message || error) });
@@ -822,7 +840,16 @@ export async function loadPathTexture(src, options = {}) {
     try {
       const canBust = bustCacheOnRetry && attempt > 1 && !/^data:/i.test(encoded);
       const key = canBust ? `${encoded}${encoded.includes('?') ? '&' : '?'}v=${Date.now()}` : encoded;
-      const texture = PIXI.Texture.from(key);
+      let texture = null;
+      if (canBust) {
+        texture = getOrCreatePixiTexture(key);
+      } else {
+        texture = SHARED_PATH_TEXTURE_CACHE.get(encoded);
+        if (!texture || texture.destroyed || texture.baseTexture?.destroyed) {
+          texture = getOrCreatePixiTexture(encoded);
+          SHARED_PATH_TEXTURE_CACHE.set(encoded, texture);
+        }
+      }
       const ok = await waitForBaseTexture(texture?.baseTexture, timeout);
       if (ok) {
         try {
@@ -913,6 +940,7 @@ export function cleanupPathOverlay(tile) {
     if (!tile) return;
     const mesh = tile.mesh;
     const container = tile.faNexusPathContainer || mesh?.faNexusPathContainer;
+    detachCustomTileOverhead(tile, { kind: 'path' });
     if (container) {
       try { container.parent?.removeChild?.(container); } catch (_) {}
       try { container.destroy({ children: true }); } catch (_) {}
@@ -925,23 +953,109 @@ export function cleanupPathOverlay(tile) {
   } catch (_) {}
 }
 
+async function deletePathWallsRobustly(scene, wallIds = []) {
+  const uniqueIds = Array.from(new Set(
+    (Array.isArray(wallIds) ? wallIds : []).filter(Boolean)
+  ));
+  if (!scene || !uniqueIds.length) return false;
+  const errors = [];
+  let deleted = false;
+  for (const wallId of uniqueIds) {
+    try {
+      const doc = scene.walls?.get?.(wallId);
+      if (!doc || doc._destroyed) continue;
+      await scene.deleteEmbeddedDocuments('Wall', [wallId]);
+      deleted = true;
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (!message.includes('does not exist')) {
+        errors.push({ wallId, error: message });
+      }
+    }
+  }
+  if (errors.length) {
+    Logger.warn('PathGeometry.cleanupWalls.failed', { errors });
+    return false;
+  }
+  return deleted || uniqueIds.length > 0;
+}
+
+function queuePathWallDeletes(scene, wallIds = []) {
+  const uniqueIds = Array.from(new Set(
+    (Array.isArray(wallIds) ? wallIds : []).filter(Boolean)
+  ));
+  if (!scene || !uniqueIds.length) return Promise.resolve(false);
+  const queueKey = scene.uuid || scene.id || null;
+  if (!queueKey) return deletePathWallsRobustly(scene, uniqueIds);
+  let entry = PATH_WALL_DELETE_QUEUE.get(queueKey);
+  if (!entry) {
+    entry = {
+      scene,
+      wallIds: new Set(),
+      task: null
+    };
+    PATH_WALL_DELETE_QUEUE.set(queueKey, entry);
+  }
+  entry.scene = scene;
+  for (const wallId of uniqueIds) entry.wallIds.add(wallId);
+  if (entry.task) return entry.task;
+  entry.task = (async () => {
+    let deleted = false;
+    await sleep(150);
+    while (entry.wallIds.size) {
+      const pendingIds = Array.from(entry.wallIds);
+      entry.wallIds.clear();
+      deleted = (await deletePathWallsRobustly(entry.scene, pendingIds)) || deleted;
+      if (entry.wallIds.size) await sleep(75);
+    }
+    return deleted;
+  })().finally(() => {
+    PATH_WALL_DELETE_QUEUE.delete(queueKey);
+  });
+  return entry.task;
+}
+
+function collectLinkedPathWallIds(doc, scene) {
+  const tileId = doc?.id || null;
+  const walls = scene?.walls || null;
+  if (!tileId || !walls?.size) return [];
+  const ids = new Set();
+  const groupIds = new Set();
+  for (const wall of walls) {
+    if (!wall?.id) continue;
+    const flag = wall.getFlag?.('fa-nexus', 'pathWall');
+    if (flag?.tileId === tileId) ids.add(wall.id);
+  }
+  const { payloads } = resolvePathPayloads(doc);
+  for (const payload of payloads) {
+    const foundryWalls = payload?.foundryWalls || null;
+    if (Array.isArray(foundryWalls?.wallIds)) {
+      for (const wallId of foundryWalls.wallIds) {
+        if (wallId) ids.add(wallId);
+      }
+    }
+    if (foundryWalls?.groupId) groupIds.add(foundryWalls.groupId);
+  }
+  if (groupIds.size) {
+    for (const wall of walls) {
+      if (!wall?.id) continue;
+      const flag = wall.getFlag?.('fa-nexus', 'pathWall');
+      if (flag?.groupId && groupIds.has(flag.groupId)) ids.add(wall.id);
+    }
+  }
+  return [...ids];
+}
+
 export async function cleanupPathWallsForTile(tileLike) {
   try {
+    if (!game?.user?.isGM) return false;
     const doc = tileLike?.document || tileLike || null;
     const tileId = doc?.id;
     if (!tileId) return false;
     const scene = doc?.parent || canvas?.scene;
-    const walls = scene?.walls;
-    if (!walls?.size) return false;
-    const ids = [];
-    for (const wall of walls) {
-      if (!wall) continue;
-      const flag = wall.getFlag?.('fa-nexus', 'pathWall');
-      if (flag?.tileId === tileId && wall.id) ids.push(wall.id);
-    }
+    const ids = collectLinkedPathWallIds(doc, scene);
     if (!ids.length) return false;
-    await scene.deleteEmbeddedDocuments('Wall', ids);
-    return true;
+    return await queuePathWallDeletes(scene, ids);
   } catch (error) {
     Logger.warn('PathGeometry.cleanupWalls.failed', { error: String(error?.message || error) });
     return false;
@@ -1048,6 +1162,18 @@ function buildRenderKey(payloads = []) {
   }
 }
 
+function syncPathContainerTransform(container, mesh, doc) {
+  if (!container || container.destroyed || !mesh || mesh.destroyed) return;
+  const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
+  const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
+  const rawSx = Number(mesh?.scale?.x ?? 1) || 1;
+  const rawSy = Number(mesh?.scale?.y ?? 1) || 1;
+  const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
+  const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
+  container.scale?.set?.(1 / sx, 1 / sy);
+  container.position?.set?.(-(docWidth / 2) / (sx || 1), -(docHeight / 2) / (sy || 1));
+}
+
 function resolvePathMeshes(container) {
   if (!container || container.destroyed) return [];
   const stored = Array.isArray(container.faNexusPathMeshes) && container.faNexusPathMeshes.length
@@ -1084,21 +1210,17 @@ export async function applyPathTile(tile) {
 
     ensureMeshTransparent(mesh);
 
-    const docAlpha = Number(doc?.alpha);
-    const containerAlpha = Number.isFinite(docAlpha) ? Math.min(1, Math.max(0, docAlpha)) : 1;
+    const containerAlpha = 1;
     const renderKey = buildRenderKey(payloads);
 
     let container = tile.faNexusPathContainer;
     if (container && !container.destroyed && container.faNexusPathRenderKey === renderKey) {
-      if (container.parent !== mesh) {
-        try { container.parent?.removeChild?.(container); } catch (_) {}
+      if (!container.parent) {
         mesh.addChild(container);
       }
-      try { container.alpha = containerAlpha; }
+        try { container.alpha = containerAlpha; }
       catch (_) {}
-      const prevContainerAlpha = Number.isFinite(container.faNexusPathContainerAlpha)
-        ? Number(container.faNexusPathContainerAlpha)
-        : 1;
+      const prevContainerAlpha = 1;
       const existingMeshes = resolvePathMeshes(container);
       for (const meshPath of existingMeshes) {
         let entryAlpha = Number.isFinite(meshPath?.faNexusPathAlpha) ? Number(meshPath.faNexusPathAlpha) : null;
@@ -1123,8 +1245,7 @@ export async function applyPathTile(tile) {
         container.sortableChildren = false;
         tile.faNexusPathContainer = container;
         mesh.addChild(container);
-      } else if (container.parent !== mesh) {
-        try { container.parent?.removeChild?.(container); } catch (_) {}
+      } else if (!container.parent) {
         mesh.addChild(container);
       }
       try { container.alpha = containerAlpha; }
@@ -1139,6 +1260,7 @@ export async function applyPathTile(tile) {
       const textureCache = new Map();
       const visibleCache = new Map();
       const useVisibleRows = kind === 'v2';
+      const tileHsbc = readDocumentHsbc(doc, { nullIfMissing: true, nullIfNeutral: true });
       for (const data of payloads) {
         const baseSrc = data?.baseSrc;
         if (!baseSrc) continue;
@@ -1170,7 +1292,10 @@ export async function applyPathTile(tile) {
 
         let meshPath = null;
         if (shouldUseWallMesher(controlPoints, data)) {
-          meshPath = createWallMesherPathMesh(controlPoints, data, texture, { visibleData });
+          meshPath = createWallMesherPathMesh(controlPoints, data, texture, {
+            visibleData,
+            hsbc: normalizeHsbc(data?.hsbc ?? tileHsbc, null)
+          });
         } else {
           const samples = computeSamplesFromPoints(
             controlPoints,
@@ -1183,15 +1308,16 @@ export async function applyPathTile(tile) {
             samples,
             data.width,
             data.repeatSpacing,
-            texture,
-            {
-              textureOffset: data?.textureOffset,
-              textureFlip: data?.textureFlip,
-              feather: data?.feather,
-              opacityFeather: data?.opacityFeather,
-              visibleData
-            }
-          );
+              texture,
+              {
+                textureOffset: data?.textureOffset,
+                textureFlip: data?.textureFlip,
+                feather: data?.feather,
+                opacityFeather: data?.opacityFeather,
+                visibleData,
+                hsbc: normalizeHsbc(data?.hsbc ?? tileHsbc, null)
+              }
+            );
         }
         if (!meshPath) continue;
 
@@ -1217,12 +1343,16 @@ export async function applyPathTile(tile) {
       cleanupPathOverlay(tile);
       return;
     }
-    const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
-    const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
-    const sx = Number(mesh?.scale?.x ?? 1) || 1;
-    const sy = Number(mesh?.scale?.y ?? 1) || 1;
-    container.scale?.set?.(1 / sx, 1 / sy);
-    container.position?.set?.(-(docWidth / 2) / (sx || 1), -(docHeight / 2) / (sy || 1));
+    syncPathContainerTransform(container, mesh, doc);
+    attachCustomTileOverhead(tile, {
+      kind: 'path',
+      contentContainer: container,
+      proxyFactory: createDisplayProxyFactory(container),
+      syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
+        syncPathContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+      }
+    });
+    invalidateCustomTileOverhead(tile, 'path-refresh');
   } catch (err) {
     Logger.warn('PathGeometry.apply.failed', String(err?.message || err));
   }

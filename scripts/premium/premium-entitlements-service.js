@@ -1,4 +1,5 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { getPremiumEntitlementSnapshotOverride, handlePremiumRuntimeSettingChange } from './premium-runtime-config.js';
 
 const DEFAULT_ENDPOINT = 'foundry-nexus-premium-entitlements';
 const MODULE_ID = 'fa-nexus';
@@ -51,6 +52,8 @@ export class PremiumEntitlementsService {
     this._latestRefresh = null;
     this._changeEmitter = new ChangeEmitter();
     this._inflight = null;
+    this._refreshSequence = 0;
+    this._activeRefreshId = 0;
     this._settingsHook = null;
     this._installSettingsHook();
   }
@@ -76,18 +79,31 @@ export class PremiumEntitlementsService {
 
   async refresh({ signal, force = false, bundle } = {}) {
     if (this._inflight && !force) return this._inflight;
-    const task = this._doRefresh({ signal, bundle }).finally(() => {
+    const requestId = ++this._refreshSequence;
+    this._activeRefreshId = requestId;
+    const task = this._doRefresh({ signal, bundle, requestId }).finally(() => {
       if (this._inflight === task) this._inflight = null;
     });
     this._inflight = task;
     return task;
   }
 
-  async _doRefresh({ signal, bundle }) {
+  async _doRefresh({ signal, bundle, requestId }) {
     try {
+      const overrideSnapshot = await getPremiumEntitlementSnapshotOverride();
+      if (overrideSnapshot) {
+        if (!this._applyRefreshState(overrideSnapshot, requestId)) return this.snapshot();
+        this._latestRefresh = Date.now();
+        Logger.info('PremiumEntitlementsService.refresh.devBridge', {
+          bundle: bundle || null,
+          bundles: Array.from(overrideSnapshot.bundles.keys())
+        });
+        return this.snapshot();
+      }
+
       const state = this._resolvePatreonState();
       if (!state) {
-        this.clear({ silent: true, reason: 'missing-state' });
+        this.clear({ silent: true, reason: 'missing-state', requestId });
         throw new PremiumGateError('STATE_MISSING', 'No stored Patreon state; authenticate first.');
       }
 
@@ -99,7 +115,7 @@ export class PremiumEntitlementsService {
       Logger.info('PremiumEntitlementsService.refresh.version', { detectedVersion: currentModuleVersion });
       if (currentModuleVersion) url.searchParams.set('moduleVersion', currentModuleVersion);
 
-      this._updateState({ status: 'refreshing' });
+      if (!this._applyRefreshState({ status: 'refreshing' }, requestId)) return this.snapshot();
 
       const res = await fetch(url.toString(), { method: 'GET', signal });
       const payload = await this._safeJson(res);
@@ -121,7 +137,7 @@ export class PremiumEntitlementsService {
         sessionToken
       };
 
-      this._updateState(snapshot);
+      if (!this._applyRefreshState(snapshot, requestId)) return this.snapshot();
       this._latestRefresh = Date.now();
       Logger.info('PremiumEntitlementsService.refresh.success', {
         expiresAt,
@@ -133,7 +149,15 @@ export class PremiumEntitlementsService {
         error: String(err?.message || err),
         code: err?.code || err?.name
       });
-      this._updateState({ status: 'error' });
+      if (!this._isActiveRefreshRequest(requestId)) {
+        Logger.info('PremiumEntitlementsService.refresh.staleFailureIgnored', {
+          requestId,
+          activeRequestId: this._activeRefreshId,
+          code: err?.code || err?.name
+        });
+        return this.snapshot();
+      }
+      this._applyRefreshState({ status: 'error' }, requestId);
       throw err;
     }
   }
@@ -208,9 +232,37 @@ export class PremiumEntitlementsService {
     this._changeEmitter.emit(this.snapshot());
   }
 
-  clear({ silent = false, reason = 'manual' } = {}) {
+  _isActiveRefreshRequest(requestId) {
+    return requestId == null || requestId === this._activeRefreshId;
+  }
+
+  _applyRefreshState(partial, requestId) {
+    if (!this._isActiveRefreshRequest(requestId)) {
+      Logger.info('PremiumEntitlementsService.refresh.staleIgnored', {
+        requestId,
+        activeRequestId: this._activeRefreshId,
+        status: partial?.status || null
+      });
+      return false;
+    }
+    this._updateState(partial);
+    return true;
+  }
+
+  clear({ silent = false, reason = 'manual', requestId = null } = {}) {
+    if (requestId != null && !this._isActiveRefreshRequest(requestId)) {
+      Logger.info('PremiumEntitlementsService.clear.staleIgnored', {
+        requestId,
+        activeRequestId: this._activeRefreshId,
+        reason
+      });
+      return false;
+    }
     this._inflight = null;
     this._latestRefresh = null;
+    if (requestId == null) {
+      this._activeRefreshId = ++this._refreshSequence;
+    }
     const snapshot = {
       status: 'idle',
       entitlements: Object.create(null),
@@ -223,6 +275,7 @@ export class PremiumEntitlementsService {
       try { Logger.info('PremiumEntitlementsService.clear', { reason }); }
       catch (_) {}
     }
+    return true;
   }
 
   destroy() {
@@ -233,6 +286,8 @@ export class PremiumEntitlementsService {
     } catch (_) {}
     this._settingsHook = null;
     this._changeEmitter.clear();
+    this._refreshSequence = 0;
+    this._activeRefreshId = 0;
     this._state = {
       status: 'idle',
       entitlements: Object.create(null),
@@ -248,11 +303,9 @@ export class PremiumEntitlementsService {
       if (!hookApi?.on || this._settingsHook) return;
       this._settingsHook = (setting) => {
         try {
-          if (!setting || setting.namespace !== MODULE_ID) return;
-          if (setting.key !== 'patreon_auth_data') return;
-          const value = setting.value ?? setting._source?.value ?? null;
-          if (value) return;
-          this.clear({ silent: true, reason: 'settings-update' });
+          handlePremiumRuntimeSettingChange(setting, {
+            clear: (options) => this.clear(options)
+          });
         } catch (error) {
           Logger.warn('PremiumEntitlementsService.settingsHook.error', { error: String(error?.message || error) });
         }

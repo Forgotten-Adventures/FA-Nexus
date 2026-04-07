@@ -12,7 +12,9 @@ const DEFAULT_OPTIONS = Object.freeze({
   mitreLimit: 4,
   textureRepeatDistance: 1,
   maxSegmentLength: DEFAULT_SEGMENT_SUBDIVISION,
-  pivot: 'center' // center | left | right (future-proof)
+  pivot: 'center', // center | left | right (future-proof)
+  startJoinDir: null,
+  endJoinDir: null
 });
 
 function isFiniteNumber(value) {
@@ -39,6 +41,16 @@ function normalize(a) {
   const len = length(a);
   if (len < EPSILON) return { x: 0, y: 0 };
   return { x: a.x / len, y: a.y / len };
+}
+
+function normalizeDirection(value) {
+  if (!value || typeof value !== 'object') return null;
+  const dir = normalize({
+    x: Number(value.x) || 0,
+    y: Number(value.y) || 0
+  });
+  if (Math.abs(dir.x) < EPSILON && Math.abs(dir.y) < EPSILON) return null;
+  return dir;
 }
 
 function rotate90(a) {
@@ -235,6 +247,8 @@ function resolveJoinVectors(points, options, centerOffset = 0) {
   const rightOffsets = new Array(count);
   const hasCenterOffset = Math.abs(centerOffset) > EPSILON;
   const centerOffsets = hasCenterOffset ? new Array(count) : null;
+  const startJoinDir = !closed ? normalizeDirection(options?.startJoinDir) : null;
+  const endJoinDir = !closed ? normalizeDirection(options?.endJoinDir) : null;
 
   for (let i = 0; i < count; i++) {
     const curr = points[i];
@@ -254,6 +268,8 @@ function resolveJoinVectors(points, options, centerOffset = 0) {
       if (vec.x || vec.y) nextDir = vec;
     }
 
+    if (!prevDir && i === 0 && startJoinDir) prevDir = startJoinDir;
+    if (!nextDir && i === count - 1 && endJoinDir) nextDir = endJoinDir;
     if (!prevDir && nextDir) prevDir = nextDir;
     if (!nextDir && prevDir) nextDir = prevDir;
 
@@ -450,7 +466,7 @@ function shouldTreatCornerVertex(prevDir, nextDir, { isEndpoint = false } = {}) 
   return dotValue <= CORNER_DOT_THRESHOLD;
 }
 
-function samplePolygonPerimeter(points, closed, maxSampleDistance = 10, cornerSampleRadius = 5) {
+function samplePolygonPerimeter(points, closed, maxSampleDistance = 10, cornerSampleRadius = 5, options = {}) {
   if (!Array.isArray(points) || points.length < 2) {
     return { samples: [], totalDistance: 0 };
   }
@@ -462,6 +478,8 @@ function samplePolygonPerimeter(points, closed, maxSampleDistance = 10, cornerSa
   const rightAngleThreshold = 0.1;
   const sharpCornerThreshold = Math.cos(Math.PI * 0.75);
   const verySharpThreshold = Math.cos(Math.PI * 0.85);
+  const startJoinDir = !closed ? normalizeDirection(options?.startJoinDir) : null;
+  const endJoinDir = !closed ? normalizeDirection(options?.endJoinDir) : null;
 
   for (let i = 0; i < segmentCount; i++) {
     const p1 = points[i];
@@ -495,11 +513,15 @@ function samplePolygonPerimeter(points, closed, maxSampleDistance = 10, cornerSa
     if (p0) {
       const prevVec = resolveDirection(p0, p1);
       if (prevVec.x || prevVec.y) prevDir = prevVec;
+    } else if (!closed && i === 0 && startJoinDir) {
+      prevDir = startJoinDir;
     }
 
     if (p3) {
       const nextVec = resolveDirection(p2, p3);
       if (nextVec.x || nextVec.y) nextSegmentDir = nextVec;
+    } else if (!closed && i === segmentCount - 1 && endJoinDir) {
+      nextSegmentDir = endJoinDir;
     }
 
     const treatCurrentVertexAsCorner = shouldTreatCornerVertex(prevDir, segmentTangent, {
@@ -542,15 +564,15 @@ function samplePolygonPerimeter(points, closed, maxSampleDistance = 10, cornerSa
       let vertexIndex = null;
 
       // Mark corner vertices to use precomputed join offsets
-      if (j === 0 && (closed || i > 0)) {
+      if (j === 0) {
         if (treatCurrentVertexAsCorner) {
           isCornerSample = true;
           vertexIndex = i;
         }
-      } else if (j === numSamples - 1 && closed && i === count - 1) {
+      } else if (j === numSamples - 1 && (closed ? i === count - 1 : i === segmentCount - 1)) {
         if (nextVertexCornerHint ?? true) {
           isCornerSample = true;
-          vertexIndex = 0;
+          vertexIndex = closed && i === count - 1 ? 0 : Math.min(count - 1, i + 1);
         }
       }
 
@@ -611,22 +633,37 @@ export class BuildingWallMesher {
       };
     }
 
-    const centerOffsetValue = Number(options?.textureOffset?.y) || 0;
+    const explicitCenterOffset = Number(options?.centerOffset);
+    const centerOffsetValue = Number.isFinite(explicitCenterOffset)
+      ? explicitCenterOffset
+      : (Number(options?.textureOffset?.y) || 0);
     const hasCenterOffset = Math.abs(centerOffsetValue) > EPSILON;
     const workingPoints = hasCenterOffset
       ? offsetPolygonPoints(normalizedPoints, centerOffsetValue, {
           closed,
           joinStyle: options.joinStyle,
           mitreLimit: options.mitreLimit,
-          width: options.width
+          width: options.width,
+          startJoinDir: options.startJoinDir,
+          endJoinDir: options.endJoinDir
         })
       : normalizedPoints;
     const adjustedTextureOffset = hasCenterOffset
       ? { ...(options.textureOffset || {}), y: 0 }
       : (options.textureOffset || { x: 0, y: 0 });
+    const geometryOptions = {
+      ...options,
+      textureOffset: adjustedTextureOffset
+    };
 
     const maxSampleDistance = Math.max(4, options.maxSegmentLength || DEFAULT_SEGMENT_SUBDIVISION);
-    const { samples, totalDistance } = samplePolygonPerimeter(workingPoints, closed, maxSampleDistance, maxSampleDistance / 2);
+    const { samples, totalDistance } = samplePolygonPerimeter(
+      workingPoints,
+      closed,
+      maxSampleDistance,
+      maxSampleDistance / 2,
+      options
+    );
     if (!samples || samples.length < 2) {
       return {
         positions: [],
@@ -638,11 +675,6 @@ export class BuildingWallMesher {
         options: geometryOptions
       };
     }
-
-    const geometryOptions = {
-      ...options,
-      textureOffset: adjustedTextureOffset
-    };
 
     const offsets = resolveJoinVectors(workingPoints, geometryOptions);
     if (offsets) {

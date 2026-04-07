@@ -4,6 +4,7 @@ import { premiumEntitlementsService } from '../premium/premium-entitlements-serv
 import { ensurePremiumFeaturesRegistered } from '../premium/premium-feature-registry.js';
 import './path-tiles.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
+import { requestSelectionFilterRefresh } from '../canvas/selection-filter-refresh.js';
 
 const MODULE_ID = 'fa-nexus';
 const PATH_SUBTOOL_SETTING_KEY = 'pathToolActiveSubtool';
@@ -119,15 +120,28 @@ export class PathManager {
 
   stop(...args) {
     this._cancelToolWindowMonitor();
-    if (!this._delegate) {
+    const finalize = () => {
       toolOptionsController.deactivateTool('path.edit');
+      requestSelectionFilterRefresh({
+        reason: 'path-editor-stop',
+        source: 'path-manager'
+      });
+    };
+    if (!this._delegate) {
+      finalize();
       return;
     }
     try {
       if (this._delegate?.isActive) this._persistDelegateToolDefaults();
-      return this._delegate.stop?.(...args);
-    } finally {
-      toolOptionsController.deactivateTool('path.edit');
+      const result = this._delegate.stop?.(...args);
+      if (result && typeof result.then === 'function') {
+        return Promise.resolve(result).finally(finalize);
+      }
+      finalize();
+      return result;
+    } catch (error) {
+      finalize();
+      throw error;
     }
   }
 
@@ -223,6 +237,10 @@ export class PathManager {
       try { active = !!delegate?.isActive; }
       catch (_) { active = false; }
       if (!active) {
+        requestSelectionFilterRefresh({
+          reason: 'path-editor-monitor-stop',
+          source: 'path-manager'
+        });
         toolOptionsController.deactivateTool(toolId);
         this._cancelToolWindowMonitor();
         return;

@@ -2,8 +2,10 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { TileFlattenManager } from './tile-flatten-manager.js';
 
 const BUTTON_ACTION = 'fa-nexus-edit';
+const MASK_BUTTON_ACTION = 'fa-nexus-mask';
 const FLATTEN_ACTION = 'fa-nexus-flatten';
 const DECONSTRUCT_ACTION = 'fa-nexus-deconstruct';
+const STANDARD_TILE_MASK_HUD_ENABLED = false;
 
 let _tileFlattenManager = null;
 
@@ -38,6 +40,10 @@ function getTileMode(doc) {
     Logger.warn('TileHud.checkFlags.failed', { error: String(error?.message || error) });
   }
   return null;
+}
+
+export function getFaNexusTileEditMode(doc) {
+  return getTileMode(doc);
 }
 
 function resolveHudElement(hud, payload) {
@@ -79,11 +85,72 @@ function ensureButton(root, mode) {
   return button;
 }
 
+function isImageTile(doc) {
+  try {
+    const src = String(doc?.texture?.src || '').trim();
+    if (!src) return false;
+    return !/\.(webm|mp4)$/i.test(src);
+  } catch (_) {
+    return false;
+  }
+}
+
+function isScatterTile(doc) {
+  try {
+    const scatter = doc?.getFlag?.('fa-nexus', 'assetScatter');
+    if (scatter && typeof scatter === 'object' && Array.isArray(scatter.instances)) return true;
+  } catch (_) {}
+  try {
+    const flags = doc?.flags?.['fa-nexus'] || doc?._source?.flags?.['fa-nexus'];
+    return !!(flags?.assetScatter && typeof flags.assetScatter === 'object' && Array.isArray(flags.assetScatter.instances));
+  } catch (_) {
+    return false;
+  }
+}
+
+function shouldShowStandardMaskButton(doc) {
+  try {
+    if (!STANDARD_TILE_MASK_HUD_ENABLED) return false;
+    if (!doc) return false;
+    if (doc.getFlag('fa-nexus', 'path') || isPathV2Tile(doc)) return false;
+    if (doc.getFlag('fa-nexus', 'maskedTiling')) return false;
+    if (doc.getFlag('fa-nexus', 'building')) return false;
+    if (isScatterTile(doc)) return false;
+    return isImageTile(doc);
+  } catch (_) {
+    return false;
+  }
+}
+
+function ensureStandardMaskButton(root, doc) {
+  const column = root?.querySelector?.('.col.right') || null;
+  const existing = column?.querySelector?.(`button[data-action="${MASK_BUTTON_ACTION}"]`) || null;
+  if (!column || !shouldShowStandardMaskButton(doc)) {
+    if (existing) existing.remove();
+    return null;
+  }
+  let button = existing;
+  if (!button) {
+    button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'control-icon fa-nexus-mask';
+    button.dataset.action = MASK_BUTTON_ACTION;
+    button.innerHTML = '<i class="fas fa-mask"></i>';
+    column.appendChild(button);
+  }
+  const hasMask = !!doc?.getFlag?.('fa-nexus', 'standardTileMask');
+  const label = hasMask ? 'Edit Standard Tile Mask in FA Nexus' : 'Mask Standard Tile in FA Nexus';
+  button.dataset.tooltip = label;
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  return button;
+}
+
 function ensureFlattenButton(root, count, allowSingleMerged) {
   const column = root?.querySelector?.('.col.right') || null;
   const existing = column?.querySelector?.(`button[data-action="${FLATTEN_ACTION}"]`) || null;
 
-  if (!column || !count || (count < 2 && !allowSingleMerged)) {
+  if (!column || count < 1) {
     if (existing) existing.remove();
     return null;
   }
@@ -100,7 +167,7 @@ function ensureFlattenButton(root, count, allowSingleMerged) {
 
   const label = count > 1
     ? `Flatten ${count} selected tile${count === 1 ? '' : 's'} in FA Nexus`
-    : 'Flatten merged tile in FA Nexus';
+    : (allowSingleMerged ? 'Flatten merged tile in FA Nexus' : 'Flatten selected tile in FA Nexus');
   button.dataset.count = String(count);
   button.dataset.tooltip = label;
   button.setAttribute('aria-label', label);
@@ -231,7 +298,7 @@ function isPathV2Tile(doc) {
   return false;
 }
 
-async function launchEditor(doc, mode) {
+async function launchEditor(doc, mode, options = {}) {
   if (!doc) throw new Error('Tile document not available');
   const pointerPayload = buildPointerPayload(doc) || {};
   const appFactory = window.faNexus?.open;
@@ -261,11 +328,26 @@ async function launchEditor(doc, mode) {
   else if (mode === 'textures') manager = tab?.texturePaintManager;
   else manager = tab?.placementManager;
   if (!manager) throw new Error('FA Nexus editor manager unavailable');
-  const options = {};
-  if (pointerPayload.pointer) options.pointer = pointerPayload.pointer;
-  if (pointerPayload.world) options.pointerWorld = pointerPayload.world;
-  options.source = 'tile-hud';
-  await manager.editTile(doc, options);
+  const launchOptions = { ...(options && typeof options === 'object' ? options : {}) };
+  if (pointerPayload.pointer) launchOptions.pointer = pointerPayload.pointer;
+  if (pointerPayload.world) launchOptions.pointerWorld = pointerPayload.world;
+  launchOptions.source = 'tile-hud';
+  if (mode === 'textures' && launchOptions.standardTileMask) {
+    await manager.editStandardTile(doc, launchOptions);
+    return;
+  }
+  await manager.editTile(doc, launchOptions);
+}
+
+export async function openFaNexusTileEditor(doc, options = {}) {
+  const mode = getTileMode(doc);
+  if (!mode) {
+    Logger.error('TileHud.openEditor.unsupportedTile', {
+      tileId: doc?.id || null
+    });
+    throw new Error('This tile does not support FA Nexus editing.');
+  }
+  return launchEditor(doc, mode, options);
 }
 
 Hooks.on('renderTileHUD', (hud, html) => {
@@ -283,26 +365,30 @@ Hooks.on('renderTileHUD', (hud, html) => {
     };
 
     const selectedTiles = TileFlattenManager.getSelectedTiles();
-    const flattenCount = Array.isArray(selectedTiles) ? selectedTiles.length : 0;
-    const allowSingleMerged = flattenCount === 1 && TileFlattenManager.isMergedTile(selectedTiles[0]);
-    const flattenButton = ensureFlattenButton(root, flattenCount, allowSingleMerged);
+    const flattenableTiles = TileFlattenManager.getFlattenableTiles(selectedTiles);
+    const flattenCount = Array.isArray(flattenableTiles) ? flattenableTiles.length : 0;
+    const selectedSingleFlattened = selectedTiles.length === 1 && TileFlattenManager.isFlattenedTile(selectedTiles[0]);
+    const allowSingleMerged = flattenCount === 1 && TileFlattenManager.isMergedTile(flattenableTiles[0]);
+    const flattenButton = ensureFlattenButton(root, selectedSingleFlattened ? 0 : flattenCount, allowSingleMerged);
     if (flattenButton) {
       if (flattenButton._faNexusFlattenHandler) {
         flattenButton.removeEventListener('click', flattenButton._faNexusFlattenHandler);
       }
       updateFlattenState = () => {
         const selection = TileFlattenManager.getSelectedTiles();
-        const count = Array.isArray(selection) ? selection.length : 0;
+        const flattenSelection = TileFlattenManager.getFlattenableTiles(selection);
+        const count = Array.isArray(flattenSelection) ? flattenSelection.length : 0;
         const canFlatten = TileFlattenManager.canFlattenSelection(selection);
-        const singleMerged = count === 1 && TileFlattenManager.isMergedTile(selection[0]);
+        const singleMerged = count === 1 && TileFlattenManager.isMergedTile(flattenSelection[0]);
+        const singleFlattened = selection.length === 1 && TileFlattenManager.isFlattenedTile(selection[0]);
         const busy = manager?.isBusy ? manager.isBusy() : !!manager?._flattening;
-        const disabled = busy || !canFlatten;
+        const disabled = busy || singleFlattened || !canFlatten;
         flattenButton.disabled = disabled;
-        flattenButton.classList.toggle('disabled', disabled);
+        flattenButton.classList.toggle('disabled', disabled || singleFlattened);
         flattenButton.dataset.count = String(count);
         const label = count > 1
           ? `Flatten ${count} selected tile${count === 1 ? '' : 's'} in FA Nexus`
-          : (singleMerged ? 'Flatten merged tile in FA Nexus' : 'Flatten tiles in FA Nexus');
+          : (singleMerged ? 'Flatten merged tile in FA Nexus' : 'Flatten selected tile in FA Nexus');
         flattenButton.dataset.tooltip = label;
         flattenButton.setAttribute('aria-label', label);
         flattenButton.title = label;
@@ -360,6 +446,8 @@ Hooks.on('renderTileHUD', (hud, html) => {
     if (!mode) {
       const existing = root.querySelector(`button[data-action="${BUTTON_ACTION}"]`);
       if (existing) existing.remove();
+      const maskExisting = root.querySelector(`button[data-action="${MASK_BUTTON_ACTION}"]`);
+      if (maskExisting) maskExisting.remove();
       return;
     }
     const button = ensureButton(root, mode);
@@ -378,6 +466,26 @@ Hooks.on('renderTileHUD', (hud, html) => {
     };
     button._faNexusHandler = handler;
     button.addEventListener('click', handler);
+
+    const maskButton = ensureStandardMaskButton(root, doc);
+    if (!maskButton) return;
+    if (maskButton._faNexusHandler) {
+      maskButton.removeEventListener('click', maskButton._faNexusHandler);
+      delete maskButton._faNexusHandler;
+    }
+    const maskHandler = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      launchEditor(doc, 'textures', { standardTileMask: true }).catch((error) => {
+        Logger.error('TileHud.launchStandardMaskEditor.failed', {
+          tileId: doc?.id || null,
+          error: String(error?.message || error)
+        });
+        ui?.notifications?.error?.(`Failed to open FA Nexus standard tile mask editor: ${error?.message || error}`);
+      });
+    };
+    maskButton._faNexusHandler = maskHandler;
+    maskButton.addEventListener('click', maskHandler);
   } catch (error) {
     Logger.warn('TileHud.render.failed', { error: String(error?.message || error) });
   }

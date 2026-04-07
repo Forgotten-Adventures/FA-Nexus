@@ -5,15 +5,20 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { getCanvasInteractionController, announceChange } from '../canvas/canvas-interaction-controller.js';
 import { getZoomAtCursorView, isPointerOverCanvas } from '../canvas/canvas-pointer-utils.js';
 import { createCanvasGestureSession } from '../canvas/canvas-gesture-session.js';
+import { SHORTCUT_ACTION, createShortcut, isGridSnapShortcut, isHelpShortcut } from '../core/editor-shortcuts.js';
+import { createNormalizedToolOptionsDescriptor, TOOL_OPTIONS_RENDERER_MODE } from '../core/tool-options-descriptor.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
 import { PlacementPrefetchQueue } from '../core/placement/placement-prefetch-queue.js';
 
 const DEFAULT_PLACE_AS_SELECTION = 'fa-nexus:create-new';
+const AUTO_NEW_ACTOR_TYPE_SELECTION = 'fa-nexus:auto-actor-type';
 const MAX_PLACE_AS_RESULTS = 60;
 const MAX_PLACE_AS_SUGGESTIONS = 10;
 const MIN_AUTO_PLACE_AS_SCORE = 35;
 const HP_MODES = ['actor', 'formula', 'percent', 'static'];
 const DEFAULT_HP_PERCENT = 20;
+const DEFAULT_ROTATION_RANDOM_MIN = 0;
+const DEFAULT_ROTATION_RANDOM_MAX = 359;
 const joinPath = (folder, name) => {
   const filename = String(name || '').trim();
   if (!filename) return String(folder || '').trim();
@@ -40,8 +45,8 @@ export class TokenPlacementManager {
     this._lastPointerWorld = null;
     this._rotation = 0;
     this._rotationRandomEnabled = false;
-    this._rotationRandomStrength = 0;
-    this._currentRandomOffset = 0;
+    this._rotationRandomMin = DEFAULT_ROTATION_RANDOM_MIN;
+    this._rotationRandomMax = DEFAULT_ROTATION_RANDOM_MAX;
     this._pendingRotation = 0;
     this._flipHorizontal = false;
     this._flipVertical = false;
@@ -57,6 +62,8 @@ export class TokenPlacementManager {
     this._suppressNextActorClick = false;
     this._settingsHook = null;
     this._gridSnapHook = null;
+    this._gridSnapShortcutHeld = false;
+    this._gridSnapShortcutPendingToggle = false;
     this._randomMode = false;
     this._randomEntries = [];
     this._currentEntry = null;
@@ -93,6 +100,12 @@ export class TokenPlacementManager {
     this._placeAsExcludedPacks = new Set();
     this._placeAsAvailablePacks = [];
     this._placeAsFilterDialogOpen = false;
+    this._newActorTypeChoices = [];
+    this._newActorTypeAuto = '';
+    this._newActorTypeOverride = null;
+    this._newActorTypeLoading = false;
+    this._newActorTypeError = null;
+    this._newActorTypeRefreshPromise = null;
     this._hpMode = 'actor';
     this._hpPercent = DEFAULT_HP_PERCENT;
     this._hpStaticValue = '';
@@ -105,6 +118,7 @@ export class TokenPlacementManager {
     this._installActorOptionHooks();
     this._loadExcludedPacks();
     this._ensureActorOptionsLoaded();
+    this._ensureNewActorTypeOptionsLoaded();
     this._syncToolOptionsState();
   }
 
@@ -135,6 +149,10 @@ export class TokenPlacementManager {
     catch (_) { /* no-op */ }
   }
 
+  primeActorTypeChoices() {
+    return this._ensureNewActorTypeOptionsLoaded();
+  }
+
   async startPlacementFromCard(cardElement, { sticky = false, pointerEvent = null } = {}) {
     try {
       if (!cardElement) return;
@@ -160,6 +178,7 @@ export class TokenPlacementManager {
       payload.url = this._resolveCurrentUrl(cardElement, payload);
 
       this._ensureActorOptionsLoaded();
+      this._ensureNewActorTypeOptionsLoaded();
       this._placeAsOpen = false;
       this._placeAsSearch = '';
       this._applyPlaceAsMatchContext(payload, cardElement, { resetContext: true, autoSelect: true });
@@ -171,8 +190,8 @@ export class TokenPlacementManager {
       this._currentEntry = this._createEntryFromCard(cardElement, payload);
       this._rotation = 0;
       this._rotationRandomEnabled = false;
-      this._rotationRandomStrength = 45;
-      this._currentRandomOffset = 0;
+      this._rotationRandomMin = DEFAULT_ROTATION_RANDOM_MIN;
+      this._rotationRandomMax = DEFAULT_ROTATION_RANDOM_MAX;
       this._pendingRotation = this._rotation;
       this._updateRotationPreview();
       this._flipHorizontal = false;
@@ -240,8 +259,8 @@ export class TokenPlacementManager {
       this._hpFormulaWarned = false;
       this._rotation = 0;
       this._rotationRandomEnabled = false;
-      this._rotationRandomStrength = 45;
-      this._currentRandomOffset = 0;
+      this._rotationRandomMin = DEFAULT_ROTATION_RANDOM_MIN;
+      this._rotationRandomMax = DEFAULT_ROTATION_RANDOM_MAX;
       this._pendingRotation = this._rotation;
       this._updateRotationPreview();
       this._flipHorizontal = false;
@@ -255,6 +274,7 @@ export class TokenPlacementManager {
       this._updateFlipPreview();
       this._placing = false;
       this._ensureActorOptionsLoaded();
+      this._ensureNewActorTypeOptionsLoaded();
       this._placeAsOpen = false;
       this._placeAsSearch = '';
       this._placeAsUserModified = false;
@@ -307,7 +327,8 @@ export class TokenPlacementManager {
     this._current = null;
     this._rotation = 0;
     this._rotationRandomEnabled = false;
-    this._currentRandomOffset = 0;
+    this._rotationRandomMin = DEFAULT_ROTATION_RANDOM_MIN;
+    this._rotationRandomMax = DEFAULT_ROTATION_RANDOM_MAX;
     this._pendingRotation = 0;
     this._flipHorizontal = false;
     this._flipVertical = false;
@@ -319,6 +340,8 @@ export class TokenPlacementManager {
     this._pendingFlipVertical = false;
     this._lastPointer = null;
     this._lastPointerWorld = null;
+    this._gridSnapShortcutHeld = false;
+    this._gridSnapShortcutPendingToggle = false;
     this._clearActorHoverHighlight();
     this._teardownActorClickBlocker();
     try {
@@ -336,8 +359,26 @@ export class TokenPlacementManager {
     return ((num % 360) + 360) % 360;
   }
 
+  _clampRotationRandomValue(value, fallback = DEFAULT_ROTATION_RANDOM_MIN) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.min(DEFAULT_ROTATION_RANDOM_MAX, Math.max(DEFAULT_ROTATION_RANDOM_MIN, Math.round(numeric)));
+  }
+
+  _getRotationRandomRange() {
+    const min = this._clampRotationRandomValue(this._rotationRandomMin, DEFAULT_ROTATION_RANDOM_MIN);
+    const max = this._clampRotationRandomValue(this._rotationRandomMax, DEFAULT_ROTATION_RANDOM_MAX);
+    return min <= max ? { min, max } : { min: max, max: min };
+  }
+
+  _sampleRotationRandomValue() {
+    const range = this._getRotationRandomRange();
+    if (range.max <= range.min) return range.min;
+    return range.min + Math.floor(Math.random() * (range.max - range.min + 1));
+  }
+
   _hasRandomRotationEnabled() {
-    return !!this._rotationRandomEnabled && Math.max(0, Math.min(180, Number(this._rotationRandomStrength) || 0)) > 0;
+    return !!this._rotationRandomEnabled;
   }
 
   _getPendingRotation() {
@@ -358,18 +399,16 @@ export class TokenPlacementManager {
   _updateRotationPreview({ regenerateOffset = false, clampOffset = false } = {}) {
     const base = this._normalizeRotation(this._rotation);
     if (!this._hasRandomRotationEnabled()) {
-      this._currentRandomOffset = 0;
       this._pendingRotation = base;
       this._applyRotationToPreview();
       return;
     }
-    const limit = Math.max(0, Math.min(180, Number(this._rotationRandomStrength) || 0));
-    if (regenerateOffset || !Number.isFinite(this._currentRandomOffset)) {
-      this._currentRandomOffset = (Math.random() * 2 - 1) * limit;
+    const range = this._getRotationRandomRange();
+    if (regenerateOffset || !Number.isFinite(this._pendingRotation)) {
+      this._pendingRotation = this._sampleRotationRandomValue();
     } else if (clampOffset) {
-      this._currentRandomOffset = Math.max(-limit, Math.min(limit, this._currentRandomOffset));
+      this._pendingRotation = Math.min(range.max, Math.max(range.min, this._normalizeRotation(this._pendingRotation)));
     }
-    this._pendingRotation = this._normalizeRotation(base + this._currentRandomOffset);
     this._applyRotationToPreview();
   }
 
@@ -488,9 +527,14 @@ export class TokenPlacementManager {
       if (!this.isPlacementActive) return;
       if (!pointer?.overCanvas || !pointer.zOk) return;
 
+      if (this._gridSnapShortcutHeld && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        this._gridSnapShortcutPendingToggle = false;
+      }
+
       if (event.ctrlKey || event.metaKey) {
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation?.();
         const baseStep = 15;
         const step = event.shiftKey ? baseStep / 3 : baseStep;
         const dir = event.deltaY > 0 ? 1 : -1;
@@ -503,6 +547,7 @@ export class TokenPlacementManager {
       try {
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation?.();
         const stage = canvas?.stage; if (!stage) return;
         const rect = pointer.canvas?.getBoundingClientRect();
         if (!rect) return;
@@ -567,10 +612,44 @@ export class TokenPlacementManager {
 
     const keyDownHandler = (event) => {
       if (!this.isPlacementActive) return;
-      if (event.key === 'Escape') {
+      const keyName = typeof event?.key === 'string' ? event.key : '';
+      if (keyName === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation?.();
         this.cancelPlacement('esc');
+        return;
+      }
+      if (typeof isHelpShortcut === 'function' && isHelpShortcut(event)) {
+        if (this._shouldIgnorePlacementHotkey(event, keyName)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        toolOptionsController.openActiveToolHelp?.({ focus: true });
+        return;
+      }
+      if (isGridSnapShortcut(event)) {
+        if (this._shouldIgnorePlacementHotkey(event, keyName)) return;
+        this._gridSnapShortcutHeld = true;
+        if (!event.repeat) this._gridSnapShortcutPendingToggle = true;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+      }
+    };
+
+    const keyUpHandler = (event) => {
+      if (String(event?.key || '').toLowerCase() === 's') {
+        const shouldToggle = this._gridSnapShortcutHeld && this._gridSnapShortcutPendingToggle;
+        this._gridSnapShortcutHeld = false;
+        this._gridSnapShortcutPendingToggle = false;
+        if (shouldToggle) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          event.stopImmediatePropagation?.();
+          void toolOptionsController.toggleGridSnapShortcut();
+          this._refreshPlacementAfterGridSnapChange();
+        }
       }
     };
 
@@ -578,12 +657,15 @@ export class TokenPlacementManager {
       pointermove: { handler: pointerMoveHandler, respectZIndex: false },
       wheel: { handler: wheelHandler, respectZIndex: true },
       pointerdown: pointerDownHandler,
-      keydown: keyDownHandler
+      keydown: keyDownHandler,
+      keyup: keyUpHandler
     }, {
       lockCanvasLayer: 'tokens',
       onCanvasTearDown: () => this.cancelPlacement('canvas-teardown'),
       onStop: () => {
         this._session = null;
+        this._gridSnapShortcutHeld = false;
+        this._gridSnapShortcutPendingToggle = false;
       }
     });
   }
@@ -849,7 +931,9 @@ export class TokenPlacementManager {
         await this._placeUsingActorSelection(placeAsSelection, dragData, drop);
       } else {
         let pendingHpOverride = null;
+        const actorTypeOverride = this._getSelectedNewActorType();
         const created = await ActorFactory.createActorFromDragData(dragData, drop, {
+          actorTypeOverride,
           beforeTokenCreate: async (actorDoc) => {
             const tokenOptions = {};
             try {
@@ -868,6 +952,12 @@ export class TokenPlacementManager {
             }
             return tokenOptions;
           }
+        });
+        Logger.info('TokenPlacement.actorType.createNew', {
+          requestedType: this._newActorTypeOverride || null,
+          effectiveType: actorTypeOverride,
+          autoType: this._newActorTypeAuto || null,
+          actorCreated: !!created?.actor
         });
         if (created?.actor && created?.token) {
           try {
@@ -1368,7 +1458,8 @@ export class TokenPlacementManager {
     if (!hooks || typeof hooks.on !== 'function') return;
     if (!this._settingsHook) {
       this._settingsHook = (setting) => {
-        if (!setting || setting.namespace !== 'fa-nexus' || setting.key !== 'gridSnap') return;
+        if (!setting || setting.namespace !== 'fa-nexus') return;
+        if (setting.key !== 'gridSnap') return;
         this._handleGridSnapChanged(!!setting.value);
       };
       try { hooks.on('updateSetting', this._settingsHook); } catch (_) { this._settingsHook = null; }
@@ -1379,8 +1470,12 @@ export class TokenPlacementManager {
     }
   }
 
-  _handleGridSnapChanged(enabled) {
+  _handleGridSnapChanged(_enabled) {
     if (!this.isPlacementActive) return;
+    this._refreshPlacementAfterGridSnapChange();
+  }
+
+  _refreshPlacementAfterGridSnapChange() {
     this._updatePreviewPosition();
   }
 
@@ -1430,8 +1525,10 @@ export class TokenPlacementManager {
   _buildToolOptionsState() {
     const state = {
       hints: [
-        'Shift - Sticky placement; ESC to cancel.',
-        'Ctrl/Cmd+Wheel rotates the token (Shift slows).',
+        'Click to place on the canvas or an actor entry; hold Shift to keep placing; ESC cancels.',
+        'Ctrl/Cmd+Wheel rotates the token (add Shift for finer steps).',
+        'Tap S to toggle grid snap.',
+        'Press F1 to open help.'
       ]
     };
     state.rotation = this._buildRotationToolState();
@@ -1441,7 +1538,7 @@ export class TokenPlacementManager {
     // Tool options window sometimes runs "sync-only" updates which cannot create new DOM.
     // Bump layoutRevision when conditional sections (like naming toggles) appear/disappear so
     // the controller forces a re-render.
-    state.layoutRevision = `token.placement:${placeAs?.naming?.available ? 'n1' : 'n0'}`;
+    state.layoutRevision = `token.placement:${placeAs?.naming?.available ? 'n1' : 'n0'}:${placeAs?.actorType?.available ? 't1' : 't0'}`;
     return state;
   }
 
@@ -1457,9 +1554,8 @@ export class TokenPlacementManager {
   _buildRotationToolState() {
     const base = this._normalizeRotation(this._rotation);
     const preview = this._getPendingRotation();
-    const strength = Math.max(0, Math.min(180, Number(this._rotationRandomStrength) || 0));
+    const range = this._getRotationRandomRange();
     const randomToggleOn = !!this._rotationRandomEnabled;
-    const randomActive = this._hasRandomRotationEnabled();
     const baseDisplay = `${Math.round(base)}°`;
     const previewDisplay = `${Math.round(preview)}°`;
     return {
@@ -1468,16 +1564,22 @@ export class TokenPlacementManager {
       max: 359,
       step: 1,
       value: base,
-      display: randomActive ? `${previewDisplay} preview` : baseDisplay,
+      defaultValue: 0,
+      display: randomToggleOn ? `${previewDisplay} preview` : baseDisplay,
       randomEnabled: randomToggleOn,
-      strength,
-      strengthMin: 0,
-      strengthMax: 180,
-      strengthStep: 1,
-      strengthDisplay: `±${Math.round(strength)}°`,
-      randomLabel: randomToggleOn ? 'Random On' : 'Random',
+      randomMode: 'range',
+      randomMin: range.min,
+      randomMax: range.max,
+      randomMinDefault: DEFAULT_ROTATION_RANDOM_MIN,
+      randomMaxDefault: DEFAULT_ROTATION_RANDOM_MAX,
+      randomMinDisplay: `${range.min}°`,
+      randomMaxDisplay: `${range.max}°`,
+      randomMinAriaLabel: 'Minimum random rotation',
+      randomMaxAriaLabel: 'Maximum random rotation',
+      randomAria: randomToggleOn ? 'Disable random rotation' : 'Enable random rotation',
+      randomLabel: randomToggleOn ? 'On' : 'Off',
       randomTooltip: randomToggleOn ? 'Disable random rotation' : 'Enable random rotation',
-      randomHint: 'Random rotation offsets each placement within the selected strength.'
+      randomHint: 'Samples a rotation between Min and Max for each placement.'
     };
   }
 
@@ -1492,22 +1594,26 @@ export class TokenPlacementManager {
     const verticalRandomEnabled = !!this._flipRandomVerticalEnabled;
     const horizontalPreviewDiff = pending.horizontal !== base.horizontal;
     const verticalPreviewDiff = pending.vertical !== base.vertical;
+    const display = randomActive ? `${previewSummary} preview` : baseSummary;
+    const previewDisplay = !previewMatches ? `Preview: ${previewSummary}` : '';
     return {
       available: true,
-      display: randomActive ? `${previewSummary} preview` : baseSummary,
-      previewDisplay: previewMatches ? '' : `Preview: ${previewSummary}`,
-      randomHint: 'Mirror Image applies per-axis. Random toggles choose a fresh horizontal/vertical mirror on each placement.',
+      display,
+      previewDisplay,
+      previewMatchesBase: previewMatches,
+      randomActive,
+      randomHint: 'Randomizes flips per placement on the selected axes.',
       horizontal: {
         active: base.horizontal,
         pending: pending.horizontal,
         label: 'Flip H',
         tooltip: 'Mirror token left/right.',
-        previewDiff: horizontalPreviewDiff,
+        previewDiff: randomActive && horizontalPreviewDiff,
         aria: 'Toggle horizontal mirroring',
         disabled: false,
         randomEnabled: horizontalRandomEnabled,
         randomLabel: horizontalRandomEnabled ? 'Random On' : 'Random',
-        randomTooltip: horizontalRandomEnabled ? 'Disable random horizontal mirror' : 'Enable random horizontal mirror',
+        randomTooltip: horizontalRandomEnabled ? 'Disable random horizontal flip' : 'Enable random horizontal flip',
         randomDisabled: false,
         randomAria: 'Toggle random horizontal mirroring',
         randomPreviewDiff: horizontalRandomEnabled && horizontalPreviewDiff
@@ -1517,17 +1623,105 @@ export class TokenPlacementManager {
         pending: pending.vertical,
         label: 'Flip V',
         tooltip: 'Mirror token up/down.',
-        previewDiff: verticalPreviewDiff,
+        previewDiff: randomActive && verticalPreviewDiff,
         aria: 'Toggle vertical mirroring',
         disabled: false,
         randomEnabled: verticalRandomEnabled,
         randomLabel: verticalRandomEnabled ? 'Random On' : 'Random',
-        randomTooltip: verticalRandomEnabled ? 'Disable random vertical mirror' : 'Enable random vertical mirror',
+        randomTooltip: verticalRandomEnabled ? 'Disable random vertical flip' : 'Enable random vertical flip',
         randomDisabled: false,
         randomAria: 'Toggle random vertical mirroring',
         randomPreviewDiff: verticalRandomEnabled && verticalPreviewDiff
       }
     };
+  }
+
+  _buildDeclarativeToolOptionsConfig(legacyState = {}) {
+    const controls = {};
+    const sections = [];
+    const addScalarRandomizedControl = ({
+      id,
+      label,
+      ariaLabel = '',
+      state,
+      variant = 'scale',
+      handlerId,
+      randomHandlerId = '',
+      strengthHandlerId = '',
+      randomMinHandlerId = '',
+      randomMaxHandlerId = ''
+    } = {}) => {
+      if (!id || !state || typeof state !== 'object') return null;
+      controls[id] = {
+        id,
+        type: 'scalar-randomized',
+        variant,
+        label: typeof state.label === 'string' && state.label.trim().length ? state.label.trim() : label,
+        ariaLabel,
+        state,
+        handlerId,
+        randomHandlerId,
+        strengthHandlerId,
+        randomMinHandlerId,
+        randomMaxHandlerId
+      };
+      return id;
+    };
+    const addAxisTogglePairControl = ({
+      id,
+      label,
+      state,
+      horizontalHandlerId,
+      verticalHandlerId,
+      horizontalRandomHandlerId = '',
+      verticalRandomHandlerId = ''
+    } = {}) => {
+      if (!id || !state || typeof state !== 'object') return null;
+      controls[id] = {
+        id,
+        type: 'axis-toggle-pair',
+        label,
+        state,
+        horizontalHandlerId,
+        verticalHandlerId,
+        horizontalRandomHandlerId,
+        verticalRandomHandlerId
+      };
+      return id;
+    };
+    const transformControlIds = [];
+    if (legacyState?.rotation?.available) {
+      transformControlIds.push(addScalarRandomizedControl({
+        id: 'token-rotation',
+        variant: 'rotation',
+        label: 'Rotation',
+        ariaLabel: 'Rotation',
+        state: legacyState.rotation,
+        handlerId: 'setRotation',
+        randomHandlerId: 'toggleRotationRandom',
+        randomMinHandlerId: 'setRotationRandomMin',
+        randomMaxHandlerId: 'setRotationRandomMax'
+      }));
+    }
+    if (legacyState?.flip?.available) {
+      transformControlIds.push(addAxisTogglePairControl({
+        id: 'token-flip',
+        label: 'Flip / Mirror',
+        state: legacyState.flip,
+        horizontalHandlerId: 'toggleFlipHorizontal',
+        verticalHandlerId: 'toggleFlipVertical',
+        horizontalRandomHandlerId: 'toggleFlipHorizontalRandom',
+        verticalRandomHandlerId: 'toggleFlipVerticalRandom'
+      }));
+    }
+    if (transformControlIds.length) {
+      sections.push({
+        id: 'transform',
+        label: 'Transform',
+        controls: transformControlIds.filter(Boolean)
+      });
+    }
+    return { controls, sections };
   }
 
   _handleRotationSliderInput(value) {
@@ -1546,18 +1740,29 @@ export class TokenPlacementManager {
   _handleRotationRandomToggle() {
     const next = !this._rotationRandomEnabled;
     this._rotationRandomEnabled = next;
-    if (next && (!Number.isFinite(this._rotationRandomStrength) || this._rotationRandomStrength <= 0)) {
-      this._rotationRandomStrength = 45;
-    }
+    const range = this._getRotationRandomRange();
+    this._rotationRandomMin = range.min;
+    this._rotationRandomMax = range.max;
     this._updateRotationPreview({ regenerateOffset: next, clampOffset: true });
     this._syncToolOptionsState({ suppressRender: false });
     return true;
   }
 
-  _handleRotationRandomStrength(value) {
-    const numeric = Number(value);
-    const clamped = Number.isFinite(numeric) ? Math.min(180, Math.max(0, numeric)) : 0;
-    this._rotationRandomStrength = clamped;
+  _handleRotationRandomMin(value) {
+    const current = this._getRotationRandomRange();
+    const nextMin = Math.min(current.max, this._clampRotationRandomValue(value, DEFAULT_ROTATION_RANDOM_MIN));
+    this._rotationRandomMin = nextMin;
+    this._rotationRandomMax = current.max;
+    this._updateRotationPreview({ clampOffset: true });
+    this._syncToolOptionsState();
+    return true;
+  }
+
+  _handleRotationRandomMax(value) {
+    const current = this._getRotationRandomRange();
+    const nextMax = Math.max(current.min, this._clampRotationRandomValue(value, DEFAULT_ROTATION_RANDOM_MAX));
+    this._rotationRandomMin = current.min;
+    this._rotationRandomMax = nextMax;
     this._updateRotationPreview({ clampOffset: true });
     this._syncToolOptionsState();
     return true;
@@ -1595,32 +1800,109 @@ export class TokenPlacementManager {
     return true;
   }
 
+  _buildToolOptionsDescriptor() {
+    const legacyState = this._buildToolOptionsState();
+    const { controls, sections } = this._buildDeclarativeToolOptionsConfig(legacyState);
+    const selectionSummary = this._currentEntry?.display_name
+      || this._currentEntry?.filename
+      || this._current?.payload?.displayName
+      || this._current?.payload?.filename
+      || null;
+    const shortcuts = [
+      createShortcut(SHORTCUT_ACTION.HELP, {
+        label: 'Help',
+        description: 'Open contextual tool help.'
+      }),
+      createShortcut(SHORTCUT_ACTION.CANCEL, {
+        label: 'Cancel',
+        description: 'Cancel token placement.'
+      }),
+      createShortcut(SHORTCUT_ACTION.TOGGLE_GRID_SNAP, {
+        label: 'Grid Snap',
+        description: 'Tap to toggle grid snapping.'
+      }),
+      createShortcut('rotate-preview', {
+        binding: 'Ctrl/Cmd+Wheel',
+        label: 'Rotate',
+        description: 'Rotate the token preview; add Shift for finer steps.'
+      }),
+      createShortcut('keep-placing', {
+        binding: 'Hold Shift',
+        label: 'Keep Placing',
+        description: 'Keep placement active after a successful drop.'
+      })
+    ];
+    return createNormalizedToolOptionsDescriptor({
+      rendererMode: TOOL_OPTIONS_RENDERER_MODE.DECLARATIVE,
+      descriptor: {
+        toolId: 'token.placement',
+        toolLabel: 'Token Placement',
+        selectionSummary,
+        helpTopicId: 'token-placement'
+      },
+      legacyState,
+      controls,
+      sections,
+      shortcuts,
+      handlers: this._buildToolOptionsHandlers()
+    });
+  }
+
+  _buildToolOptionsHandlers() {
+    return {
+      togglePlaceAsOpen: (value) => this._togglePlaceAsOpen(value),
+      setPlaceAsSearch: (value) => this._setPlaceAsSearch(value),
+      selectPlaceAsOption: (id) => this._selectPlaceAsOption(id),
+      setPlaceAsLinked: (value) => this._setPlaceAsLinked(value),
+      setPlaceAsActorType: (value) => this._setPlaceAsActorType(value),
+      setPlaceAsHpMode: (mode) => this._setPlaceAsHpMode(mode),
+      setPlaceAsHpPercent: (value) => this._setPlaceAsHpPercent(value),
+      setPlaceAsHpStatic: (value) => this._setPlaceAsHpStatic(value),
+      setPlaceAsAppendNumber: (value) => this._setPlaceAsAppendNumber(value),
+      setPlaceAsPrependAdjective: (value) => this._setPlaceAsPrependAdjective(value),
+      toggleFlipHorizontal: () => this._handleFlipHorizontalToggle(),
+      toggleFlipVertical: () => this._handleFlipVerticalToggle(),
+      toggleFlipHorizontalRandom: () => this._handleFlipRandomHorizontalToggle(),
+      toggleFlipVerticalRandom: () => this._handleFlipRandomVerticalToggle(),
+      setRotation: (value) => this._handleRotationSliderInput(value),
+      toggleRotationRandom: () => this._handleRotationRandomToggle(),
+      setRotationRandomMin: (value) => this._handleRotationRandomMin(value),
+      setRotationRandomMax: (value) => this._handleRotationRandomMax(value),
+      openCompendiumFilterDialog: () => this._openCompendiumFilterDialog()
+    };
+  }
+
   _syncToolOptionsState({ suppressRender = true } = {}) {
     try {
+      const descriptor = this._buildToolOptionsDescriptor();
       toolOptionsController.setToolOptions('token.placement', {
-        state: this._buildToolOptionsState(),
-        handlers: {
-          togglePlaceAsOpen: (value) => this._togglePlaceAsOpen(value),
-          setPlaceAsSearch: (value) => this._setPlaceAsSearch(value),
-          selectPlaceAsOption: (id) => this._selectPlaceAsOption(id),
-          setPlaceAsLinked: (value) => this._setPlaceAsLinked(value),
-          setPlaceAsHpMode: (mode) => this._setPlaceAsHpMode(mode),
-          setPlaceAsHpPercent: (value) => this._setPlaceAsHpPercent(value),
-          setPlaceAsHpStatic: (value) => this._setPlaceAsHpStatic(value),
-          setPlaceAsAppendNumber: (value) => this._setPlaceAsAppendNumber(value),
-          setPlaceAsPrependAdjective: (value) => this._setPlaceAsPrependAdjective(value),
-          toggleFlipHorizontal: () => this._handleFlipHorizontalToggle(),
-          toggleFlipVertical: () => this._handleFlipVerticalToggle(),
-          toggleFlipHorizontalRandom: () => this._handleFlipRandomHorizontalToggle(),
-          toggleFlipVerticalRandom: () => this._handleFlipRandomVerticalToggle(),
-          setRotation: (value) => this._handleRotationSliderInput(value),
-          toggleRotationRandom: () => this._handleRotationRandomToggle(),
-          setRotationRandomStrength: (value) => this._handleRotationRandomStrength(value),
-          openCompendiumFilterDialog: () => this._openCompendiumFilterDialog()
-        },
+        ...descriptor,
         suppressRender
       });
     } catch (_) {}
+  }
+
+  _shouldIgnorePlacementHotkey(event, key = '') {
+    try {
+      const target = event?.target ?? document?.activeElement ?? null;
+      if (!target || target === document.body) return false;
+      if (target.dataset?.faNexusHotkeys === 'allow') return false;
+      if (typeof target.isContentEditable === 'boolean' && target.isContentEditable) {
+        return key !== 'Escape';
+      }
+      const tag = target.tagName ? String(target.tagName).toLowerCase() : '';
+      if (!tag) return false;
+      if (tag === 'input') {
+        const type = typeof target.type === 'string' ? target.type.toLowerCase() : '';
+        const allowTypes = ['button', 'checkbox', 'radio', 'range', 'color', 'file', 'submit', 'reset', 'image', 'hidden'];
+        if (!type) return true;
+        return !allowTypes.includes(type);
+      }
+      if (tag === 'textarea' || tag === 'select') return true;
+      return false;
+    } catch (_) {
+      return false;
+    }
   }
 
   _ensureActorOptionsLoaded() {
@@ -1628,6 +1910,107 @@ export class TokenPlacementManager {
     if (this._placeAsRefreshPromise) return this._placeAsRefreshPromise;
     if (this._placeAsOptions.length) return null;
     return this._refreshActorOptions({ includeCompendium: true });
+  }
+
+  _ensureNewActorTypeOptionsLoaded() {
+    if (!globalThis?.game) return null;
+    if (this._newActorTypeRefreshPromise) return this._newActorTypeRefreshPromise;
+    if (this._newActorTypeChoices.length && this._newActorTypeAuto) return null;
+    return this._refreshNewActorTypeOptions();
+  }
+
+  _formatActorTypeLabel(actorType) {
+    const rawType = typeof actorType === 'string' ? actorType.trim() : '';
+    if (!rawType) return 'Unknown';
+    const labelKey = globalThis?.CONFIG?.Actor?.typeLabels?.[rawType];
+    let localized = '';
+    if (typeof labelKey === 'string' && labelKey.trim().length) {
+      try {
+        localized = globalThis?.game?.i18n?.localize?.(labelKey) || labelKey;
+      } catch (_) {
+        localized = labelKey;
+      }
+    }
+    if (localized && localized !== labelKey) return localized;
+    if (localized && !/^TYPES\./.test(localized)) return localized;
+    return rawType
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }
+
+  _getSelectedNewActorType() {
+    const override = typeof this._newActorTypeOverride === 'string' ? this._newActorTypeOverride.trim() : '';
+    if (override) return override;
+    const auto = typeof this._newActorTypeAuto === 'string' ? this._newActorTypeAuto.trim() : '';
+    return auto || null;
+  }
+
+  async _refreshNewActorTypeOptions() {
+    if (this._newActorTypeRefreshPromise) return this._newActorTypeRefreshPromise;
+    const promise = (async () => {
+      this._newActorTypeLoading = true;
+      this._newActorTypeError = null;
+      this._syncToolOptionsState({ suppressRender: false });
+
+      try {
+        const systemId = SystemDetection.getCurrentSystemId();
+        const availableTypes = Array.isArray(SystemDetection.getAvailableActorTypes?.())
+          ? SystemDetection.getAvailableActorTypes()
+          : [];
+        const fallbackTypes = await SystemDetection.getFallbackActorTypes(systemId);
+        const availableTypeSet = new Set(
+          availableTypes
+            .filter((value) => typeof value === 'string')
+            .map((value) => value.trim())
+            .filter((value) => value.length)
+        );
+        const orderedTypes = [...new Set(
+          availableTypeSet.size
+            ? [
+                ...fallbackTypes.filter((value) => availableTypeSet.has(value)),
+                ...availableTypes
+              ]
+            : fallbackTypes
+        )];
+
+        this._newActorTypeChoices = orderedTypes.map((actorType) => ({
+          id: actorType,
+          label: this._formatActorTypeLabel(actorType)
+        }));
+        this._newActorTypeAuto = orderedTypes[0] || '';
+
+        if (this._newActorTypeOverride && !orderedTypes.includes(this._newActorTypeOverride)) {
+          Logger.info('TokenPlacement.actorType.overrideCleared', {
+            previousOverride: this._newActorTypeOverride,
+            systemId,
+            availableTypes: orderedTypes
+          });
+          this._newActorTypeOverride = null;
+        }
+
+        Logger.info('TokenPlacement.actorType.optionsResolved', {
+          systemId,
+          autoType: this._newActorTypeAuto || null,
+          choices: this._newActorTypeChoices.map((entry) => ({ id: entry.id, label: entry.label }))
+        });
+      } catch (error) {
+        this._newActorTypeChoices = [];
+        this._newActorTypeAuto = '';
+        this._newActorTypeError = error?.message || String(error);
+        Logger.warn('TokenPlacement.actorType.optionsFailed', { error: this._newActorTypeError });
+      } finally {
+        this._newActorTypeLoading = false;
+        this._syncToolOptionsState({ suppressRender: false });
+      }
+    })();
+
+    this._newActorTypeRefreshPromise = promise.finally(() => {
+      this._newActorTypeRefreshPromise = null;
+    });
+    return this._newActorTypeRefreshPromise;
   }
 
   _installActorOptionHooks() {
@@ -2241,6 +2624,7 @@ export class TokenPlacementManager {
     const selection = this._getActivePlaceAsSelection();
     const hpState = this._buildHpUIState(selection);
     const namingState = this._buildTokenNamingUIState(selection);
+    const actorTypeState = this._buildNewActorTypeUIState(selection);
     const isFiltered = (this._placeAsSearch || '').trim().length > 0;
     const selectedLabel = (() => {
       if (selection.mode === 'actor' && selection.option) {
@@ -2257,6 +2641,7 @@ export class TokenPlacementManager {
     const selectedSubtitle = (() => {
       const parts = [];
       if (actorSubtitle) parts.push(actorSubtitle);
+      if (actorTypeState?.summary) parts.push(actorTypeState.summary);
       if (hpState?.summary) parts.push(hpState.summary);
       return parts.join(' • ');
     })();
@@ -2289,6 +2674,7 @@ export class TokenPlacementManager {
       selectedLabel,
       selectedSubtitle,
       hasSelectableOptions,
+      actorType: actorTypeState,
       hp: hpState,
       naming: namingState,
       filter: {
@@ -2298,6 +2684,60 @@ export class TokenPlacementManager {
           ? `${excludedPackCount} compendium${excludedPackCount === 1 ? '' : 's'} excluded`
           : 'Filter compendiums'
       }
+    };
+  }
+
+  _buildNewActorTypeUIState(selection) {
+    if (selection?.mode === 'actor') {
+      return { available: false };
+    }
+
+    const autoType = typeof this._newActorTypeAuto === 'string' ? this._newActorTypeAuto.trim() : '';
+    const selectedType = this._getSelectedNewActorType();
+    const selectedLabel = selectedType ? this._formatActorTypeLabel(selectedType) : '';
+    const autoLabel = autoType ? this._formatActorTypeLabel(autoType) : '';
+    const options = [];
+
+    if (autoType) {
+      options.push({
+        id: AUTO_NEW_ACTOR_TYPE_SELECTION,
+        label: `Auto (${autoLabel})`,
+        selected: !this._newActorTypeOverride
+      });
+    }
+
+    for (const entry of this._newActorTypeChoices) {
+      if (!entry?.id) continue;
+      options.push({
+        id: entry.id,
+        label: entry.label || this._formatActorTypeLabel(entry.id),
+        selected: this._newActorTypeOverride === entry.id
+      });
+    }
+
+    let hint = '';
+    if (this._newActorTypeLoading) {
+      hint = 'Detecting available actor types for this system...';
+    } else if (this._newActorTypeError) {
+      hint = `Actor type detection failed: ${this._newActorTypeError}. The normal creation fallback will still run.`;
+    } else if (!options.length) {
+      hint = 'No actor types were discovered yet. The normal creation fallback will be used.';
+    } else if (this._newActorTypeOverride) {
+      hint = autoLabel && this._newActorTypeOverride !== autoType
+        ? `Manual override for new actors. Auto suggestion: ${autoLabel}.`
+        : 'Manual override for new actors.';
+    } else if (autoLabel) {
+      hint = `Auto will try ${autoLabel} first, then fall back if actor creation fails.`;
+    }
+
+    return {
+      available: !!this._newActorTypeLoading || !!this._newActorTypeError || options.length > 0,
+      disabled: this._newActorTypeLoading || options.length === 0,
+      value: this._newActorTypeOverride || AUTO_NEW_ACTOR_TYPE_SELECTION,
+      label: 'New Actor Type',
+      hint,
+      summary: selectedLabel ? `Type: ${selectedLabel}` : '',
+      options
     };
   }
 
@@ -2552,6 +2992,28 @@ export class TokenPlacementManager {
       return true;
     }
     this._hpMode = next;
+    this._syncToolOptionsState({ suppressRender: false });
+    return true;
+  }
+
+  _setPlaceAsActorType(value) {
+    const requested = typeof value === 'string' ? value.trim() : '';
+    const next = (requested && requested !== AUTO_NEW_ACTOR_TYPE_SELECTION) ? requested : null;
+    if (next && !this._newActorTypeChoices.some((entry) => entry?.id === next)) {
+      Logger.warn('TokenPlacement.actorType.unknownOption', { requested: next });
+      this._syncToolOptionsState();
+      return false;
+    }
+    if (this._newActorTypeOverride === next) {
+      this._syncToolOptionsState();
+      return true;
+    }
+    this._newActorTypeOverride = next;
+    Logger.info('TokenPlacement.actorType.overrideChanged', {
+      override: this._newActorTypeOverride,
+      effectiveType: this._getSelectedNewActorType(),
+      autoType: this._newActorTypeAuto || null
+    });
     this._syncToolOptionsState({ suppressRender: false });
     return true;
   }
@@ -3364,8 +3826,8 @@ export class TokenPlacementManager {
 
   _announceStart(isSticky) {
     const message = isSticky
-      ? 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, hold Shift to keep placing, press ESC to cancel.'
-      : 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, hold Shift to keep placing, press ESC to cancel.';
+      ? 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, tap S toggles grid snap, F1 opens help, hold Shift to keep placing, press ESC to cancel.'
+      : 'Token placement: click to place, wheel zooms to cursor, Ctrl+Wheel rotates, tap S toggles grid snap, F1 opens help, hold Shift to keep placing, press ESC to cancel.';
     announceChange('token-placement-start', message, { level: 'info', throttleMs: 500 });
   }
 }

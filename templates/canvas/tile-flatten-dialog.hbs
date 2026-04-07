@@ -21,6 +21,26 @@
     {{/if}}
 
     <div class="form-group">
+      <label for="flatten-output-name">Output Name</label>
+      <input id="flatten-output-name" type="text" value="{{defaultOutputName}}" spellcheck="false" />
+      <p class="hint">Saved as WebP. Scene splits and chunks append suffixes automatically.</p>
+      <p class="hint fa-nexus-tile-flatten__output-status" data-output-status hidden></p>
+    </div>
+
+    <div class="form-group">
+      <label for="flatten-output-folder">Output Folder</label>
+      <div class="fa-nexus-tile-flatten__field-row">
+        <input id="flatten-output-folder" type="text" value="{{defaultOutputFolder}}" spellcheck="false" />
+        <button type="button" class="btn fa-nexus-tile-flatten__browse" data-action="pick-output-folder">
+          <i class="fas fa-folder-open"></i>
+          <span>Browse</span>
+        </button>
+      </div>
+      <p class="hint">Choose where the generated image files are uploaded.</p>
+      <p class="hint fa-nexus-tile-flatten__effective-folder" data-output-effective-folder hidden></p>
+    </div>
+
+    <div class="form-group">
       <label for="flatten-ppi">Output Density (px per grid square)</label>
       <input id="flatten-ppi" type="number" min="50" max="1000" step="10" value="{{defaultPPI}}" />
       <p class="hint">FA assets default to 200 px per square.</p>

@@ -108,42 +108,61 @@ export class NexusIndexDB {
       const recs = Array.isArray(records) ? records : [];
       Logger.info('IndexDB.save:start', { type, folder, count: recs.length });
       Logger.time(`idb-save:${type}:${folder}`);
-      // Use chunked store when large
-      if (recs.length > this.CHUNK_SIZE) {
-        await new Promise((resolve, reject) => {
-          const tx = db.transaction('indexes2', 'readwrite');
-          const store = tx.objectStore('indexes2');
-          const idx = store.index('tf');
-          // First delete existing chunks for this key
-          const delReq = idx.openCursor(IDBKeyRange.only([type, folder]));
+      const useChunked = recs.length > this.CHUNK_SIZE;
+      await new Promise((resolve, reject) => {
+        let finished = false;
+        const complete = (callback, value) => {
+          if (finished) return;
+          finished = true;
+          callback(value);
+        };
+        const tx = db.transaction(['indexes', 'indexes2'], 'readwrite');
+        const legacyStore = tx.objectStore('indexes');
+        const chunkedStore = tx.objectStore('indexes2');
+        const chunkIndex = chunkedStore.index('tf');
+
+        tx.oncomplete = () => complete(resolve, true);
+        tx.onerror = () => complete(reject, tx.error);
+        tx.onabort = () => complete(reject, tx.error || new Error('IndexDB save aborted'));
+
+        try { legacyStore.delete([type, folder]); } catch (_) {}
+
+        let writesStarted = false;
+        const writePayload = () => {
+          if (writesStarted) return;
+          writesStarted = true;
+          if (useChunked) {
+            let chunkNumber = 0;
+            for (let i = 0; i < recs.length; i += this.CHUNK_SIZE) {
+              const slice = recs.slice(i, i + this.CHUNK_SIZE);
+              chunkedStore.put({ type, folder, chunk: chunkNumber++, records: slice });
+            }
+            return;
+          }
+          legacyStore.put({ type, folder, records: recs.slice() });
+        };
+
+        try {
+          const delReq = chunkIndex.openCursor(IDBKeyRange.only([type, folder]));
           delReq.onsuccess = (e) => {
             const cursor = e.target.result;
-            if (cursor) { cursor.delete(); cursor.continue(); }
-            else {
-              // Put new chunks
-              let chunkIndex = 0;
-              for (let i = 0; i < recs.length; i += this.CHUNK_SIZE) {
-                const slice = recs.slice(i, i + this.CHUNK_SIZE);
-                store.put({ type, folder, chunk: chunkIndex++, records: slice });
-              }
-              resolve();
+            if (cursor) {
+              cursor.delete();
+              cursor.continue();
+              return;
             }
+            writePayload();
           };
-          delReq.onerror = () => reject(delReq.error);
-        });
+          delReq.onerror = () => complete(reject, delReq.error);
+        } catch (error) {
+          complete(reject, error);
+        }
+      });
+      if (useChunked) {
         Logger.info('IndexDB.save:chunked', { type, folder, chunks: Math.ceil(recs.length / this.CHUNK_SIZE) });
         Logger.timeEnd(`idb-save:${type}:${folder}`);
         return true;
       }
-      // Small payloads go to legacy store for simplicity
-      const payload = { type, folder, records: recs.slice() };
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction('indexes', 'readwrite');
-        const store = tx.objectStore('indexes');
-        const put = store.put(payload);
-        put.onsuccess = () => resolve();
-        put.onerror = () => reject(put.error);
-      });
       Logger.info('IndexDB.save:legacy', { type, folder, count: recs.length });
       Logger.timeEnd(`idb-save:${type}:${folder}`);
       return true;
@@ -162,7 +181,16 @@ export class NexusIndexDB {
       Logger.info('IndexDB.clear', { type, folder });
       // Clear legacy
       await new Promise((resolve, reject) => {
+        let finished = false;
+        const complete = (callback, value) => {
+          if (finished) return;
+          finished = true;
+          callback(value);
+        };
         const tx = db.transaction(['indexes','indexes2'], 'readwrite');
+        tx.oncomplete = () => complete(resolve, true);
+        tx.onerror = () => complete(reject, tx.error);
+        tx.onabort = () => complete(reject, tx.error || new Error('IndexDB clear aborted'));
         // Legacy store
         try {
           const s1 = tx.objectStore('indexes');
@@ -176,10 +204,9 @@ export class NexusIndexDB {
           req.onsuccess = (e) => {
             const cursor = e.target.result;
             if (cursor) { cursor.delete(); cursor.continue(); }
-            else resolve();
           };
-          req.onerror = () => reject(req.error);
-        } catch (_) { resolve(); }
+          req.onerror = () => complete(reject, req.error);
+        } catch (_) {}
       });
       return true;
     } catch (_) { return false; }

@@ -1,5 +1,11 @@
 import { FaNexusTokensFolderSelectionDialog } from "./tokens/tokens-content-sources-dialog.js";
 import { FaNexusAssetsFolderSelectionDialog } from "./assets/assets-content-sources-dialog.js";
+import { GeneratedCleanupDialog } from "./cleanup/generated-cleanup-dialog.js";
+import { configurePremiumRuntime } from "./premium/premium-runtime-config.js";
+import { installFoundryTextureLoaderCachePatch } from "./core/foundry-texture-loader-patch.js";
+import { DEFAULT_SHADOW_QUALITY, SHADOW_QUALITY_CHOICES } from "./assets/shadow-quality.js";
+
+installFoundryTextureLoaderCachePatch();
 
 let _cloudDownloadFolderPickerHookInstalled = false;
 
@@ -171,6 +177,7 @@ export function registerFaNexusSettings() {
   client('windowPos', { name: 'Window Position', type: Object, default: {}, config: false });
   client('toolOptionsWindowPos', { name: 'Tool Options Window Position', type: Object, default: {}, config: false });
   client('toolOptionsShortcuts', { name: 'Tool Options Shortcuts Collapse State', type: Object, default: {}, config: false });
+  client('toolOptionsSections', { name: 'Tool Options Section Collapse State', type: Object, default: {}, config: false });
   client('activeTab', { name: 'Active Tab', type: String, default: 'tokens', config: false });
   client('buildingsActiveSubtab', { name: 'Building Tab Active Subtab', type: String, default: 'building', config: false });
   client('buildingsSubtabSearch', { name: 'Building Tab Search State', type: Object, default: {}, config: false });
@@ -190,15 +197,51 @@ export function registerFaNexusSettings() {
       paddingExtra: 0,
       exportSplitLayers: false,
       exportChunked: false,
-      exportAction: 'flatten'
+      exportAction: 'flatten',
+      flattenOutputFolder: 'fa-nexus-assets/__generated/flattened',
+      exportOutputFolder: 'fa-nexus-assets/exports'
     },
     config: false
   });
+  client('generatedCleanupBackupFirst', {
+    name: 'Generated Cleanup Backup First',
+    type: Boolean,
+    default: true,
+    config: false
+  });
+  world('generatedFlattenRoots', {
+    name: 'Generated Flatten Roots',
+    type: String,
+    default: '[]',
+    config: false,
+    restricted: true
+  });
   client('layerManagerElevationMin', { name: 'Layer Manager Elevation Min', type: String, default: '', config: false });
   client('layerManagerElevationMax', { name: 'Layer Manager Elevation Max', type: String, default: '', config: false });
-  client('layerManagerSkipLocked', { name: 'Layer Manager Skip Locked', type: Boolean, default: false, config: false });
-  client('layerManagerSkipHidden', { name: 'Layer Manager Skip Hidden', type: Boolean, default: false, config: false });
-  client('layerManagerIgnoreForeground', { name: 'Layer Manager Ignore Foreground', type: Boolean, default: false, config: false });
+  client('layerManagerSkipLocked', { name: 'Layer Manager Skip Locked', type: Boolean, default: true, config: false });
+  client('layerManagerSkipHidden', { name: 'Layer Manager Skip Hidden', type: Boolean, default: true, config: false });
+  client('layerManagerSkipFiltered', { name: 'Layer Manager Skip Filtered', type: Boolean, default: true, config: false });
+  client('layerManagerIgnoreForeground', { name: 'Layer Manager All Layers', type: Boolean, default: true, config: false });
+  client('layerManagerCollapsedState', {
+    name: 'Layer Manager Collapsed State',
+    type: String,
+    default: '{}',
+    config: false,
+    onChange: (value) => {
+      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'layerManagerCollapsedState', value }); } catch (_) { }
+    }
+  });
+  world('layerManagerNestedGrouping', {
+    name: 'Layer Manager Nested Elevation Groups',
+    type: Boolean,
+    default: true,
+    config: true,
+    restricted: true,
+    hint: 'Group layer elevations into nested upward buckets in the Layer Manager so fractional elevations can be organized as subgroups.',
+    onChange: (value) => {
+      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'layerManagerNestedGrouping', value }); } catch (_) { }
+    }
+  });
   // Cloud download directories (separate per kind)
   world('cloudDownloadDirTokens', { name: 'Cloud Download Folder (Tokens)', type: String, filePicker: 'folder', default: 'fa-nexus-tokens', config: true, restricted: true });
   world('cloudDownloadDirAssets', { name: 'Cloud Download Folder (Assets)', type: String, filePicker: 'folder', default: 'fa-nexus-assets', config: true, restricted: true });
@@ -244,6 +287,72 @@ export function registerFaNexusSettings() {
     default: 1,
     config: false
   });
+  client('textureBrushSize', {
+    name: 'Texture Brush Size',
+    type: Number,
+    default: 128,
+    config: false
+  });
+  client('textureParticleSize', {
+    name: 'Texture Particle Size',
+    type: Number,
+    default: 100,
+    config: false
+  });
+  client('textureParticleDensity', {
+    name: 'Texture Particle Density',
+    type: Number,
+    default: 1,
+    config: false
+  });
+  client('textureSprayDeviation', {
+    name: 'Texture Spray Deviation',
+    type: Number,
+    default: 100,
+    config: false
+  });
+  client('textureBrushSpacing', {
+    name: 'Texture Brush Spacing',
+    type: Number,
+    default: 1,
+    config: false
+  });
+  client('textureBrushOpacity', {
+    name: 'Texture Brush Opacity',
+    type: Number,
+    default: 15,
+    config: false
+  });
+  client('textureFillOpacity', {
+    name: 'Texture Fill Opacity',
+    type: Number,
+    default: 100,
+    config: false
+  });
+  client('textureScale', {
+    name: 'Texture Scale',
+    type: Number,
+    default: 100,
+    config: false
+  });
+  client('textureRotation', {
+    name: 'Texture Rotation',
+    type: Number,
+    default: 0,
+    config: false
+  });
+  client('textureOffsetX', {
+    name: 'Texture Offset X',
+    type: Number,
+    default: 0,
+    config: false
+  });
+  client('textureOffsetY', {
+    name: 'Texture Offset Y',
+    type: Number,
+    default: 0,
+    config: false
+  });
   client('tokenRandomColorPlacement', { name: 'Random Color on Placement', type: Boolean, default: false, config: false });
   world('assetDropShadow', {
     name: 'Asset Drop Shadow',
@@ -254,6 +363,18 @@ export function registerFaNexusSettings() {
     hint: 'Enable drop shadows for assets placed via FA Nexus. Individual placements can still toggle shadows while this is enabled.',
     onChange: (value) => {
       try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'assetDropShadow', value }); } catch (_) { }
+    }
+  });
+  world('assetDropShadowQuality', {
+    name: 'Shadow Quality',
+    hint: 'Controls the maximum resolution of shadow render textures. Lower values reduce VRAM usage significantly on large scenes; High is the recommended default.',
+    type: String,
+    choices: SHADOW_QUALITY_CHOICES,
+    default: DEFAULT_SHADOW_QUALITY,
+    config: true,
+    restricted: true,
+    onChange: (value) => {
+      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'assetDropShadowQuality', value }); } catch (_) { }
     }
   });
   const notifyShadowSetting = (key) => (value) => {
@@ -286,6 +407,13 @@ export function registerFaNexusSettings() {
     default: 0,
     config: false,
     onChange: notifyShadowSetting('assetDropShadowOffsetDistance')
+  });
+  client('assetDropShadowOffsetMax', {
+    name: 'Asset Shadow Offset Distance Max',
+    type: Number,
+    default: 40,
+    config: false,
+    onChange: notifyShadowSetting('assetDropShadowOffsetMax')
   });
   client('assetDropShadowOffsetAngle', {
     name: 'Asset Shadow Offset Angle',
@@ -350,6 +478,18 @@ export function registerFaNexusSettings() {
     default: false,
     config: false
   });
+  client('assetPlacementScaleRandomMin', {
+    name: 'Asset Placement Scale Random Min',
+    type: Number,
+    default: 80,
+    config: false
+  });
+  client('assetPlacementScaleRandomMax', {
+    name: 'Asset Placement Scale Random Max',
+    type: Number,
+    default: 120,
+    config: false
+  });
   client('assetPlacementScaleRandomStrength', {
     name: 'Asset Placement Scale Random Strength',
     type: Number,
@@ -366,6 +506,18 @@ export function registerFaNexusSettings() {
     name: 'Asset Placement Rotation Random Enabled',
     type: Boolean,
     default: false,
+    config: false
+  });
+  client('assetPlacementRotationRandomMin', {
+    name: 'Asset Placement Rotation Random Min',
+    type: Number,
+    default: 0,
+    config: false
+  });
+  client('assetPlacementRotationRandomMax', {
+    name: 'Asset Placement Rotation Random Max',
+    type: Number,
+    default: 359,
     config: false
   });
   client('assetPlacementRotationRandomStrength', {
@@ -402,6 +554,84 @@ export function registerFaNexusSettings() {
     name: 'Asset Placement Scatter Mode',
     type: String,
     default: 'single',
+    config: false
+  });
+  client('assetScatterPlacementTransformsInitialized', {
+    name: 'Asset Scatter Placement Transforms Initialized',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('assetScatterPlacementScale', {
+    name: 'Asset Scatter Placement Scale',
+    type: Number,
+    default: 1,
+    config: false
+  });
+  client('assetScatterPlacementScaleRandomEnabled', {
+    name: 'Asset Scatter Placement Scale Random Enabled',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('assetScatterPlacementScaleRandomMin', {
+    name: 'Asset Scatter Placement Scale Random Min',
+    type: Number,
+    default: 80,
+    config: false
+  });
+  client('assetScatterPlacementScaleRandomMax', {
+    name: 'Asset Scatter Placement Scale Random Max',
+    type: Number,
+    default: 120,
+    config: false
+  });
+  client('assetScatterPlacementRotation', {
+    name: 'Asset Scatter Placement Rotation',
+    type: Number,
+    default: 0,
+    config: false
+  });
+  client('assetScatterPlacementRotationRandomEnabled', {
+    name: 'Asset Scatter Placement Rotation Random Enabled',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('assetScatterPlacementRotationRandomMin', {
+    name: 'Asset Scatter Placement Rotation Random Min',
+    type: Number,
+    default: 0,
+    config: false
+  });
+  client('assetScatterPlacementRotationRandomMax', {
+    name: 'Asset Scatter Placement Rotation Random Max',
+    type: Number,
+    default: 359,
+    config: false
+  });
+  client('assetScatterPlacementFlipHorizontal', {
+    name: 'Asset Scatter Placement Flip Horizontal',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('assetScatterPlacementFlipVertical', {
+    name: 'Asset Scatter Placement Flip Vertical',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('assetScatterPlacementFlipRandomHorizontal', {
+    name: 'Asset Scatter Placement Flip Random Horizontal',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('assetScatterPlacementFlipRandomVertical', {
+    name: 'Asset Scatter Placement Flip Random Vertical',
+    type: Boolean,
+    default: false,
     config: false
   });
   client('assetPlacementDropShadowPreference', {
@@ -449,6 +679,7 @@ export function registerFaNexusSettings() {
       try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'tilePixelSelection', value }); } catch (_) { }
     }
   });
+  configurePremiumRuntime({ moduleId: MODULE_ID, registerWorldSetting: world });
   // Patreon auth data (stored client-side; updated by OAuth flow)
   client('patreon_auth_data', {
     name: 'Patreon Auth Data', type: Object, default: null, config: false, onChange: (value) => {
@@ -475,6 +706,14 @@ export function registerFaNexusSettings() {
     hint: 'Select your local sources for the Assets/Textures/Paths Tabs and activate/deactivate FA Cloud Assets.',
     icon: 'fas fa-folder',
     type: FaNexusAssetsFolderSelectionDialog,
+    restricted: true
+  });
+  menu('generatedCleanupMenu', {
+    name: 'Generated Cleanup',
+    label: 'Open',
+    hint: 'Scan generated masks and flattened outputs, report unused and missing files, and optionally overwrite unused files with a visible marker.',
+    icon: 'fas fa-broom',
+    type: GeneratedCleanupDialog,
     restricted: true
   });
   // Actor creation target folder

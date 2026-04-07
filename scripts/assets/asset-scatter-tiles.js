@@ -12,20 +12,11 @@ try {
   Hooks.on('drawTile', (tile) => {
     try { applyAssetScatterTile(tile); } catch (_) {}
   });
-  Hooks.on('refreshTile', (tile) => {
-    try { applyAssetScatterTile(tile); } catch (_) {}
-  });
   Hooks.on('createTile', (doc) => {
     try {
       const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
       if (tile) applyAssetScatterTile(tile);
     } catch (_) {}
-  });
-  Hooks.on('activateTilesLayer', () => {
-    try { rehydrateAllAssetScatterTiles(); } catch (_) {}
-  });
-  Hooks.on('controlTile', (tile) => {
-    try { applyAssetScatterTile(tile); } catch (_) {}
   });
   Hooks.on('updateTile', (doc) => {
     try {

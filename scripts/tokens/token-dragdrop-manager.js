@@ -214,92 +214,98 @@ export class TokenDragDropManager {
   }
 
   static createPreviewForCard(card, { cursorX, cursorY, deferImage = false } = {}) {
-    const sizeInfo = TokenDragDropManager._readSizeInfoFromCard(card);
-    const gridSize = canvas?.scene?.grid?.size || 100;
-    const zoom = canvas?.stage?.scale?.x || 1;
-    const pointer = (Number.isFinite(cursorX) && Number.isFinite(cursorY)) ? { x: cursorX, y: cursorY } : null;
-    const worldWidth = Math.max(8, (sizeInfo?.gridWidth || 1) * gridSize * (sizeInfo?.scale || 1));
-    const worldHeight = Math.max(8, (sizeInfo?.gridHeight || 1) * gridSize * (sizeInfo?.scale || 1));
+    let overlay = null;
+    try {
+      const sizeInfo = TokenDragDropManager._readSizeInfoFromCard(card);
+      const gridSize = canvas?.scene?.grid?.size || 100;
+      const zoom = canvas?.stage?.scale?.x || 1;
+      const pointer = (Number.isFinite(cursorX) && Number.isFinite(cursorY)) ? { x: cursorX, y: cursorY } : null;
+      const worldWidth = Math.max(8, (sizeInfo?.gridWidth || 1) * gridSize * (sizeInfo?.scale || 1));
+      const worldHeight = Math.max(8, (sizeInfo?.gridHeight || 1) * gridSize * (sizeInfo?.scale || 1));
 
-    let loadingDiv = null;
-    let img = null;
+      let loadingDiv = null;
+      let img = null;
 
-    const source = (card?.getAttribute?.('data-source') || '').toLowerCase();
-    const isCloudSource = source === 'cloud';
-    const isCached = card?.getAttribute?.('data-cached') === 'true';
-    const spinnerNeeded = !!deferImage || !!card?._ensureLocalPromise || (isCloudSource && !isCached);
+      const source = (card?.getAttribute?.('data-source') || '').toLowerCase();
+      const isCloudSource = source === 'cloud';
+      const isCached = card?.getAttribute?.('data-cached') === 'true';
+      const spinnerNeeded = !!deferImage || !!card?._ensureLocalPromise || (isCloudSource && !isCached);
 
-    const overlay = new PlacementOverlay({
-      className: 'fa-nexus-queued-drag',
-      pointer,
-      worldWidth,
-      worldHeight,
-      zIndex: TOKEN_PREVIEW_Z_INDEX,
-      onSizeChange: (screenWidth, screenHeight) => {
-        if (loadingDiv) {
-          loadingDiv.style.width = `${screenWidth}px`;
-          loadingDiv.style.height = `${screenHeight}px`;
+      overlay = new PlacementOverlay({
+        className: 'fa-nexus-queued-drag',
+        pointer,
+        worldWidth,
+        worldHeight,
+        zIndex: TOKEN_PREVIEW_Z_INDEX,
+        onSizeChange: (screenWidth, screenHeight) => {
+          if (loadingDiv) {
+            loadingDiv.style.width = `${screenWidth}px`;
+            loadingDiv.style.height = `${screenHeight}px`;
+          }
+          if (img) {
+            img._nexusOrigW = screenWidth;
+            img._nexusOrigH = screenHeight;
+            img.style.width = `${screenWidth}px`;
+            img.style.height = `${screenHeight}px`;
+          }
         }
-        if (img) {
-          img._nexusOrigW = screenWidth;
-          img._nexusOrigH = screenHeight;
-          img.style.width = `${screenWidth}px`;
-          img.style.height = `${screenHeight}px`;
-        }
+      });
+
+      overlay.element.style.transformOrigin = 'center center';
+      overlay.content.style.position = 'relative';
+      overlay.content.style.transformOrigin = 'center center';
+
+      if (spinnerNeeded) {
+        loadingDiv = createPlacementSpinner();
+        loadingDiv.classList.add('fa-nexus-loading-preview');
+        loadingDiv.style.width = '100%';
+        loadingDiv.style.height = '100%';
+        loadingDiv.style.transformOrigin = 'center center';
+        loadingDiv.style.transform = 'scale(1)';
+        loadingDiv.style.transition = 'transform 120ms ease-out';
+        loadingDiv.style.willChange = 'transform';
+        overlay.content.appendChild(loadingDiv);
       }
-    });
 
-    overlay.element.style.transformOrigin = 'center center';
-    overlay.content.style.position = 'relative';
-    overlay.content.style.transformOrigin = 'center center';
+      img = document.createElement('img');
+      img.alt = card.getAttribute('data-filename') || '';
+      img.style.cssText = 'width:100%;height:100%;object-fit:contain;max-width:none !important;max-height:none !important;';
+      img._nexusOrigW = Math.round(worldWidth * zoom);
+      img._nexusOrigH = Math.round(worldHeight * zoom);
+      img.style.transformOrigin = 'center center';
+      img.style.transform = 'scale(1)';
+      img.style.transition = 'transform 120ms ease-out';
+      img.style.willChange = 'transform';
+      img.style.display = spinnerNeeded ? 'none' : 'block';
+      img.style.opacity = spinnerNeeded ? '0' : '1';
+      overlay.content.appendChild(img);
 
-    if (spinnerNeeded) {
-      loadingDiv = createPlacementSpinner();
-      loadingDiv.classList.add('fa-nexus-loading-preview');
-      loadingDiv.style.width = '100%';
-      loadingDiv.style.height = '100%';
-      loadingDiv.style.transformOrigin = 'center center';
-      loadingDiv.style.transform = 'scale(1)';
-      loadingDiv.style.transition = 'transform 120ms ease-out';
-      loadingDiv.style.willChange = 'transform';
-      overlay.content.appendChild(loadingDiv);
+      const preview = {
+        overlay,
+        box: overlay.element,
+        img,
+        loadingDiv,
+        sizeInfo,
+        _manualScale: 1,
+        _rotation: 0,
+        _mirrorX: false,
+        _mirrorY: false,
+        _deferredImage: !!deferImage
+      };
+
+      TokenDragDropManager._applyZoomToPreview(preview, zoom);
+      TokenDragDropManager._updatePreviewTransform(preview);
+      TokenDragDropManager._startPreviewZoomTracking(preview);
+      TokenDragDropManager._applyImageTransform(preview);
+      if (!deferImage) {
+        TokenDragDropManager._loadPreviewImageForCard(card, img, loadingDiv);
+      }
+
+      return preview;
+    } catch (error) {
+      try { overlay?.destroy?.(); } catch (_) {}
+      throw error;
     }
-
-    img = document.createElement('img');
-    img.alt = card.getAttribute('data-filename') || '';
-    img.style.cssText = 'width:100%;height:100%;object-fit:contain;max-width:none !important;max-height:none !important;';
-    img._nexusOrigW = Math.round(worldWidth * zoom);
-    img._nexusOrigH = Math.round(worldHeight * zoom);
-    img.style.transformOrigin = 'center center';
-    img.style.transform = 'scale(1)';
-    img.style.transition = 'transform 120ms ease-out';
-    img.style.willChange = 'transform';
-    img.style.display = spinnerNeeded ? 'none' : 'block';
-    img.style.opacity = spinnerNeeded ? '0' : '1';
-    overlay.content.appendChild(img);
-
-    const preview = {
-      overlay,
-      box: overlay.element,
-      img,
-      loadingDiv,
-      sizeInfo,
-      _manualScale: 1,
-      _rotation: 0,
-      _mirrorX: false,
-      _mirrorY: false,
-      _deferredImage: !!deferImage
-    };
-
-    TokenDragDropManager._applyZoomToPreview(preview, zoom);
-    TokenDragDropManager._updatePreviewTransform(preview);
-    TokenDragDropManager._startPreviewZoomTracking(preview);
-    TokenDragDropManager._applyImageTransform(preview);
-    if (!deferImage) {
-      TokenDragDropManager._loadPreviewImageForCard(card, img, loadingDiv);
-    }
-
-    return preview;
   }
 
   static _readSizeInfoFromCard(card) {
@@ -509,18 +515,20 @@ export class TokenDragDropManager {
 
   _cleanupQueuedDrag() {
     const q = this._activeQueuedDrag;
-    if (!q) return;
+    try { TokenDragDropManager.setHoverSuppressed(false); } catch (_) {}
+    try { document.querySelectorAll('.actor-drop-target').forEach(el => el.classList.remove('actor-drop-target')); } catch (_) {}
+    if (!q) {
+      try { setTimeout(() => { TokenDragDropManager._setWindowTransparency(false); }, 400); } catch (_) {}
+      return;
+    }
     try {
-      TokenDragDropManager.setHoverSuppressed(false);
-      document.removeEventListener('mousemove', q.handlers.mousemove, true);
-      document.removeEventListener('mouseup', q.handlers.mouseup, true);
-      document.removeEventListener('keydown', q.handlers.keydown, true);
+      if (q.handlers?.mousemove) document.removeEventListener('mousemove', q.handlers.mousemove, true);
+      if (q.handlers?.mouseup) document.removeEventListener('mouseup', q.handlers.mouseup, true);
+      if (q.handlers?.keydown) document.removeEventListener('keydown', q.handlers.keydown, true);
     } catch (_) {}
     try { TokenDragDropManager._stopPreviewZoomTracking(q.preview); } catch (_) {}
     try { q.preview?.overlay?.destroy?.(); } catch (_) {}
     try { q.preview?.box?.remove?.(); } catch (_) {}
-    // Remove any lingering actor highlight from queued drag
-    try { document.querySelectorAll('.actor-drop-target').forEach(el => el.classList.remove('actor-drop-target')); } catch (_) {}
     this._activeQueuedDrag = null;
     // Restore window transparency similar to normal drag end
     try { setTimeout(() => { TokenDragDropManager._setWindowTransparency(false); }, 400); } catch (_) {}
@@ -542,7 +550,14 @@ export class TokenDragDropManager {
         setTimeout(() => { try { app._hideColorVariantsPanel(); } catch (_) {} }, 150);
       }
     } catch (_) {}
-    const preview = await this._createQueuedPreview(card, startX, startY);
+    let preview;
+    try {
+      preview = await this._createQueuedPreview(card, startX, startY);
+    } catch (error) {
+      Logger.warn('TokenDragDropManager.queued.preview.failed', { error: String(error?.message || error) });
+      this._cleanupQueuedDrag();
+      return;
+    }
     // Track hovered actor element for queued drag (non-native drag)
     const actorSelector = '.directory-item.actor, .document[data-document-type="Actor"], [data-document-type="Actor"][data-entry-id], [data-document-id][data-document-type="Actor"], .document.actor';
     let highlightedActorEl = null;

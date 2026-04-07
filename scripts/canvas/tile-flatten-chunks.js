@@ -1,5 +1,11 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import {
+  attachCustomTileOverhead,
+  createDisplayProxyFactory,
+  detachCustomTileOverhead,
+  invalidateCustomTileOverhead
+} from './custom-tile-overhead.js';
+import {
   encodeTexturePath,
   ensureTileMesh,
   getTransparentTexture,
@@ -151,10 +157,42 @@ function restoreFlattenMeshTexture(mesh) {
   } catch (_) {}
 }
 
+function syncFlattenContainerTransform(container, mesh, doc) {
+  if (!container || container.destroyed || !mesh || mesh.destroyed) return;
+  const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
+  const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
+  const rawSx = Number(mesh?.scale?.x ?? 1) || 1;
+  const rawSy = Number(mesh?.scale?.y ?? 1) || 1;
+  const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
+  const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
+  const anchorX = Number(doc?.texture?.anchorX);
+  const anchorY = Number(doc?.texture?.anchorY);
+  const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
+  const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
+  try {
+    container.scale?.set?.(1 / sx, 1 / sy);
+    container.position?.set?.(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
+  } catch (_) {
+    try { container.scale?.set?.(1, 1); } catch (_) {}
+    container.position?.set?.(-docWidth / 2, -docHeight / 2);
+  }
+}
+
 export async function applyFlattenedChunks(tile) {
   try {
     if (!tile || tile.destroyed) return;
     const doc = tile.document;
+    const standardMask = doc?.getFlag?.(MODULE_ID, 'standardTileMask')
+      || doc?.flags?.[MODULE_ID]?.standardTileMask
+      || doc?._source?.flags?.[MODULE_ID]?.standardTileMask
+      || null;
+    if (standardMask) {
+      cleanupFlattenedChunks(tile);
+      Logger.info?.('TileFlatten.applyChunks.skippedForStandardMask', {
+        tileId: doc?.id || null
+      });
+      return;
+    }
     const meta = resolveFlattenedMeta(doc);
     const chunks = resolveChunkEntriesFromMeta(meta);
     if (!chunks.length) {
@@ -179,36 +217,30 @@ export async function applyFlattenedChunks(tile) {
       mesh.addChild(container);
       mesh.faNexusFlattenChunkContainer = container;
       tile.faNexusFlattenChunkContainer = container;
-    } else if (container.parent !== mesh) {
-      try { container.parent?.removeChild?.(container); } catch (_) {}
+    } else if (!container.parent) {
       mesh.addChild(container);
       mesh.faNexusFlattenChunkContainer = container;
       tile.faNexusFlattenChunkContainer = container;
     }
 
     try {
-      const docAlpha = Number(doc?.alpha);
-      const containerAlpha = Number.isFinite(docAlpha) ? Math.min(1, Math.max(0, docAlpha)) : 1;
-      container.alpha = containerAlpha;
+      container.alpha = 1;
     } catch (_) {}
 
-    const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
-    const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
-    const sx = Number(mesh?.scale?.x ?? 1) || 1;
-    const sy = Number(mesh?.scale?.y ?? 1) || 1;
-    const anchorX = Number(doc?.texture?.anchorX);
-    const anchorY = Number(doc?.texture?.anchorY);
-    const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
-    const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
-    try {
-      container.scale?.set?.(1 / sx, 1 / sy);
-      container.position?.set?.(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
-    } catch (_) {
-      try { container.scale?.set?.(1, 1); } catch (_) {}
-      container.position?.set?.(-docWidth / 2, -docHeight / 2);
-    }
+    syncFlattenContainerTransform(container, mesh, doc);
 
-    if (reuse) return;
+    if (reuse) {
+      attachCustomTileOverhead(tile, {
+        kind: 'flatten',
+        contentContainer: container,
+        proxyFactory: createDisplayProxyFactory(container),
+        syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
+          syncFlattenContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        }
+      });
+      invalidateCustomTileOverhead(tile, 'flatten-refresh');
+      return;
+    }
 
     const existingBuild = tile._faNexusFlattenChunkBuild;
     if (existingBuild && existingBuild.key === renderKey) {
@@ -267,6 +299,15 @@ export async function applyFlattenedChunks(tile) {
       container.faNexusFlattenChunkRenderKey = renderKey;
       mesh.faNexusFlattenChunkContainer = container;
       tile.faNexusFlattenChunkContainer = container;
+      attachCustomTileOverhead(tile, {
+        kind: 'flatten',
+        contentContainer: container,
+        proxyFactory: createDisplayProxyFactory(container),
+        syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
+          syncFlattenContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        }
+      });
+      invalidateCustomTileOverhead(tile, 'flatten-refresh');
     })();
 
     try {
@@ -287,6 +328,7 @@ export function cleanupFlattenedChunks(tile) {
     try { delete tile._faNexusFlattenChunkBuild; } catch (_) {}
     const mesh = tile.mesh;
     const container = mesh?.faNexusFlattenChunkContainer || tile.faNexusFlattenChunkContainer;
+    detachCustomTileOverhead(tile, { kind: 'flatten' });
     if (container) {
       try { container.parent?.removeChild?.(container); } catch (_) {}
       try { container.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
@@ -323,15 +365,6 @@ try {
     try { rehydrateAllFlattenedChunks(); } catch (_) {}
   });
   Hooks.on('drawTile', (tile) => {
-    try { applyFlattenedChunks(tile); } catch (_) {}
-  });
-  Hooks.on('refreshTile', (tile) => {
-    try { applyFlattenedChunks(tile); } catch (_) {}
-  });
-  Hooks.on('hoverTile', (tile) => {
-    try { applyFlattenedChunks(tile); } catch (_) {}
-  });
-  Hooks.on('controlTile', (tile) => {
     try { applyFlattenedChunks(tile); } catch (_) {}
   });
   Hooks.on('createTile', (doc) => {

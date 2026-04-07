@@ -3,6 +3,7 @@ import { premiumEntitlementsService } from './premium-entitlements-service.js';
 import { premiumFeatureBroker } from './premium-feature-broker.js';
 import { ensurePremiumFeaturesRegistered } from './premium-feature-registry.js';
 import { renderPatreonAuthHeader } from './patreon-auth-header.js';
+import { shouldWarmPremiumWithoutAuth } from './premium-runtime-config.js';
 
 /**
  * Patreon OAuth service for FA Nexus
@@ -80,25 +81,25 @@ export class PatreonOAuthApp extends foundry.applications.api.HandlebarsApplicat
           const response = await fetch(`${pollUrl}?state=${encodeURIComponent(state)}`, { method: 'GET', headers: { 'Accept': 'application/json' } });
           if (!response.ok) {
             if (response.status === 400) {
+              let err = null;
+              try { err = await response.json(); } catch (_) { err = null; }
               if (pollAttempts <= gracePeriodAttempts) {
-                try {
-                  const err = await response.json();
-                  const msg = (err.message || err.error || '').toString().toLowerCase();
-                  if (msg.includes('invalid state')) {
-                    if (pollAttempts >= maxPollAttempts) { this.stopPolling(); this.handleAuthComplete(null, 'Authentication timeout - please try again'); }
-                    return;
-                  }
-                } catch (_) { /* ignore */ }
+                try { Logger.info('PatreonOAuth.poll:grace400', { state, pollAttempts, gracePeriodAttempts, error: err?.message || err?.error || null }); } catch (_) {}
+                return;
               }
               this.stopPolling();
-              try { const err = await response.json(); this.handleAuthComplete(null, err.message || err.error || 'Authentication failed - invalid request'); }
-              catch (_) { this.handleAuthComplete(null, 'Authentication failed - invalid request'); }
+              this.handleAuthComplete(null, err?.message || err?.error || 'Authentication failed - invalid request');
               return;
             }
             if (response.status === 401) {
+              let err = null;
+              try { err = await response.json(); } catch (_) { err = null; }
+              if (pollAttempts <= gracePeriodAttempts) {
+                try { Logger.info('PatreonOAuth.poll:grace401', { state, pollAttempts, gracePeriodAttempts, error: err?.message || err?.error || null }); } catch (_) {}
+                return;
+              }
               this.stopPolling();
-              try { const err = await response.json(); this.handleAuthComplete(null, err.message || err.error || 'Authentication failed - insufficient access level'); }
-              catch (_) { this.handleAuthComplete(null, 'Authentication failed - insufficient access level'); }
+              this.handleAuthComplete(null, err?.message || err?.error || 'Authentication failed - insufficient access level');
               return;
             }
             if (response.status === 404) {
@@ -324,12 +325,15 @@ export class PatreonAuthService {
 }
 
 export async function warmPremiumFeatureBundles({ reason = 'auth', features } = {}) {
-  try {
-    const authData = game?.settings?.get?.('fa-nexus', 'patreon_auth_data');
-    const hasAuth = !!(authData && authData.authenticated && authData.state);
-    if (!hasAuth) return false;
-  } catch (_) {
-    return false;
+  const devBridgeEnabled = await shouldWarmPremiumWithoutAuth();
+  if (!devBridgeEnabled) {
+    try {
+      const authData = game?.settings?.get?.('fa-nexus', 'patreon_auth_data');
+      const hasAuth = !!(authData && authData.authenticated && authData.state);
+      if (!hasAuth) return false;
+    } catch (_) {
+      return false;
+    }
   }
 
   ensurePremiumFeaturesRegistered();
