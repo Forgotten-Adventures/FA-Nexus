@@ -97,12 +97,12 @@ export function parseTokenDisplayName(filename = '') {
     };
   }
 
-  // Find variant token (A1, AA2, X12, 002A)
+  // Find variant token (A1, AA2, X12, ABC123, 002A)
   let variantIndex = -1;
   let variant = '';
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
-    if (/^[A-Z]\d+$/.test(p) || /^[A-Z]{2}\d+$/.test(p) || /^[A-Z]\d{2,}$/.test(p) || /^\d{3}[A-Z]$/.test(p)) {
+    if (/^([A-Z]{1,3}\d+|\d{3}[A-Z])$/.test(p)) {
       variantIndex = i;
       variant = p;
       break;
