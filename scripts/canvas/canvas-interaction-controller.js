@@ -1,7 +1,10 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { requestSelectionFilterRefresh } from './selection-filter-refresh.js';
+import { normalizeGroundBandDocumentSort } from './elevation-band-utils.js';
 
 const GRID_BASE_PX = 200;
+const SORT_STEP = 2;
+const ELEVATION_EPSILON = 1e-6;
 
 const defaultTarget = typeof window !== 'undefined' ? window : globalThis;
 const documentTarget = typeof document !== 'undefined' ? document : null;
@@ -21,6 +24,32 @@ const EVENT_CONFIG = {
 const POINTER_EVENT_TYPES = new Set(['pointermove', 'pointerdown', 'pointerup', 'pointercancel', 'wheel', 'mousemove']);
 
 const ANNOUNCE_THROTTLE = new Map();
+const NORMALIZED_SORT_LOGS = new Set();
+
+function normalizeTileDocumentSortForPlacement(doc, {
+  elevation = doc?.elevation,
+  sort = doc?.sort,
+  scene = canvas?.scene,
+  source = 'placement-sort'
+} = {}) {
+  const result = normalizeGroundBandDocumentSort(elevation, sort, { scene });
+  if (result.normalized) {
+    const logKey = `${source}:${doc?.id || 'unknown'}:${result.originalSort}:${result.localSort}`;
+    if (!NORMALIZED_SORT_LOGS.has(logKey)) {
+      NORMALIZED_SORT_LOGS.add(logKey);
+      Logger.warn('Placement.sort.groundBandDocumentSort.normalized', {
+        source,
+        tileId: doc?.id || null,
+        elevation: Number(elevation ?? 0) || 0,
+        originalSort: result.originalSort,
+        normalizedSort: result.sort,
+        groundBandLocalSort: result.localSort,
+        encoding: result.encoding
+      });
+    }
+  }
+  return result;
+}
 
 function getCanvasElement() {
   try {
@@ -62,7 +91,7 @@ function worldFromPointer(event) {
   return worldFromScreen(x, y);
 }
 
-function computeNextSortAtElevation(elevation = 0) {
+function computeNextSortAtElevation(elevation = 0, { scene = canvas?.scene } = {}) {
   try {
     const elev = Number(elevation || 0) || 0;
     let maxSort = 0;
@@ -70,13 +99,280 @@ function computeNextSortAtElevation(elevation = 0) {
     for (const tile of tiles) {
       const doc = tile?.document;
       if (!doc) continue;
-      if (Number(doc.elevation || 0) !== elev) continue;
-      const sort = Number(doc.sort || 0) || 0;
+      if (!sameElevation(doc.elevation, elev)) continue;
+      const sort = normalizeTileDocumentSortForPlacement(doc, {
+        elevation: doc.elevation,
+        sort: doc.sort,
+        scene,
+        source: 'computeNextSortAtElevation'
+      }).sort;
       if (sort > maxSort) maxSort = sort;
     }
-    return maxSort + 2;
+    return maxSort + SORT_STEP;
   } catch (_) {
     return 35;
+  }
+}
+
+function computeLowestSortAtElevation(elevation = 0, { scene = canvas?.scene } = {}) {
+  try {
+    const elev = Number(elevation || 0) || 0;
+    let minSort = Infinity;
+    const tiles = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
+    for (const tile of tiles) {
+      const doc = tile?.document;
+      if (!doc) continue;
+      if (!sameElevation(doc.elevation, elev)) continue;
+      const sort = normalizeTileDocumentSortForPlacement(doc, {
+        elevation: doc.elevation,
+        sort: doc.sort,
+        scene,
+        source: 'computeLowestSortAtElevation'
+      }).sort;
+      if (sort < minSort) minSort = sort;
+    }
+    if (!Number.isFinite(minSort)) return -SORT_STEP;
+    return minSort - SORT_STEP;
+  } catch (_) {
+    return -SORT_STEP;
+  }
+}
+
+function sameElevation(left, right) {
+  const leftValue = Number(left);
+  const rightValue = Number(right);
+  if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) return false;
+  return Math.abs(leftValue - rightValue) <= ELEVATION_EPSILON;
+}
+
+function resolvePlacementTileDocument(anchorTile = null, anchorTileId = null, scene = canvas?.scene) {
+  const directDoc = anchorTile?.document || anchorTile;
+  if (directDoc?.id) return directDoc;
+  const resolvedId = String(anchorTileId || '').trim();
+  if (!resolvedId) return null;
+  try {
+    const doc = scene?.tiles?.get?.(resolvedId);
+    if (doc) return doc;
+  } catch (_) { /* no-op */ }
+  try {
+    const placeable = canvas?.tiles?.placeables?.find((tile) => tile?.document?.id === resolvedId);
+    if (placeable?.document) return placeable.document;
+  } catch (_) { /* no-op */ }
+  return null;
+}
+
+function getSceneTileSortEntriesAtElevation(elevation = 0, scene = canvas?.scene) {
+  const targetElevation = Number(elevation || 0) || 0;
+  const docs = [];
+  try {
+    const collection = scene?.tiles;
+    if (collection?.contents && Array.isArray(collection.contents)) {
+      docs.push(...collection.contents);
+    } else if (collection && typeof collection[Symbol.iterator] === 'function') {
+      docs.push(...Array.from(collection));
+    } else {
+      const placeables = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
+      for (const tile of placeables) {
+        if (tile?.document) docs.push(tile.document);
+      }
+    }
+  } catch (_) {
+    const placeables = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
+    for (const tile of placeables) {
+      if (tile?.document) docs.push(tile.document);
+    }
+  }
+  return docs
+    .filter((doc) => sameElevation(doc?.elevation, targetElevation))
+    .map((doc) => {
+      const rawSort = Number(doc?.sort || 0) || 0;
+      const normalized = normalizeTileDocumentSortForPlacement(doc, {
+        elevation: doc?.elevation,
+        sort: rawSort,
+        scene,
+        source: 'resolvePlacementSortAtElevation'
+      });
+      return {
+        id: String(doc?.id || ''),
+        sort: Number(normalized.sort || 0) || 0,
+        rawSort,
+        document: doc
+      };
+    })
+    .filter((entry) => !!entry.id);
+}
+
+function sortTileSortEntries(left, right) {
+  const leftSort = Number(left?.sort || 0) || 0;
+  const rightSort = Number(right?.sort || 0) || 0;
+  if (leftSort === rightSort) return String(left?.id || '').localeCompare(String(right?.id || ''));
+  return leftSort - rightSort;
+}
+
+function resolveCurrentOrderPlacementSorts({
+  previousSort = null,
+  nextSort = null,
+  placementCount = 1
+} = {}) {
+  const count = Math.max(1, Math.floor(Number(placementCount) || 1));
+  const hasPrevious = Number.isFinite(previousSort);
+  const hasNext = Number.isFinite(nextSort);
+  if (hasPrevious && hasNext && nextSort > previousSort) {
+    const step = (nextSort - previousSort) / (count + 1);
+    return Array.from({ length: count }, (_, index) => previousSort + (step * (index + 1)));
+  }
+  if (hasPrevious && !hasNext) {
+    return Array.from({ length: count }, (_, index) => previousSort + (SORT_STEP * (index + 1)));
+  }
+  if (!hasPrevious && hasNext) {
+    return Array.from({ length: count }, (_, index) => nextSort - (SORT_STEP * (count - index)));
+  }
+  if (hasPrevious && hasNext) {
+    return Array.from({ length: count }, (_, index) => previousSort + ((index + 1) / (count + 1)));
+  }
+  return Array.from({ length: count }, (_, index) => SORT_STEP * (index + 1));
+}
+
+function resolveCompactPlacementSorts(siblingEntries = [], anchorEntry = null, placementCount = 1, sortBefore = false) {
+  const entries = Array.isArray(siblingEntries) ? siblingEntries.slice().sort(sortTileSortEntries) : [];
+  const anchorIndex = entries.findIndex((entry) => entry?.id === anchorEntry?.id);
+  if (anchorIndex < 0) return null;
+  const insertionIndex = anchorIndex + (sortBefore === true ? 0 : 1);
+  const syntheticEntries = Array.from({ length: placementCount }, (_, index) => ({
+    id: `fa-nexus-placement-${Date.now()}-${index}`,
+    sort: null
+  }));
+  const previousSort = insertionIndex > 0 ? Number(entries[insertionIndex - 1]?.sort) : null;
+  const nextSort = insertionIndex < entries.length ? Number(entries[insertionIndex]?.sort) : null;
+  const hasPrevious = Number.isFinite(previousSort);
+  const hasNext = Number.isFinite(nextSort);
+  const previewSorts = resolveCurrentOrderPlacementSorts({
+    previousSort,
+    nextSort,
+    placementCount
+  });
+  const requiredGap = (placementCount + 1) * SORT_STEP;
+  let startSort = null;
+
+  if (hasPrevious && !hasNext) {
+    startSort = previousSort + SORT_STEP;
+  } else if (!hasPrevious && hasNext) {
+    startSort = nextSort - (placementCount * SORT_STEP);
+  } else if (!hasPrevious && !hasNext) {
+    startSort = SORT_STEP;
+  } else if ((nextSort - previousSort) >= requiredGap) {
+    startSort = previousSort + SORT_STEP;
+  }
+
+  const orderedEntries = entries.slice();
+  orderedEntries.splice(insertionIndex, 0, ...syntheticEntries);
+
+  if (Number.isFinite(startSort)) {
+    for (let index = 0; index < syntheticEntries.length; index += 1) {
+      syntheticEntries[index].sort = startSort + (index * SORT_STEP);
+    }
+    return { orderedEntries, syntheticEntries, previewSorts, reindexed: false };
+  }
+
+  for (let index = 0; index < orderedEntries.length; index += 1) {
+    orderedEntries[index].sort = (index + 1) * SORT_STEP;
+  }
+  return { orderedEntries, syntheticEntries, previewSorts, reindexed: true };
+}
+
+function resolvePlacementSortAtElevation(elevation = 0, {
+  anchorTileId = null,
+  anchorTile = null,
+  scene = canvas?.scene,
+  count = 1,
+  sortBefore = false
+} = {}) {
+  const targetElevation = Number(elevation);
+  const normalizedElevation = Number.isFinite(targetElevation) ? targetElevation : 0;
+  const placementCount = Math.max(1, Math.floor(Number(count) || 1));
+  const fallback = ({ reason = 'top-of-elevation' } = {}) => {
+    const startSort = computeNextSortAtElevation(normalizedElevation, { scene });
+    const baseSort = Number.isFinite(startSort) ? startSort : 35;
+    const placementSorts = Array.from({ length: placementCount }, (_, index) => baseSort + (index * SORT_STEP));
+    Logger.debug('CanvasInteractionController.sort.resolve.topOfElevation', {
+      elevation: normalizedElevation,
+      reason,
+      anchorTileId: String(anchorTileId || '').trim() || null,
+      sortBefore: sortBefore === true,
+      placementCount,
+      placementSorts
+    });
+    return {
+      sort: placementSorts[0] ?? baseSort,
+      placementSorts,
+      previewSort: placementSorts[0] ?? baseSort,
+      previewSorts: placementSorts.slice(),
+      strategy: 'top-of-elevation',
+      anchorTileId: String(anchorTileId || '').trim() || null,
+      anchorTileSort: null,
+      siblingUpdates: []
+    };
+  };
+
+  const anchorDoc = resolvePlacementTileDocument(anchorTile, anchorTileId, scene);
+  if (!anchorDoc?.id) return fallback({ reason: 'missing-anchor' });
+  const anchorElevation = Number(anchorDoc.elevation);
+  if (!Number.isFinite(anchorElevation) || !sameElevation(anchorElevation, normalizedElevation)) {
+    return fallback({ reason: 'anchor-elevation-mismatch' });
+  }
+
+  try {
+    const siblingEntries = getSceneTileSortEntriesAtElevation(normalizedElevation, scene);
+    const anchorEntry = siblingEntries.find((entry) => entry.id === anchorDoc.id) || null;
+    if (!anchorEntry) return fallback({ reason: 'anchor-not-in-scene' });
+    const originalSorts = new Map(siblingEntries.map((entry) => [entry.id, entry.rawSort]));
+    const resolved = resolveCompactPlacementSorts(siblingEntries, anchorEntry, placementCount, sortBefore);
+    if (!resolved) return fallback({ reason: 'compact-sort-resolution-failed' });
+    const { orderedEntries, syntheticEntries, previewSorts, reindexed } = resolved;
+    const placementSorts = syntheticEntries.map((entry) => Number(entry?.sort || 0) || 0);
+    const resolvedPreviewSorts = Array.isArray(previewSorts) && previewSorts.length
+      ? previewSorts.map((sort) => Number(sort)).filter((sort) => Number.isFinite(sort))
+      : placementSorts.slice();
+
+    const siblingUpdates = [];
+    for (const entry of orderedEntries) {
+      if (!originalSorts.has(entry.id)) continue;
+      const previousSort = originalSorts.get(entry.id);
+      const nextSort = Number(entry.sort || 0) || 0;
+      if (nextSort === previousSort) continue;
+      siblingUpdates.push({ _id: entry.id, sort: nextSort });
+    }
+
+    const strategy = reindexed || siblingUpdates.length ? 'after-anchor-reindex' : 'after-anchor';
+    Logger.debug('CanvasInteractionController.sort.resolve.afterAnchor', {
+      elevation: normalizedElevation,
+      anchorTileId: anchorDoc.id,
+      anchorTileSort: anchorEntry.sort,
+      sortBefore: sortBefore === true,
+      placementCount,
+      placementSorts,
+      previewSorts: resolvedPreviewSorts,
+      siblingUpdates: siblingUpdates.length,
+      strategy
+    });
+    return {
+      sort: placementSorts[0] ?? anchorEntry.sort,
+      placementSorts,
+      previewSort: resolvedPreviewSorts[0] ?? placementSorts[0] ?? anchorEntry.sort,
+      previewSorts: resolvedPreviewSorts,
+      strategy,
+      anchorTileId: anchorDoc.id,
+      anchorTileSort: anchorEntry.sort,
+      siblingUpdates
+    };
+  } catch (error) {
+    Logger.error('CanvasInteractionController.sort.resolve.failed', {
+      elevation: normalizedElevation,
+      anchorTileId: anchorDoc?.id || null,
+      placementCount,
+      error: String(error?.message || error)
+    });
+    return fallback({ reason: 'sort-resolution-failed' });
   }
 }
 
@@ -274,7 +570,10 @@ class CanvasInteractionSession {
     try {
       handler(event, context);
     } catch (err) {
-      console.error('fa-nexus | CanvasInteractionSession handler failed', err);
+      Logger.error('CanvasInteractionSession.handler.failed', {
+        type,
+        error: err
+      });
     }
   }
 
@@ -283,7 +582,11 @@ class CanvasInteractionSession {
       if (typeof this._options.onCanvasTearDown === 'function') {
         this._options.onCanvasTearDown();
       }
-    } catch (_) { /* no-op */ }
+    } catch (error) {
+      Logger.error('CanvasInteractionSession.canvasTearDown.failed', {
+        error
+      });
+    }
     this.stop('canvas-teardown');
   }
 
@@ -294,14 +597,24 @@ class CanvasInteractionSession {
       if (this._layerLock) {
         this._layerLock.release?.();
       }
-    } catch (_) { /* no-op */ }
+    } catch (error) {
+      Logger.error('CanvasInteractionSession.layerLock.release.failed', {
+        reason,
+        error
+      });
+    }
     this._layerLock = null;
     this._controller._removeSession(this);
     try {
       if (typeof this._options.onStop === 'function') {
         this._options.onStop(reason);
       }
-    } catch (_) { /* no-op */ }
+    } catch (error) {
+      Logger.error('CanvasInteractionSession.onStop.failed', {
+        reason,
+        error
+      });
+    }
   }
 }
 
@@ -339,8 +652,16 @@ class CanvasInteractionControllerImpl {
     return worldFromScreen(screenX, screenY);
   }
 
-  computeNextSortAtElevation(elevation) {
-    return computeNextSortAtElevation(elevation);
+  computeNextSortAtElevation(elevation, options) {
+    return computeNextSortAtElevation(elevation, options);
+  }
+
+  computeLowestSortAtElevation(elevation, options) {
+    return computeLowestSortAtElevation(elevation, options);
+  }
+
+  resolvePlacementSortAtElevation(elevation, options) {
+    return resolvePlacementSortAtElevation(elevation, options);
   }
 
   announceChange(type, message, options) {
@@ -472,7 +793,10 @@ export {
   getCanvasInteractionController,
   worldFromScreen,
   worldFromPointer,
+  normalizeTileDocumentSortForPlacement,
   computeNextSortAtElevation,
+  computeLowestSortAtElevation,
+  resolvePlacementSortAtElevation,
   announceChange,
   getGridScaleFactor,
   getCanvasElement

@@ -1,9 +1,47 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { premiumFeatureBroker } from '../premium/premium-feature-broker.js';
-import { premiumEntitlementsService } from '../premium/premium-entitlements-service.js';
 import { ensurePremiumFeaturesRegistered } from '../premium/premium-feature-registry.js';
+import {
+  resolveTileDocument,
+  resolveTileId
+} from '../premium/session-host/editing-targets.js';
+import {
+  buildHostedSessionContextDetails,
+  getCurrentSceneId,
+  isHostedSessionSceneCurrent,
+  isApplicationHostReady
+} from '../premium/session-host/host-context.js';
+import {
+  cancelToolWindowMonitor,
+  startHostedToolWindowMonitor
+} from '../premium/session-host/tool-window-monitor.js';
+import {
+  beginEditingTileTracking,
+  endEditingTileWithRefresh
+} from '../premium/session-host/editing-session-state.js';
+import {
+  handleSessionLaunchFailure as handleHostedSessionLaunchFailure,
+  hasHostedSessionChanges,
+  runHostedSessionLaunch,
+  stopSessionWithFinalize,
+  stopOrphanedSession as stopHostedOrphanedSession
+} from '../premium/session-host/session-lifecycle.js';
+import {
+  handleEntitlementRevalidationFailure,
+  scheduleEntitlementRevalidation
+} from '../premium/session-host/entitlement-revalidation.js';
+import {
+  scheduleHostedToolOptionsRefresh,
+  syncHostedToolOptions
+} from '../premium/session-host/tool-options-sync.js';
 import './masked-tiles.js';
-import { applyMaskedTilingToTile, applyStandardTileMaskToTile } from './texture-render.js';
+import { normalizeMaskedTextureBlendMode } from './texture-blend-runtime.js';
+import {
+  applyMaskedTilingToTile,
+  applyStandardTileMaskToTile
+} from './texture-mask-runtime.js';
+import { getFlattenedChunkEntries } from './texture-runtime-core.js';
+import { hasStandardMaskCustomBaseSource } from './standard-mask-custom-base.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
 import { buildHsbcToolOptionsControls } from '../core/hsbc.js';
 import {
@@ -17,45 +55,24 @@ import {
   resolveEffectivePolarity
 } from '../core/editor-shortcuts.js';
 import { requestSelectionFilterRefresh } from '../canvas/selection-filter-refresh.js';
+import {
+  getGroundBandRenderSort,
+  getTileRenderElevation,
+  resolvePlacementAnchorTile
+} from '../canvas/elevation-band-utils.js';
+import {
+  getDefaultTilePlacementLevelId,
+  resolveTileRenderOrder
+} from '../canvas/tile-band-utils.js';
+import { resolvePlacementSortAtElevation } from '../canvas/canvas-interaction-controller.js';
 
 const EDITING_TILE_SET_KEY = '__faNexusTextureEditingTileIds';
 const EDITING_MODE_MASKED_TILING = 'maskedTiling';
 const EDITING_MODE_STANDARD_TILE_MASK = 'standardTileMask';
+const PREVIEW_LAYER_HOOK = 'fa-nexus-preview-layers-changed';
 
-function getEditingTileSet() {
-  try {
-    const root = globalThis;
-    if (!root) return null;
-    let set = root[EDITING_TILE_SET_KEY];
-    if (!(set instanceof Set)) {
-      set = new Set();
-      root[EDITING_TILE_SET_KEY] = set;
-    }
-    return set;
-  } catch (_) {
-    return null;
-  }
-}
-
-function resolveTileId(targetTile) {
-  try {
-    return targetTile?.document?.id || targetTile?.id || targetTile?.document?._id || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function resolvePlaceableTile(targetTile, tileId) {
-  try {
-    if (targetTile?.document && targetTile?.mesh) return targetTile;
-    const doc = targetTile?.document || targetTile;
-    if (doc?.object) return doc.object;
-    const id = tileId || doc?.id || doc?._id;
-    if (!id) return null;
-    return canvas?.tiles?.placeables?.find((tile) => tile?.document?.id === id) || null;
-  } catch (_) {
-    return null;
-  }
+function stringifyError(error) {
+  return String(error?.message || error);
 }
 
 function normalizeEditingMode(mode) {
@@ -99,19 +116,6 @@ function getEditingRefreshTargets(tile, mode) {
     shouldRunMaskedTiling,
     shouldRunStandardTileMask
   };
-}
-
-function isScatterTileDocument(doc) {
-  try {
-    const scatter = doc?.getFlag?.('fa-nexus', 'assetScatter');
-    if (scatter && typeof scatter === 'object' && Array.isArray(scatter.instances)) return true;
-  } catch (_) {}
-  try {
-    const flags = doc?.flags?.['fa-nexus'] || doc?._source?.flags?.['fa-nexus'];
-    return !!(flags?.assetScatter && typeof flags.assetScatter === 'object' && Array.isArray(flags.assetScatter.instances));
-  } catch (_) {
-    return false;
-  }
 }
 
 function stripPathQueryAndHash(value) {
@@ -201,6 +205,10 @@ export class TexturePaintManager {
     this._delegateListenerBound = false;
     this._editingTileId = null;
     this._editingTileMode = null;
+    this._pendingLaunchPlacementAnchorTileId = undefined;
+    this._sessionSceneId = null;
+    this._hostUnavailableReason = 'host-context-unavailable';
+    this._lastPreviewLayerSignature = null;
     this._syncToolOptionsState();
   }
 
@@ -209,13 +217,7 @@ export class TexturePaintManager {
   }
 
   hasSessionChanges() {
-    if (!this._delegate?.isActive) return false;
-    try {
-      if (typeof this._delegate?.hasSessionChanges === 'function') {
-        return !!this._delegate.hasSessionChanges();
-      }
-    } catch (_) {}
-    return true;
+    return hasHostedSessionChanges(this._delegate);
   }
 
   async _ensureDelegate() {
@@ -245,16 +247,30 @@ export class TexturePaintManager {
   _bindDelegate(delegate) {
     if (!delegate || this._delegateListenerBound) return delegate;
     this._patchDelegate(delegate);
+    if (typeof delegate.setToolOptionsListener !== 'function') return delegate;
     try {
-      delegate.setToolOptionsListener?.((options = {}) => {
+      delegate.setToolOptionsListener((options = {}) => {
         const suppressRender = options && typeof options === 'object' && 'suppressRender' in options
           ? !!options.suppressRender
           : false;
         this._syncToolOptionsState({ suppressRender });
       });
       this._delegateListenerBound = true;
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn?.('TexturePaintManager.toolOptionsListener.bindFailed', { error: stringifyError(error) });
+    }
     return delegate;
+  }
+
+  _unbindDelegateListener(delegate = this._delegate) {
+    if (!this._delegateListenerBound) return;
+    this._delegateListenerBound = false;
+    if (typeof delegate?.setToolOptionsListener !== 'function') return;
+    try {
+      delegate.setToolOptionsListener(null);
+    } catch (error) {
+      Logger.warn?.('TexturePaintManager.toolOptionsListener.unbindFailed', { error: stringifyError(error) });
+    }
   }
 
   _patchDelegate(delegate) {
@@ -356,38 +372,50 @@ export class TexturePaintManager {
               crop.height
             );
             return { canvas: croppedCanvas, originalSize, crop, hasPartialAlpha };
-          } catch (_) {
+          } catch (error) {
+            Logger.warn?.('TexturePaintManager.prepareMaskCanvas.hostPatch.failed', {
+              error: stringifyError(error),
+              width: Number(srcCanvas?.width || 0) || 0,
+              height: Number(srcCanvas?.height || 0) || 0
+            });
             return originalPrepareMaskCanvas.call(this, srcCanvas, ...args);
           }
         };
       }
-    } catch (_) {}
+    } catch (error) {
+      Logger.error?.('TexturePaintManager.delegatePatch.failed', { error: stringifyError(error) });
+      return delegate;
+    }
     delegate._faNexusHostPatchApplied = true;
     return delegate;
   }
 
   async start(...args) {
     const delegate = await this._ensureDelegate();
-    let result;
-    try {
-      if (!this._editingTileId) {
-        this._clearEditingTile();
-      }
-      toolOptionsController.activateTool('texture.paint', { label: 'Texture Painter' });
-      this._beginToolWindowMonitor('texture.paint', delegate);
-      this._syncToolOptionsState({ suppressRender: false });
-      result = delegate.start?.(...args);
-      if (result?.then) result = await result;
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      this._syncToolOptionsState({ suppressRender: false });
-      this._scheduleToolOptionsRefresh();
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, { phase: 'start' });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._captureLaunchPlacementAnchorTileId();
+        this._snapshotSessionScene(null, 'start');
+        if (!this._editingTileId) {
+          this._clearEditingTile();
+        }
+        toolOptionsController.activateTool('texture.paint', { label: 'Texture Painter' });
+        this._beginToolWindowMonitor('texture.paint', delegate);
+        this._syncToolOptionsState({ suppressRender: false });
+      },
+      launchSession: () => delegate.start?.(...args),
+      awaitLaunch: true,
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._applyPendingLaunchPlacementAnchorTileId();
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        this._syncToolOptionsState({ suppressRender: false });
+        this._scheduleToolOptionsRefresh();
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, { phase: 'start' }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
+    });
   }
 
   async editTile(targetTile, options = {}) {
@@ -395,47 +423,48 @@ export class TexturePaintManager {
     if (!delegate || typeof delegate.editTile !== 'function') {
       throw new Error('Installed texture painter bundle does not support editing existing tiles.');
     }
-    let result;
-    try {
-      this._markEditingTile(targetTile, EDITING_MODE_MASKED_TILING);
-      toolOptionsController.activateTool('texture.paint', { label: 'Texture Painter' });
-      this._beginToolWindowMonitor('texture.paint', delegate);
-      this._syncToolOptionsState({ suppressRender: false });
-      result = delegate.editTile(targetTile, options);
-      if (result?.then) result = await result;
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      this._syncToolOptionsState({ suppressRender: false });
-      this._scheduleToolOptionsRefresh();
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, {
+    const tileId = resolveTileId(targetTile);
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._snapshotSessionScene(targetTile, 'edit');
+        this._markEditingTile(targetTile, EDITING_MODE_MASKED_TILING);
+        toolOptionsController.activateTool('texture.paint', { label: 'Texture Painter' });
+        this._beginToolWindowMonitor('texture.paint', delegate);
+        this._syncToolOptionsState({ suppressRender: false });
+      },
+      launchSession: () => delegate.editTile(targetTile, options),
+      awaitLaunch: true,
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        this._syncToolOptionsState({ suppressRender: false });
+        this._scheduleToolOptionsRefresh();
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, {
         phase: 'edit',
-        tileId: resolveTileId(targetTile)
-      });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
+        tileId
+      }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
+    });
   }
 
   async editStandardTile(targetTile, options = {}) {
     const delegate = await this._ensureDelegate();
     if (!delegate || typeof delegate.editStandardTile !== 'function') {
-      throw new Error('Installed texture painter bundle does not support editing standard tile masks.');
+      throw new Error('Installed texture painter bundle does not support Mask Tile editing.');
     }
     const doc = targetTile?.document || targetTile || null;
-    if (isScatterTileDocument(doc)) {
-      Logger.error?.('TexturePaintManager.editStandardTile.unsupportedScatter', { tileId: doc?.id || null });
-      throw new Error('Standard tile mask editing does not support scatter tiles.');
-    }
     const src = String(doc?.texture?.src || '').trim();
-    if (!src) {
+    const hasFlattenedChunks = getFlattenedChunkEntries(doc).length > 0;
+    const hasCustomBase = hasStandardMaskCustomBaseSource(doc);
+    if (!src && !hasFlattenedChunks && !hasCustomBase) {
       Logger.error?.('TexturePaintManager.editStandardTile.missingTexture', { tileId: doc?.id || null });
-      throw new Error('Standard tile mask editing requires an image-backed tile.');
+      throw new Error('Mask Tile editing requires an image-backed tile.');
     }
-    if (/\.(webm|mp4)$/i.test(src)) {
+    if (!hasCustomBase && /\.(webm|mp4)$/i.test(src)) {
       Logger.error?.('TexturePaintManager.editStandardTile.unsupportedVideo', { tileId: doc?.id || null, src });
-      throw new Error('Standard tile mask editing does not support video tiles.');
+      throw new Error('Mask Tile editing does not support video tiles.');
     }
     const launchOptions = { ...(options && typeof options === 'object' ? options : {}) };
     const filenameDetails = deriveStandardTileMaskFilenameSuggestion(doc, launchOptions);
@@ -454,108 +483,131 @@ export class TexturePaintManager {
         filenameSuggestion: launchOptions.filenameSuggestion
       });
     }
-    let result;
-    try {
-      this._markEditingTile(targetTile, EDITING_MODE_STANDARD_TILE_MASK);
-      toolOptionsController.activateTool('texture.paint', { label: 'Texture Painter' });
-      this._beginToolWindowMonitor('texture.paint', delegate);
-      this._syncToolOptionsState({ suppressRender: false });
-      result = delegate.editStandardTile(targetTile, launchOptions);
-      if (result?.then) result = await result;
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      this._syncToolOptionsState({ suppressRender: false });
-      this._scheduleToolOptionsRefresh();
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, {
+    const tileId = resolveTileId(targetTile);
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._snapshotSessionScene(targetTile, 'edit-standard');
+        this._markEditingTile(targetTile, EDITING_MODE_STANDARD_TILE_MASK);
+        toolOptionsController.activateTool('texture.paint', { label: 'Texture Painter' });
+        this._beginToolWindowMonitor('texture.paint', delegate);
+        this._syncToolOptionsState({ suppressRender: false });
+      },
+      launchSession: () => delegate.editStandardTile(targetTile, launchOptions),
+      awaitLaunch: true,
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        this._syncToolOptionsState({ suppressRender: false });
+        this._scheduleToolOptionsRefresh();
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, {
         phase: 'edit-standard',
-        tileId: resolveTileId(targetTile)
-      });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
+        tileId
+      }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
+    });
   }
 
   async _handleSessionLaunchFailure(error, { phase = 'start', tileId = null } = {}) {
-    Logger.error?.('TexturePaintManager.session.launchFailed', {
+    return handleHostedSessionLaunchFailure({
+      error,
       phase,
-      error: String(error?.message || error),
-      tileId: tileId || this._editingTileId || null,
-      editingMode: this._editingTileMode || null,
-      delegateActive: !!this._delegate?.isActive,
-      canvasReady: !!canvas?.ready,
-      hasCanvasStage: !!canvas?.stage
+      loggerPrefix: 'TexturePaintManager',
+      details: buildHostedSessionContextDetails({
+        app: this._app,
+        delegate: this._delegate,
+        tileId: tileId || this._editingTileId || null,
+        editingMode: this._editingTileMode || null
+      }),
+      cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
+      stopSession: ({ reason }) => this.stop({ reason }),
+      onFallbackCleanup: () => {
+        this._clearEditingTile();
+        try { toolOptionsController.deactivateTool('texture.paint'); } catch (_) {}
+      }
     });
-    this._cancelToolWindowMonitor();
-    try {
-      await Promise.resolve(this.stop({ reason: `${phase}-failed` }));
-    } catch (stopError) {
-      Logger.error?.('TexturePaintManager.session.launchFailed.stopFailed', {
-        phase,
-        error: String(stopError?.message || stopError)
-      });
-      this._clearEditingTile();
-      try { toolOptionsController.deactivateTool('texture.paint'); } catch (_) {}
-    }
   }
 
   _isEditorHostReady() {
-    try {
-      if (!canvas?.ready || !canvas?.stage) return false;
-      if (!this._app) return false;
-      if (this._app.rendered === false) return false;
-      if (!this._app.element) return false;
-      return true;
-    } catch (_) {
+    return isApplicationHostReady(this._app);
+  }
+
+  _snapshotSessionScene(target = null, phase = 'start') {
+    const doc = resolveTileDocument(target);
+    const sceneId = String(doc?.parent?.id || getCurrentSceneId() || '').trim();
+    this._sessionSceneId = sceneId || null;
+    if (!sceneId) {
+      Logger.warn?.('TexturePaintManager.session.sceneIdMissing', { phase });
+    }
+    return this._sessionSceneId;
+  }
+
+  _isSessionHostReady() {
+    if (!this._isEditorHostReady()) {
+      this._hostUnavailableReason = 'host-context-unavailable';
       return false;
     }
+    if (!isHostedSessionSceneCurrent(this._sessionSceneId)) {
+      this._hostUnavailableReason = 'scene-changed-during-editor-session';
+      return false;
+    }
+    this._hostUnavailableReason = 'host-context-unavailable';
+    return true;
+  }
+
+  _handleInactiveMonitorStop() {
+    if (this._sessionSceneId && !isHostedSessionSceneCurrent(this._sessionSceneId)) {
+      Logger.warn?.('TexturePaintManager.session.sceneChangedInactive', {
+        reason: 'scene-changed-during-editor-session',
+        sessionSceneId: this._sessionSceneId || null,
+        currentSceneId: getCurrentSceneId() || null,
+        tileId: this._editingTileId || null,
+        editingMode: this._editingTileMode || null
+      });
+    }
+    this._sessionSceneId = null;
   }
 
   _stopOrphanedSession({ reason = 'host-context-unavailable' } = {}) {
-    Logger.error?.('TexturePaintManager.session.orphaned', {
+    return stopHostedOrphanedSession({
       reason,
-      tileId: this._editingTileId || null,
-      editingMode: this._editingTileMode || null,
-      delegateActive: !!this._delegate?.isActive,
-      canvasReady: !!canvas?.ready,
-      hasCanvasStage: !!canvas?.stage,
-      appRendered: !!this._app?.rendered,
-      hasAppElement: !!this._app?.element
-    });
-    this._cancelToolWindowMonitor();
-    try {
-      const result = this.stop({ reason });
-      if (result && typeof result.catch === 'function') {
-        result.catch((stopError) => {
-          Logger.error?.('TexturePaintManager.session.orphaned.stopFailed', {
-            reason,
-            error: String(stopError?.message || stopError)
-          });
-        });
+      loggerPrefix: 'TexturePaintManager',
+      details: buildHostedSessionContextDetails({
+        app: this._app,
+        delegate: this._delegate,
+        includeAppState: true,
+        tileId: this._editingTileId || null,
+        editingMode: this._editingTileMode || null,
+        extra: {
+          sessionSceneId: this._sessionSceneId || null,
+          currentSceneId: getCurrentSceneId() || null
+        }
+      }),
+      cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
+      stopSession: ({ reason: stopReason }) => this.stop({ reason: stopReason }),
+      onFallbackCleanup: () => {
+        this._sessionSceneId = null;
+        this._clearEditingTile();
+        try { toolOptionsController.deactivateTool('texture.paint'); } catch (_) {}
       }
-    } catch (stopError) {
-      Logger.error?.('TexturePaintManager.session.orphaned.stopFailed', {
-        reason,
-        error: String(stopError?.message || stopError)
-      });
-      this._clearEditingTile();
-      try { toolOptionsController.deactivateTool('texture.paint'); } catch (_) {}
-    }
+    });
   }
 
   stop(...args) {
-    this._cancelToolWindowMonitor();
-    this._clearEditingTile();
-    if (!this._delegate) {
-      toolOptionsController.deactivateTool('texture.paint');
-      return;
-    }
-    try {
-      return this._delegate.stop?.(...args);
-    } finally {
-      toolOptionsController.deactivateTool('texture.paint');
-    }
+    return stopSessionWithFinalize({
+      delegate: this._delegate,
+      beforeStop: () => {
+        this._cancelToolWindowMonitor();
+        this._clearEditingTile();
+      },
+      stopSession: (delegate) => delegate.stop?.(...args),
+      finalize: () => {
+        this._sessionSceneId = null;
+        this._unbindDelegateListener();
+        toolOptionsController.deactivateTool('texture.paint');
+      }
+    });
   }
 
   async save(...args) {
@@ -573,118 +625,150 @@ export class TexturePaintManager {
     return delegate.placeMaskedTiling?.(...args);
   }
 
-  _scheduleEntitlementProbe() {
-    ensurePremiumFeaturesRegistered();
-    if (this._entitlementProbe) return this._entitlementProbe;
-    const probe = (async () => {
-      try {
-        await premiumFeatureBroker.require('texture.paint', { revalidate: true, reason: 'texture-paint:revalidate' });
-      } catch (error) {
-        this._handleEntitlementFailure(error);
-      } finally {
-        if (this._entitlementProbe === probe) this._entitlementProbe = null;
-      }
-    })();
-    this._entitlementProbe = probe;
-    probe.catch(() => {});
-    return probe;
-  }
-
-  _handleEntitlementFailure(error) {
-    try { this.stop?.(); }
-    catch (_) {}
-    this._delegate = null;
-    this._delegateListenerBound = false;
-    const hasAuth = this._hasPremiumAuth();
-    if (!hasAuth) {
-      Logger.info?.('TexturePaintManager.entitlement.skipDisconnect', {
-        code: error?.code || error?.name,
-        message: String(error?.message || error)
+  setSolidTextureColor(color, options = {}) {
+    const delegate = this._delegate;
+    if (!delegate?.isActive) return false;
+    const setter = delegate.setSolidTextureColor;
+    if (typeof setter !== 'function') {
+      Logger.error('TexturePaintManager.solidTextureColor.unsupportedDelegate', {
+        delegate: delegate?.constructor?.name || null,
+        color
       });
-      return;
-    }
-    const message = '🔐 Authentication expired - premium texture painting has been disabled. Please reconnect Patreon.';
-    if (this._isAuthFailure(error)) {
-      try { premiumEntitlementsService?.clear?.({ reason: 'texture-revalidate-failed' }); }
-      catch (_) {}
-      try { game?.settings?.set?.('fa-nexus', 'patreon_auth_data', null); }
-      catch (_) {}
-      ui?.notifications?.warn?.(message);
-    } else {
-      const fallback = `Unable to confirm premium access: ${error?.message || error}`;
-      ui?.notifications?.error?.(fallback);
-    }
-    try { Hooks?.callAll?.('fa-nexus-premium-auth-lost', { featureId: 'texture.paint', error }); }
-    catch (_) {}
-  }
-
-  _isAuthFailure(error) {
-    if (!error) return false;
-    const code = String(error?.code || error?.name || '').toUpperCase();
-    if (code && (/AUTH/.test(code) || ['STATE_MISSING', 'ENTITLEMENT_REQUIRED', 'HTTP_401', 'HTTP_403', 'SESSION_EXPIRED', 'STATE_INVALID'].includes(code))) {
-      return true;
-    }
-    const message = String(error?.message || '').toLowerCase();
-    return message.includes('auth') || message.includes('state');
-  }
-
-  _hasPremiumAuth() {
-    try {
-      const authData = game?.settings?.get?.('fa-nexus', 'patreon_auth_data');
-      return !!(authData && authData.authenticated && authData.state);
-    } catch (_) {
       return false;
     }
+    try {
+      return setter.call(delegate, color, options);
+    } catch (error) {
+      Logger.error('TexturePaintManager.solidTextureColor.failed', {
+        color,
+        error: stringifyError(error)
+      });
+      throw error;
+    }
+  }
+
+  hasActiveMarqueeSession() {
+    const delegate = this._delegate;
+    if (!delegate?.isActive) return false;
+    if (typeof delegate.hasActiveMarqueeSession !== 'function') {
+      Logger.error('TexturePaintManager.marqueeSession.unsupportedDelegate', {
+        delegate: delegate?.constructor?.name || null
+      });
+      ui?.notifications?.error?.('Texture Painter marquee session is not supported by the installed premium bundle.');
+      return false;
+    }
+    try {
+      return !!delegate.hasActiveMarqueeSession();
+    } catch (error) {
+      Logger.error('TexturePaintManager.marqueeSession.failed', {
+        error: stringifyError(error)
+      });
+      ui?.notifications?.error?.(`Failed to read Texture Painter marquee session: ${error?.message || error}`);
+      return false;
+    }
+  }
+
+  isMarqueeModeActive() {
+    const delegate = this._delegate;
+    if (!delegate?.isActive) return false;
+    if (typeof delegate.isMarqueeModeActive !== 'function') {
+      Logger.error('TexturePaintManager.marqueeMode.unsupportedDelegate', {
+        delegate: delegate?.constructor?.name || null
+      });
+      ui?.notifications?.error?.('Texture Painter marquee mode is not supported by the installed premium bundle.');
+      return false;
+    }
+    try {
+      return !!delegate.isMarqueeModeActive();
+    } catch (error) {
+      Logger.error('TexturePaintManager.marqueeMode.failed', {
+        error: stringifyError(error)
+      });
+      ui?.notifications?.error?.(`Failed to read Texture Painter marquee mode: ${error?.message || error}`);
+      return false;
+    }
+  }
+
+  async applyLayerPixelsToMarquee(docOrTile, { operation } = {}) {
+    const delegate = this._delegate;
+    const doc = docOrTile?.document || docOrTile || null;
+    const tileId = resolveTileId(docOrTile) || doc?.id || null;
+    if (!delegate?.isActive) {
+      const error = new Error('Texture Painter is not active.');
+      Logger.error('TexturePaintManager.marqueeLayerPixels.inactive', {
+        tileId,
+        operation: operation || null
+      });
+      ui?.notifications?.error?.(error.message);
+      throw error;
+    }
+    if (typeof delegate.applyLayerPixelsToMarquee !== 'function') {
+      const error = new Error('Installed texture painter bundle does not support Layer Manager marquee updates.');
+      Logger.error('TexturePaintManager.marqueeLayerPixels.unsupportedDelegate', {
+        delegate: delegate?.constructor?.name || null,
+        tileId,
+        operation: operation || null
+      });
+      ui?.notifications?.error?.(error.message);
+      throw error;
+    }
+    try {
+      return await delegate.applyLayerPixelsToMarquee(docOrTile, { operation });
+    } catch (error) {
+      Logger.error('TexturePaintManager.marqueeLayerPixels.failed', {
+        tileId,
+        operation: operation || null,
+        error: stringifyError(error)
+      });
+      ui?.notifications?.error?.(`Failed to apply layer pixels to the marquee: ${error?.message || error}`);
+      throw error;
+    }
+  }
+
+  _scheduleEntitlementProbe() {
+    return scheduleEntitlementRevalidation(this, {
+      featureId: 'texture.paint',
+      revalidateReason: 'texture-paint:revalidate',
+      onFailure: (error) => this._handleEntitlementFailure(error)
+    });
+  }
+
+  async _handleEntitlementFailure(error) {
+    return handleEntitlementRevalidationFailure({
+      error,
+      featureId: 'texture.paint',
+      loggerPrefix: 'TexturePaintManager',
+      clearReason: 'texture-revalidate-failed',
+      warningMessage: 'Authentication expired - premium texture painting has been disabled. Please reconnect Patreon.',
+      stopSession: () => this.stop?.(),
+      resetState: () => {
+        this._unbindDelegateListener();
+        this._delegate = null;
+      }
+    });
   }
 
   _beginToolWindowMonitor(toolId, delegate) {
     this._cancelToolWindowMonitor();
     if (!delegate) return;
-    const token = { cancelled: false, handle: null, usingTimeout: false, toolId };
-    const schedule = (callback) => {
-      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
-        token.usingTimeout = false;
-        token.handle = window.requestAnimationFrame(callback);
-      } else {
-        token.usingTimeout = true;
-        token.handle = setTimeout(callback, 200);
+    this._toolMonitor = startHostedToolWindowMonitor({
+      delegate,
+      toolId,
+      isHostReady: () => this._isSessionHostReady(),
+      clearEditingTile: () => this._clearEditingTile(),
+      cancelMonitor: () => this._cancelToolWindowMonitor(),
+      stopOrphanedSession: (details) => this._stopOrphanedSession({
+        ...details,
+        reason: this._hostUnavailableReason || details?.reason
+      }),
+      onInactive: () => {
+        this._handleInactiveMonitorStop();
       }
-    };
-    const tick = () => {
-      if (token.cancelled) return;
-      let active = false;
-      try { active = !!delegate?.isActive; }
-      catch (_) { active = false; }
-      if (!active) {
-        this._clearEditingTile();
-        toolOptionsController.deactivateTool(toolId);
-        this._cancelToolWindowMonitor();
-        return;
-      }
-      if (!this._isEditorHostReady()) {
-        if (!token.hostFailureHandled) {
-          token.hostFailureHandled = true;
-          this._stopOrphanedSession({ reason: 'host-context-unavailable' });
-        }
-        return;
-      }
-      schedule(tick);
-    };
-    this._toolMonitor = token;
-    schedule(tick);
+    });
   }
 
   _cancelToolWindowMonitor() {
-    const token = this._toolMonitor;
-    if (!token) return;
-    token.cancelled = true;
-    if (token.handle != null) {
-      try {
-        if (token.usingTimeout) clearTimeout(token.handle);
-        else if (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(token.handle);
-      } catch (_) {}
-    }
-    this._toolMonitor = null;
+    this._toolMonitor = cancelToolWindowMonitor(this._toolMonitor);
   }
 
   _markEditingTile(targetTile, mode = null) {
@@ -695,55 +779,55 @@ export class TexturePaintManager {
       if (this._editingTileId && (this._editingTileId !== tileId || this._editingTileMode !== editingMode)) {
         this._clearEditingTile();
       }
-      this._editingTileId = tileId;
+      const { tile } = beginEditingTileTracking(this, {
+        target: targetTile,
+        sharedSetKey: EDITING_TILE_SET_KEY
+      });
       this._editingTileMode = editingMode;
-      const set = getEditingTileSet();
-      if (set) set.add(tileId);
-      const tile = resolvePlaceableTile(targetTile, tileId);
       if (tile) {
         const targets = getEditingRefreshTargets(tile, editingMode);
         if (targets.shouldRunMaskedTiling) applyMaskedTilingToTile(tile);
         if (targets.shouldRunStandardTileMask) applyStandardTileMaskToTile(tile);
       }
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn?.('TexturePaintManager.editingTile.refresh.failed', {
+        error: stringifyError(error),
+        tileId: resolveTileId(targetTile) || null,
+        mode: normalizeEditingMode(mode)
+      });
+    }
   }
 
   _clearEditingTile() {
-    try {
-      const tileId = this._editingTileId;
-      const editingMode = this._editingTileMode;
-      if (!tileId) return;
-      this._editingTileId = null;
-      this._editingTileMode = null;
-      const set = getEditingTileSet();
-      if (set) set.delete(tileId);
-      const tile = resolvePlaceableTile(null, tileId);
-      const refreshJobs = [];
-      if (tile) {
+    const editingMode = this._editingTileMode;
+    endEditingTileWithRefresh(this, {
+      sharedSetKey: EDITING_TILE_SET_KEY,
+      loggerPrefix: 'TexturePaintManager',
+      beforeCollect: () => {
+        this._editingTileMode = null;
+      },
+      collectRefreshJobs: ({ tile }) => {
+        const refreshJobs = [];
         const targets = getEditingRefreshTargets(tile, editingMode);
         if (targets.shouldRunMaskedTiling) refreshJobs.push(Promise.resolve(applyMaskedTilingToTile(tile)));
         if (targets.shouldRunStandardTileMask) refreshJobs.push(Promise.resolve(applyStandardTileMaskToTile(tile)));
-      }
-      const requestRefresh = () => {
-        requestSelectionFilterRefresh({
-          reason: 'texture-editor-edit-exit',
-          source: 'texture-paint-manager',
-          tileIds: [tileId]
-        });
-      };
-      if (refreshJobs.length) {
-        Promise.allSettled(refreshJobs).finally(requestRefresh);
-      } else {
-        requestRefresh();
-      }
-    } catch (_) {}
+        return refreshJobs;
+      },
+      refreshAfterJobs: ({ tileId }) => requestSelectionFilterRefresh({
+        reason: 'texture-editor-edit-exit',
+        source: 'texture-paint-manager',
+        tileIds: [tileId]
+      })
+    });
   }
 
   _buildToolOptionsState() {
     try {
       const delegateState = this._delegate?.buildToolOptionsState?.();
       if (delegateState && typeof delegateState === 'object') return delegateState;
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn?.('TexturePaintManager.toolOptionsState.delegateFailed', { error: stringifyError(error) });
+    }
     return {
       hints: [
         'LMB paint the texture;',
@@ -758,6 +842,7 @@ export class TexturePaintManager {
       rotation: { available: false },
       scale: { available: false },
       layerOpacity: { available: false },
+      textureBlendMode: { available: false },
       hsbc: { available: false }
     };
   }
@@ -879,6 +964,39 @@ export class TexturePaintManager {
       };
       return id;
     };
+    const addSelectControl = ({
+      id,
+      label,
+      state,
+      handlerId,
+      valueMode = 'string'
+    } = {}) => {
+      if (!id || !state || typeof state !== 'object') return null;
+      const options = Array.isArray(state.options)
+        ? state.options
+          .map((option) => ({
+            value: String(option?.value ?? option?.id ?? ''),
+            label: String(option?.label ?? option?.value ?? option?.id ?? ''),
+            selected: !!option?.selected,
+            disabled: !!option?.disabled
+          }))
+          .filter((option) => option.value.length)
+        : [];
+      if (!options.length) return null;
+      controls[id] = {
+        id,
+        type: 'select',
+        label,
+        handlerId,
+        valueMode,
+        value: String(state.value ?? options.find((option) => option.selected)?.value ?? options[0]?.value ?? ''),
+        options,
+        disabled: !!state.disabled,
+        hint: typeof state.hint === 'string' ? state.hint : '',
+        tooltip: typeof state.tooltip === 'string' ? state.tooltip : ''
+      };
+      return id;
+    };
     const addScalarRandomizedControl = ({
       id,
       label,
@@ -976,6 +1094,24 @@ export class TexturePaintManager {
         state: legacyState.texturePaint.opacity,
         handlerId: 'setTextureOpacity',
         ariaLabel: 'Texture fill opacity'
+      }));
+    }
+    if (legacyState?.blackPixelGate?.available) {
+      const gate = legacyState.blackPixelGate;
+      paintControlIds.push(addRangeControl({
+        id: 'texture-black-pixel-fuzziness',
+        label: 'Black Fuzziness',
+        state: gate.fuzziness,
+        handlerId: 'setBlackPixelGateFuzziness',
+        headerToggle: {
+          label: gate.label || 'Block Black',
+          value: !!gate.enabled,
+          disabled: !!gate.disabled,
+          tooltip: gate.tooltip || '',
+          ariaLabel: gate.label || 'Block Black',
+          handlerId: 'setBlackPixelGateEnabled'
+        },
+        ariaLabel: 'Black pixel fuzziness'
       }));
     }
     if (legacyState?.textureBrush?.available) {
@@ -1190,6 +1326,26 @@ export class TexturePaintManager {
       idPrefix: 'texture-hsbc',
       ariaPrefix: 'Texture HSBC'
     });
+    if (legacyState?.textureBlendMode?.available) {
+      const blendControlId = addSelectControl({
+        id: 'texture-blend-mode',
+        label: 'Blend Mode',
+        state: legacyState.textureBlendMode,
+        handlerId: 'setTextureBlendMode'
+      });
+      if (blendControlId) {
+        const colorSection = sections.find((section) => section?.id === 'color');
+        if (colorSection) {
+          colorSection.controls = [blendControlId, ...(Array.isArray(colorSection.controls) ? colorSection.controls : [])];
+        } else {
+          sections.push({
+            id: 'color',
+            label: 'Color',
+            controls: [blendControlId]
+          });
+        }
+      }
+    }
 
     const editorActions = Array.isArray(legacyState?.editorActions)
       ? legacyState.editorActions.filter((action) => action && typeof action === 'object')
@@ -1212,140 +1368,53 @@ export class TexturePaintManager {
     return { controls, sections };
   }
 
+  _callDelegateToolOption(handlerName, methodNames, args = []) {
+    const names = Array.isArray(methodNames) ? methodNames : [methodNames];
+    for (const methodName of names) {
+      const fn = this._delegate?.[methodName];
+      if (typeof fn !== 'function') continue;
+      try {
+        return fn.call(this._delegate, ...(Array.isArray(args) ? args : []));
+      } catch (error) {
+        Logger.error('TexturePaint.toolOptionHandler.failed', {
+          handler: handlerName,
+          delegateMethod: methodName,
+          args,
+          error: String(error?.message || error)
+        });
+        return false;
+      }
+    }
+    return false;
+  }
+
   _buildToolOptionsHandlers(legacyState = {}) {
     const handlers = {
-      setTextureMode: (modeId) => {
-        const fn = this._delegate?.setTextureMode;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, modeId); }
-        catch (_) { return false; }
-      },
-      handleTextureAction: (actionId) => {
-        const fn = this._delegate?.handleTextureAction;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, actionId); }
-        catch (_) { return false; }
-      },
-      handleEditorAction: (actionId) => {
-        const fn = this._delegate?.handleEditorAction;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, actionId); }
-        catch (_) { return false; }
-      },
-      setTextureOpacity: (value, commit) => {
-        const fn = this._delegate?.setTextureOpacity;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setBrushSize: (value, commit) => {
-        const fn = this._delegate?.setBrushSize;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setParticleSize: (value, commit) => {
-        const fn = this._delegate?.setParticleSize;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setParticleDensity: (value, commit) => {
-        const fn = this._delegate?.setParticleDensity;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setSprayDeviation: (value, commit) => {
-        const fn = this._delegate?.setSprayDeviation;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setBrushSpacing: (value, commit) => {
-        const fn = this._delegate?.setBrushSpacing;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setElevation: (value, commit) => {
-        const fn = this._delegate?.setElevation;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setRotation: (value, commit) => {
-        const fn = this._delegate?.setRotation || this._delegate?.setTextureRotation;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setScale: (value, commit) => {
-        const fn = this._delegate?.setScale || this._delegate?.setTextureScale;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setTextureOffset: (axis, value, commit) => {
-        const fn = this._delegate?.setTextureOffset;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, axis, value, commit); }
-        catch (_) { return false; }
-      },
-      setLayerOpacity: (value, commit) => {
-        const fn = this._delegate?.setLayerOpacity;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setHue: (value, commit) => {
-        const fn = this._delegate?.setHue;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setSaturation: (value, commit) => {
-        const fn = this._delegate?.setSaturation;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setBrightness: (value, commit) => {
-        const fn = this._delegate?.setBrightness;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setContrast: (value, commit) => {
-        const fn = this._delegate?.setContrast;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setHeightThreshold: (axis, value, commit) => {
-        const fn = this._delegate?.setHeightThreshold;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, axis, value, commit); }
-        catch (_) { return false; }
-      },
-      setHeightContrast: (value, commit) => {
-        const fn = this._delegate?.setHeightContrast;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      setHeightLift: (value, commit) => {
-        const fn = this._delegate?.setHeightLift;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate, value, commit); }
-        catch (_) { return false; }
-      },
-      toggleHeightMapCollapsed: () => {
-        const fn = this._delegate?.toggleHeightMapCollapsed;
-        if (typeof fn !== 'function') return false;
-        try { return fn.call(this._delegate); }
-        catch (_) { return false; }
-      }
+      setTextureMode: (modeId) => this._callDelegateToolOption('setTextureMode', 'setTextureMode', [modeId]),
+      handleTextureAction: (actionId) => this._callDelegateToolOption('handleTextureAction', 'handleTextureAction', [actionId]),
+      handleEditorAction: (actionId) => this._callDelegateToolOption('handleEditorAction', 'handleEditorAction', [actionId]),
+      setTextureOpacity: (value, commit) => this._callDelegateToolOption('setTextureOpacity', 'setTextureOpacity', [value, commit]),
+      setBrushSize: (value, commit) => this._callDelegateToolOption('setBrushSize', 'setBrushSize', [value, commit]),
+      setParticleSize: (value, commit) => this._callDelegateToolOption('setParticleSize', 'setParticleSize', [value, commit]),
+      setParticleDensity: (value, commit) => this._callDelegateToolOption('setParticleDensity', 'setParticleDensity', [value, commit]),
+      setSprayDeviation: (value, commit) => this._callDelegateToolOption('setSprayDeviation', 'setSprayDeviation', [value, commit]),
+      setBrushSpacing: (value, commit) => this._callDelegateToolOption('setBrushSpacing', 'setBrushSpacing', [value, commit]),
+      setElevation: (value, commit) => this._callDelegateToolOption('setElevation', 'setElevation', [value, commit]),
+      setRotation: (value, commit) => this._callDelegateToolOption('setRotation', ['setRotation', 'setTextureRotation'], [value, commit]),
+      setScale: (value, commit) => this._callDelegateToolOption('setScale', ['setScale', 'setTextureScale'], [value, commit]),
+      setTextureOffset: (axis, value, commit) => this._callDelegateToolOption('setTextureOffset', 'setTextureOffset', [axis, value, commit]),
+      setLayerOpacity: (value, commit) => this._callDelegateToolOption('setLayerOpacity', 'setLayerOpacity', [value, commit]),
+      setTextureBlendMode: (value) => this._callDelegateToolOption('setTextureBlendMode', 'setTextureBlendMode', [normalizeMaskedTextureBlendMode(value)]),
+      setHue: (value, commit) => this._callDelegateToolOption('setHue', 'setHue', [value, commit]),
+      setSaturation: (value, commit) => this._callDelegateToolOption('setSaturation', 'setSaturation', [value, commit]),
+      setBrightness: (value, commit) => this._callDelegateToolOption('setBrightness', 'setBrightness', [value, commit]),
+      setContrast: (value, commit) => this._callDelegateToolOption('setContrast', 'setContrast', [value, commit]),
+      setBlackPixelGateEnabled: (enabled) => this._callDelegateToolOption('setBlackPixelGateEnabled', 'setBlackPixelGateEnabled', [enabled]),
+      setBlackPixelGateFuzziness: (value, commit) => this._callDelegateToolOption('setBlackPixelGateFuzziness', 'setBlackPixelGateFuzziness', [value, commit]),
+      setHeightThreshold: (axis, value, commit) => this._callDelegateToolOption('setHeightThreshold', 'setHeightThreshold', [axis, value, commit]),
+      setHeightContrast: (value, commit) => this._callDelegateToolOption('setHeightContrast', 'setHeightContrast', [value, commit]),
+      setHeightLift: (value, commit) => this._callDelegateToolOption('setHeightLift', 'setHeightLift', [value, commit]),
+      toggleHeightMapCollapsed: () => this._callDelegateToolOption('toggleHeightMapCollapsed', 'toggleHeightMapCollapsed')
     };
     const customToggles = this._delegate?.getCustomToggleHandlers?.();
     const mergedCustomToggles = customToggles && typeof customToggles === 'object'
@@ -1366,20 +1435,198 @@ export class TexturePaintManager {
     return handlers;
   }
 
-  _syncToolOptionsState({ suppressRender = true } = {}) {
-    try {
-      const descriptor = this._buildToolOptionsDescriptor();
-      toolOptionsController.setToolOptions('texture.paint', {
-        ...descriptor,
-        suppressRender
+  _notifyPreviewLayerChangeIfNeeded(descriptor = null, { force = false, source = 'texture-preview' } = {}) {
+    const previewState = {
+      active: !!this._delegate?.isActive,
+      elevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : null,
+      sort: Number.isFinite(this._delegate?._previewSort) ? Number(this._delegate._previewSort) : null,
+      mode: descriptor?.descriptor?.activeMode || null
+    };
+    const signature = JSON.stringify(previewState);
+    if (!force && signature === this._lastPreviewLayerSignature) return;
+    this._lastPreviewLayerSignature = signature;
+    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source, previewState }); } catch (_) {}
+  }
+
+  _captureLaunchPlacementAnchorTileId(controlledTiles = canvas?.tiles?.controlled) {
+    const anchorTile = resolvePlacementAnchorTile(controlledTiles, { source: 'texture-paint-start' });
+    const anchorTileId = String(anchorTile?.document?.id || anchorTile?.id || '').trim() || null;
+    this._pendingLaunchPlacementAnchorTileId = anchorTileId;
+    Logger.debug?.('TexturePaintManager.sortAnchor.launchCapture', {
+      anchorTileId,
+      elevation: Number(anchorTile?.document?.elevation ?? anchorTile?.elevation ?? 0) || 0,
+      sort: Number(anchorTile?.document?.sort ?? anchorTile?.sort ?? 0) || 0
+    });
+    return anchorTileId;
+  }
+
+  _applyPendingLaunchPlacementAnchorTileId() {
+    if (this._pendingLaunchPlacementAnchorTileId === undefined) return null;
+    const anchorTileId = this._pendingLaunchPlacementAnchorTileId || null;
+    this._pendingLaunchPlacementAnchorTileId = undefined;
+    if (!this._delegate) return anchorTileId;
+    try { this._delegate._placementSortAnchorTileId = anchorTileId; } catch (_) {}
+    try { this._delegate._placementSortBeforeAnchor = false; } catch (_) {}
+    Logger.debug?.('TexturePaintManager.sortAnchor.launchApply', { anchorTileId });
+    return anchorTileId;
+  }
+
+  _syncDelegatePreviewRenderSort() {
+    const delegate = this._delegate;
+    if (!delegate) return null;
+    const currentPlacementSort = Number(delegate?._previewSort ?? 0);
+    if (this._editingTileId) {
+      const resolvedSort = Number.isFinite(currentPlacementSort) ? currentPlacementSort : 0;
+      try { delegate._previewRenderSort = resolvedSort; } catch (_) {}
+      return resolvedSort;
+    }
+    const elevation = Number(delegate?._previewElevation ?? 0);
+    const resolved = resolvePlacementSortAtElevation(Number.isFinite(elevation) ? elevation : 0, {
+      anchorTileId: delegate?._placementSortAnchorTileId,
+      sortBefore: delegate?._placementSortBeforeAnchor === true,
+      scene: canvas?.scene,
+      count: 1
+    });
+    const placementSort = Number(resolved?.sort ?? currentPlacementSort);
+    if (Number.isFinite(placementSort) && Number.isFinite(currentPlacementSort) && Math.abs(placementSort - currentPlacementSort) > 0.000001) {
+      Logger.debug?.('TexturePaintManager.previewSort.launchResolved', {
+        previousSort: currentPlacementSort,
+        resolvedSort: placementSort,
+        elevation: Number.isFinite(elevation) ? elevation : 0,
+        anchorTileId: delegate?._placementSortAnchorTileId || null
       });
+      try { delegate._previewSort = placementSort; } catch (_) {}
+    }
+    const renderSort = Number(resolved?.previewSort ?? placementSort);
+    const nextRenderSort = Number.isFinite(renderSort)
+      ? renderSort
+      : (Number.isFinite(placementSort) ? placementSort : 0);
+    try { delegate._previewRenderSort = nextRenderSort; } catch (_) {}
+    return nextRenderSort;
+  }
+
+  _applyCurrentPreviewLayerOrdering() {
+    const layer = this._delegate?._layer;
+    if (!layer || layer.destroyed) return;
+    const baseSort = Number(this._delegate?._previewSort ?? 0);
+    const baseRenderSort = Number(this._delegate?._previewRenderSort ?? this._syncDelegatePreviewRenderSort() ?? baseSort);
+    const elevation = Number(this._delegate?._previewElevation ?? 0);
+    const resolvedSort = Number.isFinite(baseSort) ? baseSort : 0;
+    const resolvedRenderSort = Number.isFinite(baseRenderSort) ? baseRenderSort : resolvedSort;
+    const resolvedElevation = Number.isFinite(elevation) ? elevation : 0;
+    const placementLevelId = String(this._delegate?._previewPlacementLevelId || getDefaultTilePlacementLevelId() || '').trim() || null;
+    const renderOrder = resolveTileRenderOrder({ elevation: resolvedElevation, sort: resolvedRenderSort }, {
+      elevation: resolvedElevation,
+      sort: resolvedRenderSort,
+      placementLevelId,
+      allowCurrentLevelFallback: true
+    });
+    const renderSort = Number.isFinite(Number(renderOrder?.sort)) ? Number(renderOrder.sort) : resolvedRenderSort;
+    const renderElevation = Number.isFinite(Number(renderOrder?.elevation)) ? Number(renderOrder.elevation) : getTileRenderElevation(resolvedElevation);
+    const zIndex = Number.isFinite(Number(renderOrder?.zIndex)) ? Number(renderOrder.zIndex) : (getGroundBandRenderSort(resolvedElevation, resolvedRenderSort) !== null ? resolvedRenderSort : 0);
+    const sortLayer = Number.isFinite(Number(renderOrder?.sortLayer)) ? Number(renderOrder.sortLayer) : layer.sortLayer;
+    try { layer.sort = renderSort; } catch (_) {}
+    try { layer.faNexusSort = renderSort; } catch (_) {}
+    try { layer.faNexusPlacementSort = resolvedSort; } catch (_) {}
+    try { layer.faNexusPreviewSort = resolvedRenderSort; } catch (_) {}
+    try { layer.faNexusElevationDoc = resolvedElevation; } catch (_) {}
+    try { layer.faNexusElevation = renderElevation; } catch (_) {}
+    try { layer.faNexusPlacementLevelId = renderOrder?.placementLevelId || placementLevelId || null; } catch (_) {}
+    try { layer.faNexusBandKind = renderOrder?.kind || 'normal'; } catch (_) {}
+    try { layer.elevation = renderElevation; } catch (_) {}
+    try { layer.sortLayer = sortLayer; } catch (_) {}
+    try { layer.zIndex = zIndex; } catch (_) {}
+    const parent = layer.parent;
+    if (!parent) return;
+    try {
+      if ('sortDirty' in parent) parent.sortDirty = true;
+      parent.sortChildren?.();
     } catch (_) {}
   }
 
+  applyLayerManagerPreviewPlacement({
+    elevation = null,
+    sort = undefined,
+    previewSort = undefined,
+    placementLevelId = undefined,
+    anchorTileId = undefined,
+    sortBefore = undefined
+  } = {}) {
+    if (!this._delegate?.isActive) return false;
+    let changed = false;
+
+    if (placementLevelId !== undefined) {
+      const nextPlacementLevelId = String(placementLevelId || '').trim() || null;
+      if (String(this._delegate?._previewPlacementLevelId || '').trim() !== String(nextPlacementLevelId || '').trim()) {
+        try { this._delegate._previewPlacementLevelId = nextPlacementLevelId; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (anchorTileId !== undefined) {
+      const nextAnchorTileId = String(anchorTileId || '').trim() || null;
+      if (String(this._delegate?._placementSortAnchorTileId || '').trim() !== String(nextAnchorTileId || '').trim()) {
+        try { this._delegate._placementSortAnchorTileId = nextAnchorTileId; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (sortBefore !== undefined) {
+      const nextSortBefore = sortBefore === true;
+      if (this._delegate?._placementSortBeforeAnchor !== nextSortBefore) {
+        try { this._delegate._placementSortBeforeAnchor = nextSortBefore; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (Number.isFinite(Number(elevation))) {
+      const nextElevation = Number(elevation);
+      if (Number(this._delegate?._previewElevation) !== nextElevation) {
+        const handled = this._callDelegateToolOption('setElevation', 'setElevation', [nextElevation, true]);
+        if (handled === false) this._delegate._previewElevation = nextElevation;
+        changed = true;
+      }
+    }
+
+    if (sort !== undefined && Number.isFinite(Number(sort))) {
+      const nextSort = Number(sort);
+      if (Number(this._delegate?._previewSort) !== nextSort) {
+        try { this._delegate._previewSort = nextSort; } catch (_) {}
+        changed = true;
+      }
+      const nextPreviewSort = previewSort !== undefined && Number.isFinite(Number(previewSort))
+        ? Number(previewSort)
+        : nextSort;
+      if (Number(this._delegate?._previewRenderSort) !== nextPreviewSort) {
+        try { this._delegate._previewRenderSort = nextPreviewSort; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (!changed) return false;
+    this._applyCurrentPreviewLayerOrdering();
+    this._scheduleToolOptionsRefresh();
+    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source: 'texture-preview-layer-manager' });
+    return true;
+  }
+
+  _syncToolOptionsState({ suppressRender = true } = {}) {
+    const descriptor = this._buildToolOptionsDescriptor();
+    syncHostedToolOptions({
+      toolId: 'texture.paint',
+      descriptor,
+      suppressRender,
+      loggerPrefix: 'TexturePaintManager'
+    });
+    this._notifyPreviewLayerChangeIfNeeded(descriptor, { source: 'texture-preview' });
+  }
+
   _scheduleToolOptionsRefresh() {
-    try { queueMicrotask(() => this._syncToolOptionsState({ suppressRender: false })); } catch (_) {}
-    try { setTimeout(() => this._syncToolOptionsState({ suppressRender: false }), 0); } catch (_) {}
-    try { setTimeout(() => this._syncToolOptionsState({ suppressRender: false }), 50); } catch (_) {}
+    scheduleHostedToolOptionsRefresh({
+      refresh: () => this._syncToolOptionsState({ suppressRender: false }),
+      shouldRefresh: () => !!this._delegate?.isActive,
+      loggerPrefix: 'TexturePaintManager'
+    });
   }
 }
 

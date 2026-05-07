@@ -1,0 +1,137 @@
+<section class="fa-nexus-scene-import" autocomplete="off">
+  <header class="fa-nexus-dialog-header">
+    <h2>Backfill Scene Assets</h2>
+    <p>Find FA cloud assets and Nexus mask files referenced by the current scene, download missing cloud files to your Nexus asset folder, and relink scene references to local copies.</p>
+  </header>
+
+  <section class="fa-nexus-dialog-body">
+    <div class="fa-nexus-scene-import__toolbar">
+      <div class="fa-nexus-scene-import__scene">
+        <span>Scene</span>
+        <strong>{{sceneName}}</strong>
+      </div>
+      <div class="fa-nexus-scene-import__actions">
+        <button type="button" class="btn" data-action="scan" {{#unless canScan}}disabled{{/unless}}>
+          <i class="fas fa-magnifying-glass"></i>
+          <span>Scan</span>
+        </button>
+        <button type="button" class="btn btn-primary" data-action="repair" {{#unless canRepair}}disabled{{/unless}}>
+          <i class="fas fa-cloud-download-alt"></i>
+          <span>Download &amp; Repair</span>
+        </button>
+      </div>
+    </div>
+
+    {{#if busy}}
+    <div class="fa-nexus-scene-import__status is-busy">
+      <i class="fas fa-spinner fa-spin"></i>
+      <span>{{busyLabel}}</span>
+    </div>
+    {{/if}}
+
+    {{#if hasError}}
+    <div class="fa-nexus-scene-import__status is-error">
+      <i class="fas fa-triangle-exclamation"></i>
+      <span>{{error}}</span>
+    </div>
+    {{/if}}
+
+    {{#if hasReport}}
+    <section class="fa-nexus-scene-import__summary">
+      <article class="fa-nexus-scene-import__metric">
+        <span>Total refs</span>
+        <strong>{{summary.totalRefs}}</strong>
+      </article>
+      <article class="fa-nexus-scene-import__metric">
+        <span>Repairable</span>
+        <strong>{{summary.actionable}}</strong>
+      </article>
+      <article class="fa-nexus-scene-import__metric">
+        <span>Missing</span>
+        <strong>{{summary.downloadable}}</strong>
+      </article>
+      <article class="fa-nexus-scene-import__metric">
+        <span>Local files</span>
+        <strong>{{summary.ready}}</strong>
+      </article>
+      <article class="fa-nexus-scene-import__metric">
+        <span>Repaired</span>
+        <strong>{{summary.repaired}}</strong>
+      </article>
+      <article class="fa-nexus-scene-import__metric">
+        <span>Blocked</span>
+        <strong>{{summary.blocked}}</strong>
+      </article>
+    </section>
+
+    <section class="fa-nexus-scene-import__panel">
+      <div class="fa-nexus-scene-import__panel-header">
+        <h3>References</h3>
+        <span>{{referenceCount}}</span>
+      </div>
+      {{#if hasRows}}
+      <div class="fa-nexus-scene-import__table-wrap">
+        <table class="fa-nexus-scene-import__table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Document</th>
+              <th>Reference</th>
+              <th>Cloud Asset</th>
+              <th>Local Path</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{#each rows}}
+            <tr>
+              <td>
+                <span class="fa-nexus-scene-import__pill {{statusClass}}">{{statusLabel}}</span>
+                {{#if reason}}
+                <div class="fa-nexus-scene-import__reason">{{reason}}</div>
+                {{/if}}
+                {{#if hasError}}
+                <div class="fa-nexus-scene-import__error">{{error}}</div>
+                {{/if}}
+              </td>
+              <td>
+                <strong>{{documentName}}</strong>
+                <span>{{documentType}}</span>
+              </td>
+              <td>
+                <code>{{source}}</code>
+                <div class="fa-nexus-scene-import__muted">{{updatePath}}</div>
+              </td>
+              <td>
+                {{#if hasCloudPath}}
+                <code>{{cloudPath}}</code>
+                {{else}}
+                <span class="fa-nexus-scene-import__muted">None</span>
+                {{/if}}
+              </td>
+              <td>
+                {{#if hasLocalPath}}
+                <code>{{localPath}}</code>
+                {{else}}
+                <span class="fa-nexus-scene-import__muted">Not downloaded</span>
+                {{/if}}
+              </td>
+            </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </div>
+      {{#if hasHiddenRows}}
+      <p class="fa-nexus-scene-import__muted">Showing the first {{visibleRows}} missing or blocked references. {{hiddenRows}} more are logged in the browser console.</p>
+      {{/if}}
+      {{else}}
+      <p class="fa-nexus-scene-import__empty">No missing or blocked FA asset references were found in the current scene.</p>
+      {{/if}}
+    </section>
+    {{else}}
+    <div class="fa-nexus-scene-import__empty-state">
+      <i class="fas fa-cloud-download-alt"></i>
+      <p>Scan the current scene before downloading missing files.</p>
+    </div>
+    {{/if}}
+  </section>
+</section>

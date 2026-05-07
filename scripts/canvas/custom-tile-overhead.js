@@ -1,4 +1,12 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js'
+import { cloneDisplayObjectForProxy } from './display-object-proxy.js'
+import { resolveTileId } from './tile-targets.js'
+import {
+  mapTileOcclusionElevation,
+  tileUsesLightOrWeatherRestrictions,
+  tileUsesSurfaceTileOcclusion,
+  tileUsesVisibleTileOcclusion
+} from './tile-occlusion.js'
 
 const TILE_STATES = new Map()
 
@@ -6,29 +14,55 @@ const DEFAULT_PROXY_SIZE = 2
 const MAX_PROXY_SIZE_FALLBACK = 4096
 const MAX_PROXY_SIZE_CAP = 8192
 const LATE_TEXTURE_REASON = 'late-texture'
+const DEPTH_ALPHA_THRESHOLD_MIN = 1 / 255
+
+const FILTER_VERTEX_SHADER = `
+attribute vec2 aVertexPosition;
+
+uniform mat3 projectionMatrix;
+uniform vec2 screenDimensions;
+uniform vec4 inputSize;
+uniform vec4 outputFrame;
+
+varying vec2 vTextureCoord;
+varying vec2 vMaskTextureCoord;
+
+void main() {
+  vec2 position = aVertexPosition * max(outputFrame.zw, vec2(0.0)) + outputFrame.xy;
+  gl_Position = vec4((projectionMatrix * vec3(position, 1.0)).xy, 0.0, 1.0);
+  vTextureCoord = aVertexPosition * (outputFrame.zw * inputSize.zw);
+  vMaskTextureCoord = (aVertexPosition * outputFrame.zw + outputFrame.xy) / max(screenDimensions, vec2(1.0));
+}
+`
 
 const FILTER_FRAGMENT_SHADER = `
 varying vec2 vTextureCoord;
+varying vec2 vMaskTextureCoord;
 
 uniform sampler2D uSampler;
 uniform sampler2D occlusionTexture;
-uniform vec2 screenDimensions;
 uniform float occlusionElevation;
 uniform float baseAlpha;
 uniform float occludedAlpha;
 uniform float fadeOcclusion;
 uniform float radialOcclusion;
 uniform float visionOcclusion;
+uniform float surfaceOcclusion;
 
 void main() {
   vec4 color = texture2D(uSampler, vTextureCoord);
-  vec2 maskCoord = gl_FragCoord.xy / max(screenDimensions, vec2(1.0));
-  vec3 occluded = 1.0 - step(vec3(occlusionElevation), texture2D(occlusionTexture, maskCoord).rgb);
-  float occlusion = max(occluded.r * fadeOcclusion, max(occluded.g * radialOcclusion, occluded.b * visionOcclusion));
+  vec4 occluded = 1.0 - step(vec4(occlusionElevation), texture2D(occlusionTexture, vMaskTextureCoord));
+  float occlusion = max(
+    max(occluded.r * fadeOcclusion, occluded.g * radialOcclusion),
+    max(occluded.b * visionOcclusion, occluded.a * surfaceOcclusion)
+  );
   float alphaFactor = mix(baseAlpha, occludedAlpha, occlusion);
   gl_FragColor = color * alphaFactor;
 }
 `
+
+let CustomTileOverheadFilterClass = null
+let CustomTileOverheadFilterBase = null
 
 function clamp(value, min, max, fallback = min) {
   const numeric = Number(value)
@@ -36,29 +70,52 @@ function clamp(value, min, max, fallback = min) {
   return Math.min(max, Math.max(min, numeric))
 }
 
-function resolveTileId(tile) {
-  try {
-    return tile?.document?.id || tile?.id || null
-  } catch (_) {
-    return null
-  }
-}
-
 function shouldUseTileOcclusionProxy(tile) {
   try {
     const doc = tile?.document
     if (!doc) return false
-    const mode = Number(doc.occlusion?.mode ?? doc._source?.occlusion?.mode)
-    const occlusionModes = globalThis?.CONST?.OCCLUSION_MODES || {}
-    const allowedModes = [
-      Number(occlusionModes.FADE),
-      Number(occlusionModes.RADIAL),
-      Number(occlusionModes.VISION)
-    ].filter(Number.isFinite)
-    if (allowedModes.length) return allowedModes.includes(mode)
-    return (mode === 1) || (mode === 3) || (mode === 4)
-  } catch (_) {}
+    return tileUsesVisibleTileOcclusion(doc.occlusion, {
+      sourceOcclusion: doc._source?.occlusion
+    })
+  } catch (error) {
+    Logger.debug?.('CustomTileOverhead.shouldUseTileOcclusionProxy.failed', {
+      tileId: resolveTileId(tile),
+      error: String(error?.message || error)
+    })
+  }
   return false
+}
+
+function shouldUseTileRestrictionProxy(tile) {
+  try {
+    return tileUsesLightOrWeatherRestrictions(tile?.document)
+  } catch (error) {
+    Logger.debug?.('CustomTileOverhead.shouldUseTileRestrictionProxy.failed', {
+      tileId: resolveTileId(tile),
+      error: String(error?.message || error)
+    })
+  }
+  return false
+}
+
+function shouldUseTileSurfaceProxy(tile) {
+  try {
+    const doc = tile?.document
+    if (!doc) return false
+    return tileUsesSurfaceTileOcclusion(doc.occlusion, {
+      sourceOcclusion: doc._source?.occlusion
+    })
+  } catch (error) {
+    Logger.debug?.('CustomTileOverhead.shouldUseTileSurfaceProxy.failed', {
+      tileId: resolveTileId(tile),
+      error: String(error?.message || error)
+    })
+  }
+  return false
+}
+
+function shouldUseCustomOverheadProxy(tile) {
+  return shouldUseTileOcclusionProxy(tile) || shouldUseTileSurfaceProxy(tile) || shouldUseTileRestrictionProxy(tile)
 }
 
 function getRenderer() {
@@ -204,9 +261,10 @@ function syncProxyMeshState(state) {
   try { proxyMesh.occlusionMode = mesh.occlusionMode } catch (_) {}
   try { proxyMesh.unoccludedAlpha = mesh.unoccludedAlpha } catch (_) {}
   try { proxyMesh.occludedAlpha = mesh.occludedAlpha } catch (_) {}
+  syncProxyMeshOcclusionState(mesh, proxyMesh)
   try { proxyMesh.hidden = mesh.hidden } catch (_) {}
   try { proxyMesh.hoverFade = mesh.hoverFade } catch (_) {}
-  try { proxyMesh.textureAlphaThreshold = mesh.textureAlphaThreshold } catch (_) {}
+  try { proxyMesh.textureAlphaThreshold = resolveProxyTextureAlphaThreshold(state?.tile, mesh) } catch (_) {}
   try { proxyMesh.restrictsLight = mesh.restrictsLight } catch (_) {}
   try { proxyMesh.restrictsWeather = mesh.restrictsWeather } catch (_) {}
   try {
@@ -241,48 +299,91 @@ function syncProxyMeshState(state) {
   return proxyMesh
 }
 
-class CustomTileOverheadFilter extends PIXI.Filter {
-  constructor(tile) {
-    super(undefined, FILTER_FRAGMENT_SHADER, {
-      screenDimensions: [1, 1],
-      occlusionTexture: getTransparentFallbackTexture(),
-      occlusionElevation: 0,
-      baseAlpha: 1,
-      occludedAlpha: 0,
-      fadeOcclusion: 0,
-      radialOcclusion: 0,
-      visionOcclusion: 0
-    })
-    this.tile = tile
-  }
+function resolveProxyTextureAlphaThreshold(tile, mesh) {
+  const raw = Number(mesh?.textureAlphaThreshold ?? tile?.document?.texture?.alphaThreshold)
+  const threshold = Number.isFinite(raw) ? clamp(raw, 0, 1, 0) : 0
+  return shouldUseTileRestrictionProxy(tile)
+    ? Math.max(threshold, DEPTH_ALPHA_THRESHOLD_MIN)
+    : threshold
+}
 
-  apply(filterManager, input, output, clear, currentState) {
-    try {
-      const tile = this.tile
-      const mesh = tile?.mesh
-      const uniforms = this.uniforms
-      const effectsActive = shouldApplyVisibleOverheadEffects(tile)
-      const occlusionMask = canvas?.masks?.occlusion
-      uniforms.screenDimensions = canvas?.screenDimensions || [1, 1]
-      uniforms.occlusionTexture = occlusionMask?.renderTexture || getTransparentFallbackTexture()
-      uniforms.occlusionElevation = occlusionMask?.mapElevation?.(mesh?.elevation ?? tile?.document?.elevation ?? 0) ?? 0
-      if (!effectsActive) {
-        uniforms.baseAlpha = 1
-        uniforms.occludedAlpha = 1
-        uniforms.fadeOcclusion = 0
-        uniforms.radialOcclusion = 0
-        uniforms.visionOcclusion = 0
-      } else {
-        uniforms.baseAlpha = clamp(mesh?.unoccludedAlpha ?? tile?.document?.alpha, 0, 1, 1)
-        uniforms.occludedAlpha = clamp(mesh?.occludedAlpha ?? tile?.document?.occlusion?.alpha, 0, 1, 0)
-        const state = mesh?._occlusionState || {}
-        uniforms.fadeOcclusion = clamp(state.fade, 0, 1, 0)
-        uniforms.radialOcclusion = clamp(state.radial, 0, 1, 0)
-        uniforms.visionOcclusion = clamp(state.vision, 0, 1, 0)
-      }
-    } catch (_) {}
-    super.apply(filterManager, input, output, clear, currentState)
+function syncProxyMeshOcclusionState(sourceMesh, proxyMesh) {
+  try {
+    const sourceState = sourceMesh?._occlusionState
+    const proxyState = proxyMesh?._occlusionState
+    if (!sourceState || !proxyState) return
+    proxyState.fade = Number(sourceState.fade) || 0
+    proxyState.radial = Number(sourceState.radial) || 0
+    proxyState.vision = Number(sourceState.vision) || 0
+    proxyState.surface = Number(sourceState.surface) || 0
+  } catch (_) {}
+}
+
+function getCustomTileOverheadFilterClass() {
+  const FilterClass = globalThis.PIXI?.Filter
+  if (!FilterClass) return null
+  if (CustomTileOverheadFilterClass && CustomTileOverheadFilterBase === FilterClass) return CustomTileOverheadFilterClass
+  CustomTileOverheadFilterBase = FilterClass
+  CustomTileOverheadFilterClass = class CustomTileOverheadFilter extends FilterClass {
+    constructor(tile) {
+      super(FILTER_VERTEX_SHADER, FILTER_FRAGMENT_SHADER, {
+        screenDimensions: [1, 1],
+        occlusionTexture: getTransparentFallbackTexture(),
+        occlusionElevation: 0,
+        baseAlpha: 1,
+        occludedAlpha: 0,
+        fadeOcclusion: 0,
+        radialOcclusion: 0,
+        visionOcclusion: 0,
+        surfaceOcclusion: 0
+      })
+      this.tile = tile
+    }
+
+    apply(filterManager, input, output, clear, currentState) {
+      try {
+        const tile = this.tile
+        const mesh = tile?.mesh
+        const uniforms = this.uniforms
+        const effectsActive = shouldApplyCustomOverheadEffects(tile)
+        const occlusionMask = canvas?.masks?.occlusion
+        uniforms.screenDimensions = canvas?.screenDimensions || [1, 1]
+        uniforms.occlusionTexture = occlusionMask?.renderTexture || getTransparentFallbackTexture()
+        uniforms.occlusionElevation = mapTileOcclusionElevation(tile, { mesh, occlusionMask })
+          ?? occlusionMask?.mapElevation?.(mesh?.elevation ?? tile?.document?.elevation ?? 0)
+          ?? 0
+        if (!effectsActive) {
+          uniforms.baseAlpha = 1
+          uniforms.occludedAlpha = 1
+          uniforms.fadeOcclusion = 0
+          uniforms.radialOcclusion = 0
+          uniforms.visionOcclusion = 0
+          uniforms.surfaceOcclusion = 0
+        } else {
+          uniforms.baseAlpha = clamp(mesh?.unoccludedAlpha ?? tile?.document?.alpha, 0, 1, 1)
+          uniforms.occludedAlpha = clamp(mesh?.occludedAlpha ?? tile?.document?.occlusion?.alpha, 0, 1, 0)
+          const state = mesh?._occlusionState || {}
+          uniforms.fadeOcclusion = clamp(state.fade, 0, 1, 0)
+          uniforms.radialOcclusion = clamp(state.radial, 0, 1, 0)
+          uniforms.visionOcclusion = clamp(state.vision, 0, 1, 0)
+          uniforms.surfaceOcclusion = clamp(state.surface, 0, 1, 0)
+        }
+      } catch (_) {}
+      super.apply(filterManager, input, output, clear, currentState)
+    }
   }
+  return CustomTileOverheadFilterClass
+}
+
+function createCustomTileOverheadFilter(tile) {
+  const FilterClass = getCustomTileOverheadFilterClass()
+  if (!FilterClass) {
+    Logger.error?.('CustomTileOverhead.filter.pixiMissing', {
+      tileId: resolveTileId(tile)
+    })
+    return null
+  }
+  return new FilterClass(tile)
 }
 
 function createState(tile, mesh) {
@@ -301,7 +402,8 @@ function createState(tile, mesh) {
     rebuildQueued: false,
     rebuildHandle: null,
     rebuildTimer: null,
-    rebuildReason: null
+    rebuildReason: null,
+    depthIssueKey: null
   }
   TILE_STATES.set(tile, state)
   return state
@@ -318,7 +420,7 @@ function syncStateMesh(state, mesh) {
     restoreMeshProxyBindings(state)
     state.mesh = mesh
   }
-  if (shouldUseTileOcclusionProxy(state.tile)) ensureMeshProxyBindings(state)
+  if (shouldUseCustomOverheadProxy(state.tile)) ensureMeshProxyBindings(state)
   else restoreMeshProxyBindings(state)
   return state.mesh || null
 }
@@ -396,9 +498,8 @@ function ensureMeshProxyBindings(state) {
   if (bindings.renderDepthData) {
     mesh.renderDepthData = function (...args) {
       if (state.mesh !== this) return bindings.renderDepthData.apply(this, args)
-      const proxyMesh = syncProxyMeshState(state)
-      if (!proxyMesh) return bindings.renderDepthData.apply(this, args)
-      return bindings.renderDepthData.apply(proxyMesh, args)
+      if (renderCustomProxyDepthData(state, this, args[0])) return
+      return bindings.renderDepthData.apply(this, args)
     }
   }
 
@@ -432,8 +533,10 @@ function ensureEntryParent(state, entry) {
   const contentContainer = entry?.contentContainer
   if (!mesh || mesh.destroyed || !contentContainer || contentContainer.destroyed) return
   try {
-    contentContainer.visible = true
-    contentContainer.renderable = true
+    const suppressed = contentContainer.faNexusStandardMaskSuppressed === true
+      || contentContainer.faNexusShadowOnlySuppressed === true
+    contentContainer.visible = !suppressed
+    contentContainer.renderable = !suppressed
     contentContainer.eventMode = 'none'
     if ('interactiveChildren' in contentContainer) contentContainer.interactiveChildren = false
   } catch (_) {}
@@ -479,17 +582,97 @@ function syncVisibleState(state) {
   if (!mesh || mesh.destroyed) return
   const shouldShow = mesh.visible !== false
   const shouldRender = mesh.renderable !== false
-  const contentAlpha = shouldApplyVisibleOverheadEffects(state?.tile)
+  const contentAlpha = shouldApplyCustomOverheadEffects(state?.tile)
     ? 1
     : clamp(state?.tile?.document?.alpha, 0, 1, 1)
   try { mesh.alpha = 1 } catch (_) {}
   for (const entry of state.entries.values()) {
     const contentContainer = entry?.contentContainer
     if (!contentContainer || contentContainer.destroyed) continue
+    if (contentContainer.faNexusStandardMaskSuppressed === true || contentContainer.faNexusShadowOnlySuppressed === true) {
+      try { contentContainer.visible = false } catch (_) {}
+      try { contentContainer.renderable = false } catch (_) {}
+      continue
+    }
     try { contentContainer.visible = shouldShow } catch (_) {}
     try { contentContainer.renderable = shouldRender } catch (_) {}
     try { contentContainer.alpha = contentAlpha } catch (_) {}
   }
+}
+
+function markDepthMaskDirty() {
+  try {
+    const depth = canvas?.masks?.depth
+    if (!depth) return
+    depth.renderDirty = true
+  } catch (_) {}
+}
+
+function logDepthProxyIssue(state, code, data = {}) {
+  try {
+    const key = `${code}:${data?.error || data?.reason || ''}`
+    if (state.depthIssueKey === key) return
+    state.depthIssueKey = key
+    Logger.error?.(code, {
+      tileId: state?.tileId,
+      ...data
+    })
+  } catch (_) {}
+}
+
+function clearDepthProxyIssue(state) {
+  try { if (state) state.depthIssueKey = null } catch (_) {}
+}
+
+function renderProxyDepthDataUnchecked(proxyMesh, renderer) {
+  if (!proxyMesh || proxyMesh.destroyed || !renderer) return
+  if (!proxyMesh.visible || !proxyMesh.renderable) return
+  const shader = proxyMesh._shader
+  const depthShader = shader?.depthShader
+  if (!depthShader) throw new Error('Proxy mesh depth shader is unavailable')
+  const blendMode = proxyMesh.blendMode
+  proxyMesh.blendMode = PIXI.BLEND_MODES.MAX_COLOR
+  proxyMesh._shader = depthShader
+  try {
+    if (proxyMesh.cullable) proxyMesh._renderWithCulling(renderer)
+    else proxyMesh._render(renderer)
+  } finally {
+    proxyMesh._shader = shader
+    proxyMesh.blendMode = blendMode
+  }
+}
+
+function renderCustomProxyDepthData(state, sourceMesh, renderer) {
+  if (!state || !sourceMesh || sourceMesh.destroyed) return false
+  if (!sourceMesh.shouldRenderDepth) return true
+  if (!state.proxyTexture || state.proxyTexture.destroyed) {
+    if (!state.rebuildQueued) queueRebuild(state)
+    clearDepthProxyIssue(state)
+    return true
+  }
+  const proxyMesh = syncProxyMeshState(state)
+  if (!proxyMesh || proxyMesh.destroyed) {
+    logDepthProxyIssue(state, 'CustomTileOverhead.depthProxy.missingProxyMesh', {
+      reason: 'syncProxyMeshState returned no mesh'
+    })
+    return true
+  }
+  if (!proxyMesh.texture || proxyMesh.texture.destroyed) {
+    logDepthProxyIssue(state, 'CustomTileOverhead.depthProxy.missingTexture', {
+      reason: 'proxy mesh has no live texture'
+    })
+    return true
+  }
+  try {
+    proxyMesh.textureAlphaThreshold = resolveProxyTextureAlphaThreshold(state.tile, sourceMesh)
+    renderProxyDepthDataUnchecked(proxyMesh, renderer)
+    clearDepthProxyIssue(state)
+  } catch (error) {
+    logDepthProxyIssue(state, 'CustomTileOverhead.depthProxy.renderFailed', {
+      error: String(error?.message || error)
+    })
+  }
+  return true
 }
 
 function collectMaskObjects(displayObject, masks = new Set()) {
@@ -530,6 +713,10 @@ function shouldApplyVisibleOverheadEffects(tile = null) {
   }
 }
 
+function shouldApplyCustomOverheadEffects(tile = null) {
+  return shouldUseTileSurfaceProxy(tile) || shouldApplyVisibleOverheadEffects(tile)
+}
+
 function clearProxyTexture(state) {
   if (!state) return
   if (state.proxyTexture && !state.proxyTexture.destroyed) {
@@ -540,6 +727,7 @@ function clearProxyTexture(state) {
   state.proxySizeKey = null
   try { if (state.mesh) delete state.mesh.faNexusCustomOverheadProxyTexture } catch (_) {}
   try { if (state.tile) delete state.tile.faNexusCustomOverheadProxyTexture } catch (_) {}
+  markDepthMaskDirty()
 }
 
 function deactivateOverheadRuntime(state) {
@@ -566,9 +754,29 @@ function restoreTargetFilters(state) {
   state.targetFilters.clear()
 }
 
+function isManagedMaskedTextureBlendFilter(filter) {
+  try {
+    return Object.getOwnPropertySymbols(filter || {})
+      .some((symbol) => String(symbol) === 'Symbol(faNexusMaskedTextureBlendFilter)' && filter[symbol] === true)
+  } catch (_) {
+    return false
+  }
+}
+
+function composeCustomOverheadFilterStack(baseFilters, overheadFilter) {
+  const filters = Array.isArray(baseFilters) ? [...baseFilters] : []
+  const blendIndex = filters.findIndex(isManagedMaskedTextureBlendFilter)
+  if (blendIndex < 0) return [...filters, overheadFilter]
+  return [
+    ...filters.slice(0, blendIndex),
+    overheadFilter,
+    ...filters.slice(blendIndex)
+  ]
+}
+
 function syncTargetFilters(state) {
   if (!state) return
-  if (!shouldApplyVisibleOverheadEffects(state?.tile)) {
+  if (!shouldApplyCustomOverheadEffects(state?.tile)) {
     restoreTargetFilters(state)
     return
   }
@@ -582,9 +790,11 @@ function syncTargetFilters(state) {
       if (!record) {
         const originalFilters = Array.isArray(target.filters) ? [...target.filters] : null
         const hadFilterArea = target.filterArea !== undefined
+        const filter = createCustomTileOverheadFilter(state.tile)
+        if (!filter) continue
         record = {
           target,
-          filter: new CustomTileOverheadFilter(state.tile),
+          filter,
           originalFilters,
           originalFilterArea: target.filterArea ?? null,
           hadFilterArea
@@ -592,7 +802,7 @@ function syncTargetFilters(state) {
         state.targetFilters.set(target, record)
       }
       const baseFilters = record.originalFilters ? [...record.originalFilters] : []
-      try { target.filters = [...baseFilters, record.filter] } catch (_) {}
+      try { target.filters = composeCustomOverheadFilterStack(baseFilters, record.filter) } catch (_) {}
     }
   }
 
@@ -635,7 +845,7 @@ function collectDisplayTextures(displayObject, textures = new Set()) {
 
 function monitorLateTextures(state) {
   if (!state) return
-  if (!shouldUseTileOcclusionProxy(state.tile)) {
+  if (!shouldUseCustomOverheadProxy(state.tile)) {
     clearLateTextureWatchers(state)
     return
   }
@@ -666,6 +876,11 @@ function monitorLateTextures(state) {
 
 function ensureProxyTexture(state, size) {
   const sizeKey = `${size.proxyWidth}x${size.proxyHeight}`
+  if (state.proxyTexture && !state.proxyTexture.destroyed && state.proxySizeKey === sizeKey) {
+    state.mesh.faNexusCustomOverheadProxyTexture = state.proxyTexture
+    state.tile.faNexusCustomOverheadProxyTexture = state.proxyTexture
+    return state.proxyTexture
+  }
   if (state.proxyTexture && !state.proxyTexture.destroyed) {
     try { state.proxyTexture.destroy(true) } catch (_) {}
   }
@@ -682,6 +897,7 @@ function ensureProxyTexture(state, size) {
   state.proxySizeKey = sizeKey
   state.mesh.faNexusCustomOverheadProxyTexture = proxyTexture
   state.tile.faNexusCustomOverheadProxyTexture = proxyTexture
+  markDepthMaskDirty()
   return proxyTexture
 }
 
@@ -716,166 +932,11 @@ function queueRebuild(state) {
   }, 0)
 }
 
-function cloneUniformValue(value) {
-  if ((value instanceof PIXI.Texture) || (value instanceof PIXI.BaseTexture)) return value
-  if (ArrayBuffer.isView(value)) return new value.constructor(value)
-  if (Array.isArray(value)) return value.map((entry) => cloneUniformValue(entry))
-  if (value && typeof value === 'object') {
-    if (typeof value.clone === 'function') {
-      try { return value.clone() } catch (_) {}
-    }
-    const cloned = {}
-    for (const [key, entry] of Object.entries(value)) cloned[key] = cloneUniformValue(entry)
-    return cloned
-  }
-  return value
-}
-
-function copyCommonDisplayProps(source, target) {
-  if (!source || !target) return
-  try { target.position?.copyFrom?.(source.position) } catch (_) {
-    try { target.position?.set?.(source.position?.x ?? 0, source.position?.y ?? 0) } catch (_) {}
-  }
-  try { target.scale?.copyFrom?.(source.scale) } catch (_) {
-    try { target.scale?.set?.(source.scale?.x ?? 1, source.scale?.y ?? 1) } catch (_) {}
-  }
-  try { target.pivot?.copyFrom?.(source.pivot) } catch (_) {}
-  try { target.skew?.copyFrom?.(source.skew) } catch (_) {}
-  try { target.rotation = source.rotation ?? 0 } catch (_) {}
-  try { target.angle = source.angle ?? 0 } catch (_) {}
-  try { target.visible = source.visible !== false } catch (_) {}
-  try { target.renderable = source.renderable !== false } catch (_) {}
-  try { target.alpha = clamp(source.alpha, 0, 1, 1) } catch (_) {}
-  try { target.name = source.name || null } catch (_) {}
-  try { target.eventMode = source.eventMode || 'none' } catch (_) {}
-  try {
-    if ('interactiveChildren' in target) target.interactiveChildren = !!source.interactiveChildren
-  } catch (_) {}
-  try {
-    if ('sortableChildren' in target) target.sortableChildren = !!source.sortableChildren
-  } catch (_) {}
-  try {
-    if ('blendMode' in target && source.blendMode !== undefined) target.blendMode = source.blendMode
-  } catch (_) {}
-  try {
-    if ('tint' in target && source.tint !== undefined) target.tint = source.tint
-  } catch (_) {}
-  try {
-    if ('zIndex' in target && source.zIndex !== undefined) target.zIndex = source.zIndex
-  } catch (_) {}
-}
-
-function resolveMeshTexture(mesh) {
-  return mesh?.texture
-    || mesh?.shader?.texture
-    || mesh?.shader?.uniforms?.uSampler
-    || mesh?.shader?.uniforms?.sampler
-    || mesh?.shader?.uniforms?.texture
-    || mesh?.material?.texture
-    || null
-}
-
-function cloneMeshShader(mesh) {
-  const shader = mesh?.shader || mesh?.material || null
-  if (!shader) return null
-  if (shader?.program && shader?.uniforms) {
-    return new PIXI.Shader(shader.program, cloneUniformValue(shader.uniforms))
-  }
-  const texture = resolveMeshTexture(mesh)
-  if (texture && PIXI?.MeshMaterial) {
-    try {
-      const material = new PIXI.MeshMaterial(texture)
-      material.alpha = Number.isFinite(Number(shader?.alpha)) ? Number(shader.alpha) : 1
-      if (material.uvMatrix && shader?.uvMatrix) {
-        material.uvMatrix.isSimple = shader.uvMatrix.isSimple
-        material.uvMatrix.clampOffset = shader.uvMatrix.clampOffset
-        material.uvMatrix.clampMargin = shader.uvMatrix.clampMargin
-        material.uvMatrix.update()
-      }
-      return material
-    } catch (_) {}
-  }
-  return shader
-}
-
-function cloneDisplayObjectTree(source, map = new Map()) {
-  if (!source || source.destroyed) return null
-  if (map.has(source)) return map.get(source)
-  let clone = null
-  if (source instanceof PIXI.TilingSprite) {
-    clone = new PIXI.TilingSprite(source.texture, Math.max(1, Number(source.width) || 1), Math.max(1, Number(source.height) || 1))
-    try { clone.tilePosition?.copyFrom?.(source.tilePosition) } catch (_) {}
-    try { clone.tileScale?.copyFrom?.(source.tileScale) } catch (_) {}
-    try {
-      if (clone.tileTransform && source.tileTransform) clone.tileTransform.rotation = source.tileTransform.rotation
-    } catch (_) {}
-    try { clone.anchor?.copyFrom?.(source.anchor) } catch (_) {}
-  } else if (source instanceof PIXI.Sprite) {
-    clone = new PIXI.Sprite(source.texture)
-    try { clone.anchor?.copyFrom?.(source.anchor) } catch (_) {}
-    try { clone.width = Math.max(1, Number(source.width) || 1) } catch (_) {}
-    try { clone.height = Math.max(1, Number(source.height) || 1) } catch (_) {}
-  } else if ((source instanceof PIXI.Mesh) || (source?.geometry && (source?.shader || source?.material))) {
-    const shader = cloneMeshShader(source)
-    try {
-      clone = new source.constructor(source.geometry, shader)
-    } catch (_) {
-      clone = new PIXI.Mesh(source.geometry, shader)
-    }
-    try {
-      if (source.state && clone.state) clone.state.blendMode = source.state.blendMode
-    } catch (_) {}
-  } else {
-    clone = new PIXI.Container()
-  }
-
-  map.set(source, clone)
-  copyCommonDisplayProps(source, clone)
-  const children = Array.isArray(source.children) ? source.children : []
-  for (const child of children) {
-    const childClone = cloneDisplayObjectTree(child, map)
-    if (!childClone) continue
-    try { clone.addChild(childClone) } catch (_) {}
-  }
-  return clone
-}
-
-function applyClonedMasks(map) {
-  for (const [source, clone] of map.entries()) {
-    const mask = source?.mask
-    if (!mask) continue
-    const clonedMask = map.get(mask)
-    if (!clonedMask) continue
-    try { clonedMask.visible = true } catch (_) {}
-    try { clonedMask.renderable = true } catch (_) {}
-    try { clone.mask = clonedMask } catch (_) {}
-  }
-}
-
-export function cloneDisplayObjectForCustomTileProxy(displayObject) {
-  try {
-    const map = new Map()
-    const clone = cloneDisplayObjectTree(displayObject, map)
-    applyClonedMasks(map)
-    return clone
-  } catch (error) {
-    Logger.warn?.('CustomTileOverhead.cloneProxy.failed', {
-      error: String(error?.message || error),
-      tileId: resolveTileId(displayObject?.tile || null)
-    })
-    return null
-  }
-}
-
-export function createDisplayProxyFactory(displayObject) {
-  return () => cloneDisplayObjectForCustomTileProxy(displayObject)
-}
-
 function createProxyRoot(entry, state) {
   try {
     const root = typeof entry?.proxyFactory === 'function'
       ? entry.proxyFactory({ tile: state.tile, mesh: state.mesh, state, entry })
-      : cloneDisplayObjectForCustomTileProxy(entry?.contentContainer)
+      : cloneDisplayObjectForProxy(entry?.contentContainer)
     if (root && !root.destroyed) return root
   } catch (error) {
     Logger.warn?.('CustomTileOverhead.proxyFactory.failed', {
@@ -883,7 +944,7 @@ function createProxyRoot(entry, state) {
       tileId: state?.tileId
     })
   }
-  return cloneDisplayObjectForCustomTileProxy(entry?.contentContainer)
+  return cloneDisplayObjectForProxy(entry?.contentContainer)
 }
 
 function destroyProxyRoot(root) {
@@ -960,7 +1021,7 @@ function rebuildCustomTileOverhead(state) {
     syncEntryParentsToMesh(state)
     syncEntryContentTransforms(state, state.rebuildReason || 'rebuild')
     syncVisibleState(state)
-    if (!shouldUseTileOcclusionProxy(state.tile)) {
+    if (!shouldUseCustomOverheadProxy(state.tile)) {
       deactivateOverheadRuntime(state)
       return
     }
@@ -973,6 +1034,7 @@ function rebuildCustomTileOverhead(state) {
 
     ensureMeshProxyBindings(state)
     refreshMeshProxyAlphaData(state)
+    markDepthMaskDirty()
     monitorLateTextures(state)
   } catch (error) {
     Logger.warn?.('CustomTileOverhead.rebuild.failed', {
@@ -1037,7 +1099,7 @@ export function attachCustomTileOverhead(tile, {
     ensureEntryParent(state, state.entries.get(kind))
     syncEntryContent(state, state.entries.get(kind), 'attach')
     syncVisibleState(state)
-    if (!shouldUseTileOcclusionProxy(tile)) {
+    if (!shouldUseCustomOverheadProxy(tile)) {
       deactivateOverheadRuntime(state)
       return state
     }
@@ -1059,7 +1121,7 @@ export function invalidateCustomTileOverhead(tile, reason = 'refresh') {
     const state = getState(tile)
     if (!state) return
     state.rebuildReason = reason
-    if (!shouldUseTileOcclusionProxy(tile)) {
+    if (!shouldUseCustomOverheadProxy(tile)) {
       deactivateOverheadRuntime(state)
       return
     }
@@ -1116,6 +1178,46 @@ export function invalidateAllCustomTileOverheads(reason = 'global-refresh') {
   } catch (_) {}
 }
 
+export function flushCustomTileOverhead(tile, reason = 'flush') {
+  try {
+    const state = getState(tile)
+    if (!state) return false
+    cancelScheduledRebuild(state)
+    state.rebuildReason = reason
+    rebuildCustomTileOverhead(state)
+    return true
+  } catch (error) {
+    Logger.error?.('CustomTileOverhead.flush.failed', {
+      tileId: resolveTileId(tile),
+      reason,
+      error: String(error?.message || error)
+    })
+    return false
+  }
+}
+
+export function flushAllCustomTileOverheads(reason = 'global-flush') {
+  const results = {
+    total: 0,
+    flushed: 0,
+    failed: 0
+  }
+  try {
+    for (const state of Array.from(TILE_STATES.values())) {
+      results.total += 1
+      if (flushCustomTileOverhead(state?.tile, reason)) results.flushed += 1
+      else results.failed += 1
+    }
+  } catch (error) {
+    Logger.error?.('CustomTileOverhead.flushAll.failed', {
+      reason,
+      error: String(error?.message || error)
+    })
+    results.failed += 1
+  }
+  return results
+}
+
 function refreshCustomTileOverhead(tile, reason = null) {
   try {
     const state = getState(tile)
@@ -1125,7 +1227,7 @@ function refreshCustomTileOverhead(tile, reason = null) {
     syncEntryParentsToMesh(state)
     syncEntryContentTransforms(state, reason || 'refresh')
     syncVisibleState(state)
-    if (!shouldUseTileOcclusionProxy(tile)) {
+    if (!shouldUseCustomOverheadProxy(tile)) {
       deactivateOverheadRuntime(state)
       return
     }
@@ -1151,6 +1253,21 @@ function detachDeletedTile(doc) {
     const state = Array.from(TILE_STATES.values()).find((entry) => entry?.tile?.document?.id === doc?.id)
     if (!state) return
     destroyState(state)
+  } catch (_) {}
+}
+
+function detachDestroyedTile(tile) {
+  try {
+    const state = getState(tile)
+    if (state) {
+      Logger.debug?.('CustomTileOverhead.destroyTile.cleanup', {
+        tileId: state.tileId,
+        isPreview: !!tile?.isPreview
+      })
+      destroyState(state)
+      return
+    }
+    if (tile?.document?.id) detachDeletedTile(tile.document)
   } catch (_) {}
 }
 
@@ -1209,6 +1326,9 @@ try {
   })
   Hooks.on('deleteTile', (doc) => {
     detachDeletedTile(doc)
+  })
+  Hooks.on('destroyTile', (tile) => {
+    detachDestroyedTile(tile)
   })
   Hooks.on('canvasTearDown', () => {
     clearAllStates()

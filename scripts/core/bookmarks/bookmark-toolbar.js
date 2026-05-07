@@ -1,6 +1,11 @@
 import { BookmarkDialog } from './bookmark-dialog.js';
 import { NexusLogger as Logger } from '../nexus-logger.js';
 
+/**
+ * @typedef {import('../fa-nexus-types.js').FaNexusBookmark} FaNexusBookmark
+ * @typedef {import('../fa-nexus-types.js').FaNexusFolderSelection} FaNexusFolderSelection
+ */
+
 function createBookmarkLabel(title) {
   const span = document.createElement('span');
   span.textContent = String(title ?? '');
@@ -67,12 +72,18 @@ export class BookmarkToolbar {
     this._lastDragClientY = null;
   }
 
-  /** Get bookmarks for the active tab */
+  /**
+   * Get bookmarks for the active tab.
+   * @returns {FaNexusBookmark[]}
+   */
   getCurrentTabBookmarks() {
     return this._bookmarkManager.getBookmarksForTab(this._getActiveTabId());
   }
 
-  /** Save current search/folder state as a bookmark */
+  /**
+   * Save current search/folder state as a bookmark.
+   * @returns {FaNexusBookmark}
+   */
   saveCurrentStateAsBookmark(title) {
     const tabId = this._getActiveTabId();
     const searchQuery = this._searchController.getSearchQuery(tabId);
@@ -128,6 +139,7 @@ export class BookmarkToolbar {
     try {
       const tabId = this._getActiveTabId();
       const searchQuery = this._searchController.getSearchQuery(tabId);
+      /** @type {FaNexusFolderSelection|null} */
       const folderSelection = this._tabManager.getActiveTab()?.getActiveFolderSelection?.() || null;
 
       let defaultTitle = '';
@@ -231,6 +243,10 @@ export class BookmarkToolbar {
     this._events.on(saveBtn, 'click', () => this.promptSaveCurrentState());
   }
 
+  /**
+   * @param {MouseEvent} event
+   * @param {FaNexusBookmark} bookmark
+   */
   async _showBookmarkContextMenu(event, bookmark) {
     try {
       const dialog = new BookmarkDialog({
@@ -360,6 +376,10 @@ export class BookmarkToolbar {
     }
   }
 
+  /**
+   * @param {MouseEvent} event
+   * @param {FaNexusBookmark[]} overflowBookmarks
+   */
   _showBookmarkOverflowMenu(event, overflowBookmarks) {
     try {
       const existingMenu = document.querySelector('.fa-nexus-bookmark-overflow-menu');
@@ -447,6 +467,12 @@ export class BookmarkToolbar {
     }
   }
 
+  /**
+   * @param {HTMLElement} wrapper
+   * @param {FaNexusBookmark} bookmark
+   * @param {number} index
+   * @param {PointerEvent|MouseEvent|null} [pointerEvent]
+   */
   _startBookmarkDrag(wrapper, bookmark, index, pointerEvent = null) {
     this._activeDragOperations++;
     wrapper.classList.add('fa-nexus-bookmark-dragging');
@@ -467,6 +493,10 @@ export class BookmarkToolbar {
     }
   }
 
+  /**
+   * @param {FaNexusBookmark} bookmark
+   * @param {PointerEvent|MouseEvent|null} [pointerEvent]
+   */
   _startOverflowBookmarkDrag(bookmark, pointerEvent = null) {
     this._activeDragOperations++;
     this._dragBookmarkId = bookmark.id;

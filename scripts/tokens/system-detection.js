@@ -4,6 +4,12 @@
  */
 
 /**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorData} FaNexusActorData
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorPrototypeTokenData} FaNexusActorPrototypeTokenData
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorSystemMapping} FaNexusActorSystemMapping
+ */
+
+/**
  * Actor type mapping for different game systems.
  * Each system maps to its preferred actor types and required fields.
  */
@@ -54,9 +60,18 @@ const ACTOR_TYPE_MAPPINGS = {
   },
 
   // Call of Cthulhu 7th Edition
+  'CoC7': {
+    defaultType: 'npc',
+    supportedTypes: ['character', 'npc', 'creature', 'vehicle', 'container'],
+    requiredFields: ['name', 'type'],
+    optionalFields: ['img'],
+    description: 'Call of Cthulhu 7th Edition'
+  },
+
+  // Legacy lowercase alias retained for older local installs or stale worlds
   'coc7': {
     defaultType: 'npc',
-    supportedTypes: ['character', 'npc', 'creature'],
+    supportedTypes: ['character', 'npc', 'creature', 'vehicle', 'container'],
     requiredFields: ['name', 'type'],
     optionalFields: ['img'],
     description: 'Call of Cthulhu 7th Edition'
@@ -64,8 +79,8 @@ const ACTOR_TYPE_MAPPINGS = {
 
   // Cyberpunk RED
   'cyberpunk-red-core': {
-    defaultType: 'character',
-    supportedTypes: ['character', 'npc'],
+    defaultType: 'mook',
+    supportedTypes: ['mook', 'character', 'blackIce', 'demon', 'container'],
     requiredFields: ['name', 'type'],
     optionalFields: ['img'],
     description: 'Cyberpunk RED'
@@ -81,9 +96,18 @@ const ACTOR_TYPE_MAPPINGS = {
   },
 
   // Alien RPG
+  'alienrpg': {
+    defaultType: 'creature',
+    supportedTypes: ['creature', 'character', 'synthetic', 'vehicles', 'spacecraft', 'colony', 'planet', 'territory'],
+    requiredFields: ['name', 'type'],
+    optionalFields: ['img'],
+    description: 'Alien RPG'
+  },
+
+  // Legacy hyphenated alias retained for older local installs or stale worlds
   'alien-rpg': {
-    defaultType: 'character',
-    supportedTypes: ['character', 'npc', 'creature'],
+    defaultType: 'creature',
+    supportedTypes: ['creature', 'character', 'synthetic', 'vehicles', 'spacecraft', 'colony', 'planet', 'territory'],
     requiredFields: ['name', 'type'],
     optionalFields: ['img'],
     description: 'Alien RPG'
@@ -91,8 +115,8 @@ const ACTOR_TYPE_MAPPINGS = {
 
   // Forbidden Lands
   'forbidden-lands': {
-    defaultType: 'npc',
-    supportedTypes: ['character', 'npc', 'monster'],
+    defaultType: 'monster',
+    supportedTypes: ['monster', 'character', 'party', 'stronghold'],
     requiredFields: ['name', 'type'],
     optionalFields: ['img'],
     description: 'Forbidden Lands'
@@ -127,20 +151,29 @@ const ACTOR_TYPE_MAPPINGS = {
 
   // Starfinder
   'sfrpg': {
-    defaultType: 'npc',
-    supportedTypes: ['character', 'npc', 'vehicle', 'starship'],
+    defaultType: 'npc2',
+    supportedTypes: ['npc2', 'character', 'drone', 'hazard', 'vehicle', 'starship'],
     requiredFields: ['name', 'type'],
     optionalFields: ['img'],
     description: 'Starfinder'
   },
 
-  // Vampire: The Masquerade 5th Edition
-  'vtm5e': {
-    defaultType: 'character',
-    supportedTypes: ['character'],
+  // World of Darkness 5th Edition
+  'wod5e': {
+    defaultType: 'spc',
+    supportedTypes: ['spc', 'vampire', 'mortal', 'ghoul', 'hunter', 'werewolf', 'group'],
     requiredFields: ['name', 'type'],
     optionalFields: ['img'],
-    description: 'Vampire: The Masquerade 5th Edition'
+    description: 'World of Darkness 5th Edition'
+  },
+
+  // Vampire: The Masquerade 5th Edition archive package
+  'vtm5e': {
+    defaultType: 'spc',
+    supportedTypes: ['spc', 'vampire', 'mortal', 'ghoul', 'hunter', 'werewolf', 'group'],
+    requiredFields: ['name', 'type'],
+    optionalFields: ['img'],
+    description: 'World of Darkness 5th Edition'
   },
 
   // Shadowdark
@@ -608,7 +641,7 @@ export function getCurrentSystemId() {
 /**
  * Get system mapping for the current or specified system.
  * @param {string} [systemId] - Optional system ID to check. Defaults to current system.
- * @returns {Object} System mapping object with defaultType, supportedTypes, etc.
+ * @returns {FaNexusActorSystemMapping} System mapping object with defaultType, supportedTypes, etc.
  */
 export function getSystemMapping(systemId = null) {
   const targetSystem = systemId || getCurrentSystemId();
@@ -712,7 +745,7 @@ export function getCreatureSizeFromDimensions(gridWidth, gridHeight) {
 
 /**
  * Validate actor data against system requirements.
- * @param {Object} actorData - Actor data to validate
+ * @param {FaNexusActorData} actorData - Actor data to validate
  * @returns {boolean} True if valid, false otherwise
  */
 export function validateActorData(actorData) {
@@ -747,8 +780,8 @@ export function validateActorData(actorData) {
  * @param {string} actorType - Type of actor to create
  * @param {string} actorName - Name for the actor
  * @param {string} imageUrl - Image URL for the actor
- * @param {Object} tokenData - Token data for prototype token
- * @returns {Object} Basic actor data template
+ * @param {FaNexusActorPrototypeTokenData} tokenData - Token data for prototype token
+ * @returns {FaNexusActorData} Basic actor data template
  */
 export function getActorDataForType(actorType, actorName, imageUrl, tokenData = {}) {
   return {
@@ -771,7 +804,7 @@ export function getActorDataForType(actorType, actorName, imageUrl, tokenData = 
  * @param {string} actorName - Name for the actor
  * @param {string} imageUrl - Image URL for the actor
  * @param {string|null} [actorType] - Optional actor type override
- * @returns {Object} Minimal actor data
+ * @returns {FaNexusActorData} Minimal actor data
  */
 export function getMinimalActorData(actorName, imageUrl, actorType = null) {
   const defaultType = actorType || getDefaultActorType();

@@ -1,6 +1,15 @@
 import { localToAssetInventoryRecord } from '../content/inventory-utils.js';
 import { NexusIndexDB } from '../content/cache-index.js';
 import { forgeIntegration } from '../core/forge-integration.js';
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import {
+  requireFilePickerMethod,
+  wrapOperationalError
+} from '../content/nexus-content-service.js';
+
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ */
 
 export class AssetsDataService {
   /** Create a new assets data service */
@@ -23,19 +32,31 @@ export class AssetsDataService {
   /**
    * Stream local assets in batches and emit canonical records per batch
    * @param {string} folder
-   * @param {(records:Array<object>)=>Promise<void>|void} onBatch
+   * @param {(records:FaNexusInventoryRecord[])=>Promise<void>|void} onBatch
    * @param {{batchSize?:number,sleepMs?:number}} options
    * @returns {Promise<number>} total files discovered
    */
   async streamLocalAssets(folder, onBatch, options = {}) {
     if (!folder) return 0;
-    await forgeIntegration.initialize();
-    const FilePickerBase = foundry.applications.apps.FilePicker ?? globalThis.FilePicker;
-    const FilePickerImpl = FilePickerBase?.implementation ?? FilePickerBase;
-    if (!FilePickerImpl?.browse) {
-      console.warn('fa-nexus | asset stream missing FilePicker implementation');
-      return 0;
+    try {
+      await forgeIntegration.initialize();
+    } catch (error) {
+      throw wrapOperationalError(error, {
+        code: 'LOCAL_STREAM_INIT_FAILED',
+        source: 'AssetsDataService.streamLocalAssets',
+        operation: 'initialize-local-asset-stream',
+        folder,
+        kind: 'assets',
+        userMessage: `FA Nexus could not initialize local asset scanning for "${folder}".`
+      });
     }
+    const FilePickerImpl = requireFilePickerMethod('browse', {
+      source: 'AssetsDataService.streamLocalAssets',
+      operation: 'stream-local-assets',
+      folder,
+      kind: 'assets',
+      userMessage: `FA Nexus could not scan "${folder}" because the Foundry FilePicker runtime is unavailable.`
+    });
     const { source: resolvedSource, target: initialTarget, options: resolvedOptions, fallbacks } =
       forgeIntegration.resolveFilePickerContext(folder);
     const primarySource = resolvedSource || (forgeIntegration.isRunningOnForge() ? 'forgevtt' : 'data');
@@ -80,7 +101,15 @@ export class AssetsDataService {
           lastError = error;
         }
       }
-      throw lastError;
+      throw wrapOperationalError(lastError, {
+        code: 'LOCAL_FOLDER_BROWSE_FAILED',
+        source: 'AssetsDataService.streamLocalAssets',
+        operation: 'browse-local-asset-folder',
+        folder,
+        kind: 'assets',
+        userMessage: `FA Nexus could not browse the asset folder "${folder}".`,
+        details: { targetPath }
+      });
     };
 
     while (queue.length) {
@@ -92,8 +121,15 @@ export class AssetsDataService {
       try {
         listing = await browseWithFallback(nextTarget);
       } catch (error) {
-        console.warn('fa-nexus | asset stream scan error', error);
-        continue;
+        throw wrapOperationalError(error, {
+          code: 'LOCAL_FOLDER_BROWSE_FAILED',
+          source: 'AssetsDataService.streamLocalAssets',
+          operation: 'scan-local-asset-folder',
+          folder,
+          kind: 'assets',
+          userMessage: `FA Nexus could not scan the asset folder "${folder}".`,
+          details: { targetPath: nextTarget }
+        });
       }
       checkAbort();
       for (const filePath of listing.files) {
@@ -110,10 +146,17 @@ export class AssetsDataService {
             if (record.cachedLocalPath) record.cachedLocalPath = forgeIntegration.optimizeCacheURL(record.cachedLocalPath);
           }
           batch.push(record);
-        } catch (_) {}
+        } catch (error) {
+          Logger.warn('AssetsDataService.localRecord.failed', {
+            folder,
+            filePath,
+            filename,
+            error: String(error?.message || error)
+          });
+        }
         if (batch.length >= batchSize) {
           const emitBatch = batch.slice();
-          try { await onBatch?.(emitBatch); } catch (e) { console.warn('fa-nexus | onBatch error:', e); }
+          await onBatch?.(emitBatch);
           total += batch.length;
           batch = [];
           if (sleepMs) {
@@ -130,7 +173,7 @@ export class AssetsDataService {
     }
     if (batch.length) {
       const emitBatch = batch.slice();
-      try { await onBatch?.(emitBatch); } catch (e) { console.warn('fa-nexus | onBatch error:', e); }
+      await onBatch?.(emitBatch);
       total += batch.length;
     }
     return total;

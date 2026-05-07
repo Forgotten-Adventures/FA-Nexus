@@ -3,13 +3,10 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { AssetPreviewManager } from './assets-preview-manager.js';
 import { NexusContentService } from '../content/nexus-content-service.js';
 import {
-  normalizeFolderSelection,
-  enforceFolderSelectionAvailability,
-  mergeFolderSelectionExcludes,
-  folderSelectionKey,
-  logFolderSelection
-} from '../content/content-sources/content-sources-utils.js';
-import { createEmptyFolderTreeIndex } from '../content/folder-tree-index.js';
+  applyFolderBrowserSelectionChange,
+  createEmptyFolderBrowserStats,
+  readFolderBrowserSelection
+} from '../core/folder-browser-state.js';
 import { AssetsTabController } from './assets-tab-controller.js';
 import { AssetsTabSelectionHelper } from './assets-selection-helper.js';
 import { AssetsTabProbeHelper } from './assets-probe-helper.js';
@@ -44,6 +41,11 @@ const buildSolidTextureDataUrl = (color) => {
   return canvas.toDataURL('image/png');
 };
 
+const normalizeFaNexusModulePath = (value) => {
+  const raw = String(value || 'modules/fa-nexus').replace(/^https?:\/\/[^/]+/i, '');
+  return raw.replace(/^\/+/, '').replace(/\/+$/, '') || 'modules/fa-nexus';
+};
+
 /**
  * AssetsTab
  * Local assets browser tab with virtualized grid, per‑tab search and thumbnail sizing,
@@ -73,13 +75,7 @@ export class AssetsTab extends GridBrowseTab {
     const requestedMode = String(options?.mode || 'assets').toLowerCase();
     this._mode = ['textures', 'paths'].includes(requestedMode) ? requestedMode : 'assets';
     this._activeFolderSelection = { type: 'all', includePaths: [], includePathLowers: [] };
-    this._folderStats = {
-      pathCounts: [],
-      lowerKeys: new Set(),
-      unassignedCount: 0,
-      tree: createEmptyFolderTreeIndex(),
-      version: 0
-    };
+    this._folderStats = createEmptyFolderBrowserStats();
     this._solidTextureItem = null;
   }
 
@@ -97,10 +93,6 @@ export class AssetsTab extends GridBrowseTab {
 
   get texturePaintManager() {
     return this._controller?.texturePaintManager || this._texturePaint || null;
-  }
-
-  get pathManager() {
-    return this._controller?.pathManager || this._pathManager || null;
   }
 
   get pathManagerV2() {
@@ -219,25 +211,31 @@ export class AssetsTab extends GridBrowseTab {
   }
 
   getActiveFolderSelection() {
-    const normalized = normalizeFolderSelection(this._activeFolderSelection, {
-      normalizePath: (value) => this._normalizeFolderPath(value)
+    return readFolderBrowserSelection({
+      selection: this._activeFolderSelection,
+      normalizePath: (value) => this._normalizeFolderPath(value),
+      logger: Logger,
+      loggerLabel: 'AssetsTab.selection.getActiveFolderSelection'
     });
-    logFolderSelection('AssetsTab.selection.getActiveFolderSelection', normalized, { logger: Logger });
-    return normalized;
   }
 
   onFolderSelectionChange(selection) {
-    if (!this.supportsFolderBrowser()) return;
-    this._activeFolderSelection = normalizeFolderSelection(selection, {
-      normalizePath: (value) => this._normalizeFolderPath(value)
+    applyFolderBrowserSelectionChange({
+      app: this.app,
+      tabId: this.id,
+      selection,
+      normalizePath: (value) => this._normalizeFolderPath(value),
+      logger: Logger,
+      loggerLabel: 'AssetsTab.selection.normalize',
+      enabled: this.supportsFolderBrowser(),
+      setSelection: (nextSelection) => {
+        this._activeFolderSelection = nextSelection;
+      },
+      beforeSync: () => {
+        // Filter the grid first for immediate visual feedback
+        this.applySearch(this.getCurrentSearchValue());
+      }
     });
-    logFolderSelection('AssetsTab.selection.normalize', this._activeFolderSelection, { logger: Logger });
-
-    // Filter the grid first for immediate visual feedback
-    this.applySearch(this.getCurrentSearchValue());
-
-    // Then update the folder filter UI (can be slightly delayed)
-    try { this.app?.updateFolderFilterSelection?.(this.id, this._activeFolderSelection); } catch (_) {}
   }
 
   /** Track the visible list for range-selection and refresh selection UI */
@@ -321,6 +319,12 @@ export class AssetsTab extends GridBrowseTab {
           this._needsReload = false;
           try {
             await this.loadAssets({ forceReload: true });
+          } catch (error) {
+            Logger.warn('AssetsTab.settingsReload.failed', {
+              tab: this.id,
+              setting: setting.key,
+              error: String(error?.message || error)
+            });
           } finally {
             this._needsReload = this._controller.sharedCatalog.dirty;
           }
@@ -354,13 +358,21 @@ export class AssetsTab extends GridBrowseTab {
       const reason = needsInitialLoad ? 'initial' : 'forced';
       Logger.info('AssetsTab.onActivate:loadAssets:start', { tab: this.id, reason });
       this._needsReload = false;
-      try {
-        const options = shouldForceReload ? { forceReload: true } : {};
-        await this.loadAssets(options);
-      } finally {
+      const options = shouldForceReload ? { forceReload: true } : {};
+      const loadTask = this.loadAssets(options);
+      this._activationLoadTask = loadTask;
+      loadTask.then(() => {
+        Logger.info('AssetsTab.onActivate:loadAssets:complete', { tab: this.id, itemCount: this._items?.length || 0, reason });
+      }).catch((error) => {
+        Logger.warn('AssetsTab.onActivate:loadAssets:failed', {
+          tab: this.id,
+          reason,
+          error: String(error?.message || error)
+        });
+      }).finally(() => {
+        if (this._activationLoadTask === loadTask) this._activationLoadTask = null;
         if (shouldForceReload) this._needsReload = sharedCatalog.dirty;
-      }
-      Logger.info('AssetsTab.onActivate:loadAssets:complete', { tab: this.id, itemCount: this._items?.length || 0, reason });
+      });
     } else {
       Logger.info('AssetsTab.onActivate:useCachedData', { tab: this.id, itemCount: this._items.length });
       // Defer all heavy operations to avoid blocking tab switch completion
@@ -469,19 +481,6 @@ export class AssetsTab extends GridBrowseTab {
             if (result?.catch) result.catch(() => {});
           } else {
             this.pathManagerV2?.stop?.({ reason: 'tab-deactivate' });
-          }
-        }
-      } catch (_) {}
-      try {
-        if (this.pathManager?.isActive) {
-          const hasChanges = typeof this.pathManager?.hasSessionChanges === 'function'
-            ? this.pathManager.hasSessionChanges()
-            : true;
-          if (hasChanges) {
-            const result = this.pathManager?.save?.();
-            if (result?.catch) result.catch(() => {});
-          } else {
-            this.pathManager?.stop?.({ reason: 'tab-deactivate' });
           }
         }
       } catch (_) {}
@@ -616,7 +615,17 @@ export class AssetsTab extends GridBrowseTab {
   }
 
   destroy() {
+    try { this.onDeactivate(); }
+    catch (error) {
+      Logger.warn('AssetsTab.destroy.deactivateFailed', { tab: this.id, error: String(error?.message || error) });
+    }
+    try { this.placementManager?.destroy?.(); }
+    catch (error) {
+      Logger.warn('AssetsTab.destroy.placementDestroyFailed', { tab: this.id, error: String(error?.message || error) });
+    }
+    try { this._probe?.dispose?.(); } catch (_) {}
     try { this._controller?.dispose?.(); } catch (_) {}
+    this._placement = null;
     if (super.destroy) super.destroy();
   }
 
@@ -910,6 +919,11 @@ export class AssetsTab extends GridBrowseTab {
     return !!(item && (item.isSolidTexture || item.id === SOLID_TEXTURE_ITEM_ID));
   }
 
+  _getGridSortPinRank(item, context = {}) {
+    if (this.isTexturesMode && this._isSolidTextureItem(item)) return -1;
+    return super._getGridSortPinRank?.(item, context) || 0;
+  }
+
   _getSolidTextureColor() {
     try {
       const stored = game?.settings?.get?.('fa-nexus', 'solidTextureColor');
@@ -919,15 +933,78 @@ export class AssetsTab extends GridBrowseTab {
     }
   }
 
-  _setSolidTextureColor(value) {
+  _getSolidTexturePlaceholderPath() {
+    try {
+      const raw = game?.modules?.get?.('fa-nexus')?.url ?? 'modules/fa-nexus';
+      const routed = globalThis?.foundry?.utils?.getRoute?.(raw) ?? raw;
+      return `${normalizeFaNexusModulePath(routed)}/images/transparent.png`;
+    } catch (_) {
+      return 'modules/fa-nexus/images/transparent.png';
+    }
+  }
+
+  _notifyActiveSolidTextureSessionColor(color, { commit = false } = {}) {
+    const manager = this.texturePaintManager;
+    if (!manager?.isActive) return false;
+    if (typeof manager.setSolidTextureColor !== 'function') {
+      Logger.error('AssetsTab.solidTextureColor.activeSessionUnsupported', {
+        color,
+        manager: manager?.constructor?.name || null
+      });
+      return false;
+    }
+    try {
+      const result = manager.setSolidTextureColor(color, { commit });
+      if (result?.catch) {
+        result.catch((error) => {
+          Logger.error('AssetsTab.solidTextureColor.activeSessionSyncFailed', {
+            color,
+            error: String(error?.message || error)
+          });
+        });
+      }
+      return result !== false;
+    } catch (error) {
+      Logger.error('AssetsTab.solidTextureColor.activeSessionSyncFailed', {
+        color,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  _previewSolidTextureColor(value) {
+    const normalized = normalizeSolidTextureColor(value);
+    this._notifyActiveSolidTextureSessionColor(normalized, { commit: false });
+    return normalized;
+  }
+
+  _setSolidTextureColor(value, { persist = true, notifyTexturePaint = true } = {}) {
     const normalized = normalizeSolidTextureColor(value);
     if (this._solidTextureItem && this._solidTextureItem.solidColor !== normalized) {
       this._applySolidTextureColor(this._solidTextureItem, normalized);
     }
-    try {
-      const result = game?.settings?.set?.('fa-nexus', 'solidTextureColor', normalized);
-      if (result?.catch) result.catch(() => {});
-    } catch (_) {}
+    if (notifyTexturePaint) {
+      this._notifyActiveSolidTextureSessionColor(normalized, { commit: !!persist });
+    }
+    if (persist) {
+      try {
+        const result = game?.settings?.set?.('fa-nexus', 'solidTextureColor', normalized);
+        if (result?.catch) {
+          result.catch((error) => {
+            Logger.error('AssetsTab.solidTextureColor.persistFailed', {
+              color: normalized,
+              error: String(error?.message || error)
+            });
+          });
+        }
+      } catch (error) {
+        Logger.error('AssetsTab.solidTextureColor.persistFailed', {
+          color: normalized,
+          error: String(error?.message || error)
+        });
+      }
+    }
     return normalized;
   }
 

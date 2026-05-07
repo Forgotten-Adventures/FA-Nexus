@@ -4,11 +4,16 @@ import * as SystemDetection from './system-detection.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { getCanvasInteractionController, announceChange } from '../canvas/canvas-interaction-controller.js';
 import { getZoomAtCursorView, isPointerOverCanvas } from '../canvas/canvas-pointer-utils.js';
-import { createCanvasGestureSession } from '../canvas/canvas-gesture-session.js';
 import { SHORTCUT_ACTION, createShortcut, isGridSnapShortcut, isHelpShortcut } from '../core/editor-shortcuts.js';
 import { createNormalizedToolOptionsDescriptor, TOOL_OPTIONS_RENDERER_MODE } from '../core/tool-options-descriptor.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
 import { PlacementPrefetchQueue } from '../core/placement/placement-prefetch-queue.js';
+import {
+  activatePlacementToolOptions,
+  createManagedPlacementGestureSession,
+  deactivatePlacementToolOptions,
+  stopManagedPlacementGestureSession
+} from '../core/placement/placement-session-utils.js';
 
 const DEFAULT_PLACE_AS_SELECTION = 'fa-nexus:create-new';
 const AUTO_NEW_ACTOR_TYPE_SELECTION = 'fa-nexus:auto-actor-type';
@@ -62,6 +67,7 @@ export class TokenPlacementManager {
     this._suppressNextActorClick = false;
     this._settingsHook = null;
     this._gridSnapHook = null;
+    this._actorOptionHook = null;
     this._gridSnapShortcutHeld = false;
     this._gridSnapShortcutPendingToggle = false;
     this._randomMode = false;
@@ -134,14 +140,15 @@ export class TokenPlacementManager {
   }
 
   _activateToolOptions() {
-    try {
-      this._syncToolOptionsState({ suppressRender: false });
-      toolOptionsController.activateTool('token.placement', { label: 'Token Placement' });
-    } catch (_) {}
+    activatePlacementToolOptions({
+      toolId: 'token.placement',
+      label: 'Token Placement',
+      syncToolOptions: (options) => this._syncToolOptionsState(options)
+    });
   }
 
   _deactivateToolOptions() {
-    try { toolOptionsController.deactivateTool('token.placement'); } catch (_) {}
+    deactivatePlacementToolOptions('token.placement');
   }
 
   _activateTokensLayer() {
@@ -340,10 +347,6 @@ export class TokenPlacementManager {
     this._pendingFlipVertical = false;
     this._lastPointer = null;
     this._lastPointerWorld = null;
-    this._gridSnapShortcutHeld = false;
-    this._gridSnapShortcutPendingToggle = false;
-    this._clearActorHoverHighlight();
-    this._teardownActorClickBlocker();
     try {
       if (reason === 'esc') {
         const target = this.app?.element || document;
@@ -351,6 +354,33 @@ export class TokenPlacementManager {
       }
     } catch (_) {}
     this._hpFormulaWarned = false;
+  }
+
+  destroy() {
+    try { this.cancelPlacement('destroy'); } catch (_) {}
+    if (this._placeAsRefreshTimer) {
+      try { clearTimeout(this._placeAsRefreshTimer); } catch (_) {}
+      this._placeAsRefreshTimer = null;
+    }
+    const hooks = globalThis?.Hooks;
+    if (hooks && typeof hooks.off === 'function') {
+      if (this._settingsHook) {
+        try { hooks.off('updateSetting', this._settingsHook); } catch (_) {}
+        this._settingsHook = null;
+      }
+      if (this._gridSnapHook) {
+        try { hooks.off('fa-nexus:gridSnapChanged', this._gridSnapHook); } catch (_) {}
+        this._gridSnapHook = null;
+      }
+      if (this._actorOptionHook) {
+        for (const hookName of ['createActor', 'deleteActor', 'updateActor']) {
+          try { hooks.off(hookName, this._actorOptionHook); } catch (_) {}
+        }
+        this._actorOptionHook = null;
+        this._placeAsActorHooksInstalled = false;
+      }
+    }
+    try { this._randomPrefetch?.reset?.(); } catch (_) {}
   }
 
   _normalizeRotation(value) {
@@ -647,40 +677,37 @@ export class TokenPlacementManager {
           event.preventDefault?.();
           event.stopPropagation?.();
           event.stopImmediatePropagation?.();
-          void toolOptionsController.toggleGridSnapShortcut();
-          this._refreshPlacementAfterGridSnapChange();
+          void Promise.resolve(toolOptionsController.toggleGridSnapShortcut())
+            .finally(() => this._refreshPlacementAfterGridSnapChange());
         }
       }
     };
 
-    this._session = createCanvasGestureSession({
+    this._session = createManagedPlacementGestureSession({
       pointermove: { handler: pointerMoveHandler, respectZIndex: false },
       wheel: { handler: wheelHandler, respectZIndex: true },
       pointerdown: pointerDownHandler,
       keydown: keyDownHandler,
       keyup: keyUpHandler
     }, {
+      cancelPlacement: (reason) => this.cancelPlacement(reason),
       lockCanvasLayer: 'tokens',
-      onCanvasTearDown: () => this.cancelPlacement('canvas-teardown'),
-      onStop: () => {
-        this._session = null;
-        this._gridSnapShortcutHeld = false;
-        this._gridSnapShortcutPendingToggle = false;
-      }
+      onStop: () => this._cleanupInteractionSessionState()
     });
   }
 
-  _teardownEvents() {
-    if (this._session) {
-      try {
-        this._session.stop('manual');
-      } catch (_) {
-        // no-op
-      }
-      this._session = null;
-    }
+  _cleanupInteractionSessionState() {
+    this._session = null;
+    this._gridSnapShortcutHeld = false;
+    this._gridSnapShortcutPendingToggle = false;
     this._clearActorHoverHighlight();
     this._teardownActorClickBlocker();
+  }
+
+  _teardownEvents() {
+    stopManagedPlacementGestureSession(this._session, {
+      cleanup: () => this._cleanupInteractionSessionState()
+    });
   }
 
   _updateActorHoverHighlight(clientX, clientY) {
@@ -1404,7 +1431,7 @@ export class TokenPlacementManager {
 
     const canvasElement = pointer?.canvas || this._interactionController.getCanvasElement?.();
     const stage = canvas?.stage;
-    const gridSnapEnabled = !!game.settings.get('fa-nexus', 'gridSnap');
+    const gridSnapEnabled = TokenDragDropManager.isGridSnapEnabled();
     let previewX = screen.x;
     let previewY = screen.y;
 
@@ -2022,8 +2049,13 @@ export class TokenPlacementManager {
       hooks.on('createActor', handler);
       hooks.on('deleteActor', handler);
       hooks.on('updateActor', handler);
+      this._actorOptionHook = handler;
       this._placeAsActorHooksInstalled = true;
     } catch (error) {
+      for (const hookName of ['createActor', 'deleteActor', 'updateActor']) {
+        try { hooks.off?.(hookName, handler); } catch (_) {}
+      }
+      this._actorOptionHook = null;
       this._placeAsActorHooksInstalled = false;
       Logger.warn('TokenPlacement.placeAs.hookFailed', { error: String(error?.message || error) });
     }
@@ -3365,6 +3397,7 @@ export class TokenPlacementManager {
       tokenProto = {
         width,
         height,
+        depth: ActorFactory.resolveTokenDepthFromGridDimensions(width, height),
         texture: {
           src: dragData?.url || actor.prototypeToken?.texture?.src || '',
           scaleX: scale * (dragData?.mirrorX ? -1 : 1),
@@ -3377,10 +3410,19 @@ export class TokenPlacementManager {
     const gridSize = canvas?.grid?.size || 100;
     const tokenWidthPx = Number(tokenProto.width || 1) * gridSize;
     const tokenHeightPx = Number(tokenProto.height || 1) * gridSize;
+    const tokenDepth = ActorFactory.resolveTokenDepthFromGridDimensions(
+      tokenProto.width,
+      tokenProto.height,
+      tokenProto.depth
+    );
     const rotation = Number.isFinite(dragData?.rotation) ? Number(dragData.rotation) : 0;
     const world = drop.world;
     const x = world.x - tokenWidthPx / 2;
     const y = world.y - tokenHeightPx / 2;
+    const {
+      levelId: tokenLevelId,
+      elevation: tokenElevation
+    } = ActorFactory._resolveCurrentTokenPlacementContext(canvas.scene);
 
     const utils = foundry?.utils;
     const protoScaleX = Number(tokenProto?.texture?.scaleX ?? tokenSize.scale ?? 1) || 1;
@@ -3416,14 +3458,17 @@ export class TokenPlacementManager {
         const tokenTemplate = actor.getTokenDocument({
           x,
           y,
+          level: tokenLevelId,
+          elevation: tokenElevation,
           width: Number(tokenProto.width || 1) || 1,
           height: Number(tokenProto.height || 1) || 1,
+          depth: tokenDepth,
           rotation,
           lockRotation: false,
           randomImg: false,
           actorLink: !!linked,
           ...namingOverrides
-        });
+        }, { parent: canvas.scene });
         const resolvedTemplate = tokenTemplate && typeof tokenTemplate.then === 'function'
           ? await tokenTemplate
           : tokenTemplate;
@@ -3434,8 +3479,11 @@ export class TokenPlacementManager {
           merged = utils.mergeObject(merged, {
             x,
             y,
+            level: tokenLevelId,
+            elevation: tokenElevation,
             width: Number(tokenProto.width || 1) || 1,
             height: Number(tokenProto.height || 1) || 1,
+            depth: tokenDepth,
             rotation,
             lockRotation: false,
             randomImg: false,
@@ -3443,8 +3491,14 @@ export class TokenPlacementManager {
           }, { inplace: false, overwrite: true, recursive: true });
         }
       }
-    } catch (_) {
-      merged = {};
+    } catch (error) {
+      Logger.error('TokenPlacement.actorTokenDocument.failed', {
+        actorId: actor?.id || null,
+        actorName: actor?.name || null,
+        level: tokenLevelId,
+        error: String(error?.message || error)
+      });
+      throw new Error(`Failed to prepare token document for ${actor?.name || 'actor'}: ${error?.message || error}`);
     }
 
     // Apply explicit texture overrides while preserving the rest of the prototype token data.
@@ -3491,6 +3545,9 @@ export class TokenPlacementManager {
     merged.actorId = actor.id;
     merged.actorLink = !!linked;
     merged.randomImg = false;
+    merged.level = tokenLevelId;
+    merged.elevation = tokenElevation;
+    merged.depth = tokenDepth;
     if (hpOverride && !linked) {
       this._applyHpOverrideToTokenData(merged, hpOverride);
     }
@@ -3743,44 +3800,17 @@ export class TokenPlacementManager {
   }
 
   async _rollHpFormula(formula) {
-    const RollClass = foundry?.dice?.Roll || globalThis?.Roll || globalThis?.CONFIG?.Dice?.Roll;
+    const RollClass = globalThis?.foundry?.dice?.Roll;
     if (typeof RollClass !== 'function') {
       Logger.warn('TokenPlacement.hp.rollUnavailable', { formula });
       return { success: false };
     }
     try {
-      let roll = new RollClass(formula);
-      let evaluated = false;
-
-      if (typeof roll.evaluate === 'function') {
-        try {
-          const result = roll.evaluate({});
-          if (result?.then) await result;
-          evaluated = true;
-        } catch (compatError) {
-          // Recreate the roll and try legacy async option for older core versions.
-          roll = new RollClass(formula);
-          try {
-            const legacyResult = roll.evaluate({ async: true });
-            if (legacyResult?.then) await legacyResult;
-            evaluated = true;
-          } catch (_) {
-            throw compatError;
-          }
-        }
+      const roll = new RollClass(formula);
+      if (typeof roll.evaluate !== 'function') {
+        throw new Error('Roll.evaluate is unavailable.');
       }
-      if (!evaluated && typeof roll.evaluateSync === 'function') {
-        roll.evaluateSync({});
-        evaluated = true;
-      }
-      if (!evaluated && typeof roll.roll === 'function') {
-        const legacy = roll.roll({});
-        if (legacy?.then) await legacy;
-        evaluated = true;
-      }
-      if (!evaluated) {
-        throw new Error('Unable to evaluate roll formula.');
-      }
+      await roll.evaluate();
 
       const total = Math.max(1, Math.round(Number(roll.total) || 0));
       return { success: Number.isFinite(total) && total > 0, value: total };
@@ -3813,7 +3843,7 @@ export class TokenPlacementManager {
     const world = canvas.canvasCoordinatesFromClient({ x: screenX, y: screenY });
 
     // Check FA Nexus grid snap setting - only snap if enabled
-    const gridSnapEnabled = !!game.settings.get('fa-nexus', 'gridSnap');
+    const gridSnapEnabled = TokenDragDropManager.isGridSnapEnabled();
     const finalCoords = gridSnapEnabled
       ? TokenDragDropManager.applyGridSnapping(world, canvas, tokenSize)
       : world;

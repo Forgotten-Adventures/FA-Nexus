@@ -4,6 +4,12 @@ import { ensurePremiumFeaturesRegistered } from '../premium/premium-feature-regi
 import { premiumEntitlementsService } from '../premium/premium-entitlements-service.js';
 import { PlacementOverlay, createPlacementSpinner } from '../core/placement/placement-overlay.js';
 
+function clearLockedCardState(cardElement) {
+  if (!cardElement) return;
+  try { cardElement.classList.remove('locked-token'); } catch (_) {}
+  try { cardElement.removeAttribute('data-locked'); } catch (_) {}
+}
+
 export class AssetsTabCardHelper {
   constructor(tab) {
     this.tab = tab;
@@ -360,24 +366,60 @@ export class AssetsTabCardHelper {
       input.value = color;
       if (!input._faNexusBound) {
         const stop = (event) => event.stopPropagation();
+        let liveCommitTimer = null;
+        const clearLiveCommitTimer = () => {
+          if (!liveCommitTimer) return;
+          try { clearTimeout(liveCommitTimer); } catch (_) {}
+          liveCommitTimer = null;
+        };
+        const scheduleLiveSessionColor = (nextColor) => {
+          clearLiveCommitTimer();
+          liveCommitTimer = setTimeout(() => {
+            liveCommitTimer = null;
+            tab?._previewSolidTextureColor?.(nextColor);
+          }, 90);
+        };
+        const applyLiveColorPreview = (event) => {
+          stop(event);
+          const nextColor = event?.target?.value || color;
+          cardElement.style.setProperty('--fa-nexus-solid-color', nextColor);
+          if (img) img.style.opacity = '0';
+          input.value = nextColor;
+          scheduleLiveSessionColor(nextColor);
+        };
+        const commitColorInput = (event) => {
+          stop(event);
+          clearLiveCommitTimer();
+          const nextColor = event?.target?.value;
+          const normalized = tab?._setSolidTextureColor?.(nextColor, {
+            persist: true,
+            notifyTexturePaint: true
+          }) || nextColor || color;
+          const updatedItem = tab?._solidTextureItem || tab?._getSolidTextureItem?.() || resolvedItem;
+          const nextUrl = updatedItem.cachedLocalPath || updatedItem.thumbnail_url || updatedItem.url || url;
+          if (!nextUrl) {
+            Logger.error('AssetsTab.solidTextureColor.previewMissing', {
+              color: normalized
+            });
+            return;
+          }
+          if (img) {
+            img.src = nextUrl;
+            img.style.opacity = '';
+          }
+          cardElement.style.setProperty('--fa-nexus-solid-color', normalized);
+          cardElement.setAttribute('data-url', nextUrl);
+          input.value = normalized;
+          cardElement._assetItem = updatedItem;
+        };
         if (picker && !picker._faNexusBound) {
           picker.addEventListener('click', stop);
           picker._faNexusBound = true;
         }
         input.addEventListener('click', stop);
         input.addEventListener('pointerdown', stop);
-        input.addEventListener('change', (event) => {
-          stop(event);
-          const nextColor = event?.target?.value;
-          const normalized = tab?._setSolidTextureColor?.(nextColor) || nextColor || color;
-          const updatedItem = tab?._getSolidTextureItem?.() || resolvedItem;
-          const nextUrl = updatedItem.cachedLocalPath || updatedItem.thumbnail_url || updatedItem.url || url;
-          if (img && nextUrl) img.src = nextUrl;
-          cardElement.style.setProperty('--fa-nexus-solid-color', normalized);
-          cardElement.setAttribute('data-url', nextUrl);
-          input.value = normalized;
-          cardElement._assetItem = updatedItem;
-        });
+        input.addEventListener('input', applyLiveColorPreview);
+        input.addEventListener('change', commitColorInput);
         input._faNexusBound = true;
       }
     }
@@ -544,7 +586,7 @@ export class AssetsTabCardHelper {
           const auth = game.settings.get('fa-nexus', 'patreon_auth_data');
           authed = !!(auth && auth.authenticated && auth.state);
         } catch (_) {}
-        cardElement.classList.remove('locked-token');
+        clearLockedCardState(cardElement);
         if (isLocal) {
           statusIcon.classList.add('local');
           icon = 'fa-folder';
@@ -659,6 +701,7 @@ export class AssetsTabCardHelper {
       // Only mark as cached if actually downloaded locally
       if (!isDirectUrl) {
         try { cardElement.setAttribute('data-cached', 'true'); } catch (_) {}
+        clearLockedCardState(cardElement);
         const icon = cardElement.querySelector?.('.fa-nexus-status-icon');
         if (icon) {
           icon.classList.remove('cloud-plus', 'cloud', 'premium');
@@ -673,6 +716,39 @@ export class AssetsTabCardHelper {
     }
   }
 
+  _markSingleToolSessionSelection(cardElement, item, reason = 'tool-session') {
+    const tab = this.tab;
+    if (!tab?._selection || !cardElement) return;
+    const key = tab._keyFromCard?.(cardElement) || tab._computeItemKey?.(item) || '';
+    if (!key) {
+      Logger.warn('AssetsTab.select.toolSession.keyMissing', {
+        tab: tab?.id || null,
+        reason,
+        filename: item?.filename || cardElement.getAttribute?.('data-filename') || ''
+      });
+      return;
+    }
+
+    try {
+      tab._selection.clearSelection?.();
+      tab._selection.selectedKeys.add(key);
+      tab._selection.lastClickedIndex = tab._indexOfVisibleKey?.(key, item) ?? -1;
+      tab._refreshSelectionUIInView?.();
+      Logger.info?.('AssetsTab.select.toolSession', {
+        tab: tab?.id || null,
+        reason,
+        key,
+        count: tab._selection.selectedKeys.size
+      });
+    } catch (error) {
+      Logger.warn('AssetsTab.select.toolSession.failed', {
+        tab: tab?.id || null,
+        reason,
+        key,
+        error: String(error?.message || error)
+      });
+    }
+  }
 
   async handleTextureCardClick(cardElement, item, triggerEvent = null) {
     const tab = this.tab;
@@ -715,7 +791,7 @@ export class AssetsTabCardHelper {
     if (isSolid) {
       const solidItem = tab?._getSolidTextureItem?.() || item;
       solidColor = solidItem?.solidColor || tab?._getSolidTextureColor?.() || null;
-      localPath = solidItem?.cachedLocalPath || solidItem?.thumbnail_url || solidItem?.url || '';
+      localPath = tab?._getSolidTexturePlaceholderPath?.() || 'modules/fa-nexus/images/transparent.png';
     } else {
       localPath = await this.ensureLocalAssetForCard(cardElement, item, {
         triggerEvent,
@@ -737,6 +813,9 @@ export class AssetsTabCardHelper {
       const startOptions = { pointer: pointerCoords, pointerEvent: triggerEvent };
       if (solidColor) startOptions.solidColor = solidColor;
       await texturePaint?.start?.(localPath, `masked-${sanitizedName}.webp`, startOptions);
+      if (requestId === this._textureRequestId) {
+        this._markSingleToolSessionSelection(cardElement, item, 'texture-paint-start');
+      }
     } catch (error) {
       Logger.warn('AssetsTab.texture.paint.start.failed', { error: String(error?.message || error) });
       if (this._isAuthFailure(error)) {
@@ -759,8 +838,8 @@ export class AssetsTabCardHelper {
     if (!(await this._requirePremiumFeature(featureId, { label }))) return;
     try { await tab._controller.ensureServices(); }
     catch (error) { Logger.warn('AssetsTab.paths.ensure.failed', { error: String(error?.message || error) }); }
-    const pathManager = tab.pathManagerV2 || tab.pathManager;
-    if (!pathManager) {
+    const pathManagerV2 = tab.pathManagerV2;
+    if (!pathManagerV2) {
       Logger.warn('AssetsTab.paths.manager.unavailable');
       return;
     }
@@ -770,10 +849,10 @@ export class AssetsTabCardHelper {
 
     let localPath = '';
     const pointerCoords = this._extractPointerScreenCoords(triggerEvent);
-    const wasActive = !!pathManager?.isActive;
+    const wasActive = !!pathManagerV2?.isActive;
     try {
       if (!wasActive) {
-        await Promise.resolve(pathManager?.stop?.());
+        await Promise.resolve(pathManagerV2?.stop?.());
       }
     } catch (stopError) {
       Logger.warn('AssetsTab.path.manager.stop.failed', { error: String(stopError?.message || stopError) });
@@ -809,7 +888,10 @@ export class AssetsTabCardHelper {
 
     const sanitizedName = filename ? filename.replace(/\.[^.]+$/, '') : 'path-texture';
     try {
-      await pathManager?.start?.(localPath, `path-${sanitizedName}.webp`, { pointer: pointerCoords, pointerEvent: triggerEvent });
+      await pathManagerV2?.start?.(localPath, `path-${sanitizedName}.webp`, { pointer: pointerCoords, pointerEvent: triggerEvent });
+      if (requestId === this._pathRequestId) {
+        this._markSingleToolSessionSelection(cardElement, item, 'path-editor-start');
+      }
     } catch (error) {
       Logger.warn('AssetsTab.path.manager.start.failed', { error: String(error?.message || error) });
       if (this._isAuthFailure(error)) {

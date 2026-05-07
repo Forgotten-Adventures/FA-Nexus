@@ -37,23 +37,79 @@ export class VirtualGridManager {
     this._onScroll = this._onScroll.bind(this);
     this._onResize = this._onResize.bind(this);
     this._resizeRaf = null;
-    this._padding = document.createElement('div');
+    this._hostWindow = null;
+    this._ro = null;
+    this._padding = this._createElement('div');
     this._padding.style.height = '0px';
     this.container.innerHTML = '';
     this.container.appendChild(this._padding);
     this.container.addEventListener('scroll', this._onScroll, { passive: true });
-    window.addEventListener('resize', this._onResize, { passive: true });
-    // Also observe container size changes (window resize may not catch all cases)
+    this._syncHostWindow();
+  }
+
+  _getHostDocument() {
+    return this.container?.ownerDocument || globalThis.document || null;
+  }
+
+  _getHostWindow() {
+    return this._getHostDocument()?.defaultView || globalThis.window || null;
+  }
+
+  _createElement(tagName) {
+    const doc = this._getHostDocument();
+    if (!doc?.createElement) throw new Error('VirtualGridManager requires a host document');
+    return doc.createElement(tagName);
+  }
+
+  _requestFrame(callback) {
+    const win = this._getHostWindow();
+    if (typeof win?.requestAnimationFrame === 'function') return win.requestAnimationFrame(callback);
+    if (typeof globalThis.requestAnimationFrame === 'function') return globalThis.requestAnimationFrame(callback);
+    return globalThis.setTimeout(callback, 16);
+  }
+
+  _cancelFrame(id) {
+    const win = this._hostWindow || this._getHostWindow();
     try {
-      this._ro = new ResizeObserver(() => {
-        if (this._resizeRaf) cancelAnimationFrame(this._resizeRaf);
-        this._resizeRaf = requestAnimationFrame(() => {
+      if (typeof win?.cancelAnimationFrame === 'function') win.cancelAnimationFrame(id);
+      else if (typeof globalThis.cancelAnimationFrame === 'function') globalThis.cancelAnimationFrame(id);
+      else globalThis.clearTimeout?.(id);
+    } catch (_) {}
+  }
+
+  _installResizeObserver() {
+    try { this._ro?.disconnect?.(); } catch (_) {}
+    this._ro = null;
+    const win = this._hostWindow || this._getHostWindow();
+    const ResizeObserverCtor = win?.ResizeObserver || globalThis.ResizeObserver;
+    if (typeof ResizeObserverCtor !== 'function') return;
+    try {
+      this._ro = new ResizeObserverCtor(() => {
+        if (this._resizeRaf) this._cancelFrame(this._resizeRaf);
+        this._resizeRaf = this._requestFrame(() => {
           this._resizeRaf = null;
           try { this._render(true); } catch (e) {}
         });
       });
       this._ro.observe(this.container);
-    } catch (e) {}
+    } catch (error) {
+      Logger.debug('VGrid.resizeObserver.installFailed', { error: String(error?.message || error) });
+      this._ro = null;
+    }
+  }
+
+  _syncHostWindow() {
+    const nextWindow = this._getHostWindow();
+    if (this._hostWindow === nextWindow) {
+      if (!this._ro) this._installResizeObserver();
+      return;
+    }
+    try { this._hostWindow?.removeEventListener?.('resize', this._onResize); } catch (_) {}
+    this._hostWindow = nextWindow;
+    try { this._hostWindow?.addEventListener?.('resize', this._onResize, { passive: true }); } catch (error) {
+      Logger.warn('VGrid.resizeListener.installFailed', { error: String(error?.message || error) });
+    }
+    this._installResizeObserver();
   }
 
   /**
@@ -92,22 +148,37 @@ export class VirtualGridManager {
   destroy() {
     try { Logger.debug('VGrid.destroy'); } catch (_) {}
     this.container.removeEventListener('scroll', this._onScroll);
-    window.removeEventListener('resize', this._onResize);
+    try { this._hostWindow?.removeEventListener?.('resize', this._onResize); } catch (_) {}
     try { this._ro?.disconnect(); } catch (e) {}
-    if (this._resizeRaf) cancelAnimationFrame(this._resizeRaf);
+    if (this._resizeRaf) this._cancelFrame(this._resizeRaf);
     this.container.innerHTML = '';
     this._mounted.clear();
+    this._hostWindow = null;
+    this._ro = null;
   }
 
   _onScroll() { this._render(); }
   _onResize() { this._render(); }
 
-  _render() {    
+  refreshMounted() {
+    for (const [idx, el] of this._mounted) {
+      try {
+        if (typeof this.onMountItem === 'function') this.onMountItem(el, this.items[idx], idx);
+      } catch (error) {
+        Logger.warn('VGrid.refreshMounted.itemFailed', {
+          index: idx,
+          error: String(error?.message || error)
+        });
+      }
+    }
+  }
+
+  _render() {
+    this._syncHostWindow();
     // Grid mode is required - card configuration must be provided
     if (!this.card || !this.card.width || !this.card.height) {
       const error = 'VirtualGridManager requires card configuration (width, height) for grid mode';
       try { Logger.error('VGrid.render', { error, card: this.card }); } catch (_) {}
-      console.error('[fa-nexus]', error, this.card);
       return;
     }
       const gap = this.card.gap ?? 12;
@@ -169,4 +240,3 @@ export class VirtualGridManager {
       }
   }
 }
-

@@ -1,14 +1,19 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { forgeIntegration } from '../core/forge-integration.js';
-import { encodeTexturePath } from '../textures/texture-render.js';
+import { encodeTexturePath } from '../textures/texture-runtime-core.js';
 import {
   appendStoragePath,
-  buildGeneratedRoot,
   buildWorldGeneratedFolder,
   getConfiguredAssetsDir,
   getCurrentWorldId,
   sanitizeStoragePathSegments
-} from '../core/generated-asset-paths.js';
+} from '../storage/generated-paths.js';
+import {
+  ensureGeneratedFlattenRootsRegistered,
+  extractGeneratedFlattenRootFromPath,
+  getGeneratedCleanupRootSpecs
+} from '../storage/generated-output-roots.js';
+import { sanitizeStorageTargetPath } from '../storage/path-utils.js';
 
 const MODULE_ID = 'fa-nexus';
 const MASK_DIR = 'masks';
@@ -19,34 +24,8 @@ const MASKED_TILING_FLAG = 'maskedTiling';
 const STANDARD_TILE_MASK_FLAG = 'standardTileMask';
 const FLATTENED_FLAG = 'flattened';
 
-function stripQueryAndHash(value) {
-  return String(value ?? '').split(/[?#]/, 1)[0] || '';
-}
-
-function safeDecode(value) {
-  if (typeof value !== 'string') return value;
-  try {
-    return decodeURI(value);
-  } catch (_) {
-    try {
-      return decodeURIComponent(value);
-    } catch (_) {
-      return value;
-    }
-  }
-}
-
 function sanitizeTargetPath(value) {
-  let normalized = String(value ?? '').trim().replace(/\\/g, '/');
-  normalized = stripQueryAndHash(normalized);
-  for (let i = 0; i < 3; i += 1) {
-    const next = safeDecode(normalized);
-    if (!next || next === normalized) break;
-    normalized = next;
-  }
-  while (normalized.startsWith('/')) normalized = normalized.slice(1);
-  if (normalized.length > 1) normalized = normalized.replace(/\/+$/, '');
-  return normalized;
+  return sanitizeStorageTargetPath(value);
 }
 
 function pathBasename(value) {
@@ -169,43 +148,6 @@ export class GeneratedCleanupService {
 
   _getCurrentWorldId() {
     return getCurrentWorldId();
-  }
-
-  _readGeneratedFlattenRoots() {
-    try {
-      const assetsDir = this._getAssetsDir();
-      const currentDefault = buildGeneratedRoot('flattened', { assetsDir }).replace(/\/+$/, '');
-      const legacyDefault = appendStoragePath(assetsDir, 'flattened').replace(/\/+$/, '');
-      const previousDefault = appendStoragePath(appendStoragePath(assetsDir, 'generated'), 'flattened').replace(/\/+$/, '');
-      const raw = game?.settings?.get?.(MODULE_ID, 'generatedFlattenRoots');
-      const parsed = JSON.parse(String(raw || '[]'));
-      if (!Array.isArray(parsed)) throw new Error('Setting is not an array');
-      return parsed
-        .map((value) => sanitizeStoragePathSegments(String(value || '').trim()).replace(/\/+$/, ''))
-        .map((value) => (value === previousDefault ? currentDefault : value))
-        .filter((value) => value && value !== legacyDefault)
-        .filter(Boolean);
-    } catch (error) {
-      Logger.error('GeneratedCleanup.generatedRoots.readFailed', { error: String(error?.message || error) });
-      throw new Error(`Failed to read generated flatten roots: ${error?.message || error}`);
-    }
-  }
-
-  _readCurrentFlattenConfiguredRoot() {
-    try {
-      const assetsDir = this._getAssetsDir();
-      const currentDefault = buildGeneratedRoot('flattened', { assetsDir }).replace(/\/+$/, '');
-      const legacyDefault = appendStoragePath(assetsDir, 'flattened').replace(/\/+$/, '');
-      const previousDefault = appendStoragePath(appendStoragePath(assetsDir, 'generated'), 'flattened').replace(/\/+$/, '');
-      const stored = game?.settings?.get?.(MODULE_ID, 'flattenOptions');
-      const configured = sanitizeStoragePathSegments(String(stored?.flattenOutputFolder || '').trim()).replace(/\/+$/, '');
-      if (!configured) return '';
-      if (configured === legacyDefault || configured === previousDefault) return currentDefault;
-      return configured;
-    } catch (error) {
-      Logger.error('GeneratedCleanup.flattenOptions.readFailed', { error: String(error?.message || error) });
-      throw new Error(`Failed to read flatten output folder setting: ${error?.message || error}`);
-    }
   }
 
   _isWithinOwnedRoots(entry, ownedRoots) {
@@ -350,6 +292,7 @@ export class GeneratedCleanupService {
     target.count = Number(target.count || 0) + 1;
     target.origins.add(ref.origin);
     if (ref.refKind) target.refKinds.add(ref.refKind);
+    if (ref.sceneId) target.sceneIds.add(ref.sceneId);
     if (ref.sceneName) target.sceneNames.add(ref.sceneName);
     if (ref.tileId) target.tileIds.add(ref.tileId);
     if (!target.path && ref.path) target.path = ref.path;
@@ -376,6 +319,7 @@ export class GeneratedCleanupService {
       count: 1,
       origins: new Set([ref.origin]),
       refKinds: new Set(ref.refKind ? [ref.refKind] : []),
+      sceneIds: new Set(ref.sceneId ? [ref.sceneId] : []),
       sceneNames: new Set(ref.sceneName ? [ref.sceneName] : []),
       tileIds: new Set(ref.tileId ? [ref.tileId] : [])
     });
@@ -596,27 +540,10 @@ export class GeneratedCleanupService {
     const roots = new Map();
     const assetsDir = this._getAssetsDir();
     const worldId = this._getCurrentWorldId();
-    const defaultFlattenRoot = buildGeneratedRoot('flattened', { assetsDir });
-    const configuredFlattenRoot = this._readCurrentFlattenConfiguredRoot();
-    const flattenRoots = new Set([
-      defaultFlattenRoot,
-      configuredFlattenRoot,
-      ...this._readGeneratedFlattenRoots()
-    ].filter(Boolean));
-    const rootSpecs = [
-      {
-        category: 'mask',
-        storedRoot: buildGeneratedRoot('masks', { assetsDir }),
-        reason: 'default-generated-root'
-      },
-      ...[...flattenRoots].map((storedRoot) => ({
-        category: 'flattened',
-        storedRoot,
-        reason: storedRoot === defaultFlattenRoot
-          ? 'default-generated-root'
-          : 'registered-generated-root'
-      }))
-    ];
+    const rootSpecs = getGeneratedCleanupRootSpecs({
+      moduleId: MODULE_ID,
+      assetsDir
+    });
 
     for (const spec of rootSpecs) {
       let storedPath = '';
@@ -664,6 +591,17 @@ export class GeneratedCleanupService {
     const defaultList = [...defaultRoots.values()];
     for (const ref of liveRefs.values()) {
       if (!ref?.target || !ref.parentTarget) continue;
+      if (ref.category !== 'flattened') continue;
+      const sceneIds = [...(ref.sceneIds || [])].filter(Boolean);
+      const generatedRoot = sceneIds
+        .map((sceneId) => extractGeneratedFlattenRootFromPath(ref.target, {
+          moduleId: MODULE_ID,
+          assetsDir: this._getAssetsDir(),
+          worldId: this._getCurrentWorldId(),
+          sceneId
+        }))
+        .find(Boolean);
+      if (!generatedRoot) continue;
       const covered = defaultList.some((root) => root.signature === ref.signature && comparePathWithinRoot(ref.target, root.target));
       if (covered) continue;
       const root = {
@@ -695,6 +633,80 @@ export class GeneratedCleanupService {
       this._upsertRoot(roots, root);
     }
     return roots;
+  }
+
+  _collectDiscoveredGeneratedFlattenRoots(liveRefs) {
+    const roots = new Set();
+    const assetsDir = this._getAssetsDir();
+    const worldId = this._getCurrentWorldId();
+
+    for (const ref of liveRefs.values()) {
+      if (ref?.category !== 'flattened' || !ref?.target) continue;
+      const sceneIds = [...(ref.sceneIds || [])].filter(Boolean);
+      const rootCandidates = sceneIds.length
+        ? sceneIds.map((sceneId) => extractGeneratedFlattenRootFromPath(ref.target, {
+          moduleId: MODULE_ID,
+          assetsDir,
+          worldId,
+          sceneId
+        }))
+        : [extractGeneratedFlattenRootFromPath(ref.target, {
+          moduleId: MODULE_ID,
+          assetsDir,
+          worldId
+        })];
+
+      for (const root of rootCandidates) {
+        if (root) roots.add(root);
+      }
+    }
+
+    return Array.from(roots).sort((left, right) => left.localeCompare(right));
+  }
+
+  async _registerDiscoveredGeneratedFlattenRoots(liveRefs, skipped) {
+    const discoveredRoots = this._collectDiscoveredGeneratedFlattenRoots(liveRefs);
+    if (!discoveredRoots.length) {
+      return {
+        requestedRoots: [],
+        registeredRoots: [],
+        existingRoots: [],
+        changed: false,
+        roots: []
+      };
+    }
+
+    try {
+      const result = await ensureGeneratedFlattenRootsRegistered(discoveredRoots, {
+        moduleId: MODULE_ID,
+        assetsDir: this._getAssetsDir()
+      });
+      Logger.info('GeneratedCleanup.root.discovery', {
+        requestedRoots: result.requestedRoots,
+        registeredRoots: result.registeredRoots,
+        existingRoots: result.existingRoots,
+        changed: result.changed
+      });
+      return result;
+    } catch (error) {
+      const message = String(error?.message || error);
+      Logger.error('GeneratedCleanup.root.discoveryFailed', {
+        requestedRoots: discoveredRoots,
+        error: message
+      });
+      skipped.push(this._buildSkipEntry('register-root', 'register-generated-root-failed', {
+        category: 'flattened',
+        path: discoveredRoots.join(', '),
+        error: message
+      }));
+      return {
+        requestedRoots: discoveredRoots,
+        registeredRoots: [],
+        existingRoots: [],
+        changed: false,
+        roots: []
+      };
+    }
   }
 
   _fileKey(source, options, target) {
@@ -1003,13 +1015,18 @@ export class GeneratedCleanupService {
       uniqueLiveFiles: summary.uniqueLiveFiles
     });
 
+    await this._registerDiscoveredGeneratedFlattenRoots(liveRefs, skipped);
     const ownedRoots = this._buildOwnedRoots(skipped);
+    const extraRoots = this._collectExtraRoots(liveRefs, ownedRoots, skipped);
     const roots = new Map(ownedRoots);
-    const scope = this._assessCrossWorldSafety(ownedRoots);
+    for (const root of extraRoots.values()) {
+      this._upsertRoot(roots, root);
+    }
+    const scope = this._assessCrossWorldSafety(roots);
     const scopedLiveRefs = new Map();
 
     for (const ref of liveRefs.values()) {
-      if (this._isWithinOwnedRoots(ref, ownedRoots)) {
+      if (this._isWithinOwnedRoots(ref, roots)) {
         scopedLiveRefs.set(ref.key, ref);
         continue;
       }

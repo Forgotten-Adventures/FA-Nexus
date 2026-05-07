@@ -1,30 +1,19 @@
 import { NexusLogger as Logger } from '../../core/nexus-logger.js';
+import {
+  encodeNormalizedPathKey,
+  normalizeContentSourcePath
+} from '../../storage/path-utils.js';
 
-const windowsDrivePattern = /^[A-Za-z]:$/;
-
-export function normalizeContentSourcePath(path) {
-  if (!path) return '';
-  let str = String(path).trim();
-  let prefix = '';
-  const schemeMatch = str.match(/^([^:]+:)/);
-  if (schemeMatch) {
-    prefix = schemeMatch[1];
-    str = str.slice(prefix.length);
-  }
-  const isWindowsDrive = windowsDrivePattern.test(prefix);
-  if (isWindowsDrive) prefix = prefix.toLowerCase();
-  let normalized = str.replace(/\\/g, '/');
-  if (isWindowsDrive) normalized = normalized.toLowerCase();
-  if (normalized.length > 1) normalized = normalized.replace(/\/+$/, '');
-  return `${prefix}${normalized}`;
-}
+export { normalizeContentSourcePath };
 
 export function contentSourceKey(path) {
   try {
-    return encodeURIComponent(normalizeContentSourcePath(path));
+    return encodeNormalizedPathKey(path, {
+      normalizePath: normalizeContentSourcePath,
+      lowerCase: true
+    });
   } catch (error) {
-    try { Logger.warn?.('ContentSources.key:normalize-failed', { path, error }); }
-    catch (_) {}
+    Logger.warn?.('ContentSources.key:normalize-failed', { path, error });
     return encodeURIComponent(String(path || ''));
   }
 }

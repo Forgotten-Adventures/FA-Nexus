@@ -1,6 +1,11 @@
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 import { NexusLogger as Logger } from '../../core/nexus-logger.js';
-import { forgeIntegration } from '../../core/forge-integration.js';
+import {
+  browseFolderPickerWithFallbacks,
+  getFilePickerClass,
+  normalizePickedFolderPath,
+  prepareFolderPickerContext
+} from '../../core/file-picker-folder-browser.js';
 import { ContentSourcesIndexer } from './content-sources-indexer.js';
 import {
   normalizeContentSourcePath,
@@ -365,40 +370,38 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   /** Detach DOM event listeners */
   _unbindEvents() {
     const root = this.element; if (!root) return;
-    try { root.querySelector('#fa-nexus-add-folder-btn')?.removeEventListener('click', this._handlers.add); } catch(_) {}
-    try { root.querySelector('#fa-nexus-save-folders-btn')?.removeEventListener('click', this._handlers.save); } catch(_) {}
-    try { root.querySelector('#fa-nexus-cancel-folders-btn')?.removeEventListener('click', this._handlers.cancel); } catch(_) {}
-    root.querySelectorAll('.fa-nexus-folder-checkbox').forEach((cb, idx) => { try { cb.removeEventListener('change', this._handlers.checkboxes?.[idx]); } catch(_) {} });
-    root.querySelectorAll('.fa-nexus-folder-label').forEach((el, idx) => { try { el.removeEventListener('click', this._handlers.labels?.[idx]); } catch(_) {} });
-    root.querySelectorAll('.fa-nexus-remove-folder-btn').forEach((el, idx) => { try { el.removeEventListener('click', this._handlers.removes?.[idx]); } catch(_) {} });
-    root.querySelectorAll('.fa-nexus-edit-folder-btn').forEach((el, idx) => { try { el.removeEventListener('click', this._handlers.edits?.[idx]); } catch(_) {} });
+    root.querySelector('#fa-nexus-add-folder-btn')?.removeEventListener('click', this._handlers.add);
+    root.querySelector('#fa-nexus-save-folders-btn')?.removeEventListener('click', this._handlers.save);
+    root.querySelector('#fa-nexus-cancel-folders-btn')?.removeEventListener('click', this._handlers.cancel);
+    root.querySelectorAll('.fa-nexus-folder-checkbox').forEach((cb, idx) => cb.removeEventListener('change', this._handlers.checkboxes?.[idx]));
+    root.querySelectorAll('.fa-nexus-folder-label').forEach((el, idx) => el.removeEventListener('click', this._handlers.labels?.[idx]));
+    root.querySelectorAll('.fa-nexus-remove-folder-btn').forEach((el, idx) => el.removeEventListener('click', this._handlers.removes?.[idx]));
+    root.querySelectorAll('.fa-nexus-edit-folder-btn').forEach((el, idx) => el.removeEventListener('click', this._handlers.edits?.[idx]));
     if (this._cacheType) {
-      root.querySelectorAll('.fa-nexus-clear-cache-btn').forEach((el, idx) => { try { el.removeEventListener('click', this._handlers.clears?.[idx]); } catch(_) {} });
-      try { root.querySelector('#fa-nexus-clear-all-cache-btn')?.removeEventListener('click', this._handlers.clearAll); } catch(_) {}
-      try { root.querySelector('#fa-nexus-clear-orphan-cache-btn')?.removeEventListener('click', this._handlers.clearOrphan); } catch(_) {}
-      root.querySelectorAll('[data-action="clear-orphan-cache"]').forEach((el, idx) => { try { el.removeEventListener('click', this._handlers.orphanClears?.[idx]); } catch(_) {} });
+      root.querySelectorAll('.fa-nexus-clear-cache-btn').forEach((el, idx) => el.removeEventListener('click', this._handlers.clears?.[idx]));
+      root.querySelector('#fa-nexus-clear-all-cache-btn')?.removeEventListener('click', this._handlers.clearAll);
+      root.querySelector('#fa-nexus-clear-orphan-cache-btn')?.removeEventListener('click', this._handlers.clearOrphan);
+      root.querySelectorAll('[data-action="clear-orphan-cache"]').forEach((el, idx) => el.removeEventListener('click', this._handlers.orphanClears?.[idx]));
     }
     if (this._indexRunner) {
-      root.querySelectorAll('.fa-nexus-index-folder-btn').forEach((el, idx) => { try { el.removeEventListener('click', this._handlers.indexes?.[idx]); } catch(_) {} });
+      root.querySelectorAll('.fa-nexus-index-folder-btn').forEach((el, idx) => el.removeEventListener('click', this._handlers.indexes?.[idx]));
     }
     if (this._handlers.cloudToggle && this._cloudContext?.toggleId) {
-      try { root.querySelector(`#${this._cloudContext.toggleId}`)?.removeEventListener('change', this._handlers.cloudToggle); } catch(_) {}
+      root.querySelector(`#${this._cloudContext.toggleId}`)?.removeEventListener('change', this._handlers.cloudToggle);
     }
     if (this._handlers.cloudClear) {
-      try { root.querySelector('.fa-nexus-cloud-clear-btn')?.removeEventListener('click', this._handlers.cloudClear); } catch(_) {}
+      root.querySelector('.fa-nexus-cloud-clear-btn')?.removeEventListener('click', this._handlers.cloudClear);
     }
     this._clearRenderTimer();
     this._handlers = {};
   }
 
   _captureScrollPosition() {
-    try {
-      const list = this.element?.querySelector('.fa-nexus-folder-items');
-      if (!list) return;
-      const current = list.scrollTop;
-      this._lastScrollTop = current;
-      if (this._pendingScrollTop == null) this._pendingScrollTop = current;
-    } catch (_) {}
+    const list = this.element?.querySelector('.fa-nexus-folder-items');
+    if (!list) return;
+    const current = list.scrollTop;
+    this._lastScrollTop = current;
+    if (this._pendingScrollTop == null) this._pendingScrollTop = current;
   }
 
   _clearRenderTimer() {
@@ -411,10 +414,8 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   _restoreScrollPosition() {
     const target = this._pendingScrollTop != null ? this._pendingScrollTop : this._lastScrollTop;
     if (target == null) return;
-    try {
-      const list = this.element?.querySelector('.fa-nexus-folder-items');
-      if (list) list.scrollTop = target;
-    } catch (_) {}
+    const list = this.element?.querySelector('.fa-nexus-folder-items');
+    if (list) list.scrollTop = target;
     this._pendingScrollTop = null;
   }
 
@@ -437,27 +438,9 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   }
 
   _normalizePickedFolderPath(path, filePicker) {
-    let result = String(path ?? '').trim();
-    if (!result) return '';
-    const source = String(filePicker?.activeSource || '').toLowerCase();
-    if (!source) return result;
-
-    // Some sources (notably S3 and certain Forge providers) do not include a source/bucket marker in the selected
-    // folder path. Store an explicit prefix so later scans can resolve the correct FilePicker context.
-    const hasPrefix = /^[^:]+:/.test(result);
-    const clean = result.startsWith('/') ? result.slice(1) : result;
-
-    if (!hasPrefix && (source === 'forge-bazaar' || source === 'bazaar')) {
-      return `${source === 'bazaar' ? 'forge-bazaar' : source}:${clean}`;
-    }
-
-    if (!hasPrefix && source === 's3') {
-      const bucket = String(filePicker?.source?.bucket || filePicker?.sources?.s3?.bucket || filePicker?.options?.bucket || '').trim();
-      if (bucket) return clean ? `s3:${bucket}/${clean}` : `s3:${bucket}`;
-      return clean ? `s3:${clean}` : 's3:';
-    }
-
-    return result;
+    return normalizePickedFolderPath(path, filePicker, {
+      normalizePath: (value) => this._normalizePath(value)
+    });
   }
 
   _labelForFolderPath(path) {
@@ -885,81 +868,14 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
     this._cacheFetchPromise = null;
   }
 
-  async _prepareForgeFilePicker(filePicker) {
-    if (!filePicker) {
-      try { Logger.warn('Folders.filePickerInit:missingInstance'); } catch (_) {}
-      return { source: null, options: {} };
-    }
-    try {
-      try { Logger.debug('Folders.filePickerInit:start'); } catch (_) {}
-      await forgeIntegration.initialize();
-      const context = forgeIntegration.getFilePickerContext();
-      try {
-        const storages = game?.data?.files?.storages;
-        Logger.debug?.('Folders.filePickerInit:context', {
-          storages,
-          context,
-          hasForgeStorage: forgeIntegration.hasForgeStorage(),
-          detectedBucket: forgeIntegration.detectCurrentForgeBucket?.()
-        });
-      } catch (_) {}
-      if (context?.source === 'forgevtt') {
-        const bucketOptions = Object.assign({}, context.options || {});
-        try {
-          Logger.debug?.('Folders.filePickerInit:forgeContext', {
-            bucketOptions,
-            existingSources: Object.keys(filePicker.sources || {})
-          });
-        } catch (_) {}
-        filePicker.activeSource = 'forgevtt';
-        filePicker.options = Object.assign({}, filePicker.options || {}, bucketOptions);
-        if (bucketOptions.bucketKey !== undefined) {
-          filePicker.options.bucketKey = bucketOptions.bucketKey;
-        }
-        filePicker.__faNexusForgeContext = { source: 'forgevtt', options: bucketOptions };
-        const handler = (app, html) => {
-          if (app !== filePicker) return;
-          Hooks.off('renderFilePicker', handler);
-          try { app.activeSource = 'forgevtt'; } catch (_) {}
-          const root = html && typeof html === 'object' && 'length' in html ? html[0] || null : html;
-          if (!root) return;
-          const forgeTab = root.querySelector('[data-tab="forgevtt"]');
-          if (forgeTab) {
-            forgeTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-          }
-          setTimeout(() => {
-            try {
-              const ctx = app.__faNexusForgeContext;
-              if (!ctx || ctx.source !== 'forgevtt') return;
-              const select = root.querySelector('select[name="bucket"]');
-              const selectValue = ctx.options?.bucketKey ?? (ctx.options?.bucket !== undefined ? String(ctx.options.bucket) : null);
-              if (select && selectValue !== null) {
-                const value = String(selectValue);
-                Logger.debug?.('Folders.filePickerInit:bucketSelect', { selectValue: value });
-                if (select.value !== value) {
-                  select.value = value;
-                  select.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-              }
-            } catch (bucketError) {
-              try { Logger.debug('Folders.filePickerForgeBucketFailed', bucketError); } catch (_) {}
-            }
-          }, 75);
-        };
-        Hooks.once('renderFilePicker', handler);
-      }
-      return context;
-    } catch (error) {
-      try { Logger.debug('Folders.filePickerForgeConfigFailed', error); } catch (_) {}
-      return { source: null, options: {} };
-    }
-  }
-
   /** Open a FilePicker to add a new folder entry */
   async _addFolder() {
-    try { Logger.info('Folders.add:open'); } catch (_) {}
-    const FilePickerBase = foundry.applications.apps.FilePicker ?? globalThis.FilePicker;
-    const FilePickerClass = FilePickerBase?.implementation ?? FilePickerBase ?? globalThis.FilePicker;
+    Logger.info('Folders.add:open');
+    const FilePickerClass = getFilePickerClass();
+    if (!FilePickerClass) {
+      if (ui?.notifications?.warn) ui.notifications.warn('Unable to open file storage; FilePicker is unavailable.');
+      return;
+    }
     const fp = new FilePickerClass({
       type: 'folder', title: 'Select Folder',
       callback: (path) => {
@@ -970,47 +886,21 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
           return;
         }
         this.folders.push({ path, label, enabled: true, customLabel: null });
-        try { Logger.info('Folders.add:done', { path }); } catch (_) {}
+        Logger.info('Folders.add:done', { path });
         this._requestRender({ preserveScroll: true });
       }
     });
-    const context = await this._prepareForgeFilePicker(fp);
-    const fallbackSource = 'data';
-    const attempts = [];
-    if (context?.source) attempts.push({ source: context.source, options: context.options || {} });
-    if (!attempts.length || attempts[0].source !== fallbackSource) {
-      attempts.push({ source: fallbackSource, options: {} });
-    }
-    try { Logger.debug?.('Folders.add:browseAttempts', { attempts, initialSources: Object.keys(fp.sources || {}) }); } catch (_) {}
-
-    for (const attempt of attempts) {
-      const { source, options } = attempt;
-      if (!source) continue;
-      try {
-        if (!fp.sources[source]) {
-          fp.sources[source] = { target: '' };
-        } else if (typeof fp.sources[source] !== 'object') {
-          fp.sources[source] = { target: '' };
-        }
-        const sourceConfig = fp.sources[source];
-        sourceConfig.target = sourceConfig.target ?? '';
-        if (options && typeof options === 'object') {
-          if (options.bucket !== undefined) sourceConfig.bucket = options.bucket;
-          if (options.bucketKey !== undefined) sourceConfig.bucketKey = options.bucketKey;
-          if (options.buckets !== undefined) sourceConfig.buckets = options.buckets;
-        }
-        fp.activeSource = source;
-        if (options && typeof options === 'object' && Object.keys(options).length) {
-          fp.options = Object.assign({}, fp.options || {}, options);
-        }
-        Logger.debug?.('Folders.add:browseAttempt', { source, options: fp.options, sourceConfig });
-        await fp.browse(undefined, Object.assign({}, options));
-        return;
-      } catch (error) {
-        try { Logger.warn('Folders.add:browseFailed', { source, error }); } catch (_) {}
-        continue;
-      }
-    }
+    const context = await prepareFolderPickerContext(fp, {
+      useCurrentContext: true,
+      logger: Logger,
+      loggerTag: 'Folders.add'
+    });
+    const opened = await browseFolderPickerWithFallbacks(fp, {
+      context,
+      logger: Logger,
+      loggerTag: 'Folders.add'
+    });
+    if (opened?.opened) return;
     if (ui?.notifications?.warn) ui.notifications.warn('Unable to open file storage; please configure your Forge buckets.');
   }
 
@@ -1026,9 +916,12 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   async _editFolder(index) {
     const existing = this.folders[index];
     if (!existing) return;
-    try { Logger.info('Folders.edit:open', { index, existing }); } catch (_) {}
-    const FilePickerBase = foundry.applications.apps.FilePicker ?? globalThis.FilePicker;
-    const FilePickerClass = FilePickerBase?.implementation ?? FilePickerBase ?? globalThis.FilePicker;
+    Logger.info('Folders.edit:open', { index, existing });
+    const FilePickerClass = getFilePickerClass();
+    if (!FilePickerClass) {
+      if (ui?.notifications?.warn) ui.notifications.warn('Unable to open file storage; FilePicker is unavailable.');
+      return;
+    }
     const fp = new FilePickerClass({
       type: 'folder', title: 'Select Folder',
       callback: async (path) => {
@@ -1040,7 +933,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
         }
         const previousPath = existing.path;
         this.folders[index] = { ...existing, path, label };
-        try { Logger.info('Folders.edit:done', { index, path }); } catch (_) {}
+        Logger.info('Folders.edit:done', { index, path });
         if (path !== previousPath) {
           this._cancelIndexFor(previousPath, 'folder-edited');
           if (this._cacheType) {
@@ -1050,43 +943,17 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
         this._requestRender({ preserveScroll: true });
       }
     });
-    const context = await this._prepareForgeFilePicker(fp);
-    const fallbackSource = 'data';
-    const attempts = [];
-    if (context?.source) attempts.push({ source: context.source, options: context.options || {} });
-    if (!attempts.length || attempts[0].source !== fallbackSource) {
-      attempts.push({ source: fallbackSource, options: {} });
-    }
-    try { Logger.debug?.('Folders.edit:browseAttempts', { attempts, initialSources: Object.keys(fp.sources || {}) }); } catch (_) {}
-
-    for (const attempt of attempts) {
-      const { source, options } = attempt;
-      if (!source) continue;
-      try {
-        if (!fp.sources[source]) {
-          fp.sources[source] = { target: '' };
-        } else if (typeof fp.sources[source] !== 'object') {
-          fp.sources[source] = { target: '' };
-        }
-        const sourceConfig = fp.sources[source];
-        sourceConfig.target = sourceConfig.target ?? '';
-        if (options && typeof options === 'object') {
-          if (options.bucket !== undefined) sourceConfig.bucket = options.bucket;
-          if (options.bucketKey !== undefined) sourceConfig.bucketKey = options.bucketKey;
-          if (options.buckets !== undefined) sourceConfig.buckets = options.buckets;
-        }
-        fp.activeSource = source;
-        if (options && typeof options === 'object' && Object.keys(options).length) {
-          fp.options = Object.assign({}, fp.options || {}, options);
-        }
-        Logger.debug?.('Folders.edit:browseAttempt', { source, options: fp.options, sourceConfig });
-        await fp.browse(undefined, Object.assign({}, options));
-        return;
-      } catch (error) {
-        try { Logger.warn('Folders.edit:browseFailed', { source, error }); } catch (_) {}
-        continue;
-      }
-    }
+    const context = await prepareFolderPickerContext(fp, {
+      folder: existing.path,
+      logger: Logger,
+      loggerTag: 'Folders.edit'
+    });
+    const opened = await browseFolderPickerWithFallbacks(fp, {
+      context,
+      logger: Logger,
+      loggerTag: 'Folders.edit'
+    });
+    if (opened?.opened) return;
     if (ui?.notifications?.warn) ui.notifications.warn('Unable to open file storage; please configure your Forge buckets.');
   }
 
@@ -1094,7 +961,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   _editLabel(index) {
     const folder = this.folders[index];
     if (!folder) return;
-    try { Logger.debug('Folders.label:edit', { index, current: folder.customLabel || folder.label }); } catch (_) {}
+    Logger.debug('Folders.label:edit', { index, current: folder.customLabel || folder.label });
     const root = this.element;
     const labelEl = root?.querySelector(`[data-index="${index}"].fa-nexus-folder-label`);
     if (!labelEl) return;
@@ -1122,7 +989,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   async _removeFolder(index) {
     if (index >= 0 && index < this.folders.length) {
       const [removed] = this.folders.splice(index, 1);
-      try { Logger.info('Folders.remove', { index }); } catch (_) {}
+      Logger.info('Folders.remove', { index });
       if (removed?.path) {
         this._cancelIndexFor(removed.path, 'folder-removed');
       }
@@ -1161,7 +1028,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
           this._renderCloudRow();
         }
       }
-      try { Logger.info('Folders.save', { key: this._settingsKey, count: this.folders.length }); } catch (_) {}
+      Logger.info('Folders.save', { key: this._settingsKey, count: this.folders.length });
       ui.notifications.info(`Saved ${this.folders.length} folder(s)`);
       this.close();
     } catch (e) {

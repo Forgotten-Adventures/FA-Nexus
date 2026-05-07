@@ -5,13 +5,21 @@
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
+/**
+ * @typedef {import('../fa-nexus-types.js').FaNexusFolderSelection} FaNexusFolderSelection
+ */
+
 export class BookmarkDialog extends HandlebarsApplicationMixin(ApplicationV2) {
+  /**
+   * @param {{mode?: 'save'|'edit', titleValue?: string, bookmarkId?: string|null, searchQuery?: string, folderSelection?: FaNexusFolderSelection|null}} [options]
+   */
   constructor(options = {}) {
     super(options);
     this.mode = options.mode || 'save'; // 'save' | 'edit'
     this.titleValue = options.titleValue || '';
     this.bookmarkId = options.bookmarkId || null;
     this.searchQuery = options.searchQuery || '';
+    /** @type {FaNexusFolderSelection|null} */
     this.folderSelection = options.folderSelection || null;
     this._resolver = null;
   }
@@ -133,4 +141,3 @@ export class BookmarkDialog extends HandlebarsApplicationMixin(ApplicationV2) {
     });
   }
 }
-

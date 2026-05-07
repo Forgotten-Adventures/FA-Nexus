@@ -1,6 +1,15 @@
 import { localToTokenInventoryRecord } from '../content/inventory-utils.js';
 import { NexusIndexDB } from '../content/cache-index.js';
 import { forgeIntegration } from '../core/forge-integration.js';
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import {
+  requireFilePickerMethod,
+  wrapOperationalError
+} from '../content/nexus-content-service.js';
+
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ */
 
 /**
  * TokenDataService (local-only scaffold)
@@ -52,19 +61,31 @@ export class TokenDataService {
    * Stream local tokens in batches and emit canonical records per batch
    * (indexing-time file size fetching removed for performance)
    * @param {string} folder
-   * @param {(records:Array<object>)=>Promise<void>|void} onBatch
+   * @param {(records:FaNexusInventoryRecord[])=>Promise<void>|void} onBatch
    * @param {{batchSize?:number,sleepMs?:number}} options
    * @returns {Promise<number>} total files discovered
    */
   async streamLocalTokens(folder, onBatch, options = {}) {
     if (!folder) return 0;
-    await forgeIntegration.initialize();
-    const FilePickerBase = foundry.applications.apps.FilePicker ?? globalThis.FilePicker;
-    const FilePickerImpl = FilePickerBase?.implementation ?? FilePickerBase;
-    if (!FilePickerImpl?.browse) {
-      console.warn('fa-nexus | token stream missing FilePicker implementation');
-      return 0;
+    try {
+      await forgeIntegration.initialize();
+    } catch (error) {
+      throw wrapOperationalError(error, {
+        code: 'LOCAL_STREAM_INIT_FAILED',
+        source: 'TokenDataService.streamLocalTokens',
+        operation: 'initialize-local-token-stream',
+        folder,
+        kind: 'tokens',
+        userMessage: `FA Nexus could not initialize local token scanning for "${folder}".`
+      });
     }
+    const FilePickerImpl = requireFilePickerMethod('browse', {
+      source: 'TokenDataService.streamLocalTokens',
+      operation: 'stream-local-tokens',
+      folder,
+      kind: 'tokens',
+      userMessage: `FA Nexus could not scan "${folder}" because the Foundry FilePicker runtime is unavailable.`
+    });
     const { source: resolvedSource, target: initialTarget, options: resolvedOptions, fallbacks } =
       forgeIntegration.resolveFilePickerContext(folder);
     const primarySource = resolvedSource || (forgeIntegration.isRunningOnForge() ? 'forgevtt' : 'data');
@@ -109,7 +130,15 @@ export class TokenDataService {
           lastError = error;
         }
       }
-      throw lastError;
+      throw wrapOperationalError(lastError, {
+        code: 'LOCAL_FOLDER_BROWSE_FAILED',
+        source: 'TokenDataService.streamLocalTokens',
+        operation: 'browse-local-token-folder',
+        folder,
+        kind: 'tokens',
+        userMessage: `FA Nexus could not browse the token folder "${folder}".`,
+        details: { targetPath }
+      });
     };
 
     while (queue.length) {
@@ -121,8 +150,15 @@ export class TokenDataService {
       try {
         listing = await browseWithFallback(nextTarget);
       } catch (error) {
-        console.warn('fa-nexus | stream scan error', error);
-        continue;
+        throw wrapOperationalError(error, {
+          code: 'LOCAL_FOLDER_BROWSE_FAILED',
+          source: 'TokenDataService.streamLocalTokens',
+          operation: 'scan-local-token-folder',
+          folder,
+          kind: 'tokens',
+          userMessage: `FA Nexus could not scan the token folder "${folder}".`,
+          details: { targetPath: nextTarget }
+        });
       }
       checkAbort();
       for (const filePath of listing.files) {
@@ -139,10 +175,17 @@ export class TokenDataService {
             if (record.cachedLocalPath) record.cachedLocalPath = forgeIntegration.optimizeCacheURL(record.cachedLocalPath);
           }
           batch.push(record);
-        } catch (_) {}
+        } catch (error) {
+          Logger.warn('TokenDataService.localRecord.failed', {
+            folder,
+            filePath,
+            filename,
+            error: String(error?.message || error)
+          });
+        }
         if (batch.length >= batchSize) {
           const emitBatch = batch.slice();
-          try { await onBatch?.(emitBatch); } catch (e) { console.warn('fa-nexus | onBatch error:', e); }
+          await onBatch?.(emitBatch);
           total += batch.length;
           batch = [];
           if (sleepMs) {
@@ -159,7 +202,7 @@ export class TokenDataService {
     }
     if (batch.length) {
       const emitBatch = batch.slice();
-      try { await onBatch?.(emitBatch); } catch (e) { console.warn('fa-nexus | onBatch error:', e); }
+      await onBatch?.(emitBatch);
       total += batch.length;
     }
     return total;

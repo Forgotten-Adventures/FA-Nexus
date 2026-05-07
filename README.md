@@ -1,7 +1,7 @@
 # FA Nexus
 
-![Foundry VTT v13](https://img.shields.io/badge/Foundry%20VTT-v13+-green)
-![Version](https://img.shields.io/badge/version-0.4.x-orange)
+![Foundry VTT v14](https://img.shields.io/badge/Foundry%20VTT-v14-green)
+![Version](https://img.shields.io/badge/version-0.5.x-orange)
 ![Status](https://img.shields.io/badge/status-Beta-yellow)
 
 FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featured mapmaking capabilities* and *advanced token management inside* Foundry VTT as well as other QoL improvements.
@@ -9,20 +9,21 @@ FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featur
 ## Freemium Model
 ### Free Content & Features
 
-- **Advanced Tokens placement and Assets placement tools** - backed by entire free section of *Forgotten Adventures library* - available instantly via cloud with no extra setup or cost. 
+- **Advanced Token and Asset placement tools** - backed by the free section of the *Forgotten Adventures library* and available instantly via cloud with no extra setup or cost.
 - This includes *over 141 000 Mapmaking Assets & over 1390 Unique topdown Tokens* available for free.
 - **Elevation based Drop Shadows** - Customize drop shadow alpha, blur, dilation, angle, and distance for Asset placements.
-- **Layer Manager** - Right sidebar tab with a list of all tiles within a scene, right under the 'Scenes' button. Grouped by elevation with visibility/lock toggles, selection sync, Alt+scroll elevation nudges, and `F2` inline rename for tile labels.
+- **Layer Manager** - Right sidebar tab with a list of all tiles within a scene, right under the 'Scenes' button. Supports v14 level-aware groups, visibility/lock toggles, selection sync, drag-and-drop ordering, and `F2` inline rename for tile labels.
 - Custom Tokens & Assets support - Bring your own content to FA Nexus interface & Tools.
-- **Flatten & Scene Export** -  Merge tiles or export whole scenes with background/foregroudn split support, custom output names, and selectable save folders.
+- **Flatten & Scene Export** - Merge tiles or export scenes for the current viewed level or all scene levels, with background/middle/foreground split support, custom output names, and selectable save folders.
 - Smart Search, Folders, and Bookmarks
 - Pixel Perfect tiles selection
 
-### Premium content & Features - ([Patreon Adventurer tier ($7) or higher](https://www.patreon.com/forgottenadventures/membership))**
+### Premium content & Features - [Patreon Adventurer tier ($7) or higher](https://www.patreon.com/forgottenadventures/membership)
 - **Content unlocks** - All Token Color variants, Premium Tokens, Assets, Paths & Textures 
-- **Texture painting** - Brush and fill tools with height-map masking for rapid terrain blending.
+- **Texture painting** - Brush and fill tools with height-map masking and blend modes for rapid terrain blending.
+- **Tile Masking** - Mask compatible tiles through the premium Texture Painting editor, clear masks from Tile Config or Layer Manager, and remove parts of a tile image directly in Foundry.
 - **Paths** - Place or freehand draw curved paths with optional Foundry Walls & Drop Shadow support.
-- **Building tool** - Draw outer and inner walls, place doors and windows, build entire structures in seconds with automatic shadows, foundry walls and texturing.
+- **Building tool** - Draw outer and inner walls, place doors and windows, then assemble structures with automatic shadows, Foundry walls, composite building tiles, and generated Regions.
 
 
 
@@ -35,11 +36,13 @@ FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featur
 ## Tokens Tab
 - **Click-to-place workflow:** Click once to start placement, then drop tokens directly onto the canvas. Sticky mode keeps the placement cursor active for batch drops.
 - **Multi-select randomizer:** Select several tokens and let Nexus randomize which one lands next.
-- **Radom Color on Placement:** Randomize colors of selected Token(s) on drop.
+- **Random Color on Placement:** Randomize colors of selected Token(s) on drop.
 - **Place Token As:** Choose an existing actor from your world or compendium to place token as that actor.
+- **Level-aware placement:** Token placement targets the currently viewed v14 scene level and uses that level's bottom elevation for new token drops.
+- **Eye Level Height:** Token Config includes an FA Nexus eye-level field, plus a module setting for a higher default eye level to avoid midpoint line-of-sight edge cases between elevations.
 - **Hit point presets:** Use the actor default, roll a formula, apply a percentage, add a ±variance, or enter a custom value—even per placement session.
 - **Grid savvy:** Snap to grid, rotate, mirror, or randomize facing before every drop.
-- **Super Wildcards:** Combination of the systems above allow you to essentially havea "super" wildcard placement. e.g. Multiselect All our NPCs, Activate "Random Color on Placement", choose "Commoner" statblock as "Place Token As" , activate random rotation and flip & start placing!  You'll get a random NPC with random color and random rotation with each click!
+- **Super Wildcards:** Combine the systems above for "super" wildcard placement. For example, multi-select NPCs, enable "Random Color on Placement", choose a "Commoner" statblock as "Place Token As", enable random rotation/flip, and start placing. Each click can drop a random NPC with random color and random rotation.
 
 [token_placement_v2.webm](https://github.com/user-attachments/assets/28af5e4e-2d7e-445d-a04c-715613291bee)
 
@@ -48,8 +51,9 @@ FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featur
 ## Assets Tab
 - **Same placement magic:** Sticky mode, random rotation, mirroring, scaling, and grid snapping work just like the Tokens tab—plus randomized scale offsets for organic placement.
 - **Scatter brush placement:** Spray selected assets with density, spray deviation, and spacing controls; merge stamps into a single scatter tile per elevation (flatten if you go wild on counts).
-- **Elevation on the fly:** Hold `Alt` + scroll to bump placement elevation by 0.1 increments. Decimal elevations keep assets layered without jumping ahead of tokens (override in settings if you prefer Foundry defaults).
+- **Elevation on the fly:** Use `Alt` + scroll, `Alt` + `[` / `]`, or `Alt` + `Up` / `Down` to nudge placement elevation. The default step is `0.01`, with `Ctrl/Cmd` for `0.001` and `Shift` for `0.1`.
 - **Shadow presets per elevation:** Customize drop shadow alpha, blur, dilation, angle, and distance for each elevation level. Save up to five presets and reapply them with a click.
+- **Shadow Only mode:** Keep the generated FA shadow while hiding the source artwork, useful for contact shadows, subtle depth, and hand-placed shadow passes.
 - **Multi-select randomizer:** Select several assets and let Nexus randomize which one lands next. Combine with random rotation and scale!
 
 Scatter preview:
@@ -62,6 +66,8 @@ Single placement preview:
 
 ## Texture Painting *(Adventurer tier $7+)*
 - **Height-map masking:** Paint only the raised or recessed parts of a texture with a live preview window.
+- **Tile Masking:** Use the premium Texture Painting editor to mask compatible tiles.
+- **Blend modes:** Paint texture layers as Normal, Overlay, Soft Light, Multiply, Screen, or Add to blend dirt, moss, water, scorch marks, highlights, color passes, and similar details into the scene underneath.
 - **Brush controls:** Adjust size, tip size, density, spray deviation, spacing, and opacity for finer control.
 - **Fill & mask tools:** Flood fill, rectangle, ellipse, polygonal lasso with arc segments (Shift+click) all support snap-to-grid for precise coverage.
 - **Solid color mode:** Paint with a flat color for shadows and overlays.
@@ -76,8 +82,10 @@ Single placement preview:
 ---
 
 ## Building Tool *(Adventurer tier $7+)*
-- **Rapid structure creation:** Construct building footprints with help of rectangle, elipse and polygon shapes (with arcs support) and inner walls that auto-generate foundry walls.
-- **Portals:** Place textured doors, windows and gaps on any wall segment, the tool automatically cuts openings, creates appropriate foundry walls and textures. Doors and windows can even be animated!
+- **Rapid structure creation:** Construct building footprints with rectangle, ellipse, and polygon shapes (with arcs support) and inner walls that auto-generate Foundry walls.
+- **Composite output:** Building commits combine walls, portal frames, static windows, fills, and sill art into foreground/background composite tiles instead of leaving every generated element as its own tile.
+- **Generated Regions:** Building commits create Foundry Regions from generated outer walls when region geometry is available, with predefined Define Surface and Suppress Weather behaviors.
+- **Portals:** Place textured doors, windows and gaps on any wall segment. The tool automatically cuts openings, creates appropriate Foundry walls, and adds textures. Doors and windows can even be animated.
 - **Texture per surface:** Assign different textures to exterior walls, interior walls, and floor independently.
 - **Per-segment editing:** In `Edit Shapes`, left click selects the whole shape, right click selects an individual wall segment for per-segment texture, transform, color, and shadow edits.
 - **Automatic shadows:** Structures inherit the same elevation-based shadow system as regular assets for consistent depth.
@@ -101,8 +109,11 @@ Single placement preview:
 
 ---
 
-## Layer Manager v2
+## Level-aware Layer Manager
 - **Right sidebar tab:** Layer Manager tab sits under Scenes and lists all tiles in the scene.
+- **v14 level groups:** Each level shows dedicated `<level> Background` and `<level> Foreground` groups for the special ground/foreground bands.
+- **Parent Level:** Tiles visible on multiple levels can store which v14 level owns them, so grouping, band sorting, flatten/deconstruct, and editing target the intended level. Single-level tiles can usually stay on `Auto / Unset`.
+- **Preview rows:** Active Asset Placement, Scatter, Path, Texture Painting, Building, and Building Fill sessions appear as preview rows that can be drag-and-dropped before commit.
 - **Search and chip filters:** Filter by type/status, use `OR` and `NOT`, or prefix a term with `-` to exclude results like `-scatter`.
 - **Visibility, lock, and bulk actions:** Toggle visibility/lock per group or row, and bulk lock/delete selected layers.
 - **Inline rename:** Press `F2` to rename a row. This stores a display-only tile name and falls back to the computed label when cleared.
@@ -112,12 +123,12 @@ Single placement preview:
 - **Context menus:** Layers and groups expose rename, elevation change, lock/unlock, flatten, Foundry `Edit`, and FA `Nexus Edit` actions where applicable.
 - **Help and diagnostics:** Built-in help, per-group counts, persistent collapse state, and precise elevation formatting make dense scenes easier to manage.
 
-![20260407_1257_Foundry_Virtual_Tabletop_fwgxaoXMRZ](https://github.com/user-attachments/assets/a2d69bd7-5f01-4042-a7ef-b92a183fc4ec)
+<img width="863" height="852" alt="image" src="https://github.com/user-attachments/assets/56364fea-7db8-449d-b012-62b1139cb287" />
 
 ---
 
 ## Flatten & Scene Export
-- **Layer Manager access:** Flatten button lives at the bottom of the Layer Manager. Tile hud or right click context menu in the layer manager.
+- **Layer Manager access:** The Flatten button lives at the bottom of the Layer Manager, and flattening is also available from the Tile HUD or Layer Manager right-click context menu.
 - **Output name:** Set a custom base name before flattening or exporting.
 - **Output folder:** Choose where generated files are uploaded; flatten and export remember separate last-used folders.
 - **Predictable generated paths:** Generated flatten files are organized into scene-owned folders, and the dialog shows the effective upload destination before saving.
@@ -127,7 +138,7 @@ Single placement preview:
 - **Persistent settings:** Options like PPI and quality are remembered.
 - **Smart deconstruct:** Moved flattened tiles deconstruct in their new position, and nested flattened metadata is preserved.
 - **Chunking:** Large flattened tiles are split automatically and stitched at runtime for better performance.
-- **Scene export:** Export or flatten the full scene with optional foreground/background split and deterministic suffixes for multi-part outputs.
+- **Level export:** Export or flatten the current viewed level, or run every scene level in sequence. Split output uses background, middle, and foreground band suffixes.
 
 <img width="409" height="819" alt="image" src="https://github.com/user-attachments/assets/9f176bb7-c08b-4ec7-859c-e36b07b2b685" />
 
@@ -136,8 +147,6 @@ Single placement preview:
 ## Generated Cleanup
 - **Generated Cleanup tool:** Scan FA Nexus generated masks and flattened outputs for unused or missing files from module settings.
 - **Manual cleanup workflow:** Foundry does not allow automatic deletions here, so Nexus can only back up and mark unused files for manual removal.
-
-![20260330_0210_Foundry_Virtual_Tabletop_t9jh6MmUWM](https://github.com/user-attachments/assets/ad8c03e1-344c-4e7c-ae40-3ef653033da1)
 
 ---
 
@@ -158,12 +167,13 @@ Single placement preview:
 - **Session guardrails:** Auto-commit on tab change or app close, `Esc` cancel with confirmation, and explicit Commit/Undo/Redo/Cancel buttons in tool panels.
 - **Precise controls:** Slider values are remembered, right-click resets to default, numeric inputs stay in sync, and randomization ranges use explicit `Min` / `Max` controls.
 - **Overhead-aware FA tiles:** Paths, masked textures, buildings, scatter tiles, and chunked flatten tiles can participate in Foundry's native overhead occlusion when marked `Overhead`.
+- **FA Nexus Tile Config tab:** Tile Config exposes Parent Level, HSBC, mask clearing, and shadow settings for supported tiles.
 - **Pixel-perfect selection:** Precise tile hit detection respects transparent areas.
 - **Performance-first browsing:** One-time indexing and virtualized grids keep massive libraries snappy.
 - **Background cloud preload:** The cloud asset catalog starts loading after startup so Nexus often opens without waiting on a blocking cloud overlay.
-- **Placement prefetcher:** Random placement queues downloads ahead of time so you do not drop an empty tile.
+- **Placement prefetcher:** Random placement queues downloads ahead of time to reduce empty or late tile drops.
 - **Edit existing tiles:** Right click a supported tile and choose `Edit <tile> in FA Nexus` from the tile controls.
-- **Forge VTT compatible:** Works in Forge environments. Testing is ongoing, so please report anything odd.
+- **Forge VTT/S3 path support:** Forge VTT and S3 browsing/download paths are supported, with hosted-environment testing still ongoing. Please report anything odd.
 
 ---
 
@@ -179,7 +189,7 @@ Single placement preview:
 ---
 
 ## Getting Started
-1. Launch a world in Foundry v13+ and enable FA Nexus.
+1. Launch a world in Foundry v14 and enable FA Nexus.
 2. Click the **FA Nexus** button above the player list to open the window.
 3. Pick a tab (`Tokens`, `Assets`, and more if unlocked) and start browsing.
 4. Use the search bar, folder filters, and bookmarks to home in on what you need.
@@ -191,8 +201,8 @@ Premium supporter? Authenticate with Patreon inside the app to unlock texture pa
 ---
 
 ## Requirements & Compatibility
-- **Foundry VTT:** v13 or later.
-- **Systems tested:** D&D 5e, Pathfinder 1e/2e, DSA5 / The Dark Eye, Black Flag, Daggerheart, Shadowdark RPG, Rolemaster Unified.
+- **Foundry VTT:** v14 only. The 0.5.x release line is not backwards compatible with Foundry v13.
+- **Token system mappings:** Updated actor type mappings include Call of Cthulhu 7th Edition, Cyberpunk RED, Alien RPG, Forbidden Lands, Starfinder, World of Darkness 5th Edition/VTM5e, and Daggerheart.
 - **Internet connection:** Needed for cloud content and Patreon validation.
 - **Patreon Adventurer tier ($7+):** Required for premium textures, paths, building tools, and locked assets.
 

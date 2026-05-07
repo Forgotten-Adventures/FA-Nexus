@@ -42,7 +42,7 @@ export class FaNexusTokensFolderSelectionDialog extends BaseContentSourcesDialog
     this._cloudEnabledSetting = 'cloudTokensEnabled';
     this._cloudCacheMeta = { count: 0, folder: 'cloud:tokens', latest: null };
     this._indexControllers = new Map(); // Initialize controller tracking for cloud indexing
-    this._loadCloudMeta().catch(() => {});
+    void this._loadCloudMeta();
   }
 
   async _loadCloudMeta() {
@@ -63,7 +63,13 @@ export class FaNexusTokensFolderSelectionDialog extends BaseContentSourcesDialog
           this._renderCloudRow();
         }
       }
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn('TokensContentSources.cloudMeta.loadFailed', {
+        setting: this._cloudEnabledSetting,
+        store: 'tokens',
+        error: String(error?.message || error)
+      });
+    }
   }
 
   _getCloudConfig() {

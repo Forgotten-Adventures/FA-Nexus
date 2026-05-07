@@ -5,11 +5,6 @@ import { ensurePremiumFeaturesRegistered } from './premium-feature-registry.js';
 import { renderPatreonAuthHeader } from './patreon-auth-header.js';
 import { shouldWarmPremiumWithoutAuth } from './premium-runtime-config.js';
 
-/**
- * Patreon OAuth service for FA Nexus
- * Adapted from fa-token-browser with minimal changes and Nexus integration.
- */
-
 export class PatreonOAuthApp extends foundry.applications.api.HandlebarsApplicationMixin(foundry.applications.api.ApplicationV2) {
   /**
    * OAuth popup window UI
@@ -284,9 +279,6 @@ export class PatreonAuthService {
     }
   }
 
-  /**
-   * App-specific post-auth refresh hook (placeholder for now)
-   */
   async refreshAfterAuth(app, authData) {
     try {
       if (authData && authData.authenticated) ui.notifications.info('✅ Patreon connected');
@@ -347,7 +339,7 @@ export async function warmPremiumFeatureBundles({ reason = 'auth', features } = 
 
   const list = Array.isArray(features) && features.length
     ? features
-    : ['texture.paint', 'path.edit', 'path.edit.v2', 'building.edit'];
+    : ['texture.paint', 'path.edit.v2', 'building.edit'];
 
   for (const featureId of list) {
     if (!premiumFeatureBroker.can(featureId)) continue;

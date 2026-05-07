@@ -7,6 +7,14 @@
 import { ActorFactory } from './actor-factory.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { PlacementOverlay, createPlacementSpinner } from '../core/placement/placement-overlay.js';
+import { toolOptionsController } from '../core/tool-options-controller.js';
+
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusPoint} FaNexusPoint
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorDropCoordinates} FaNexusActorDropCoordinates
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenDragData} FaNexusTokenDragData
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenSize} FaNexusTokenSize
+ */
 
 const TOKEN_PREVIEW_Z_INDEX = 30; // Keep queued previews under FA Nexus UI chrome
 
@@ -78,13 +86,8 @@ export class TokenDragDropManager {
     });
   }
 
-  /**
-   * Back-compat: called from onMountItem; just schedule a rebind
-   * @param {HTMLElement} _card
-   */
   enableForCard(_card) { this.scheduleRebind(); }
 
-  /** Back-compat: schedule a rebind after data changes */
   refreshForMountedCards() { this.scheduleRebind(); }
 
   /**
@@ -612,6 +615,7 @@ export class TokenDragDropManager {
         const originSource = card.getAttribute('data-source') || '';
         const originTier = card.getAttribute('data-tier') || '';
         const displayName = card.getAttribute('data-display-name') || '';
+        /** @type {FaNexusTokenDragData} */
         const dragData = { type: 'fa-nexus-token', source: 'fa-nexus', filename, url: localPath, tokenSize: { gridWidth, gridHeight, scale }, originSource, originTier, displayName };
         Logger.info('TokenDrag.queued.dragData', { dragData });
         // If we're over an actor in the sidebar, handle as ActorDrop instead of canvas place
@@ -683,8 +687,6 @@ export class TokenDragDropManager {
     this._boundDropHandler = null;
   }
 
-  // Native drag preview preloading removed; unified queued drag does not need it
-
   /**
    * Calculate drag preview pixel dimensions based on token size, scene grid, and canvas zoom
    * @param {{gridWidth:number, gridHeight:number, scale:number}} sizeInfo
@@ -702,33 +704,12 @@ export class TokenDragDropManager {
     };
   }
 
-  // Native DragDrop dragstart removed
-
-  /**
-   * Setup drag preview using preloaded canvas (matches Token Browser implementation)
-   * @param {DragEvent} event - The drag event
-   * @param {HTMLElement} card - The card element
-   * @param {number} gridWidth - Grid width in squares
-   * @param {number} gridHeight - Grid height in squares
-   * @param {number} scale - Scale modifier
-   */
-  // Native drag preview setup removed
-
-  /**
-   * Handle canvas drop events from Foundry's dropCanvasData hook
-   * @param {Canvas} canvas - The canvas instance
-   * @param {Object} data - Drop data from the hook
-   * @param {DragEvent} event - The drop event
-   * @returns {boolean} True if handled, false to allow other handlers
-   */
-  // Canvas drop handler for native DragDrop removed; queued drag places directly
-
   /**
    * Transform screen coordinates to world coordinates with grid snapping
    * @param {DragEvent} event - The drop event
    * @param {Canvas} canvas - The canvas instance
-   * @param {Object} tokenSize - Token size info {gridWidth, gridHeight, scale}
-   * @returns {Object} Coordinates object with screen and world properties
+   * @param {FaNexusTokenSize} tokenSize - Token size info
+   * @returns {FaNexusActorDropCoordinates}
    */
   static transformCoordinates(event, canvas, tokenSize = { gridWidth: 1, gridHeight: 1, scale: 1 }) {
     // Get screen coordinates from the drop event
@@ -737,22 +718,44 @@ export class TokenDragDropManager {
     
     // Transform screen coordinates to world coordinates
     const worldCoords = canvas.canvasCoordinatesFromClient({ x: screenX, y: screenY });
-    
-    // Apply grid snapping
-    const snappedCoords = TokenDragDropManager.applyGridSnapping(worldCoords, canvas, tokenSize);
+    const gridSnapEnabled = TokenDragDropManager.isGridSnapEnabled();
+    const finalCoords = gridSnapEnabled
+      ? TokenDragDropManager.applyGridSnapping(worldCoords, canvas, tokenSize)
+      : worldCoords;
     
     return {
       screen: { x: screenX, y: screenY },
-      world: snappedCoords
+      world: finalCoords
     };
+  }
+
+  static isGridSnapEnabled() {
+    try {
+      return !!globalThis?.game?.settings?.get?.('fa-nexus', 'gridSnap');
+    } catch (error) {
+      Logger.warn('TokenDrag.gridSnap.readFailed', { error: String(error?.message || error) });
+    }
+
+    try {
+      if (typeof toolOptionsController?.supportsGridSnap === 'function') {
+        toolOptionsController.supportsGridSnap();
+      }
+      if (typeof toolOptionsController?.isGridSnapEnabled === 'function') {
+        return !!toolOptionsController.isGridSnapEnabled();
+      }
+    } catch (error) {
+      Logger.warn('TokenDrag.gridSnap.stateFailed', { error: String(error?.message || error) });
+    }
+
+    return true;
   }
 
   /**
    * Apply grid snapping to world coordinates based on token size
-   * @param {Object} worldCoords - World coordinates {x, y}
+   * @param {FaNexusPoint} worldCoords - World coordinates
    * @param {Canvas} canvas - The Foundry VTT canvas
-   * @param {Object} tokenSize - Token size info {gridWidth, gridHeight, scale}
-   * @returns {Object} Snapped coordinates {x, y}
+   * @param {FaNexusTokenSize} tokenSize - Token size info
+   * @returns {FaNexusPoint} Snapped coordinates
    */
   static applyGridSnapping(worldCoords, canvas, tokenSize = { gridWidth: 1, gridHeight: 1, scale: 1 }) {
     // Check if grid snapping is enabled and we have a grid
@@ -788,7 +791,7 @@ export class TokenDragDropManager {
 
   /**
    * Check if drop location is within valid canvas bounds
-   * @param {Object} worldCoords - World coordinates {x, y}
+   * @param {FaNexusPoint} worldCoords - World coordinates
    * @param {Canvas} canvas - The canvas instance
    * @returns {boolean} True if location is valid
    */
@@ -819,7 +822,7 @@ export class TokenDragDropManager {
   /**
    * Handle drop onto actor in the actors sidebar
    * @param {HTMLElement} actorElement - The actor element that was dropped onto
-   * @param {Object} data - The drag data
+   * @param {FaNexusTokenDragData} data - The drag data
    * @param {DragEvent} event - The drop event
    * @returns {boolean} True if handled, false if not our drop
    */
@@ -905,7 +908,7 @@ export class TokenDragDropManager {
   /**
    * Show confirmation dialog for actor token update
    * @param {Actor} actor - The actor to update
-   * @param {Object} dropData - The drop data
+   * @param {FaNexusTokenDragData} dropData - The drop data
    * @param {DragEvent} event - The drop event
    * @returns {Promise<boolean>} True if confirmed, false if cancelled
    */
@@ -1040,16 +1043,6 @@ export class TokenDragDropManager {
       return super.close(options);
     }
   }
-
-  /**
-   * Setup canvas as a drop zone for FA Nexus tokens
-   */
-  static setupCanvasDropZone() { /* no-op in unified queued drag mode */ }
-
-  /**
-   * Setup actors sidebar as a drop zone for FA Nexus tokens
-   */
-  static setupActorDropZone() { /* no-op in unified queued drag mode */ }
 
   /**
    * Make FA Nexus window semi-transparent/non-interactive during drag, then restore.

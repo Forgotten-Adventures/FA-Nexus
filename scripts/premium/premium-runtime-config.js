@@ -146,10 +146,6 @@ export function configurePremiumRuntime({ moduleId = DEFAULT_MODULE_ID, register
   void loadPremiumRuntimeBridge();
 }
 
-export function isPremiumDevBridgeBootstrapEnabled() {
-  return shouldAttemptPremiumRuntimeBridgeLoad() === true;
-}
-
 export async function setPremiumDevBridgeBootstrapEnabled(enabled, { persist = 'local' } = {}) {
   const moduleId = RUNTIME_STATE.moduleId || DEFAULT_MODULE_ID;
   const normalized = enabled === true;
@@ -182,7 +178,7 @@ export async function setPremiumDevBridgeEnabled(enabled, { persist = 'local' } 
 
   if (!settingKey || !fullKey || !game?.settings?.settings?.has?.(fullKey)) {
     if (normalized) {
-      Logger.error('PremiumRuntimeConfig.devBridge.setting.missing', {
+      Logger.warn('PremiumRuntimeConfig.devBridge.setting.missing', {
         moduleId: RUNTIME_STATE.moduleId,
         settingKey,
         bridgeLoaded

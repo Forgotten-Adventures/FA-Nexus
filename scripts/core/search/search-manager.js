@@ -3,6 +3,18 @@
  * Windows-like semantics: implicit AND, explicit OR/NOT/AND, plus relevance scoring.
  */
 
+/**
+ * @typedef {import('../fa-nexus-types.js').FaNexusSelectionItem} FaNexusSelectionItem
+ */
+
+/**
+ * @typedef {object} SearchToken
+ * @property {'AND'|'OR'|'NOT'|'LPAREN'|'RPAREN'|'TERM'} type
+ * @property {string} [value]
+ * @property {boolean} [exact]
+ * @property {boolean} [negated]
+ */
+
 const TOKEN_PATTERN = /\(|\)|'[^']*'|"[^"]*"|[^\s()]+/g;
 const WORD_BOUNDARY_RE = /[^a-z0-9]/;
 
@@ -10,7 +22,7 @@ const WORD_BOUNDARY_RE = /[^a-z0-9]/;
  * Tokenize a free-text query into TERM/OR/NOT/AND tokens.
  * Quoted terms (single or double) require whole-word matches.
  * @param {string} [query]
- * @returns {Array<object>}
+ * @returns {SearchToken[]}
  */
 export function tokenizeQuery(query = '') {
   const rawTokens = String(query).match(TOKEN_PATTERN) || [];
@@ -372,7 +384,7 @@ function scoreMatch(item, ast) {
 
 /**
  * Return true if an item matches a query string
- * @param {object} item - Inventory record or similar
+ * @param {FaNexusSelectionItem} item - Inventory record or similar
  * @param {string} query
  * @returns {boolean}
  */
@@ -388,9 +400,9 @@ export function matches(item, query) {
 export class NexusSearchManager {
   /**
    * Filter items by query using Windows-like semantics
-   * @param {Array<object>} items
+   * @param {FaNexusSelectionItem[]} items
    * @param {string} query
-   * @returns {Array<object>}
+   * @returns {FaNexusSelectionItem[]}
    */
   filter(items, query) {
     const q = (query || '').trim();

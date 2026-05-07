@@ -9,10 +9,20 @@ import {
 } from '../core/hsbc.js';
 import {
   attachCustomTileOverhead,
-  createDisplayProxyFactory,
   detachCustomTileOverhead,
   invalidateCustomTileOverhead
 } from '../canvas/custom-tile-overhead.js';
+import {
+  waitForTileMesh,
+  clearTileMeshWaiters as clearSharedTileMeshWaiters
+} from '../canvas/tile-mesh-waiter.js';
+import { createDisplayProxyFactory } from '../canvas/display-object-proxy.js';
+import { syncStandardMaskCustomSourceSuppression } from '../textures/standard-mask-custom-base.js';
+import {
+  isShadowOnlyActive,
+  isShadowOnlyStateActive,
+  syncShadowOnlyDisplayObject
+} from '../assets/shadow-only-runtime.js';
 
 export const DEFAULT_SEGMENT_SAMPLES = 200;
 export const MIN_POINTS_TO_RENDER = 2;
@@ -22,7 +32,6 @@ const FEATHER_GROW_MULTIPLIER = 1.5;
 const EPSILON = 1e-6;
 const CORNER_DOT_THRESHOLD = Math.cos(Math.PI / 12); // ~15°
 
-const TILE_MESH_WAITERS = new WeakMap();
 let TRANSPARENT_TEXTURE = null;
 let PATH_PROGRAM = null;
 const VISIBLE_ALPHA_THRESHOLD = 10;
@@ -32,6 +41,18 @@ const EDITING_TILES_KEY = '__faNexusPathEditingTiles';
 const PATH_WALL_DELETE_QUEUE = new Map();
 const SHARED_PATH_TEXTURE_CACHE = new Map();
 const PATH_HSBC_SLOT = 'path-runtime';
+const LEGACY_PATH_RUNTIME_WARNED_TILE_IDS = new Set();
+
+function resolveLiveSceneDocument(scene = null) {
+  const activeScene = canvas?.scene || null;
+  const sceneId = scene?.id || scene?._id || null;
+  if (sceneId) {
+    if (activeScene?.id && String(activeScene.id) === String(sceneId)) return activeScene;
+    const worldScene = game?.scenes?.get?.(sceneId) || null;
+    if (worldScene) return worldScene;
+  }
+  return scene || activeScene || null;
+}
 
 function isEditingTile(doc) {
   try {
@@ -84,6 +105,88 @@ export function normalizeTension(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return 0;
   return Math.max(-1, Math.min(1, num));
+}
+
+function isSamePoint(a, b, epsilon = EPSILON) {
+  if (!a || !b) return false;
+  const ax = Number(a.x);
+  const ay = Number(a.y);
+  const bx = Number(b.x);
+  const by = Number(b.y);
+  if (![ax, ay, bx, by].every(Number.isFinite)) return false;
+  return Math.abs(ax - bx) <= epsilon && Math.abs(ay - by) <= epsilon;
+}
+
+function cloneShadowPoint(point, { x = null, y = null } = {}) {
+  const cloned = {
+    x: Number.isFinite(x) ? Number(x) : (Number(point?.x) || 0),
+    y: Number.isFinite(y) ? Number(y) : (Number(point?.y) || 0),
+    widthLeft: Number.isFinite(point?.widthLeft) ? Number(point.widthLeft) : 1,
+    widthRight: Number.isFinite(point?.widthRight) ? Number(point.widthRight) : 1,
+    offset: Number.isFinite(point?.offset) ? Number(point.offset) : 0
+  };
+  return cloned;
+}
+
+function computePathShadowNormal(points, index, { closed = false } = {}) {
+  const total = Array.isArray(points) ? points.length : 0;
+  if (!total) return { x: 0, y: 1 };
+  const prevIndex = index - 1 >= 0 ? index - 1 : (closed ? total - 1 : index);
+  const nextIndex = index + 1 < total ? index + 1 : (closed ? 0 : index);
+  const prev = points[prevIndex] || points[index] || { x: 0, y: 0 };
+  const next = points[nextIndex] || points[index] || { x: 0, y: 0 };
+  let tangent = {
+    x: (Number(next.x) || 0) - (Number(prev.x) || 0),
+    y: (Number(next.y) || 0) - (Number(prev.y) || 0)
+  };
+  const length = Math.hypot(tangent.x, tangent.y);
+  if (length < EPSILON) tangent = { x: 0, y: 1 };
+  const normal = { x: -tangent.y, y: tangent.x };
+  const normalLength = Math.hypot(normal.x, normal.y) || 1;
+  return {
+    x: normal.x / normalLength,
+    y: normal.y / normalLength
+  };
+}
+
+export function computePathShadowPoints(controlPointsRaw = [], offset = 0, options = {}) {
+  const normalizedPoints = normalizeControlPoints(controlPointsRaw);
+  if (!normalizedPoints.length) return [];
+
+  const requestedClosed = !!options?.closed && normalizedPoints.length >= MIN_POINTS_TO_RENDER;
+  const hasClosingDuplicate = requestedClosed
+    && normalizedPoints.length > 2
+    && isSamePoint(normalizedPoints[0], normalizedPoints[normalizedPoints.length - 1]);
+  const workingPoints = hasClosingDuplicate ? normalizedPoints.slice(0, -1) : normalizedPoints.slice();
+  const closed = requestedClosed && workingPoints.length >= MIN_POINTS_TO_RENDER;
+  const shrinkStart = String(options?.feather?.startMode || '').toLowerCase() === 'shrink';
+  const shrinkEnd = String(options?.feather?.endMode || '').toLowerCase() === 'shrink';
+  const offsetValue = Number(offset) || 0;
+  const result = workingPoints.map((basePoint, index) => {
+    const baseX = Number(basePoint?.x) || 0;
+    const baseY = Number(basePoint?.y) || 0;
+    const isStart = index === 0;
+    const isEnd = index === workingPoints.length - 1;
+    const lockStart = !closed && isStart && shrinkStart;
+    const lockEnd = !closed && isEnd && shrinkEnd;
+    if (Math.abs(offsetValue) < EPSILON || lockStart || lockEnd) {
+      return cloneShadowPoint(basePoint, { x: baseX, y: baseY });
+    }
+    const normal = computePathShadowNormal(workingPoints, index, { closed });
+    return cloneShadowPoint(basePoint, {
+      x: baseX + (normal.x * offsetValue),
+      y: baseY + (normal.y * offsetValue)
+    });
+  });
+
+  if (hasClosingDuplicate && result.length) {
+    const closingSource = normalizedPoints[normalizedPoints.length - 1] || normalizedPoints[0];
+    result.push(cloneShadowPoint(closingSource, {
+      x: Number(result[0]?.x) || 0,
+      y: Number(result[0]?.y) || 0
+    }));
+  }
+  return result;
 }
 
 function shouldUseWallMesher(controlPoints, data) {
@@ -872,6 +975,21 @@ export async function loadPathTexture(src, options = {}) {
   throw lastError || new Error(`Texture failed to load: ${src}`);
 }
 
+export function clearPathTextureCache(options = {}) {
+  const count = SHARED_PATH_TEXTURE_CACHE.size;
+  try { SHARED_PATH_TEXTURE_CACHE.clear(); }
+  catch (error) { Logger.warn('PathGeometry.textureCache.clearFailed', String(error?.message || error)); }
+  if (options?.resetProgram) {
+    try { PATH_PROGRAM?.destroy?.(); } catch (_) {}
+    PATH_PROGRAM = null;
+  }
+  Logger.debug?.('PathGeometry.textureCache.cleared', {
+    count,
+    resetProgram: !!options?.resetProgram
+  });
+  return count;
+}
+
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
@@ -954,30 +1072,133 @@ export function cleanupPathOverlay(tile) {
 }
 
 async function deletePathWallsRobustly(scene, wallIds = []) {
-  const uniqueIds = Array.from(new Set(
+  const requestedIds = Array.from(new Set(
     (Array.isArray(wallIds) ? wallIds : []).filter(Boolean)
   ));
-  if (!scene || !uniqueIds.length) return false;
+  if (!scene || !requestedIds.length) return false;
+  const liveScene = resolveLiveSceneDocument(scene);
+  const collectExistingIds = (targetScene, ids) => {
+    const collection = targetScene?.walls;
+    return (Array.isArray(ids) ? ids : []).filter((wallId) => {
+      if (!wallId) return false;
+      const doc = collection?.get?.(wallId);
+      return !!doc && !doc._destroyed;
+    });
+  };
+  const normalizeDeletedIds = (deleted) => Array.from(new Set(
+    (Array.isArray(deleted) ? deleted : []).map((entry) => {
+      if (typeof entry === 'string') return entry;
+      return entry?.id || entry?._id || null;
+    }).filter(Boolean)
+  ));
   const errors = [];
-  let deleted = false;
-  for (const wallId of uniqueIds) {
+  const deletedIds = new Set();
+
+  // Tile delete hooks can fire while Foundry is still reconciling document collections.
+  // Yield once so linked wall cleanup runs against settled scene state.
+  await sleep(75);
+
+  const existingIds = collectExistingIds(liveScene, requestedIds);
+  const missingCollectionIds = requestedIds.filter((wallId) => !existingIds.includes(wallId));
+  if (missingCollectionIds.length) {
+    Logger.debug?.('PathGeometry.cleanupWalls.collectionMissingBeforeDelete', {
+      sceneId: liveScene?.id || null,
+      sceneName: liveScene?.name || null,
+      requestedIds,
+      existingIds,
+      missingCollectionIds,
+      viewedLevelId: canvas?.scene?.id === liveScene?.id ? (canvas?.scene?._view || null) : null
+    });
+  }
+
+  Logger.debug?.('PathGeometry.cleanupWalls.deleteAttempt', {
+    sceneId: liveScene?.id || null,
+    sceneName: liveScene?.name || null,
+    requestedIds,
+    existingIds,
+    viewedLevelId: canvas?.scene?.id === liveScene?.id ? (canvas?.scene?._view || null) : null
+  });
+
+  try {
+    const deleted = await liveScene.deleteEmbeddedDocuments('Wall', requestedIds);
+    for (const wallId of normalizeDeletedIds(deleted)) deletedIds.add(wallId);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (message.includes('does not exist') && existingIds.length) {
+      try {
+        const deleted = await liveScene.deleteEmbeddedDocuments('Wall', existingIds);
+        for (const wallId of normalizeDeletedIds(deleted)) deletedIds.add(wallId);
+      } catch (retryError) {
+        const retryMessage = String(retryError?.message || retryError);
+        if (!retryMessage.includes('does not exist')) {
+          errors.push({ phase: 'initialExistingBatch', error: retryMessage, wallIds: existingIds });
+        }
+      }
+    } else if (!message.includes('does not exist')) {
+      errors.push({ phase: 'initialBatch', error: message, wallIds: requestedIds });
+    }
+  }
+
+  await sleep(50);
+  let survivingIds = collectExistingIds(liveScene, requestedIds);
+
+  if (survivingIds.length) {
+    Logger.warn('PathGeometry.cleanupWalls.survivorsAfterBatch', {
+      sceneId: liveScene?.id || null,
+      sceneName: liveScene?.name || null,
+      requestedIds,
+      existingIds,
+      deletedIds: [...deletedIds],
+      survivingIds
+    });
     try {
-      const doc = scene.walls?.get?.(wallId);
-      if (!doc || doc._destroyed) continue;
-      await scene.deleteEmbeddedDocuments('Wall', [wallId]);
-      deleted = true;
+      const retried = await liveScene.deleteEmbeddedDocuments('Wall', survivingIds, { noHook: true });
+      for (const wallId of normalizeDeletedIds(retried)) deletedIds.add(wallId);
     } catch (error) {
       const message = String(error?.message || error);
       if (!message.includes('does not exist')) {
-        errors.push({ wallId, error: message });
+        errors.push({ phase: 'retryNoHook', error: message, wallIds: survivingIds });
       }
     }
+    await sleep(50);
+    survivingIds = collectExistingIds(liveScene, requestedIds);
   }
+
   if (errors.length) {
-    Logger.warn('PathGeometry.cleanupWalls.failed', { errors });
+    Logger.warn('PathGeometry.cleanupWalls.failed', {
+      sceneId: liveScene?.id || null,
+      sceneName: liveScene?.name || null,
+      requestedIds,
+      deletedIds: [...deletedIds],
+      survivingIds,
+      errors
+    });
+  }
+  if (survivingIds.length) {
+    Logger.error?.('PathGeometry.cleanupWalls.persisted', {
+      sceneId: liveScene?.id || null,
+      sceneName: liveScene?.name || null,
+      requestedIds,
+      deletedIds: [...deletedIds],
+      survivingIds
+    });
     return false;
   }
-  return deleted || uniqueIds.length > 0;
+  Logger.debug?.('PathGeometry.cleanupWalls.complete', {
+    sceneId: liveScene?.id || null,
+    sceneName: liveScene?.name || null,
+    requestedIds,
+    deletedIds: [...deletedIds]
+  });
+  return deletedIds.size > 0 || existingIds.length > 0;
+}
+
+function readPathWallFlag(doc) {
+  try {
+    const direct = doc?.getFlag?.('fa-nexus', 'pathWall');
+    if (direct !== undefined) return direct;
+  } catch (_) {}
+  return doc?.flags?.['fa-nexus']?.pathWall ?? doc?._source?.flags?.['fa-nexus']?.pathWall ?? null;
 }
 
 function queuePathWallDeletes(scene, wallIds = []) {
@@ -1017,14 +1238,17 @@ function queuePathWallDeletes(scene, wallIds = []) {
 
 function collectLinkedPathWallIds(doc, scene) {
   const tileId = doc?.id || null;
-  const walls = scene?.walls || null;
-  if (!tileId || !walls?.size) return [];
+  const liveScene = resolveLiveSceneDocument(scene);
+  const walls = liveScene?.walls || null;
+  if (!tileId) return [];
   const ids = new Set();
   const groupIds = new Set();
-  for (const wall of walls) {
-    if (!wall?.id) continue;
-    const flag = wall.getFlag?.('fa-nexus', 'pathWall');
-    if (flag?.tileId === tileId) ids.add(wall.id);
+  if (walls?.size) {
+    for (const wall of walls) {
+      if (!wall?.id) continue;
+      const flag = readPathWallFlag(wall);
+      if (flag?.tileId === tileId) ids.add(wall.id);
+    }
   }
   const { payloads } = resolvePathPayloads(doc);
   for (const payload of payloads) {
@@ -1036,14 +1260,65 @@ function collectLinkedPathWallIds(doc, scene) {
     }
     if (foundryWalls?.groupId) groupIds.add(foundryWalls.groupId);
   }
-  if (groupIds.size) {
+  if (groupIds.size && walls?.size) {
     for (const wall of walls) {
       if (!wall?.id) continue;
-      const flag = wall.getFlag?.('fa-nexus', 'pathWall');
+      const flag = readPathWallFlag(wall);
       if (flag?.groupId && groupIds.has(flag.groupId)) ids.add(wall.id);
     }
   }
   return [...ids];
+}
+
+function summarizePathWallCleanupExpectation(doc) {
+  const { payloads } = resolvePathPayloads(doc);
+  const groupIds = new Set();
+  const wallIds = new Set();
+  for (const payload of payloads) {
+    const foundryWalls = payload?.foundryWalls || null;
+    if (foundryWalls?.groupId) groupIds.add(foundryWalls.groupId);
+    if (Array.isArray(foundryWalls?.wallIds)) {
+      for (const wallId of foundryWalls.wallIds) {
+        if (wallId) wallIds.add(wallId);
+      }
+    }
+  }
+  return {
+    tileId: doc?.id || null,
+    payloadCount: payloads.length,
+    groupIds: [...groupIds],
+    wallIds: [...wallIds]
+  };
+}
+
+function summarizeScenePathWallCandidates(scene, { tileId = null, groupIds = [], wallIds = [] } = {}) {
+  const walls = scene?.walls || null;
+  const groupSet = new Set((Array.isArray(groupIds) ? groupIds : []).filter(Boolean));
+  const wallIdSet = new Set((Array.isArray(wallIds) ? wallIds : []).filter(Boolean));
+  const summary = {
+    pathWallCount: 0,
+    tileMatches: [],
+    groupMatches: [],
+    wallIdMatches: []
+  };
+  if (!walls?.size) return summary;
+  for (const wall of walls) {
+    if (!wall?.id) continue;
+    const flag = readPathWallFlag(wall);
+    if (!flag) continue;
+    summary.pathWallCount += 1;
+    const entry = {
+      id: wall.id,
+      tileId: flag.tileId || null,
+      groupId: flag.groupId || null,
+      pathId: flag.pathId || null,
+      levels: Array.isArray(wall.levels) ? wall.levels : Array.from(wall.levels || wall._source?.levels || [])
+    };
+    if (tileId && flag.tileId === tileId) summary.tileMatches.push(entry);
+    if (flag.groupId && groupSet.has(flag.groupId)) summary.groupMatches.push(entry);
+    if (wallIdSet.has(wall.id)) summary.wallIdMatches.push(entry);
+  }
+  return summary;
 }
 
 export async function cleanupPathWallsForTile(tileLike) {
@@ -1052,9 +1327,27 @@ export async function cleanupPathWallsForTile(tileLike) {
     const doc = tileLike?.document || tileLike || null;
     const tileId = doc?.id;
     if (!tileId) return false;
-    const scene = doc?.parent || canvas?.scene;
+    const scene = resolveLiveSceneDocument(doc?.parent || canvas?.scene);
+    const expectation = summarizePathWallCleanupExpectation(doc);
     const ids = collectLinkedPathWallIds(doc, scene);
-    if (!ids.length) return false;
+    if (!ids.length) {
+      if (expectation.groupIds.length || expectation.wallIds.length) {
+        Logger.warn('PathGeometry.cleanupWalls.missingLinkedWalls', {
+          sceneId: scene?.id || null,
+          sceneName: scene?.name || null,
+          expectation,
+          candidates: summarizeScenePathWallCandidates(scene, expectation)
+        });
+      }
+      return false;
+    }
+    Logger.debug?.('PathGeometry.cleanupWalls.start', {
+      sceneId: scene?.id || null,
+      sceneName: scene?.name || null,
+      tileId,
+      wallIds: ids,
+      expectation
+    });
     return await queuePathWallDeletes(scene, ids);
   } catch (error) {
     Logger.warn('PathGeometry.cleanupWalls.failed', { error: String(error?.message || error) });
@@ -1063,33 +1356,10 @@ export async function cleanupPathWallsForTile(tileLike) {
 }
 
 export async function ensureTileMesh(tile, options = {}) {
-  try {
-    if (!tile || tile.destroyed) return null;
-    if (tile.mesh && !tile.mesh.destroyed) return tile.mesh;
-    const { attempts = 6, delay = 60 } = options || {};
-    if (TILE_MESH_WAITERS.has(tile)) return TILE_MESH_WAITERS.get(tile);
-    const waiter = (async () => {
-      if (typeof tile.draw === 'function') {
-        try { await Promise.resolve(tile.draw()); } catch (_) {}
-        if (tile.mesh && !tile.mesh.destroyed) return tile.mesh;
-      }
-      for (let i = 0; i < attempts; i++) {
-        await sleep(delay);
-        if (!tile || tile.destroyed || !tile.document?.scene) break;
-        if (tile.mesh && !tile.mesh.destroyed) return tile.mesh;
-      }
-      return tile?.mesh && !tile.mesh.destroyed ? tile.mesh : null;
-    })();
-    TILE_MESH_WAITERS.set(tile, waiter);
-    try {
-      const mesh = await waiter;
-      return mesh;
-    } finally {
-      TILE_MESH_WAITERS.delete(tile);
-    }
-  } catch (_) {
-    return null;
-  }
+  return waitForTileMesh(tile, {
+    ...options,
+    scope: 'PathGeometry.ensureTileMesh'
+  });
 }
 
 function readPathFlag(doc, key) {
@@ -1120,18 +1390,38 @@ function resolvePathPayloads(doc) {
   }
   const v2 = readPathFlag(doc, 'pathV2');
   if (v2 && Array.isArray(v2.controlPoints)) return { kind: 'v2', payloads: [v2] };
-  const v1 = readPathFlag(doc, 'path');
-  if (v1 && Array.isArray(v1.controlPoints)) return { kind: 'v1', payloads: [v1] };
   return { kind: null, payloads: [] };
 }
 
-function shouldSkipV1Runtime(doc) {
-  if (!globalThis?.faNexusPathTilesPremium) return false;
+function hasCurrentPathPayloads(doc) {
   const v2 = readPathFlag(doc, 'pathV2');
-  if (v2 && Array.isArray(v2.controlPoints)) return false;
+  if (v2 && Array.isArray(v2.controlPoints)) return true;
   const merged = readPathFlag(doc, 'pathsV2');
-  if (merged && Array.isArray(merged.paths)) return false;
-  return true;
+  return !!(merged && Array.isArray(merged.paths) && merged.paths.length > 0);
+}
+
+function hasLegacyPathPayload(doc) {
+  const legacy = readPathFlag(doc, 'path');
+  return !!(legacy && typeof legacy === 'object');
+}
+
+function shouldBlockLegacyPathRuntime(doc) {
+  if (!doc || hasCurrentPathPayloads(doc)) return false;
+  return hasLegacyPathPayload(doc);
+}
+
+function warnLegacyPathRuntimeBlocked(doc, context) {
+  try {
+    const tileId = doc?.id || null;
+    const key = tileId || `anonymous:${context || 'runtime'}`;
+    if (LEGACY_PATH_RUNTIME_WARNED_TILE_IDS.has(key)) return;
+    LEGACY_PATH_RUNTIME_WARNED_TILE_IDS.add(key);
+    Logger.warn?.('PathRuntime.legacyPath.skippedMigrationRequired', {
+      tileId,
+      sceneId: doc?.parent?.id || canvas?.scene?.id || null,
+      context
+    });
+  } catch (_) {}
 }
 
 function normalizeControlPoints(controlPointsRaw = []) {
@@ -1170,8 +1460,12 @@ function syncPathContainerTransform(container, mesh, doc) {
   const rawSy = Number(mesh?.scale?.y ?? 1) || 1;
   const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
   const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
+  const anchorX = Number(doc?.texture?.anchorX);
+  const anchorY = Number(doc?.texture?.anchorY);
+  const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
+  const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
   container.scale?.set?.(1 / sx, 1 / sy);
-  container.position?.set?.(-(docWidth / 2) / (sx || 1), -(docHeight / 2) / (sy || 1));
+  container.position?.set?.(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
 }
 
 function resolvePathMeshes(container) {
@@ -1193,7 +1487,11 @@ export async function applyPathTile(tile) {
   try {
     if (!tile || tile.destroyed) return;
     const doc = tile.document;
-    if (shouldSkipV1Runtime(doc)) return;
+    if (shouldBlockLegacyPathRuntime(doc)) {
+      warnLegacyPathRuntimeBlocked(doc, 'applyPathTile');
+      cleanupPathOverlay(tile);
+      return;
+    }
     if (isEditingTile(doc)) {
       cleanupPathOverlay(tile);
       return;
@@ -1212,6 +1510,7 @@ export async function applyPathTile(tile) {
 
     const containerAlpha = 1;
     const renderKey = buildRenderKey(payloads);
+    const tileShadowOnly = isShadowOnlyActive(doc);
 
     let container = tile.faNexusPathContainer;
     if (container && !container.destroyed && container.faNexusPathRenderKey === renderKey) {
@@ -1232,6 +1531,8 @@ export async function applyPathTile(tile) {
         if (!Number.isFinite(entryAlpha)) entryAlpha = 1;
         entryAlpha = Math.min(1, Math.max(0, entryAlpha));
         applyMeshOpacity(meshPath, containerAlpha * entryAlpha);
+        const payload = payloads.find((entry) => entry?.id && entry.id === meshPath?.faNexusPathId) || null;
+        syncShadowOnlyDisplayObject(meshPath, tileShadowOnly || isShadowOnlyStateActive(payload?.shadow));
         if (!Number.isFinite(meshPath?.faNexusPathAlpha)) {
           try { meshPath.faNexusPathAlpha = entryAlpha; } catch (_) {}
         }
@@ -1324,6 +1625,8 @@ export async function applyPathTile(tile) {
         const entryAlpha = Number.isFinite(data?.layerOpacity) ? Number(data.layerOpacity) : 1;
         applyMeshOpacity(meshPath, containerAlpha * entryAlpha);
         try { meshPath.faNexusPathAlpha = entryAlpha; } catch (_) {}
+        try { meshPath.faNexusPathId = data?.id || null; } catch (_) {}
+        syncShadowOnlyDisplayObject(meshPath, tileShadowOnly || isShadowOnlyStateActive(data?.shadow));
         container.addChild(meshPath);
         meshPaths.push(meshPath);
       }
@@ -1352,6 +1655,14 @@ export async function applyPathTile(tile) {
         syncPathContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
       }
     });
+    try {
+      syncStandardMaskCustomSourceSuppression(tile, !!doc?.getFlag?.('fa-nexus', 'standardTileMask'), 'path-refresh');
+    } catch (error) {
+      Logger.warn('PathGeometry.standardMaskSuppression.failed', {
+        tileId: tile?.document?.id,
+        error: String(error?.message || error)
+      });
+    }
     invalidateCustomTileOverhead(tile, 'path-refresh');
   } catch (err) {
     Logger.warn('PathGeometry.apply.failed', String(err?.message || err));
@@ -1365,7 +1676,11 @@ export function rehydrateAllPathTiles() {
     for (const tile of list) {
       try {
         const doc = tile?.document;
-        if (shouldSkipV1Runtime(doc)) continue;
+        if (shouldBlockLegacyPathRuntime(doc)) {
+          warnLegacyPathRuntimeBlocked(doc, 'rehydrateAllPathTiles');
+          cleanupPathOverlay(tile);
+          continue;
+        }
         const { payloads } = resolvePathPayloads(doc);
         if (payloads.length) applyPathTile(tile);
         else cleanupPathOverlay(tile);
@@ -1375,6 +1690,5 @@ export function rehydrateAllPathTiles() {
 }
 
 export function clearTileMeshWaiters() {
-  try { TILE_MESH_WAITERS.clear(); }
-  catch (_) {}
+  clearSharedTileMeshWaiters('PathGeometry.clearTileMeshWaiters');
 }

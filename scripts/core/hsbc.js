@@ -1,3 +1,5 @@
+import { resolveTilePlaceable } from '../canvas/tile-targets.js';
+
 const HUE_MIN = -180;
 const HUE_MAX = 180;
 const FACTOR_MIN = 0;
@@ -18,8 +20,6 @@ export const HSBC_DEFAULTS = Object.freeze({
   brightness: 1,
   contrast: 1
 });
-
-export const DEFAULT_HSBC = HSBC_DEFAULTS;
 
 const HSBC_FRAGMENT_SRC = `
 precision mediump float;
@@ -200,15 +200,6 @@ export function serializeHsbc(value, options = {}) {
   if (!normalized) return null;
   if (nullIfNeutral && isNeutralHsbc(normalized)) return null;
   return { ...normalized };
-}
-
-export function mergeHsbc(base, override, options = {}) {
-  const { nullIfNeutral = false } = options;
-  const normalizedBase = normalizeHsbc(base);
-  const normalized = normalizeHsbc(override, normalizedBase);
-  if (!normalized) return null;
-  if (nullIfNeutral && isNeutralHsbc(normalized)) return null;
-  return normalized;
 }
 
 export function isNeutralHsbc(value) {
@@ -441,15 +432,6 @@ export function buildHsbcToolOptionsHandlers(config = {}) {
     [names.brightness || 'setBrightness']: (value, commit) => update('brightness', value, commit),
     [names.contrast || 'setContrast']: (value, commit) => update('contrast', value, commit)
   };
-}
-
-function resolveTilePlaceable(tileOrDoc) {
-  if (!tileOrDoc) return null;
-  if (tileOrDoc.mesh || tileOrDoc.document) return tileOrDoc;
-  const docId = tileOrDoc.id || tileOrDoc._id || null;
-  if (!docId) return null;
-  const tiles = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
-  return tiles.find((tile) => tile?.document?.id === docId) || tileOrDoc.object || null;
 }
 
 function getFaNexusDocumentFlags(doc) {

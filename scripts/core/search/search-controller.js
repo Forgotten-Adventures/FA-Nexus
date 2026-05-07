@@ -83,7 +83,15 @@ export class SearchController {
         // Only apply if the same tab is still active; otherwise the new tab will handle its own apply
         if (this.app._activeTab === tabAtInput) {
           const applyOptions = tabAtInput === 'buildings' ? { refreshTextures: false } : undefined;
-          try { this.app._activeTabObj?.applySearch?.(query, applyOptions); } catch (_) {}
+          try {
+            this.app._activeTabObj?.applySearch?.(query, applyOptions);
+          } catch (error) {
+            Logger.warn('SearchController.applySearch.failed', {
+              tabId: tabAtInput,
+              query,
+              error
+            });
+          }
         }
         this._searchDebounceId = null;
       }, 250);
@@ -105,7 +113,14 @@ export class SearchController {
         // Only apply clear on current tab; switching tabs will restore their own query
         if (this.app._activeTab === tabAtClick) {
           const applyOptions = tabAtClick === 'buildings' ? { refreshTextures: false } : undefined;
-          try { this.app._activeTabObj?.applySearch?.('', applyOptions); } catch (_) {}
+          try {
+            this.app._activeTabObj?.applySearch?.('', applyOptions);
+          } catch (error) {
+            Logger.warn('SearchController.clearSearch.failed', {
+              tabId: tabAtClick,
+              error
+            });
+          }
         }
         try { searchInput.focus(); } catch (_) {}
       };
@@ -150,16 +165,16 @@ export class SearchController {
     // Apply to tab if it's active
     const shouldApply = options.apply !== false;
     if (this.app._activeTab === tabId && shouldApply) {
-      try { this.app._activeTabObj?.applySearch?.(query, options); } catch (_) {}
+      try {
+        this.app._activeTabObj?.applySearch?.(query, options);
+      } catch (error) {
+        Logger.warn('SearchController.applySearchToTab.failed', {
+          tabId,
+          query,
+          error
+        });
+      }
     }
-  }
-
-  /**
-   * Clear search for a specific tab
-   * @param {string} tabId - Tab identifier
-   */
-  clearSearch(tabId, options = {}) {
-    this.applySearchToTab(tabId, '', options);
   }
 
   /**
@@ -192,7 +207,7 @@ export class SearchController {
       if (!searchWrap) return;
 
       const tabId = this.app._activeTab || 'tokens';
-      const controller = this.app._folderFilterController || this.app._folderBrowserController;
+      const controller = this.app._folderFilterController;
       const folderSelection = controller?.getSelectionForTab?.(tabId) || null;
 
       // Check if folders are selected (not "all" type or has includes/excludes)
@@ -203,7 +218,7 @@ export class SearchController {
 
       Logger.debug('Updated search bar folder indicator:', { tabId, hasFolderFilter, folderSelection });
     } catch (e) {
-      Logger.error('Failed to update search bar folder indicator:', e);
+      Logger.debug('Failed to update search bar folder indicator:', e);
     }
   }
 

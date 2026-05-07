@@ -1,6 +1,17 @@
 // NexusDownloadManager — manages downloading cloud files to local Foundry storage
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { forgeIntegration } from '../core/forge-integration.js';
+import {
+  requireFilePickerMethod,
+  wrapOperationalError
+} from './nexus-content-service.js';
+import {
+  appendStoragePath,
+  buildTypedPathLookupKey,
+  generateNormalizedPathLookupKeys,
+  normalizeRelativeStoragePath,
+  stripPathQueryAndHash
+} from '../storage/path-utils.js';
 import { ProgressEmitter } from './nexus-content-service.js';
 
 // Import retry utility
@@ -75,6 +86,7 @@ export class NexusDownloadManager {
     this._bgScanDelayMs = 20; // small delay to yield between directory scans
     this._maxIndexEntries = 200000; // soft cap to avoid unbounded memory usage
     this.progressEmitter = options.progressEmitter || new ProgressEmitter();
+    this._initializationError = null;
   }
 
   /**
@@ -107,9 +119,16 @@ export class NexusDownloadManager {
         files: this._inventory.size,
         backgroundScan: allowScan
       });
+      this._initializationError = null;
       return true;
     } catch (e) {
-      Logger.error('DownloadManager.init:failed', e);
+      this._initializationError = wrapOperationalError(e, {
+        code: 'DOWNLOAD_MANAGER_INIT_FAILED',
+        source: 'DownloadManager.initialize',
+        operation: 'initialize-download-manager',
+        userMessage: 'FA Nexus could not initialize local download storage.'
+      });
+      Logger.error('DownloadManager.init:failed', this._initializationError);
       return false;
     }
   }
@@ -145,13 +164,26 @@ export class NexusDownloadManager {
 
   /** Ensure a data directory exists (create if missing) */
   async _ensureDir(dir, context = null) {
-    const FilePickerImpl = foundry.applications.apps.FilePicker.implementation;
+    const FilePickerImpl = requireFilePickerMethod('browse', {
+      source: 'DownloadManager._ensureDir',
+      operation: 'ensure-download-directory',
+      folder: dir,
+      kind: context?.kind || '',
+      userMessage: `FA Nexus could not access the download directory "${dir}" because the Foundry FilePicker runtime is unavailable.`
+    });
     const source = context?.source || forgeIntegration.getStorageTarget?.() || (forgeIntegration.isRunningOnForge() ? 'forgevtt' : 'data');
     const options = Object.assign({}, context?.options || {});
     try {
       await FilePickerImpl.browse(source, dir, options);
     } catch (_) {
       Logger.info('DownloadManager.mkdir', { dir });
+      requireFilePickerMethod('createDirectory', {
+        source: 'DownloadManager._ensureDir',
+        operation: 'create-download-directory',
+        folder: dir,
+        kind: context?.kind || '',
+        userMessage: `FA Nexus could not create the download directory "${dir}" because the Foundry FilePicker runtime is unavailable.`
+      });
       await FilePickerImpl.createDirectory(source, dir, options);
     }
   }
@@ -244,39 +276,105 @@ export class NexusDownloadManager {
     return forgeIntegration.normalizeFilePickerTarget(source, str);
   }
 
-  _relativePathFromFilePath(filePath, baseDir, fallbackName = '') {
-    const raw = String(filePath ?? '');
-    const base = String(baseDir ?? '').replace(/\/+$/, '');
-    const name = String(fallbackName || '').trim() || raw.split(/[?#]/)[0].split('/').pop() || '';
-    if (!base) return name;
+  _normalizeProbeBrowsePath(value) {
+    return String(normalizeRelativeStoragePath(value) || '').toLowerCase();
+  }
 
-    const noQuery = raw.split(/[?#]/)[0];
-    if (noQuery.startsWith(`${base}/`)) return noQuery.slice(base.length + 1);
+  _splitProbeBrowseTarget(target) {
+    const normalized = normalizeRelativeStoragePath(target);
+    if (!normalized) return [];
+    return normalized.split('/').filter(Boolean);
+  }
 
-    if (/^https?:\/\//i.test(noQuery)) {
+  _probeSegmentsStartWith(segments, rootSegments) {
+    if (!rootSegments.length) return true;
+    if (segments.length < rootSegments.length) return false;
+    for (let i = 0; i < rootSegments.length; i += 1) {
+      if (String(segments[i] || '').toLowerCase() !== String(rootSegments[i] || '').toLowerCase()) return false;
+    }
+    return true;
+  }
+
+  _directoryListIncludesProbeChild(result, parentTarget, childSegment) {
+    const dirs = result?.dirs;
+    if (!Array.isArray(dirs)) return null;
+    const expected = this._normalizeProbeBrowsePath(appendStoragePath(parentTarget, childSegment));
+    const child = this._normalizeProbeBrowsePath(childSegment);
+    for (const dir of dirs) {
+      const normalized = this._normalizeProbeBrowsePath(dir);
+      if (!normalized) continue;
+      if (normalized === expected || normalized === child) return true;
+      if (expected && normalized.endsWith(`/${expected}`)) return true;
+      if (child && normalized.endsWith(`/${child}`)) return true;
+    }
+    return false;
+  }
+
+  async _isMissingProbeDirectory(FilePickerImpl, storage, targetDir) {
+    const targetSegments = this._splitProbeBrowseTarget(targetDir);
+    const rootSegments = this._splitProbeBrowseTarget(storage?.target || '');
+    if (!targetSegments.length || !this._probeSegmentsStartWith(targetSegments, rootSegments)) return false;
+
+    const minParentLength = rootSegments.length;
+    if (targetSegments.length <= minParentLength) return false;
+
+    const source = storage?.source || 'data';
+    const options = Object.assign({}, storage?.options || {});
+    for (let parentLength = targetSegments.length - 1; parentLength >= minParentLength; parentLength -= 1) {
+      const parentTarget = targetSegments.slice(0, parentLength).join('/');
+      const childSegment = targetSegments[parentLength];
+      let parentResult = null;
       try {
-        const url = new URL(noQuery);
-        const path = String(url.pathname || '').replace(/^\/+/, '');
-        if (path.startsWith(`${base}/`)) return path.slice(base.length + 1);
-      } catch (_) {}
+        parentResult = await FilePickerImpl.browse(source, parentTarget, Object.assign({}, options));
+      } catch (error) {
+        continue;
+      }
+
+      const childExists = this._directoryListIncludesProbeChild(parentResult, parentTarget, childSegment);
+      if (childExists === null) {
+        Logger.debug('DownloadManager.probeLocal:parentBrowseMissingDirs', {
+          source,
+          parentTarget,
+          targetDir
+        });
+        return false;
+      }
+
+      return childExists === false;
     }
 
-    const marker = `/${base}/`;
-    const idx = noQuery.indexOf(marker);
-    if (idx >= 0) return noQuery.slice(idx + marker.length);
+    return false;
+  }
 
-    return name;
+  _relativePathFromFilePath(filePath, baseDir, fallbackName = '') {
+    const raw = String(filePath ?? '');
+    const normalizedBase = normalizeRelativeStoragePath(baseDir);
+    const fallback = normalizeRelativeStoragePath(fallbackName)
+      || normalizeRelativeStoragePath(stripPathQueryAndHash(raw).split('/').pop() || '');
+    const normalizedFile = normalizeRelativeStoragePath(raw);
+    if (!normalizedBase) return normalizedFile || fallback;
+    if (normalizedFile === normalizedBase) return fallback;
+    if (normalizedFile.startsWith(`${normalizedBase}/`)) {
+      return normalizedFile.slice(normalizedBase.length + 1) || fallback;
+    }
+    const collapsedRaw = stripPathQueryAndHash(raw).replace(/\\/g, '/').replace(/\/+/g, '/');
+    const marker = `/${normalizedBase}/`;
+    const idx = collapsedRaw.indexOf(marker);
+    if (idx >= 0) {
+      return normalizeRelativeStoragePath(collapsedRaw.slice(idx + marker.length)) || fallback;
+    }
+    return normalizedFile || fallback;
   }
 
   _stripQueryAndHash(value) {
-    return String(value ?? '').split(/[?#]/)[0];
+    return stripPathQueryAndHash(value);
   }
 
   _pathEndsWithFilename(value, filename) {
     if (!value || !filename) return false;
-    const target = String(filename).trim().toLowerCase();
+    const target = String(normalizeRelativeStoragePath(filename) || '').trim().toLowerCase();
     if (!target) return false;
-    const raw = this._stripQueryAndHash(value);
+    const raw = normalizeRelativeStoragePath(value);
     const tail = raw.split('/').pop();
     if (!tail) return false;
     return tail.toLowerCase() === target;
@@ -338,16 +436,18 @@ export class NexusDownloadManager {
    * @param {'tokens'|'assets'} kind
    * @param {{filename:string,tier?:string}} item
    * @param {string} url - Source URL to download from
+   * @param {{forceDownload?:boolean}} [options]
    * @returns {Promise<string>} Local path in the Foundry data storage (or direct URL if useDirectCloudUrls is enabled for free items)
    */
-  async ensureLocal(kind, item, url) {
+  async ensureLocal(kind, item, url, options = {}) {
     if (!item || !url) throw new Error('ensureLocal requires item and url');
 
     // If useDirectCloudUrls setting is enabled and item is free tier, return URL directly without downloading
     // Treat empty/missing tier as 'free' since that's the default
     const tierLower = String(item.tier || '').toLowerCase();
     const isFree = tierLower === 'free' || tierLower === '';
-    if (isFree) {
+    const forceDownload = options?.forceDownload === true;
+    if (isFree && !forceDownload) {
       try {
         const useDirectUrls = game?.settings?.get?.('fa-nexus', 'useDirectCloudUrls') === true;
         if (useDirectUrls) {
@@ -357,7 +457,8 @@ export class NexusDownloadManager {
       } catch (_) { /* setting not available, fall through to normal download */ }
     }
 
-    await this.initialize();
+    const initialized = await this.initialize();
+    if (!initialized) throw this._initializationError || new Error('Download manager initialization failed');
     const filename = String(item.filename || '').trim();
     if (!filename) throw new Error('Missing filename');
     let existing = null;
@@ -374,7 +475,13 @@ export class NexusDownloadManager {
       const relSanitized = this._sanitizeRelativePath(rel);
       const subdir = this._dirName(relSanitized);
       const targetDir = [storage.target, subdir].filter(Boolean).join('/');
-      const FilePickerImpl = foundry.applications.apps.FilePicker.implementation;
+      const FilePickerImpl = requireFilePickerMethod('browse', {
+        source: 'DownloadManager.ensureLocal',
+        operation: 'probe-download-directory',
+        folder: targetDir,
+        kind,
+        userMessage: `FA Nexus could not browse the download directory "${targetDir}" because the Foundry FilePicker runtime is unavailable.`
+      });
       const res = await FilePickerImpl.browse(storage.source, targetDir, Object.assign({}, storage.options));
       const foundPath = (res.files || []).find((p) => this._pathEndsWithFilename(p, filename)) || null;
       if (foundPath) {
@@ -386,7 +493,7 @@ export class NexusDownloadManager {
     } catch (_) { /* ignore and fallback to download */ }
 
     const relative = this._normalizeRelativePathFromItem(item, filename);
-    const key = `${kind}:${(relative || filename).toLowerCase()}`;
+    const key = this._inventoryLookupKey(kind, relative || filename);
     if (this._inflight.has(key)) return this._inflight.get(key);
     const storage = this._getStorage(kind);
     const p = this._download(kind, filename, url, relative, storage).finally(() => this._inflight.delete(key));
@@ -434,7 +541,13 @@ export class NexusDownloadManager {
       );
 
       const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
-      const FilePickerImpl = foundry.applications.apps.FilePicker.implementation;
+      const FilePickerImpl = requireFilePickerMethod('upload', {
+        source: 'DownloadManager._download',
+        operation: 'upload-downloaded-file',
+        folder: targetDir,
+        kind,
+        userMessage: `FA Nexus could not upload "${filename}" because the Foundry FilePicker runtime is unavailable.`
+      });
 
       // Ensure nested directory structure exists before uploading
       this.progressEmitter.emit('download:prepare', { kind, filename, targetDir });
@@ -465,7 +578,8 @@ export class NexusDownloadManager {
    */
   async probeLocal(kind, item) {
     try {
-      await this.initialize();
+      const initialized = await this.initialize();
+      if (!initialized) throw this._initializationError || new Error('Download manager initialization failed');
       const filename = String(item?.filename || '').trim();
       if (!filename) return null;
       // Quick inventory lookup first
@@ -482,16 +596,38 @@ export class NexusDownloadManager {
       const relSanitized = this._sanitizeRelativePath(rel);
       const subdir = this._dirName(relSanitized);
       const targetDir = [storage.target, subdir].filter(Boolean).join('/');
-      const FilePickerImpl = foundry.applications.apps.FilePicker.implementation;
-      const res = await FilePickerImpl.browse(storage.source, targetDir, Object.assign({}, storage.options));
+      const FilePickerImpl = requireFilePickerMethod('browse', {
+        source: 'DownloadManager.probeLocal',
+        operation: 'probe-local-download-cache',
+        folder: targetDir,
+        kind,
+        userMessage: `FA Nexus could not probe the local ${kind} cache for "${filename}".`
+      });
+      let res = null;
+      try {
+        res = await FilePickerImpl.browse(storage.source, targetDir, Object.assign({}, storage.options));
+      } catch (browseError) {
+        if (await this._isMissingProbeDirectory(FilePickerImpl, storage, targetDir)) {
+          return null;
+        }
+        throw browseError;
+      }
       const foundPath = (res.files || []).find((p) => this._pathEndsWithFilename(p, filename)) || null;
       if (!foundPath) return null;
       const path = this._resolveStoredFilePath(storage, targetDir, filename, foundPath);
       this._registerInventoryEntry(kind, [filename, relSanitized], path);
       Logger.info('DownloadManager.probeLocal:found', { path });
       return forgeIntegration.optimizeCacheURL(path);
-    } catch (_) {
-      return null;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error;
+      throw wrapOperationalError(error, {
+        code: 'LOCAL_PROBE_FAILED',
+        source: 'DownloadManager.probeLocal',
+        operation: 'probe-local-download-cache',
+        folder: String(item?.path || item?.file_path || ''),
+        kind,
+        userMessage: `FA Nexus could not probe the local ${kind} cache for "${item?.filename || 'unknown file'}".`
+      });
     }
   }
 
@@ -544,41 +680,15 @@ export class NexusDownloadManager {
   }
 
   _inventoryLookupKey(kind, key) {
-    const normalizedKind = String(kind || '').trim().toLowerCase();
-    const normalizedKey = String(key || '').trim().toLowerCase();
-    if (!normalizedKind || !normalizedKey) return '';
-    return `${normalizedKind}:${normalizedKey}`;
+    return buildTypedPathLookupKey(kind, key, {
+      normalizePath: normalizeRelativeStoragePath
+    });
   }
 
   _generateInventoryKeys(name) {
-    const keys = new Set();
-    const push = (value) => {
-      if (!value) return;
-      const trimmed = String(value).trim();
-      if (!trimmed) return;
-      keys.add(trimmed.toLowerCase());
-    };
-
-    const base = String(name || '');
-    push(base);
-
-    let decoded = base;
-    for (let i = 0; i < 3; i++) {
-      const next = this._safeDecode(decoded);
-      if (!next || next === decoded) break;
-      decoded = next;
-      push(decoded);
-    }
-
-    let encoded = base;
-    for (let i = 0; i < 3; i++) {
-      const next = this._safeEncode(encoded);
-      if (!next || next === encoded) break;
-      encoded = next;
-      push(encoded);
-    }
-
-    return Array.from(keys.values());
+    return generateNormalizedPathLookupKeys(name, {
+      normalizePath: normalizeRelativeStoragePath
+    });
   }
 
   /** Ensure nested subdirectories exist under data scheme */
@@ -596,31 +706,21 @@ export class NexusDownloadManager {
   /** Convert item.path or item.file_path into a clean relative path with filename */
   _normalizeRelativePathFromItem(item, fallbackFilename) {
     const fromItem = String(item?.file_path || item?.path || '').trim();
-    const filename = String(item?.filename || fallbackFilename || '').trim();
+    const filename = normalizeRelativeStoragePath(item?.filename || fallbackFilename || '');
     if (!fromItem) return filename;
     const sanitized = this._sanitizeRelativePath(fromItem);
     if (!sanitized) return filename;
     // Ensure the last segment matches the filename; if not, append filename
     const tail = sanitized.split('/').pop();
-    if (tail && tail.toLowerCase() === filename.toLowerCase()) return sanitized;
+    if (tail && filename && tail.toLowerCase() === filename.toLowerCase()) return sanitized;
+    if (!filename) return sanitized;
     const dir = this._dirName(sanitized);
     return dir ? `${dir}/${filename}` : filename;
   }
 
   /** Sanitize a user/cloud provided relative path for local storage */
   _sanitizeRelativePath(p) {
-    if (!p) return '';
-    let s = String(p).replace(/\\/g, '/');
-    s = s.replace(/^\/+/, '');
-    s = s.replace(/\/+$/, '');
-    const parts = [];
-    for (const seg of s.split('/')) {
-      const trimmed = seg.trim();
-      if (!trimmed || trimmed === '.' || trimmed === '') continue;
-      if (trimmed === '..') continue;
-      parts.push(trimmed);
-    }
-    return parts.join('/');
+    return normalizeRelativeStoragePath(p);
   }
 
   /** Return directory name portion of a path (without trailing slash) */
@@ -630,29 +730,4 @@ export class NexusDownloadManager {
     return p.slice(0, idx);
   }
 
-  _safeDecode(value) {
-    if (typeof value !== 'string') return value;
-    try {
-      return decodeURI(value);
-    } catch (_) {
-      try {
-        return decodeURIComponent(value);
-      } catch (_) {
-        return value;
-      }
-    }
-  }
-
-  _safeEncode(value) {
-    if (typeof value !== 'string') return value;
-    try {
-      return encodeURI(value);
-    } catch (_) {
-      try {
-        return encodeURIComponent(value);
-      } catch (_) {
-        return value;
-      }
-    }
-  }
 }

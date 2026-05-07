@@ -42,17 +42,3 @@ export function formatGridSnapSubdivisionLabel(value) {
   const index = normalizeGridSnapSubdivision(value);
   return GRID_SNAP_SUBDIV_LABELS[index] ?? GRID_SNAP_SUBDIV_LABELS[0];
 }
-
-export function snapPointToSubgrid(point, gridSize, subdivisions = undefined) {
-  if (!point) return { x: 0, y: 0 };
-  const step = getGridSnapStep(gridSize, subdivisions);
-  if (!step || !Number.isFinite(step) || step <= 0) {
-    return { x: Number(point.x) || 0, y: Number(point.y) || 0 };
-  }
-  const x = Number(point.x) || 0;
-  const y = Number(point.y) || 0;
-  return {
-    x: Math.round(x / step) * step,
-    y: Math.round(y / step) * step
-  };
-}

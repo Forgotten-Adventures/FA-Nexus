@@ -36,8 +36,7 @@ export class ContentSourcesIndexer {
     if (typeof onBeforeStart === 'function') {
       try { onBeforeStart(folder); }
       catch (error) {
-        try { Logger.warn?.('ContentSourcesIndexer.beforeStart:failed', { folder, error }); }
-        catch (_) {}
+        Logger.warn?.('ContentSourcesIndexer.beforeStart:failed', { folder, error });
       }
     }
 
@@ -90,8 +89,7 @@ export class ContentSourcesIndexer {
     if (!normalized) return;
     const controller = this._controllers.get(normalized);
     if (controller) {
-      try { controller.abort(reason); }
-      catch (_) {}
+      controller.abort(reason);
       this._controllers.delete(normalized);
     }
     const state = this._states.get(normalized);
@@ -102,8 +100,7 @@ export class ContentSourcesIndexer {
 
   cancelAll(reason = 'cancelled') {
     for (const controller of this._controllers.values()) {
-      try { controller.abort(reason); }
-      catch (_) {}
+      controller.abort(reason);
     }
     this._controllers.clear();
     for (const [normalized, state] of this._states.entries()) {
@@ -119,8 +116,7 @@ export class ContentSourcesIndexer {
   dispose() {
     this.cancelAll('disposed');
     for (const timer of this._cleanupTimers.values()) {
-      try { clearTimeout(timer); }
-      catch (_) {}
+      clearTimeout(timer);
     }
     this._cleanupTimers.clear();
     this._states.clear();
@@ -131,8 +127,7 @@ export class ContentSourcesIndexer {
     try {
       return this._normalizePath(folder);
     } catch (error) {
-      try { Logger.error?.('ContentSourcesIndexer.normalize:failed', { folder, error }); }
-      catch (_) {}
+      Logger.error?.('ContentSourcesIndexer.normalize:failed', { folder, error });
       return folder || '';
     }
   }
@@ -156,8 +151,7 @@ export class ContentSourcesIndexer {
     this._states.delete(normalized);
     const timer = this._cleanupTimers.get(normalized);
     if (timer) {
-      try { clearTimeout(timer); }
-      catch (_) {}
+      clearTimeout(timer);
       this._cleanupTimers.delete(normalized);
     }
   }
@@ -166,8 +160,7 @@ export class ContentSourcesIndexer {
     for (const listener of this._listeners) {
       try { listener(folder, state); }
       catch (error) {
-        try { Logger.warn?.('ContentSourcesIndexer.listener:failed', { folder, error }); }
-        catch (_) {}
+        Logger.warn?.('ContentSourcesIndexer.listener:failed', { folder, error });
       }
     }
   }
@@ -175,8 +168,7 @@ export class ContentSourcesIndexer {
   _scheduleCleanup(normalized, state) {
     const timer = this._cleanupTimers.get(normalized);
     if (timer) {
-      try { clearTimeout(timer); }
-      catch (_) {}
+      clearTimeout(timer);
       this._cleanupTimers.delete(normalized);
     }
     if (!state || state.status === 'running') return;
@@ -218,8 +210,7 @@ export class ContentSourcesIndexer {
       const value = Number(result.count ?? result.total ?? result.items ?? result.length);
       if (Number.isFinite(value)) return Number(value);
     }
-    try { Logger.warn?.('ContentSourcesIndexer.count:unknown', { result }); }
-    catch (_) {}
+    Logger.warn?.('ContentSourcesIndexer.count:unknown', { result });
     return Number(this._states.get(normalized)?.count || 0) || 0;
   }
 }

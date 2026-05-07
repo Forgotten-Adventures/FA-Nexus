@@ -1,5 +1,10 @@
 import { GridBrowseTab } from '../core/ui/grid-browse-tab.js';
-import { collectLocalInventory, getEnabledFolders, mergeLocalAndCloudRecords } from '../content/nexus-content-service.js';
+import {
+  collectLocalInventory,
+  formatOperationalError,
+  getEnabledFolders,
+  mergeLocalAndCloudRecords
+} from '../content/nexus-content-service.js';
 import { abortError, formatCatalogLoaderText, isAbortError, loadAndMergeCloudRecords } from '../content/catalog-pipeline.js';
 import { TokenDataService } from './token-data-service.js';
 import { TokenPreviewManager } from './token-preview-manager.js';
@@ -10,28 +15,32 @@ import { TokenSelectionHelper } from './token-selection-helper.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { forgeIntegration } from '../core/forge-integration.js';
 import {
-  normalizeFolderSelection,
-  enforceFolderSelectionAvailability,
-  mergeFolderSelectionExcludes,
-  folderSelectionKey,
-  logFolderSelection
-} from '../content/content-sources/content-sources-utils.js';
-import { createEmptyFolderTreeIndex, createFolderTreeIndex } from '../content/folder-tree-index.js';
+  applyFolderBrowserSelectionChange,
+  computeFolderBrowserStats,
+  createEmptyFolderBrowserStats,
+  readFolderBrowserSelection,
+  syncFolderBrowserFilterState
+} from '../core/folder-browser-state.js';
+import { normalizeFolderPath as normalizeSharedFolderPath } from '../storage/path-utils.js';
+import { getFolderPathInfo as getSharedFolderPathInfo } from '../storage/folder-path-info.js';
 
-function getHostTheme() {
-  const body = document.body;
+function getHostTheme(hostDocument = null) {
+  const doc = hostDocument || (typeof document !== 'undefined' ? document : null);
+  const body = doc?.body;
+  if (!body) return 'dark';
   const isDark = body.classList.contains('theme-dark');
   return isDark ? 'dark' : 'light';
 }
 function applyThemeToElement(el) {
   if (!el) return;
-  const theme = getHostTheme();
+  const theme = getHostTheme(el.ownerDocument || null);
   el.classList.toggle('fa-theme-dark', theme === 'dark');
   el.classList.toggle('fa-theme-light', theme !== 'dark');
 }
 
-function createFaIcon(iconClass) {
-  const icon = document.createElement('i');
+function createFaIcon(iconClass, hostDocument = null) {
+  const doc = hostDocument || (typeof document !== 'undefined' ? document : null);
+  const icon = doc.createElement('i');
   icon.className = `fas ${iconClass}`;
   icon.setAttribute('aria-hidden', 'true');
   return icon;
@@ -39,7 +48,7 @@ function createFaIcon(iconClass) {
 
 function setIconOnlyContent(element, iconClass) {
   if (!element) return;
-  element.replaceChildren(createFaIcon(iconClass));
+  element.replaceChildren(createFaIcon(iconClass, element.ownerDocument || null));
 }
 
 export class TokensTab extends GridBrowseTab {
@@ -64,13 +73,7 @@ export class TokensTab extends GridBrowseTab {
     // Deferred cache-state probing (run when scrolling stops)
     this._probeLoader = null;
     this._activeFolderSelection = { type: 'all', includePaths: [], includePathLowers: [] };
-    this._folderStats = {
-      pathCounts: [],
-      lowerKeys: new Set(),
-      unassignedCount: 0,
-      tree: createEmptyFolderTreeIndex(),
-      version: 0
-    };
+    this._folderStats = createEmptyFolderBrowserStats();
     this._deferredActivationTimeout = null;
     this._didDeactivate = false;
     this._cloudAbort = null;
@@ -106,22 +109,31 @@ export class TokensTab extends GridBrowseTab {
   }
 
   getActiveFolderSelection() {
-    const normalized = normalizeFolderSelection(this._activeFolderSelection, {
+    return readFolderBrowserSelection({
+      selection: this._activeFolderSelection,
       normalizePath: (value) => this._normalizeFolderPath(value),
-      supportsUnassigned: true
+      supportsUnassigned: true,
+      logger: Logger,
+      loggerLabel: 'TokensTab.selection.getActiveFolderSelection'
     });
-    logFolderSelection('TokensTab.selection.getActiveFolderSelection', normalized, { logger: Logger });
-    return normalized;
   }
 
   onFolderSelectionChange(selection) {
-    this._activeFolderSelection = normalizeFolderSelection(selection, {
+    applyFolderBrowserSelectionChange({
+      app: this.app,
+      tabId: this.id,
+      selection,
       normalizePath: (value) => this._normalizeFolderPath(value),
-      supportsUnassigned: true
+      supportsUnassigned: true,
+      logger: Logger,
+      loggerLabel: 'TokensTab.selection.normalize',
+      setSelection: (nextSelection) => {
+        this._activeFolderSelection = nextSelection;
+      },
+      afterSync: () => {
+        this.applySearch(this.getCurrentSearchValue());
+      }
     });
-    logFolderSelection('TokensTab.selection.normalize', this._activeFolderSelection, { logger: Logger });
-    try { this.app?.updateFolderFilterSelection?.(this.id, this._activeFolderSelection); } catch (_) {}
-    this.applySearch(this.getCurrentSearchValue());
   }
 
   /**
@@ -157,11 +169,6 @@ export class TokensTab extends GridBrowseTab {
     return true;
   }
 
-
-
-  onInit() {
-    // no-op for now
-  }
 
   /**
    * Activate the tab: build grid, bind events, and load/merge token data
@@ -306,6 +313,17 @@ export class TokensTab extends GridBrowseTab {
       this._selection?.refreshSelectionUI();
     } catch (_) {}
     super.onDeactivate();
+  }
+
+  destroy() {
+    try { this.onDeactivate(); } catch (_) {}
+    try { this._placement?.destroy?.(); } catch (_) {}
+    this._placement = null;
+    try { this._dragDrop?.destroy?.(); } catch (_) {}
+    this._dragDrop = null;
+    try { this._tokenPreview?.destroy?.(); } catch (_) {}
+    this._tokenPreview = null;
+    if (super.destroy) super.destroy();
   }
 
   _setIndexingLock(active, message = 'Indexing local tokens...') {
@@ -599,9 +617,6 @@ export class TokensTab extends GridBrowseTab {
     const isUiActive = () => !!(app?.rendered && app?.element && app?._grid && app?._activeTab === this.id && !this._didDeactivate);
     const isCancelled = () => signal.aborted || (loadId !== this._loadId) || !app?.rendered || !app?.element;
 
-    const folders = getEnabledFolders('tokenFolders');
-    Logger.info('TokensTab.loadTokens:folders', { count: folders.length, folders });
-
     const showGridLoader = (message) => {
       if (!isUiActive()) return;
       try { this.app?.showGridLoader?.(message, { owner: this.id }); } catch (_) {}
@@ -656,6 +671,8 @@ export class TokensTab extends GridBrowseTab {
     };
 
     try {
+      const folders = getEnabledFolders('tokenFolders');
+      Logger.info('TokensTab.loadTokens:folders', { count: folders.length, folders });
       if (!folders.length) {
         // No local folders: show cloud only. Clear current locals immediately and show a loader.
         this._items = [];
@@ -678,7 +695,7 @@ export class TokensTab extends GridBrowseTab {
               }
             });
             if (result?.error && !result.partial) {
-              throw new Error(result.error);
+              throw (result.errorObject || new Error(result.error));
             }
             if (isCancelled()) throw abortError();
             hideGridLoader();
@@ -766,7 +783,7 @@ export class TokensTab extends GridBrowseTab {
             }
           });
           if (result?.error && !result.partial) {
-            throw new Error(result.error);
+            throw (result.errorObject || new Error(result.error));
           }
           if (isCancelled()) throw abortError();
           hideGridLoader();
@@ -804,7 +821,16 @@ export class TokensTab extends GridBrowseTab {
         Logger.info('TokensTab.loadTokens:aborted');
         return;
       }
-      Logger.warn('TokensTab.loadTokens:failed', String(error?.message || error));
+      Logger.error('TokensTab.loadTokens:failed', {
+        code: error?.code || null,
+        source: error?.source || null,
+        settingKey: error?.settingKey || null,
+        folder: error?.folder || null,
+        error: String(error?.message || error)
+      });
+      try {
+        ui?.notifications?.error?.(formatOperationalError(error, 'Failed to load token sources.'));
+      } catch (_) {}
     } finally {
       if (this._cloudAbort === controller) this._cloudAbort = null;
       if (signal.aborted) hideGridLoader();
@@ -821,6 +847,7 @@ export class TokensTab extends GridBrowseTab {
 
     let hadCachedIndex = false;
     let syncError = null;
+    let syncErrorObject = null;
     try {
       const meta = await svc.getMeta?.('tokens');
       hadCachedIndex = !!meta?.latest;
@@ -837,8 +864,10 @@ export class TokensTab extends GridBrowseTab {
         progressBatch: 500
       });
     } catch (error) {
+      if (signal?.aborted) throw abortError();
       if (isAbortError(error)) throw error;
       syncError = String(error?.message || error);
+      syncErrorObject = error ?? null;
       Logger.warn('TokensTab.cloud.sync.failed', { error: syncError, hadCachedIndex });
     }
 
@@ -855,6 +884,7 @@ export class TokensTab extends GridBrowseTab {
       items = Array.isArray(result?.items) ? result.items : [];
       Logger.info('TokensTab.cloud.list', { count: items.length, total: result?.total ?? items.length });
     } catch (error) {
+      if (signal?.aborted) throw abortError();
       if (isAbortError(error)) throw error;
       const listError = String(error?.message || error);
       if (syncError) {
@@ -897,6 +927,7 @@ export class TokensTab extends GridBrowseTab {
     return {
       items: out,
       error: syncError,
+      errorObject: syncErrorObject,
       partial: !!syncError && (hadCachedIndex || out.length > 0)
     };
   }
@@ -1035,37 +1066,11 @@ export class TokensTab extends GridBrowseTab {
   }
 
   _normalizeFolderPath(path) {
-    if (!path && path !== '') return '';
-    const raw = String(path || '');
-    return raw
-      .replace(/\\/g, '/')
-      .replace(/\/+/g, '/')
-      .replace(/^\/+/, '')
-      .replace(/\/+$/, '')
-      .trim();
+    return normalizeSharedFolderPath(path);
   }
 
   _getFolderPathInfo(item, hydrate = false) {
-    if (!item || typeof item !== 'object') return { normalized: '', lower: '' };
-    if (!hydrate && typeof item._faFolderLower === 'string') {
-      return {
-        normalized: item._faFolderNormalized || '',
-        lower: item._faFolderLower
-      };
-    }
-    let folder = this._normalizeFolderPath(item?.path);
-    if (!folder) {
-      const filePath = this._normalizeFolderPath(item?.file_path);
-      if (filePath) {
-        const idx = filePath.lastIndexOf('/');
-        folder = idx >= 0 ? filePath.slice(0, idx) : '';
-        folder = this._normalizeFolderPath(folder);
-      }
-    }
-    const lower = folder ? folder.toLowerCase() : '';
-    item._faFolderNormalized = folder;
-    item._faFolderLower = lower;
-    return { normalized: folder, lower };
+    return getSharedFolderPathInfo(item, { hydrate });
   }
 
   _getNormalizedFolderPath(item) {
@@ -1073,91 +1078,45 @@ export class TokensTab extends GridBrowseTab {
   }
 
   _computeFolderStats(items) {
-    const pathCountsMap = new Map();
-    const lowerKeys = new Set();
-    let unassignedCount = 0;
-    for (const item of items) {
-      const info = this._getFolderPathInfo(item, true);
-      if (info.lower) {
-        pathCountsMap.set(info.normalized, (pathCountsMap.get(info.normalized) || 0) + 1);
-        lowerKeys.add(info.lower);
-      } else {
-        unassignedCount += 1;
-      }
-    }
-    const pathCounts = pathCountsMap.size ? Array.from(pathCountsMap.entries()) : [];
-    const version = (this._folderStats?.version || 0) + 1;
-    const tree = createFolderTreeIndex(pathCountsMap, { version });
-    this._folderStats = { pathCounts, lowerKeys, unassignedCount, tree, version };
+    this._folderStats = computeFolderBrowserStats(items, {
+      previousStats: this._folderStats,
+      getFolderInfo: (item) => this._getFolderPathInfo(item, true)
+    });
     return this._folderStats;
   }
 
 
   _updateFolderFilter() {
-    const app = this.app;
-    const stats = this._folderStats || {
-      pathCounts: [],
-      lowerKeys: new Set(),
-      unassignedCount: 0,
-      tree: createEmptyFolderTreeIndex(),
-      version: 0
-    };
-    const lowerKeys = stats.lowerKeys instanceof Set ? stats.lowerKeys : new Set(stats.lowerKeys || []);
-    const availableLowers = lowerKeys.size ? lowerKeys : null;
-    const supportsUnassigned = (Number(stats.unassignedCount) || 0) > 0;
-    const baseVersion = Number.isFinite(stats.version) ? Number(stats.version) : 0;
-    const tree = (stats.tree && typeof stats.tree === 'object')
-      ? stats.tree
-      : createFolderTreeIndex(stats.pathCounts || [], { version: baseVersion });
-    if (tree && tree.version == null) tree.version = baseVersion;
-
-    const prevSelection = normalizeFolderSelection(this._activeFolderSelection, {
+    const result = syncFolderBrowserFilterState({
+      app: this.app,
+      tabId: this.id,
+      selection: this._activeFolderSelection,
+      stats: this._folderStats || createEmptyFolderBrowserStats(),
       normalizePath: (value) => this._normalizeFolderPath(value),
-      supportsUnassigned: true
-    });
-    const constrainedSelection = enforceFolderSelectionAvailability(prevSelection, {
-      availableLowers,
-      supportsUnassigned,
-      normalizePath: (value) => this._normalizeFolderPath(value)
-    });
-    const nextSelection = mergeFolderSelectionExcludes({
-      selection: constrainedSelection,
-      previousSelection: prevSelection,
-      normalizePath: (value) => this._normalizeFolderPath(value),
-      availableLowers
-    }) || { type: 'all', includePaths: [], includePathLowers: [] };
-
-    this._activeFolderSelection = nextSelection;
-    const prevKey = folderSelectionKey(prevSelection);
-    const currentKey = folderSelectionKey(nextSelection);
-
-    logFolderSelection('TokensTab.selection.updateFolderFilter.final', nextSelection, { logger: Logger });
-    try {
-      app?.setFolderFilterData?.(this.id, {
+      labels: {
         label: 'Token Folders',
         allLabel: 'All Tokens',
-        unassignedLabel: 'Unsorted',
-        pathCounts: stats.pathCounts,
-        tree,
-        totalCount: tree.totalCount,
-        unassignedCount: stats.unassignedCount,
-        selection: nextSelection,
-        version: baseVersion
-      });
-    } catch (_) {}
-    const selectionChanged = currentKey !== prevKey;
-    if (selectionChanged) {
-      try { app?.updateFolderFilterSelection?.(this.id, nextSelection); } catch (_) {}
-      if (app?._activeTab === this.id) {
-        this.applySearchAsync(this.getCurrentSearchValue());
+        unassignedLabel: 'Unsorted'
+      },
+      logger: Logger,
+      loggerLabel: 'TokensTab.selection.updateFolderFilter.final',
+      supportsUnassigned: true,
+      onSelectionChanged: () => {
+        if (this.app?._activeTab === this.id) {
+          this.applySearchAsync(this.getCurrentSearchValue());
+        }
       }
-    }
+    });
+    this._activeFolderSelection = result.nextSelection;
   }
 
 
   _isCloudEnabled() {
     try { return !!game.settings.get('fa-nexus', 'cloudTokensEnabled'); }
-    catch (_) { return true; }
+    catch (error) {
+      Logger.warn('TokensTab.cloudEnabled.readFailed', { error: String(error?.message || error) });
+      return true;
+    }
   }
 
   _createTokenCard(item) {
@@ -1324,6 +1283,10 @@ export class TokensTab extends GridBrowseTab {
       }
     } catch (_) {}
     try {
+      if (cardElement?._faNexusTokenPlacementClick) {
+        try { cardElement.removeEventListener('click', cardElement._faNexusTokenPlacementClick); } catch (_) {}
+        delete cardElement._faNexusTokenPlacementClick;
+      }
       const onClick = async (event) => {
         if (event.button !== 0) return;
         if (!cardElement.isConnected) return;
@@ -1704,7 +1667,14 @@ export class TokensTab extends GridBrowseTab {
         try { card.setAttribute('data-cached', 'true'); } catch (_) {}
         const statusIcon = card.querySelector('.fa-nexus-status-icon');
         if (statusIcon) { card.classList.remove('locked-token'); statusIcon.classList.remove('cloud-plus','cloud','premium'); statusIcon.classList.add('cloud','cached'); statusIcon.title = 'Downloaded'; statusIcon.innerHTML = '<i class=\"fas fa-cloud-check\"></i>'; }
-      }).catch(() => {}).finally(() => { L.running = false; this._drainProbeQueue(); });
+      }).catch((error) => {
+        Logger.debug('TokensTab.probe.error', {
+          filename,
+          file_path: resolvedPath,
+          path: folderPathAttr,
+          error: String(error?.message || error)
+        });
+      }).finally(() => { L.running = false; this._drainProbeQueue(); });
     } catch (_) { L.running = false; this._drainProbeQueue(); }
   }
 
@@ -1769,31 +1739,47 @@ export class TokensTab extends GridBrowseTab {
   _showColorVariantsPanel(anchorCard, baseName, variants) {
     this._hideColorVariantsPanel();
     try { this._tokenPreview?.hidePreview?.(); } catch (_) {}
-    const panel = document.createElement('div');
+    const doc = anchorCard?.ownerDocument || this.app?.element?.ownerDocument || (typeof document !== 'undefined' ? document : null);
+    const hostWindow = doc?.defaultView || (typeof window !== 'undefined' ? window : null);
+    if (!doc?.body) {
+      Logger.debug('TokensTab.colorVariants.noHostDocument', {
+        baseName: String(baseName ?? ''),
+        variants: Array.isArray(variants) ? variants.length : 0
+      });
+      return;
+    }
+    const createElement = (tag) => doc.createElement(tag);
+    const requestFrame = typeof hostWindow?.requestAnimationFrame === 'function'
+      ? hostWindow.requestAnimationFrame.bind(hostWindow)
+      : (typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (callback) => setTimeout(callback, 16));
+
+    const panel = createElement('div');
     panel.className = 'fa-nexus-color-variants-panel  application';
     try { applyThemeToElement(panel); } catch (_) {}
     try {
-      this._variantThemeObserver = new MutationObserver(() => {
+      const MutationObserverCtor = hostWindow?.MutationObserver || (typeof MutationObserver !== 'undefined' ? MutationObserver : null);
+      if (!MutationObserverCtor) throw new Error('MutationObserver unavailable');
+      this._variantThemeObserver = new MutationObserverCtor(() => {
         try { applyThemeToElement(panel); } catch (_) {}
       });
-      this._variantThemeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+      this._variantThemeObserver.observe(doc.body, { attributes: true, attributeFilter: ['class'] });
     } catch (_) {}
-    const header = document.createElement('div');
+    const header = createElement('div');
     header.className = 'fa-nexus-variant-header';
-    const title = document.createElement('span');
+    const title = createElement('span');
     title.className = 'fa-nexus-variant-title';
     title.textContent = String(baseName ?? '');
-    const closeButton = document.createElement('button');
+    const closeButton = createElement('button');
     closeButton.type = 'button';
     closeButton.className = 'fa-nexus-variant-close';
     closeButton.title = 'Close';
     closeButton.textContent = '×';
     header.append(title, closeButton);
-    const grid = document.createElement('div');
+    const grid = createElement('div');
     grid.className = 'fa-nexus-variant-grid';
     panel.replaceChildren(header, grid);
     for (const it of variants) {
-      const item = document.createElement('div');
+      const item = createElement('div');
       item.className = 'fa-nexus-variant-item';
       item._variantRecord = it;
       item.setAttribute('data-filename', it.filename || '');
@@ -1834,15 +1820,15 @@ export class TokensTab extends GridBrowseTab {
         return 'fa-cloud';
       })();
       const cv = (it.color_variant || '').toString().padStart(2,'0');
-      const thumb = document.createElement('div');
+      const thumb = createElement('div');
       thumb.className = 'thumb';
-      const img = document.createElement('img');
+      const img = createElement('img');
       img.alt = String(it.filename || '');
       thumb.appendChild(img);
-      const variantNumber = document.createElement('div');
+      const variantNumber = createElement('div');
       variantNumber.className = 'fa-nexus-variant-number';
       variantNumber.textContent = cv;
-      const statusIcon = document.createElement('div');
+      const statusIcon = createElement('div');
       statusIcon.className = 'fa-nexus-token-status-icon';
       statusIcon.title = isLocal ? 'Local storage' : (isPremium ? (authed || cachedLocalPath ? 'Premium (unlocked)' : 'Premium (locked)') : (cachedLocalPath ? 'Downloaded' : 'Cloud'));
       setIconOnlyContent(statusIcon, iconClass);
@@ -1980,11 +1966,15 @@ export class TokensTab extends GridBrowseTab {
         }
         const startX = ev.clientX, startY = ev.clientY; const threshold = 4;
         item._faVariantDragging = false;
+        const listenerDocument = item.ownerDocument || doc;
+        const defer = typeof hostWindow?.setTimeout === 'function'
+          ? hostWindow.setTimeout.bind(hostWindow)
+          : setTimeout;
         const move = (e) => {
           const dx = Math.abs((e.clientX||0) - startX); const dy = Math.abs((e.clientY||0) - startY);
           if (dx + dy > threshold) {
-            document.removeEventListener('mousemove', move, true);
-            document.removeEventListener('mouseup', up, true);
+            listenerDocument.removeEventListener('mousemove', move, true);
+            listenerDocument.removeEventListener('mouseup', up, true);
             item._faVariantDragging = true;
             try { 
               TokenDragDropManager.setHoverSuppressed(true);
@@ -1992,9 +1982,13 @@ export class TokensTab extends GridBrowseTab {
             } catch(_) {}
           }
         };
-        const up = () => { document.removeEventListener('mousemove', move, true); document.removeEventListener('mouseup', up, true); setTimeout(() => { item._faVariantDragging = false; }, 0); };
-        document.addEventListener('mousemove', move, true);
-        document.addEventListener('mouseup', up, true);
+        const up = () => {
+          listenerDocument.removeEventListener('mousemove', move, true);
+          listenerDocument.removeEventListener('mouseup', up, true);
+          defer(() => { item._faVariantDragging = false; }, 0);
+        };
+        listenerDocument.addEventListener('mousemove', move, true);
+        listenerDocument.addEventListener('mouseup', up, true);
       }, { capture: true });
 
       item.addEventListener('click', (ev) => {
@@ -2040,12 +2034,12 @@ export class TokensTab extends GridBrowseTab {
 
       grid.appendChild(item);
     }
-    document.body.appendChild(panel);
+    doc.body.appendChild(panel);
     const panelRect = () => panel.getBoundingClientRect();
     const cardRect = anchorCard.getBoundingClientRect();
     let left = cardRect.right + 10; let top = cardRect.top;
-    requestAnimationFrame(() => {
-      const pr = panelRect(); const vw = window.innerWidth; const vh = window.innerHeight;
+    requestFrame(() => {
+      const pr = panelRect(); const vw = hostWindow?.innerWidth || 1920; const vh = hostWindow?.innerHeight || 1080;
       if (left + pr.width > vw) left = Math.max(8, cardRect.left - pr.width - 10);
       if (top + pr.height > vh) top = Math.max(8, vh - pr.height - 8);
       panel.style.left = `${left}px`; panel.style.top = `${top}px`; panel.classList.add('visible');
@@ -2054,12 +2048,12 @@ export class TokensTab extends GridBrowseTab {
     const onCloseBtn = (e) => { e.preventDefault(); e.stopPropagation(); this._hideColorVariantsPanel(); };
     const onOutside = (e) => { if (!panel.contains(e.target)) this._hideColorVariantsPanel(); };
     const onResize = () => { this._hideColorVariantsPanel(); };
-    document.addEventListener('click', onOutside, true);
-    window.addEventListener('resize', onResize);
+    doc.addEventListener('click', onOutside, true);
+    hostWindow?.addEventListener?.('resize', onResize);
     closeBtn?.addEventListener('click', onCloseBtn);
     this._variantCleanup = () => {
-      document.removeEventListener('click', onOutside, true);
-      window.removeEventListener('resize', onResize);
+      doc.removeEventListener('click', onOutside, true);
+      hostWindow?.removeEventListener?.('resize', onResize);
       closeBtn?.removeEventListener('click', onCloseBtn);
     };
     this._variantPanelEl = panel;

@@ -4,43 +4,31 @@ import {
   readDocumentHsbc
 } from '../core/hsbc.js';
 import {
-  ensureTileMesh,
-  getTransparentTexture
-} from '../paths/path-geometry.js';
-import {
   attachCustomTileOverhead,
-  createDisplayProxyFactory,
   detachCustomTileOverhead,
   invalidateCustomTileOverhead
 } from '../canvas/custom-tile-overhead.js';
-import { getSharedTexture } from '../textures/texture-render.js';
+import { createDisplayProxyFactory } from '../canvas/display-object-proxy.js';
+import {
+  ensureTileMesh,
+  ensureMeshTransparent,
+  getSharedTexture,
+  restoreMeshTexture
+} from '../textures/texture-runtime-core.js';
+import { syncStandardMaskCustomSourceSuppression } from '../textures/standard-mask-custom-base.js';
+import { syncShadowOnlyCustomContainer } from './shadow-only-runtime.js';
 
 const SCATTER_FLAG_KEY = 'assetScatter';
 const SCATTER_VERSION = 1;
 const TEXTURE_CACHE = new Map();
 const SCATTER_RETRY_TIMERS = new Map();
 
-function ensureScatterMeshTransparent(mesh) {
-  try {
-    if (!mesh || mesh.destroyed) return;
-    if (!mesh.faNexusAssetScatterOriginalTexture) {
-      mesh.faNexusAssetScatterOriginalTexture = mesh.texture;
-    }
-    const placeholder = getTransparentTexture();
-    if (mesh.texture !== placeholder) mesh.texture = placeholder;
-    mesh.alpha = 1;
-    mesh.renderable = true;
-  } catch (_) {}
-}
-
-function restoreScatterMeshTexture(mesh) {
-  try {
-    if (!mesh || mesh.destroyed) return;
-    if (mesh.faNexusAssetScatterOriginalTexture) {
-      mesh.texture = mesh.faNexusAssetScatterOriginalTexture;
-      mesh.faNexusAssetScatterOriginalTexture = null;
-    }
-  } catch (_) {}
+function logScatterFailure(event, error, details = {}) {
+  Logger.warn('AssetScatter.runtime.failed', {
+    event,
+    error: String(error?.message || error),
+    ...details
+  });
 }
 
 function readScatterFlag(doc) {
@@ -118,7 +106,9 @@ function clearScatterRetry(tile) {
     if (!existing) return;
     if (existing.timeout) clearTimeout(existing.timeout);
     SCATTER_RETRY_TIMERS.delete(tile);
-  } catch (_) {}
+  } catch (error) {
+    logScatterFailure('retryClear', error, { tileId: tile?.document?.id || '' });
+  }
 }
 
 function scheduleScatterRetry(tile, attempt = 1) {
@@ -128,10 +118,13 @@ function scheduleScatterRetry(tile, attempt = 1) {
     if (attempt > 4) return;
     const timeout = setTimeout(() => {
       SCATTER_RETRY_TIMERS.delete(tile);
-      try { applyAssetScatterTile(tile, { retryAttempt: attempt + 1 }); } catch (_) {}
+      try { applyAssetScatterTile(tile, { retryAttempt: attempt + 1 }); }
+      catch (error) { logScatterFailure('retryApply', error, { tileId: tile?.document?.id || '', attempt: attempt + 1 }); }
     }, Math.min(250 * attempt, 1000));
     SCATTER_RETRY_TIMERS.set(tile, { timeout, attempt });
-  } catch (_) {}
+  } catch (error) {
+    logScatterFailure('retrySchedule', error, { tileId: tile?.document?.id || '', attempt });
+  }
 }
 
 function applySpriteSizing(sprite, instance) {
@@ -178,10 +171,12 @@ export function cleanupAssetScatterOverlay(tile) {
     }
     if (mesh) {
       mesh.faNexusAssetScatterContainer = null;
-      restoreScatterMeshTexture(mesh);
+      restoreMeshTexture(mesh, 'faNexusAssetScatterOriginalTexture');
     }
     tile.faNexusAssetScatterContainer = null;
-  } catch (_) {}
+  } catch (error) {
+    logScatterFailure('cleanup', error, { tileId: tile?.document?.id || '' });
+  }
 }
 
 export async function applyAssetScatterTile(tile, options = {}) {
@@ -198,7 +193,7 @@ export async function applyAssetScatterTile(tile, options = {}) {
     if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
     if (!mesh || mesh.destroyed) return;
 
-    ensureScatterMeshTransparent(mesh);
+    ensureMeshTransparent(mesh, 'faNexusAssetScatterOriginalTexture');
 
     const renderKey = buildRenderKey(payload.instances);
 
@@ -242,6 +237,7 @@ export async function applyAssetScatterTile(tile, options = {}) {
       readDocumentHsbc(doc, { nullIfMissing: true, nullIfNeutral: true }),
       { slot: 'asset-scatter' }
     );
+    syncShadowOnlyCustomContainer(tile, container);
 
     syncScatterContainerTransform(container, mesh, doc);
     attachCustomTileOverhead(tile, {
@@ -252,6 +248,14 @@ export async function applyAssetScatterTile(tile, options = {}) {
         syncScatterContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
       }
     });
+    try {
+      syncStandardMaskCustomSourceSuppression(tile, !!doc?.getFlag?.('fa-nexus', 'standardTileMask'), 'scatter-refresh');
+    } catch (error) {
+      Logger.warn('AssetScatter.standardMaskSuppression.failed', {
+        tileId: tile?.document?.id,
+        error: String(error?.message || error)
+      });
+    }
     invalidateCustomTileOverhead(tile, 'scatter-refresh');
     if (hasPendingTexture) scheduleScatterRetry(tile, Number(options?.retryAttempt) || 1);
     else clearScatterRetry(tile);
@@ -264,14 +268,20 @@ export function rehydrateAllAssetScatterTiles() {
   try {
     const tiles = canvas?.tiles?.placeables || [];
     for (const tile of tiles) {
-      try { applyAssetScatterTile(tile); } catch (_) {}
+      try { applyAssetScatterTile(tile); }
+      catch (error) { logScatterFailure('rehydrateTile', error, { tileId: tile?.document?.id || '' }); }
     }
-  } catch (_) {}
+  } catch (error) {
+    logScatterFailure('rehydrateAll', error);
+  }
 }
 
 export function clearAssetScatterCache() {
-  try { TEXTURE_CACHE.clear(); } catch (_) {}
+  try { TEXTURE_CACHE.clear(); }
+  catch (error) { logScatterFailure('textureCacheClear', error); }
   try {
     for (const tile of Array.from(SCATTER_RETRY_TIMERS.keys())) clearScatterRetry(tile);
-  } catch (_) {}
+  } catch (error) {
+    logScatterFailure('retryCacheClear', error);
+  }
 }

@@ -173,6 +173,7 @@ export function registerFaNexusSettings() {
   client('thumbWidthTextures', { name: 'Texture Thumbnail Width', type: Number, default: 108, config: false });
   client('thumbWidthPaths', { name: 'Path Thumbnail Width', type: Number, default: 108, config: false });
   client('thumbWidthBuildingTextures', { name: 'Building Fill Texture Thumbnail Width', type: Number, default: 108, config: false });
+  client('gridSortModes', { name: 'Grid Sort Modes', type: Object, default: {}, config: false });
   client('solidTextureColor', { name: 'Solid Texture Color', type: String, default: '#808080', config: false });
   client('windowPos', { name: 'Window Position', type: Object, default: {}, config: false });
   client('toolOptionsWindowPos', { name: 'Tool Options Window Position', type: Object, default: {}, config: false });
@@ -329,6 +330,18 @@ export function registerFaNexusSettings() {
     default: 100,
     config: false
   });
+  client('textureBlackPixelGateEnabled', {
+    name: 'Texture Block Black Pixels',
+    type: Boolean,
+    default: false,
+    config: false
+  });
+  client('textureBlackPixelGateFuzziness', {
+    name: 'Texture Black Pixel Fuzziness',
+    type: Number,
+    default: 12,
+    config: false
+  });
   client('textureScale', {
     name: 'Texture Scale',
     type: Number,
@@ -435,6 +448,13 @@ export function registerFaNexusSettings() {
     default: '[]',
     config: false,
     onChange: notifyShadowSetting('assetDropShadowPresets')
+  });
+  client('assetDropShadowOnly', {
+    name: 'Asset Shadow Only',
+    type: Boolean,
+    default: false,
+    config: false,
+    onChange: notifyShadowSetting('assetDropShadowOnly')
   });
   client('assetScatterBrushSize', {
     name: 'Asset Scatter Brush Size',
@@ -657,15 +677,27 @@ export function registerFaNexusSettings() {
     }
   });
   world('tokenElevationOffset', {
-    name: 'Shift BG & Tile Elevation Down',
+    name: 'Keep near-ground tiles under tokens',
     type: Boolean,
     default: true,
     config: true,
     restricted: true,
-    hint: 'Shift tile render elevation down by 1 for all tiles below elevation 1 (including negatives), and push the scene background lower, so tokens render above tiles at 0.xxx elevations.',
+    hint: 'Keeps tiles within the first 1 unit of elevation under tokens without changing the token elevation. Example: on a level that starts at 10, tiles placed from 10.000 to 10.999 stay under tokens at 10',
     onChange: (value) => {
       try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'tokenElevationOffset', value }); } catch (_) { }
       try { Hooks.callAll('fa-nexus-token-elevation-offset-changed', { enabled: !!value }); } catch (_) { }
+    }
+  });
+  world('overwriteEyeLevel', {
+    name: 'Overwrite Token Eye Level',
+    type: Boolean,
+    default: true,
+    config: true,
+    restricted: true,
+    hint: 'When enabled, Eye Level Height will use the top of the token\'s cube for vision and visibility tests instead of Foundry\'s default mid-height.',
+    onChange: (value) => {
+      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'overwriteEyeLevel', value }); } catch (_) { }
+      try { Hooks.callAll('fa-nexus-overwrite-eye-level-changed', { enabled: !!value }); } catch (_) { }
     }
   });
   world('tilePixelSelection', {

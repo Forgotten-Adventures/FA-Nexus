@@ -1,20 +1,27 @@
 import { AssetsDataService } from './assets-data-service.js';
 import { AssetPlacementManager } from './asset-placement-manager.js';
 import { TexturePaintManager } from '../textures/texture-paint-manager.js';
-import { PathManager } from '../paths/path-manager.js';
 import { PathManagerV2 } from '../paths/path-manager-v2.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { collectLocalInventory, getEnabledFolders, mergeLocalAndCloudRecords, NexusContentService } from '../content/nexus-content-service.js';
+import {
+  collectLocalInventory,
+  formatOperationalError,
+  getEnabledFolders,
+  mergeLocalAndCloudRecords,
+  NexusContentService
+} from '../content/nexus-content-service.js';
 import { NexusDownloadManager } from '../content/nexus-download-manager.js';
 import { abortError, formatCatalogLoaderText, isAbortError, loadAndMergeCloudRecords } from '../content/catalog-pipeline.js';
 import {
-  normalizeFolderSelection,
-  enforceFolderSelectionAvailability,
-  mergeFolderSelectionExcludes,
-  folderSelectionKey,
-  logFolderSelection
-} from '../content/content-sources/content-sources-utils.js';
-import { createEmptyFolderTreeIndex, createFolderTreeIndex } from '../content/folder-tree-index.js';
+  computeFolderBrowserStats,
+  createEmptyFolderBrowserStats,
+  syncFolderBrowserFilterState
+} from '../core/folder-browser-state.js';
+import { normalizeFolderPath as normalizeSharedFolderPath } from '../storage/path-utils.js';
+import {
+  getFolderPathInfo as getSharedFolderPathInfo,
+  resolveFolderPathFromRecord
+} from '../storage/folder-path-info.js';
 
 const SHARED_ASSET_CATALOG = {
   items: null,
@@ -130,7 +137,7 @@ function getWarmCloudReuseState(latest = null) {
   };
 }
 
-function invalidateSharedAssetCatalog(reason = 'unknown') {
+export function invalidateSharedAssetCatalog(reason = 'unknown') {
   SHARED_ASSET_CATALOG.dirty = true;
   SHARED_ASSET_CATALOG.status = 'stale';
   SHARED_ASSET_CATALOG.items = null;
@@ -514,7 +521,6 @@ export class AssetsTabController {
     ASSET_TAB_INSTANCES.add(tab);
     this._placement = tab._placement || null;
     this._texturePaint = tab._texturePaint || null;
-    this._pathManager = tab._pathManager || null;
     this._pathManagerV2 = tab._pathManagerV2 || null;
     this._content = tab._content || null;
     this._download = tab._download || null;
@@ -536,10 +542,6 @@ export class AssetsTabController {
 
   get texturePaintManager() {
     return this._texturePaint || null;
-  }
-
-  get pathManager() {
-    return this._pathManager || null;
   }
 
   get pathManagerV2() {
@@ -575,12 +577,27 @@ export class AssetsTabController {
   }
 
   async loadAssets(options = {}) {
-    const result = await loadAssets(this.tab, options);
-    // For backward compatibility, return just items if no error, or throw error if present
-    if (result.error) {
-      throw new Error(result.error);
+    try {
+      const result = await loadAssets(this.tab, options);
+      // For backward compatibility, return just items if no error, or throw error if present
+      if (result.error) {
+        throw (result.errorObject || new Error(result.error));
+      }
+      return result.items;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      Logger.error('AssetsTab.loadAssets:failed', {
+        code: error?.code || null,
+        source: error?.source || null,
+        settingKey: error?.settingKey || null,
+        folder: error?.folder || null,
+        error: String(error?.message || error)
+      });
+      try {
+        ui?.notifications?.error?.(formatOperationalError(error, 'Failed to load asset sources.'));
+      } catch (_) {}
+      throw error;
     }
-    return result.items;
   }
 
   async loadAssetsInternal(options = {}) {
@@ -591,7 +608,7 @@ export class AssetsTabController {
     const result = await loadAndMergeCloud(this.tab, includeLocal, options);
     // For backward compatibility, return just items if no error, or throw error if present
     if (result.error && !result.partial) {
-      throw new Error(result.error);
+      throw (result.errorObject || new Error(result.error));
     }
     return result.items;
   }
@@ -683,10 +700,6 @@ async function ensureServices(tab) {
   }
 
   if (tab.isPathsMode) {
-    if (!(controller._pathManager instanceof PathManager)) {
-      controller._pathManager = tab._pathManager instanceof PathManager ? tab._pathManager : new PathManager(app);
-    }
-    tab._pathManager = controller._pathManager;
     if (!(controller._pathManagerV2 instanceof PathManagerV2)) {
       controller._pathManagerV2 = tab._pathManagerV2 instanceof PathManagerV2 ? tab._pathManagerV2 : new PathManagerV2(app);
     }
@@ -759,7 +772,7 @@ async function loadAssets(tab, options = {}) {
         shared.loadPromise = null;
         shared.dirty = true;
       }
-      return { items: [], error: String(e?.message || e), partial: false };
+      return { items: [], error: String(e?.message || e), partial: false, errorObject: e ?? null };
     }
 
     const items = Array.isArray(result?.items) ? result.items : [];
@@ -808,7 +821,7 @@ async function loadAssets(tab, options = {}) {
         return { items: fallbackItems, error: null, partial: false, aborted: true };
       }
       Logger.warn('AssetsTab.loadAssetsInternal.failed', { error: String(error?.message || error) });
-      return { items: [], error: String(error?.message || error), partial: false };
+      return { items: [], error: String(error?.message || error), partial: false, errorObject: error ?? null };
     }
   })();
 
@@ -829,7 +842,7 @@ async function loadAssets(tab, options = {}) {
       shared.version += 1;
     }
   } catch (e) {
-    result = { items: [], error: String(e?.message || e), partial: false };
+    result = { items: [], error: String(e?.message || e), partial: false, errorObject: e ?? null };
     shared.dirty = true;
     shared.status = isAbortError(e) ? 'aborted' : 'error';
     Logger.warn('AssetsTab.loadAssets.shared.failed', { error: String(e?.message || e) });
@@ -921,8 +934,8 @@ async function loadAssetsInternal(tab, _options = {}) {
       tab._items = shared.items;
       computeFolderStats(tab, tab._items);
       shared.folderStats.set(tab._mode, tab._folderStats);
+      updateFolderFilter(tab);
       await tab.applySearchAsync(tab.getCurrentSearchValue());
-      tab.app?.updateFolderFilterSelection?.(tab.id, tab._activeFolderSelection);
       return;
     }
 
@@ -1000,13 +1013,14 @@ async function loadAssetsInternal(tab, _options = {}) {
           onTotal: (total) => cloudLoader?.update?.(cloudLoader.state?.count ?? 0, total)
         });
         if (result?.error && !result.partial) {
-          throw new Error(result.error);
+          throw (result.errorObject || new Error(result.error));
         }
         if (!isCancelled() && result && Array.isArray(result.items)) {
           hideGridLoader();
           tab._items = result.items;
           computeFolderStats(tab, tab._items);
           SHARED_ASSET_CATALOG.folderStats.set(tab._mode, tab._folderStats);
+          updateFolderFilter(tab);
           await tab.applySearchAsync(tab.getCurrentSearchValue());
           Logger.info('AssetsTab.streaming:done', {
             total: tab._items.length,
@@ -1041,6 +1055,7 @@ async function loadAssetsInternal(tab, _options = {}) {
       hideGridLoader();
       computeFolderStats(tab, tab._items);
       SHARED_ASSET_CATALOG.folderStats.set(tab._mode, tab._folderStats);
+      updateFolderFilter(tab);
       await tab.applySearchAsync(tab.getCurrentSearchValue());
       return { uiReady: !tab.isTexturesMode };
     }
@@ -1325,6 +1340,7 @@ async function fetchCloudAssets(tab, onProgress, signal) {
   const kind = 'assets';
   let hadCachedIndex = false;
   let syncError = null;
+  let syncErrorObject = null;
   let latest = null;
   try {
     const meta = await svc.getMeta?.(kind);
@@ -1381,8 +1397,9 @@ async function fetchCloudAssets(tab, onProgress, signal) {
       progressBatch: 500
     });
   } catch (error) {
-    if (error?.name === 'AbortError') throw error;
+    if (error?.name === 'AbortError' || signal?.aborted) throw abortError();
     syncError = String(error?.message || error);
+    syncErrorObject = error ?? null;
     Logger.warn('AssetsTab.cloud.sync.failed', { error: syncError, hadCachedIndex });
   }
 
@@ -1408,6 +1425,7 @@ async function fetchCloudAssets(tab, onProgress, signal) {
       return {
         items: warmItems,
         error: syncError,
+        errorObject: syncErrorObject,
         partial: !!syncError && (hadCachedIndex || warmItems.length > 0),
         source: 'warm-cache',
         usedWarmCache: true,
@@ -1431,7 +1449,7 @@ async function fetchCloudAssets(tab, onProgress, signal) {
     });
     items = Array.isArray(result?.items) ? result.items : [];
   } catch (error) {
-    if (error?.name === 'AbortError') throw error;
+    if (error?.name === 'AbortError' || signal?.aborted) throw abortError();
     const listError = String(error?.message || error);
     if (syncError) {
       throw new Error(`Cloud asset sync failed (${syncError}); cached index unavailable (${listError})`);
@@ -1456,6 +1474,7 @@ async function fetchCloudAssets(tab, onProgress, signal) {
   return {
     items: out,
     error: syncError,
+    errorObject: syncErrorObject,
     partial: !!syncError && (hadCachedIndex || out.length > 0),
     source: 'cloud-list',
     usedWarmCache: false,
@@ -1484,86 +1503,29 @@ function matchesMode(tab, item) {
 }
 
 function resolveFolderPath(tab, item) {
-  if (!item) return '';
-  const filePath = String(item.file_path || '');
-  const inferredFilename = filePath ? filePath.split('/').pop() : '';
-  const filename = String(item.filename || inferredFilename || '');
-  const rawPath = String(item.path || '');
-  if (rawPath) {
-    if (filename && rawPath.endsWith(`/${filename}`)) {
-      return rawPath.slice(0, rawPath.length - (filename.length + 1));
-    }
-    return rawPath;
-  }
-  if (!filePath) return '';
-  const lastSlash = filePath.lastIndexOf('/');
-  return lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
+  return resolveFolderPathFromRecord(item);
 }
 
 function normalizeFolderPath(tab, path) {
-  if (!path && path !== '') return '';
-  const raw = String(path || '');
-  const normalized = raw
-    .replace(/\\/g, '/')
-    .replace(/\/+/g, '/')
-    .replace(/^\/+/, '')
-    .replace(/\/+$/, '')
-    .trim();
-  return normalized;
+  return normalizeSharedFolderPath(path);
 }
 
 function getFolderPathInfo(tab, item, hydrate = false) {
-  if (!item || typeof item !== 'object') return { normalized: '', lower: '' };
-  if (!hydrate && typeof item._faFolderLower === 'string') {
-    return {
-      normalized: item._faFolderNormalized || '',
-      lower: item._faFolderLower
-    };
-  }
-  const basePath = typeof item.path === 'string' ? item.path : resolveFolderPath(tab, item);
-  const normalized = normalizeFolderPath(tab, basePath);
-  const lower = normalized ? normalized.toLowerCase() : '';
-  item._faFolderNormalized = normalized;
-  item._faFolderLower = lower;
-  return { normalized, lower };
+  return getSharedFolderPathInfo(item, { hydrate });
 }
 
 function computeFolderStats(tab, items) {
-  if (!tab.supportsFolderBrowser?.()) {
-    const version = (tab._folderStats?.version || 0) + 1;
-    tab._folderStats = {
-      pathCounts: [],
-      lowerKeys: new Set(),
-      unassignedCount: 0,
-      tree: createEmptyFolderTreeIndex(version),
-      version
-    };
-    return tab._folderStats;
-  }
-  const pathCountsMap = new Map();
-  const lowerKeys = new Set();
-  let unassignedCount = 0;
   const skipSolid = tab?.isTexturesMode && typeof tab._isSolidTextureItem === 'function';
-  for (const item of items) {
-    if (!matchesMode(tab, item)) continue;
-    if (skipSolid && tab._isSolidTextureItem(item)) continue;
-    const info = getFolderPathInfo(tab, item, true);
-    if (info.lower) {
-      pathCountsMap.set(info.normalized, (pathCountsMap.get(info.normalized) || 0) + 1);
-      lowerKeys.add(info.lower);
-    } else {
-      unassignedCount += 1;
-    }
-  }
-  const version = (tab._folderStats?.version || 0) + 1;
-  const tree = createFolderTreeIndex(pathCountsMap, { version });
-  tab._folderStats = {
-    pathCounts: pathCountsMap.size ? Array.from(pathCountsMap.entries()) : [],
-    lowerKeys,
-    unassignedCount,
-    tree,
-    version
-  };
+  tab._folderStats = computeFolderBrowserStats(items, {
+    enabled: !!tab.supportsFolderBrowser?.(),
+    previousStats: tab._folderStats,
+    includeItem: (item) => {
+      if (!matchesMode(tab, item)) return false;
+      if (skipSolid && tab._isSolidTextureItem(item)) return false;
+      return true;
+    },
+    getFolderInfo: (item) => getFolderPathInfo(tab, item, true)
+  });
   return tab._folderStats;
 }
 
@@ -1573,69 +1535,32 @@ function getNormalizedFolderPath(tab, item) {
 
 function updateFolderFilter(tab) {
   if (!tab.supportsFolderBrowser?.()) return;
-  const app = tab.app;
-  const stats = tab._folderStats || {
-    pathCounts: [],
-    lowerKeys: new Set(),
-    unassignedCount: 0,
-    tree: createEmptyFolderTreeIndex(),
-    version: 0
-  };
-  const baseVersion = Number.isFinite(stats.version) ? Number(stats.version) : 0;
-  const tree = (stats.tree && typeof stats.tree === 'object')
-    ? stats.tree
-    : createFolderTreeIndex(stats.pathCounts || [], { version: baseVersion });
-  if (tree && tree.version == null) tree.version = baseVersion;
-  const lowerKeys = stats.lowerKeys instanceof Set ? stats.lowerKeys : new Set(stats.lowerKeys || []);
-  const availableLowers = lowerKeys.size ? lowerKeys : null;
-
-  const prevSelection = normalizeFolderSelection(tab._activeFolderSelection, {
-    normalizePath: (value) => normalizeFolderPath(tab, value)
-  });
-  const constrainedSelection = enforceFolderSelectionAvailability(prevSelection, {
-    availableLowers,
-    normalizePath: (value) => normalizeFolderPath(tab, value)
-  });
-  const nextSelection = mergeFolderSelectionExcludes({
-    selection: constrainedSelection,
-    previousSelection: prevSelection,
-    normalizePath: (value) => normalizeFolderPath(tab, value),
-    availableLowers
-  }) || { type: 'all', includePaths: [], includePathLowers: [] };
-
-  tab._activeFolderSelection = nextSelection;
-  const prevKey = folderSelectionKey(prevSelection);
-  const currentKey = folderSelectionKey(nextSelection);
-
-  logFolderSelection('AssetsTab.selection.updateFolderFilter.final', nextSelection, { logger: Logger });
-
   const modeLabels = {
     assets: { label: 'Asset Folders', allLabel: 'All Assets', unassignedLabel: 'Unsorted' },
     textures: { label: 'Texture Folders', allLabel: 'All Textures', unassignedLabel: 'Unsorted' },
     paths: { label: 'Path Folders', allLabel: 'All Paths', unassignedLabel: 'Unsorted' }
   };
   const labels = modeLabels[tab._mode] || modeLabels.assets;
-
-  try {
-    app?.setFolderFilterData?.(tab.id, {
-      label: labels.label,
-      allLabel: labels.allLabel,
-      unassignedLabel: labels.unassignedLabel,
-      pathCounts: stats.pathCounts,
-      tree,
-      totalCount: tree.totalCount,
-      unassignedCount: stats.unassignedCount,
-      version: stats.version,
-      selection: tab._activeFolderSelection
-    });
-  } catch (_) {}
-
-  if (prevKey !== currentKey) {
-    try { app?.updateFolderFilterSelection?.(tab.id, tab._activeFolderSelection); } catch (_) {}
-  }
+  const result = syncFolderBrowserFilterState({
+    app: tab.app,
+    tabId: tab.id,
+    selection: tab._activeFolderSelection,
+    stats: tab._folderStats || createEmptyFolderBrowserStats(),
+    normalizePath: (value) => normalizeFolderPath(tab, value),
+    labels,
+    logger: Logger,
+    loggerLabel: 'AssetsTab.selection.updateFolderFilter.final'
+  });
+  tab._activeFolderSelection = result.nextSelection;
 }
 
 function isCloudEnabled(tab) {
   try { return !!game.settings.get('fa-nexus', 'cloudAssetsEnabled'); }
-  catch (_) { return true; }
+  catch (error) {
+    Logger.warn('AssetsTab.cloudEnabled.readFailed', {
+      tabId: tab?.id || '',
+      error: String(error?.message || error)
+    });
+    return true;
+  }
 }

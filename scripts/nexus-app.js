@@ -1,7 +1,3 @@
-/*
- * FA Nexus — minimal shell (ApplicationV2 + Handlebars) and launcher panel
- */
-
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 import { EventManager } from './core/event-manager.js';
 import { PatreonAuthService, warmPremiumFeatureBundles } from './premium/patreon-auth-service.js';
@@ -24,6 +20,22 @@ import {
 import { FooterController } from './core/footer-controller.js';
 import { scheduleAssetCloudWarmup } from './assets/assets-tab-controller.js';
 import './tokens/token-elevation-offset.js';
+import './scene-import/scene-asset-import-helper.js';
+import './canvas/scene-transition-readiness.js';
+import './canvas/active-session-level-switch-guard.js';
+import './canvas/tile-placement-level.js';
+import './canvas/region-surface-invalidation.js';
+import './canvas/region-perception-refresh.js';
+import './canvas/tile-config.js';
+import {
+  clearNexusTileSelectionContext,
+  installNexusTileSelectionContextHooks,
+  preserveCurrentTileSelectionForNexus
+} from './canvas/tile-selection-context.js';
+
+function logAppLifecycleFailure(scope, error, details = {}) {
+  Logger.warn(scope, { ...details, error });
+}
 
 /**
  * FaNexusApp
@@ -49,7 +61,6 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     super(...args);
     this._folderFilterController = new FolderFilterController(this);
 
-    // Legacy compatibility: provide _activeTab and _activeTabObj getters for tab classes
     Object.defineProperty(this, '_activeTab', {
       get: () => this._tabManager?.getActiveTabId() || null,
       configurable: true
@@ -81,10 +92,12 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     try {
       const p = this.position || position || {};
       const state = { left: p.left, top: p.top, width: p.width, height: p.height };
-      // Persist immediately on any position/size change
       this._saveWindowPosition(state);
-    } catch (_) {}
-    try { this._folderFilterController.syncWindowPosition(); } catch (_) {}
+    } catch (error) {
+      logAppLifecycleFailure('App.windowPos.scheduleSaveFailed', error);
+    }
+    try { this._folderFilterController.syncWindowPosition(); }
+    catch (error) { logAppLifecycleFailure('App.folderFilter.syncPositionFailed', error); }
     return result;
   }
 
@@ -95,15 +108,27 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
    */
   _onRender(initial, context) {
     super._onRender(initial, context);
-    try { applyThemeToElement(this.element); } catch (e) {}
+    try { preserveCurrentTileSelectionForNexus('app-render'); }
+    catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveRenderFailed', error); }
+    try { applyThemeToElement(this.element); }
+    catch (error) { logAppLifecycleFailure('App.theme.applyFailed', error); }
     Logger.info('App._onRender', { initial: !!initial });
     // Ensure shared cloud services are ready for tabs/drag
     try {
       const authProvider = () => this._getAuthService();
       if (!this._contentService) this._contentService = new NexusContentService({ app: this, authService: authProvider });
       else this._contentService.setAuthContext({ app: this, authService: authProvider });
-    } catch (_) {}
-    try { if (!this._downloadManager) { this._downloadManager = new NexusDownloadManager(); this._downloadManager.initialize(); } } catch (_) {}
+    } catch (error) {
+      logAppLifecycleFailure('App.contentService.initFailed', error);
+    }
+    try {
+      if (!this._downloadManager) {
+        this._downloadManager = new NexusDownloadManager();
+        this._downloadManager.initialize();
+      }
+    } catch (error) {
+      logAppLifecycleFailure('App.downloadManager.initFailed', error);
+    }
     // Restore window position/size/state
     try {
       const pos = game.settings.get('fa-nexus', 'windowPos') || {};
@@ -116,7 +141,9 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
         if (Number.isFinite(height)) p.height = height;
         this.setPosition(p);
       }
-    } catch (_) {}
+    } catch (error) {
+      logAppLifecycleFailure('App.windowPos.restoreFailed', error);
+    }
     // Wire search with debounce via SearchController
     if (!this._events) this._events = new EventManager();
     this._searchController.initialize(this._events);
@@ -137,18 +164,20 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     // If the grid doesn't exist or points to an old container, (re)activate the current tab
     if (gridContainer && (!this._grid || this._grid.container !== gridContainer)) {
       try {
-        if (this._grid && this._grid.container !== gridContainer) { try { this._grid.destroy(); } catch (_) {} this._grid = null; }
+        if (this._grid && this._grid.container !== gridContainer) {
+          try { this._grid.destroy(); }
+          catch (error) { logAppLifecycleFailure('App.grid.destroyBeforeRebindFailed', error); }
+          this._grid = null;
+        }
         Logger.info('App.reactivateTab', { tab: activeTabId });
         // Always reactivate the current tab when grid container changes
         this._tabManager.switchToTab(activeTabId);
       } catch (e) { Logger.error('App.reactivateTab failed', e); }
     }
-    // Grid is fully managed by the active tab; legacy bootstrap removed
-
-    // Tabs switching
     this._tabManager.bindTabButtons({ element: this.element, events: this._events });
     this._footerController.bindGlobalFooter();
-    try { this._folderFilterController.refreshBrowser(); } catch (_) {}
+    try { this._folderFilterController.refreshBrowser(); }
+    catch (error) { logAppLifecycleFailure('App.folderFilter.refreshBrowserFailed', error); }
 
     // Auth header (Patreon) setup injected into window header
     try {
@@ -174,7 +203,52 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
         };
         Hooks.on('updateSetting', this._authSettingHook);
       }
+    } catch (error) {
+      logAppLifecycleFailure('App.authHeader.hookInstallFailed', error);
+    }
+  }
+
+  _onAttach(fromDocument, toDocument) {
+    this._handleHostDocumentChanged('attach', fromDocument, toDocument);
+  }
+
+  _onDetach(fromDocument, toDocument) {
+    this._handleHostDocumentChanged('detach', fromDocument, toDocument);
+  }
+
+  _handleHostDocumentChanged(reason, fromDocument, toDocument) {
+    try {
+      Logger.info('App.hostDocumentChanged', {
+        reason,
+        from: fromDocument?.location?.href || null,
+        to: toDocument?.location?.href || null
+      });
     } catch (_) {}
+    try { applyThemeToElement(this.element); }
+    catch (error) { logAppLifecycleFailure('App.hostDocumentChanged.themeApplyFailed', error, { reason }); }
+    const activeTab = this._tabManager?.getActiveTab?.() || null;
+    let handledByTab = false;
+    if (activeTab && typeof activeTab.onHostDocumentChanged === 'function') {
+      handledByTab = true;
+      try { activeTab.onHostDocumentChanged({ reason, fromDocument, toDocument }); }
+      catch (error) {
+        handledByTab = false;
+        logAppLifecycleFailure('App.hostDocumentChanged.activeTabFailed', error, {
+          reason,
+          tab: this._tabManager?.getActiveTabId?.() || null
+        });
+      }
+    }
+    if (!handledByTab) {
+      try { this._grid?._syncHostWindow?.(); }
+      catch (error) { logAppLifecycleFailure('App.hostDocumentChanged.gridSyncFailed', error, { reason }); }
+      try { this._grid?._onResize?.(); }
+      catch (error) { logAppLifecycleFailure('App.hostDocumentChanged.gridResizeFailed', error, { reason }); }
+      try { this._grid?.refreshMounted?.(); }
+      catch (error) { logAppLifecycleFailure('App.hostDocumentChanged.gridRefreshFailed', error, { reason }); }
+    }
+    try { this._folderFilterController?.syncWindowPosition?.(); }
+    catch (error) { logAppLifecycleFailure('App.hostDocumentChanged.folderFilterSyncFailed', error, { reason }); }
   }
 
   async minimize() {
@@ -193,24 +267,32 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
   _onClose(options = {}) {
     try {
       Logger.info('App._onClose');
-      try { this._footerController?.destroy?.(); } catch (_) {}
-      try { this._tabManager.setTabsLocked(false); } catch (_) {}
-      try { this._tabManager.cancelActiveOperations('app-close'); } catch (_) {}
-      try { this._tabManager.getActiveTab()?.onDeactivate?.(); } catch (_) {}
+      try { this._footerController?.destroy?.(); }
+      catch (error) { logAppLifecycleFailure('App.close.footerDestroyFailed', error); }
+      try { this._tabManager.setTabsLocked(false); }
+      catch (error) { logAppLifecycleFailure('App.close.unlockTabsFailed', error); }
+      try { this._tabManager.cancelActiveOperations('app-close'); }
+      catch (error) { logAppLifecycleFailure('App.close.cancelActiveOperationsFailed', error); }
+      try { this._tabManager.getActiveTab()?.onDeactivate?.(); }
+      catch (error) { logAppLifecycleFailure('App.close.deactivateTabFailed', error, { tab: this._tabManager?.getActiveTabId?.() || null }); }
       // Persist window position/size
       try {
         const p = this.position || {};
         const state = { left: p.left, top: p.top, width: p.width, height: p.height };
         this._saveWindowPosition(state);
-      } catch (_) {}
-      try { this._tabManager.saveActiveTabToSettings(this._tabManager.getActiveTabId() || 'tokens'); } catch (_) {}
+      } catch (error) {
+        logAppLifecycleFailure('App.close.windowPos.scheduleSaveFailed', error);
+      }
+      try { this._tabManager.saveActiveTabToSettings(this._tabManager.getActiveTabId() || 'tokens'); }
+      catch (error) { logAppLifecycleFailure('App.close.saveActiveTabFailed', error); }
       if (this._tokenPreview) {
         this._tokenPreview.hidePreview?.();
         this._tokenPreview.destroy();
         this._tokenPreview = null;
       }
       if (this._dragDrop) {
-        try { this._dragDrop._cleanupPreview?.(); } catch (_) {}
+        try { this._dragDrop._cleanupPreview?.(); }
+        catch (error) { logAppLifecycleFailure('App.close.dragDropPreviewCleanupFailed', error); }
         this._dragDrop = null; // listeners are on shared EventManager and get cleaned up below
       }
       if (this._grid) {
@@ -221,9 +303,15 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
         this._events.cleanup();
         this._events = null;
       }
-      if (this._authSettingHook) { try { Hooks.off('updateSetting', this._authSettingHook); } catch (_) {} this._authSettingHook = null; }
-      try { this._folderFilterController.cleanup(); } catch (_) {}
-      try { this._bookmarkToolbar.cleanup(); } catch (_) {}
+      if (this._authSettingHook) {
+        try { Hooks.off('updateSetting', this._authSettingHook); }
+        catch (error) { logAppLifecycleFailure('App.close.authHookRemoveFailed', error); }
+        this._authSettingHook = null;
+      }
+      try { this._folderFilterController.cleanup(); }
+      catch (error) { logAppLifecycleFailure('App.close.folderFilterCleanupFailed', error); }
+      try { this._bookmarkToolbar.cleanup(); }
+      catch (error) { logAppLifecycleFailure('App.close.bookmarkToolbarCleanupFailed', error); }
       if (this._searchController) {
         this._searchController.cleanup();
         this._searchController = null;
@@ -236,7 +324,11 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
         this._tabManager.cleanup();
         this._tabManager = null;
       }
-    } catch (e) {}
+      try { clearNexusTileSelectionContext('app-close'); }
+      catch (error) { logAppLifecycleFailure('App.close.tileSelectionContextClearFailed', error); }
+    } catch (error) {
+      logAppLifecycleFailure('App.close.failed', error);
+    }
     super._onClose(options);
   }
 
@@ -265,7 +357,9 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     try {
       const header = this.element?.querySelector('.header-patreon-auth');
       if (header) header.hidden = !visible;
-    } catch (_) {}
+    } catch (error) {
+      logAppLifecycleFailure('App.authHeader.visibilityFailed', error, { visible: !!visible });
+    }
   }
 
   showGridLoader(message = '', { owner = null } = {}) {
@@ -362,6 +456,8 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
 function renderFaNexus() {
   // Only GMs can access the module
   if (!game?.user?.isGM) return null;
+  try { preserveCurrentTileSelectionForNexus('app-open'); }
+  catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveOpenFailed', error); }
 
   try {
     const existing = foundry.applications.instances.get('fa-nexus-app');
@@ -369,9 +465,13 @@ function renderFaNexus() {
       // If already rendered, just bring to front; avoid duplicate _onRender triggers mid-layout
       if (!existing.rendered) existing.render(true);
       else existing.bringToFront?.();
+      try { preserveCurrentTileSelectionForNexus('app-focus-existing'); }
+      catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveExistingFailed', error); }
       return existing;
     }
-  } catch (e) {}
+  } catch (error) {
+    logAppLifecycleFailure('App.render.lookupExistingFailed', error);
+  }
   const app = new FaNexusApp();
   app.render(true);
   return app;
@@ -395,8 +495,11 @@ async function disablePremiumDevBridge(options = {}) {
 }
 
 Hooks.once('ready', () => {
+  try { installNexusTileSelectionContextHooks(); }
+  catch (error) { logAppLifecycleFailure('App.ready.tileSelectionContextInstallFailed', error); }
   // Register drag/drop globally via TokensTab (tokens-only feature)
-  try { TokensTab.registerGlobalDragDrop?.(); } catch (e) {}
+  try { TokensTab.registerGlobalDragDrop?.(); }
+  catch (error) { logAppLifecycleFailure('App.ready.registerGlobalDragDropFailed', error); }
 
   // Preload templates for synchronous rendering
   try {
@@ -406,15 +509,24 @@ Hooks.once('ready', () => {
     ];
     foundry.applications.handlebars.loadTemplates(templates)
       .then(() => foundry.applications.handlebars.getTemplate('modules/fa-nexus/templates/tokens/token-card.hbs'))
-      .then((template) => { try { FaNexusApp.CARD_TEMPLATE = template; } catch (_) {} })
-      .catch(() => {});
-  } catch (e) {}
+      .then((template) => {
+        try { FaNexusApp.CARD_TEMPLATE = template; }
+        catch (error) { logAppLifecycleFailure('App.ready.cacheCardTemplateFailed', error); }
+      })
+      .catch((error) => {
+        logAppLifecycleFailure('App.ready.preloadTokenTemplatesFailed', error);
+      });
+  } catch (error) {
+    logAppLifecycleFailure('App.ready.scheduleTemplatePreloadFailed', error);
+  }
 
   try {
     warmPremiumFeatureBundles({ reason: 'startup' }).catch((error) => {
       Logger.warn('FaNexusApp.premiumWarmup.failed', { error: String(error?.message || error) });
     });
-  } catch (_) {}
+  } catch (error) {
+    logAppLifecycleFailure('App.ready.schedulePremiumWarmupFailed', error);
+  }
 
   try {
     scheduleAssetCloudWarmup({ reason: 'startup' });

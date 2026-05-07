@@ -1,6 +1,7 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { gatherBuildingLoops } from '../buildings/building-shape-helpers.js';
 import { applyHsbcToDisplayObject } from '../core/hsbc.js';
+import { DoorVisualProxyManager } from './door-visual-proxy-manager.js';
 
 const SHADOW_BLUR_QUALITY_MIN = 3;
 const SHADOW_BLUR_QUALITY_STEP = 4;
@@ -12,11 +13,37 @@ const FALLBACK_OFFSET = 0;
 // Offset should allow the same range as wall/path shadows (up to ±5 grid @ 200px grid ≈ 1000px).
 const MAX_OFFSET_DISTANCE = 1200;
 const SORT_EPSILON = 0.0001;
+const SHADOW_OCCLUSION_FRAGMENT_SHADER = `
+varying vec2 vTextureCoord;
+
+uniform sampler2D uSampler;
+uniform sampler2D occlusionTexture;
+uniform vec2 screenDimensions;
+uniform float occlusionElevation;
+uniform float unoccludedAlpha;
+uniform float occludedAlpha;
+uniform float fadeOcclusion;
+uniform float radialOcclusion;
+uniform float visionOcclusion;
+uniform float surfaceOcclusion;
+
+void main() {
+  vec4 color = texture2D(uSampler, vTextureCoord);
+  vec2 maskCoord = gl_FragCoord.xy / max(screenDimensions, vec2(1.0));
+  vec4 occluded = 1.0 - step(vec4(occlusionElevation), texture2D(occlusionTexture, maskCoord));
+  float occlusion = max(
+    max(occluded.r * fadeOcclusion, occluded.g * radialOcclusion),
+    max(occluded.b * visionOcclusion, occluded.a * surfaceOcclusion)
+  );
+  gl_FragColor = color * mix(unoccludedAlpha, occludedAlpha, occlusion);
+}
+`;
 
 let _singleton = null;
 const _VISIBLE_CACHE = new Map();
 const _OFFSET_CACHE = new Map();
 const _TILE_HOLE_CACHE = new Map(); // tileId -> { holes, stamp }
+const _MESH_ELEVATION_WARNED = new Set();
 
 function sleep(ms = 50) {
   if (foundry?.utils?.sleep) return foundry.utils.sleep(ms);
@@ -25,6 +52,48 @@ function sleep(ms = 50) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function clampUnit(value, fallback = 0) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return Math.min(1, Math.max(0, numeric));
+  return Math.min(1, Math.max(0, Number(fallback) || 0));
+}
+
+function getTransparentTexture() {
+  try {
+    return PIXI.Texture.EMPTY;
+  } catch (_) {
+    return null;
+  }
+}
+
+function createDoorShadowOcclusionFilter() {
+  const FilterClass = globalThis.PIXI?.Filter;
+  if (!FilterClass) return null;
+  return new FilterClass(undefined, SHADOW_OCCLUSION_FRAGMENT_SHADER, {
+    screenDimensions: [1, 1],
+    occlusionTexture: getTransparentTexture(),
+    occlusionElevation: 0,
+    unoccludedAlpha: 1,
+    occludedAlpha: 0,
+    fadeOcclusion: 0,
+    radialOcclusion: 0,
+    visionOcclusion: 0,
+    surfaceOcclusion: 0
+  });
+}
+
+function hasActiveOcclusionState(mesh) {
+  const mode = Number(mesh?.occlusionMode ?? 0) || 0;
+  if (!mode) return false;
+  const state = mesh?._occlusionState || {};
+  return !!(
+    clampUnit(state.fade, 0)
+    || clampUnit(state.radial, 0)
+    || clampUnit(state.vision, 0)
+    || clampUnit(state.surface, 0)
+  );
 }
 
 function computeBlurQuality(blur) {
@@ -181,6 +250,40 @@ function readPortalHsbc(doc) {
   return null;
 }
 
+function readBuildingWindowFlag(doc) {
+  const faFlags = doc?.flags?.['fa-nexus'] || null;
+  return doc?.getFlag?.('fa-nexus', 'buildingWindow') || faFlags?.buildingWindow || null;
+}
+
+function hasSmallPortalTextureToken(path) {
+  return /(?:^|[\\/_\-\s.])small(?:$|[\\/_\-\s.])/.test(String(path || '').toLowerCase());
+}
+
+function parseExplicitPortalTextureGridWidth(path) {
+  const match = String(path || '').toLowerCase().match(/(?:^|[^0-9])(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)(?=[^0-9]|$)/);
+  if (!match) return null;
+  const width = Number.parseFloat(String(match[1] || ''));
+  return Number.isFinite(width) && width > 0 ? width : null;
+}
+
+function isSmallAnimatedWindowDocument(doc) {
+  const buildingWindow = readBuildingWindowFlag(doc);
+  if (!buildingWindow) return false;
+  const animation = doc?.animation || doc?._source?.animation || doc?.data?.animation || null;
+  const texture = String(animation?.texture || buildingWindow.textureLocal || buildingWindow.textureKey || '');
+  const explicitWidth = parseExplicitPortalTextureGridWidth(texture);
+  if (Number.isFinite(explicitWidth) && explicitWidth > 1) return false;
+  const flagWidth = Number(buildingWindow.textureGridWidth);
+  if (Number.isFinite(flagWidth) && flagWidth > 1) return false;
+  if (buildingWindow.smallTexture === true) return true;
+  if (Number.isFinite(flagWidth) && flagWidth <= 0.5) return true;
+  return hasSmallPortalTextureToken(texture);
+}
+
+function getTextureWidth(texture) {
+  return Number(texture?.width || texture?.baseTexture?.width || 0) || 0;
+}
+
 function resolveDocumentElevation(doc) {
   try {
     const directElevation = doc?.elevation;
@@ -194,8 +297,27 @@ function resolveDocumentElevation(doc) {
     const coreElevation = doc?.getFlag?.('core', 'elevation');
     if (Number.isFinite(coreElevation)) return Number(coreElevation);
   } catch (_) { /* ignore */ }
-  const fg = Number(canvas?.scene?.foregroundElevation);
+  const fg = Number(canvas?.primary?.foreground?.elevation);
   return Number.isFinite(fg) ? fg - 1 : 0;
+}
+
+function resolveShadowRenderElevation(doc, mesh, fallback) {
+  const meshElevation = Number(mesh?.elevation);
+  if (Number.isFinite(meshElevation)) return meshElevation;
+  const fallbackElevation = Number(fallback);
+  const wallId = doc?.id || null;
+  const warningKey = wallId || mesh?.name || 'unknown';
+  if (!_MESH_ELEVATION_WARNED.has(warningKey)) {
+    _MESH_ELEVATION_WARNED.add(warningKey);
+    Logger.warn?.('DoorShadow.meshElevation.invalid', {
+      wallId,
+      meshName: mesh?.name || null,
+      meshElevation: mesh?.elevation ?? null,
+      storedElevation: Number.isFinite(fallbackElevation) ? fallbackElevation : null
+    });
+  }
+  if (Number.isFinite(fallbackElevation)) return fallbackElevation;
+  return resolveDocumentElevation(doc);
 }
 
 function computeDoorOffsetDelta(doc, mesh, offset) {
@@ -291,6 +413,8 @@ export class DoorShadowManager {
     this._readyRan = false;
     this._canvasReadyRan = false;
     this._noMeshSkip = new Set(); // wallIds that permanently skipped due to missing meshes
+    this._sceneId = null;
+    this._sceneGeneration = 0;
     this._bindHooks();
     this._ensureLifecycleCatchup();
     _singleton = this;
@@ -313,10 +437,14 @@ export class DoorShadowManager {
     this._hooksBound = true;
     try { Hooks.once('ready', () => this._onReady()); } catch (_) {}
     try { Hooks.on('canvasReady', () => this._onCanvasReady()); } catch (_) {}
+    try { Hooks.on('canvasTearDown', () => this._onCanvasTearDown()); } catch (_) {}
     try { Hooks.on('createWall', (doc) => this._onCreateWall(doc)); } catch (_) {}
+    try { Hooks.on('drawWall', (wall) => this._onDrawWall(wall)); } catch (_) {}
+    try { Hooks.on('refreshWall', (wall) => this._onDrawWall(wall)); } catch (_) {}
     try { Hooks.on('updateWall', (doc, diff) => this._onUpdateWall(doc, diff)); } catch (_) {}
     try { Hooks.on('deleteWall', (doc) => this._onDeleteWall(doc)); } catch (_) {}
     try { Hooks.on('updateSetting', (setting) => this._onSetting(setting)); } catch (_) {}
+    try { Hooks.on('faNexusDoorVisualProxyRefresh', (doc) => this._onDoorVisualProxyRefresh(doc)); } catch (_) {}
   }
 
   _onReady() {
@@ -337,14 +465,32 @@ export class DoorShadowManager {
 
   async _onCanvasReady() {
     this._canvasReadyRan = true;
+    this._sceneGeneration += 1;
+    this._sceneId = this._getActiveSceneId();
     this._clearAll();
     if (!canvas?.ready) return;
     this._ensureRoot();
-    const walls = Array.isArray(canvas?.walls?.placeables) ? canvas.walls.placeables : [];
-    for (const wall of walls) {
+    const docs = new Map();
+    const wallPlaceables = Array.isArray(canvas?.walls?.placeables) ? canvas.walls.placeables : [];
+    for (const wall of wallPlaceables) {
       const doc = wall?.document || wall;
+      if (doc?.id) docs.set(doc.id, doc);
+    }
+    const sceneWalls = canvas?.scene?.walls || [];
+    for (const doc of sceneWalls) {
+      if (doc?.id) docs.set(doc.id, doc);
+    }
+    for (const doc of docs.values()) {
       this._trackWall(doc);
     }
+  }
+
+  _onCanvasTearDown() {
+    this._sceneGeneration += 1;
+    const previousSceneId = this._sceneId || this._getActiveSceneId();
+    this._sceneId = null;
+    this._clearAll();
+    Logger.debug?.('DoorShadow.canvasTearDown.cleared', { sceneId: previousSceneId });
   }
 
   _ensureLifecycleCatchup() {
@@ -361,16 +507,83 @@ export class DoorShadowManager {
     } catch (_) { /* ignore */ }
   }
 
+  _getActiveSceneId() {
+    try {
+      const id = canvas?.scene?.id ?? game?.scenes?.current?.id ?? null;
+      return id ? String(id) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _getDocumentSceneId(doc) {
+    try {
+      const id = doc?.parent?.id ?? doc?.scene?.id ?? null;
+      return id ? String(id) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _isCurrentSceneScope(generation = this._sceneGeneration, sceneId = this._sceneId || this._getActiveSceneId()) {
+    const activeSceneId = this._sceneId || this._getActiveSceneId();
+    return generation === this._sceneGeneration
+      && !!sceneId
+      && !!activeSceneId
+      && String(sceneId) === String(activeSceneId)
+      && !!canvas?.ready;
+  }
+
+  _isActiveSceneDocument(doc, { phase = 'unknown', log = true } = {}) {
+    if (!doc) return false;
+    const activeSceneId = this._sceneId || this._getActiveSceneId();
+    const docSceneId = this._getDocumentSceneId(doc);
+    if (!activeSceneId || !docSceneId) {
+      if (log) {
+        Logger.debug?.('DoorShadow.sceneOwnership.missing', {
+          phase,
+          wallId: doc?.id || null,
+          activeSceneId,
+          docSceneId
+        });
+      }
+      return false;
+    }
+    if (docSceneId === activeSceneId) return true;
+    if (log) {
+      Logger.debug?.('DoorShadow.foreignSceneDocument.ignored', {
+        phase,
+        wallId: doc?.id || null,
+        activeSceneId,
+        docSceneId
+      });
+    }
+    return false;
+  }
+
   _onCreateWall(doc) {
     if (!this._enabled || !canvas?.ready) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'createWall' })) return;
     this._trackWall(doc);
+  }
+
+  _onDrawWall(wall) {
+    if (!this._enabled || !canvas?.ready) return;
+    const doc = wall?.document || wall;
+    if (!doc?.id) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'drawWall' })) return;
+    this._noMeshSkip.delete(doc.id);
+    this._trackWall(doc, { force: true });
   }
 
   _onUpdateWall(doc, diff = {}) {
     if (!doc || !this._enabled) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'updateWall' })) return;
     const flags = diff.flags || {};
     const faFlags = flags['fa-nexus'] || {};
     const coreFlags = flags.core || {};
+    const hasFaFlags = !!(faFlags && Object.keys(faFlags).length);
+    const hasCoreFlags = !!(coreFlags && Object.keys(coreFlags).length);
 
     const forceRebuild = ('door' in diff)
       || ('animation' in diff)
@@ -379,12 +592,12 @@ export class DoorShadowManager {
 
     const shadowOnly =
       !forceRebuild &&
-      faFlags &&
+      hasFaFlags &&
       Object.keys(faFlags).length === 1 &&
       (Object.prototype.hasOwnProperty.call(faFlags, 'doorShadow') ||
        Object.prototype.hasOwnProperty.call(faFlags, 'windowShadow'));
 
-    if (!forceRebuild && !shadowOnly && !faFlags && !coreFlags) return;
+    if (!forceRebuild && !shadowOnly && !hasFaFlags && !hasCoreFlags) return;
 
     // Shadow-only changes just refresh config without rebuilding meshes.
     this._trackWall(doc, { force: forceRebuild });
@@ -393,7 +606,15 @@ export class DoorShadowManager {
   _onDeleteWall(doc) {
     const id = doc?.id;
     if (!id) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'deleteWall' })) return;
     this._removeEntry(id);
+  }
+
+  _onDoorVisualProxyRefresh(doc) {
+    if (!doc?.id || !this._enabled || !canvas?.ready) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'doorVisualProxyRefresh' })) return;
+    this._noMeshSkip.delete(doc.id);
+    this._trackWall(doc, { force: true });
   }
 
   /* -------------------------------------------- */
@@ -410,6 +631,7 @@ export class DoorShadowManager {
   _trackWall(doc, { force = false } = {}) {
     const id = doc?.id;
     if (!id || !canvas?.ready) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'trackWall' })) return;
     if (this._noMeshSkip.has(id) && !force) return;
     if (force) this._removeEntry(id);
     const config = this._getShadowConfig(doc);
@@ -425,9 +647,14 @@ export class DoorShadowManager {
       return;
     }
     if (this._pendingBuilds.has(id)) return;
-    const promise = this._buildEntry(doc, config);
-    this._pendingBuilds.set(id, promise);
-    promise.finally(() => this._pendingBuilds.delete(id));
+    const sceneId = this._sceneId || this._getActiveSceneId();
+    const generation = this._sceneGeneration;
+    const promise = this._buildEntry(doc, config, { generation, sceneId });
+    const pending = { promise, generation, sceneId };
+    this._pendingBuilds.set(id, pending);
+    promise.finally(() => {
+      if (this._pendingBuilds.get(id) === pending) this._pendingBuilds.delete(id);
+    });
   }
 
   _getShadowConfig(doc) {
@@ -451,17 +678,25 @@ export class DoorShadowManager {
     }
   }
 
-  async _buildEntry(doc, config) {
+  async _buildEntry(doc, config, { generation = this._sceneGeneration, sceneId = this._sceneId || this._getActiveSceneId() } = {}) {
     const id = doc?.id;
     if (!id || !canvas?.ready) return;
+    if (!this._isCurrentSceneScope(generation, sceneId)) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'buildEntry', log: false })) return;
     const elevation = resolveDocumentElevation(doc);
-    const meshes = await this._waitForDoorMeshes(doc);
+    const meshes = await this._waitForDoorMeshes(doc, { generation, sceneId });
+    if (meshes === null) {
+      Logger.debug?.('DoorShadow.buildEntry.staleDiscarded', { wallId: id, sceneId, generation });
+      return;
+    }
     if (!meshes?.length) {
       this._noMeshSkip.add(id);
       return;
     }
+    this._applyAnimatedWindowMeshScaling(doc, meshes);
     const root = this._ensureRoot();
     if (!root) return;
+    if (!this._isCurrentSceneScope(generation, sceneId)) return;
     const entry = {
       id,
       doc,
@@ -509,6 +744,7 @@ export class DoorShadowManager {
         sprite,
         baseSprite,
         blurFilter,
+        occlusionFilter: null,
         dilationSprites: [],
         offscreen,
         renderTexture: null
@@ -518,14 +754,61 @@ export class DoorShadowManager {
     this._startTicker();
   }
 
-  async _waitForDoorMeshes(doc, attempts = 60, delay = 100) {
+  async _waitForDoorMeshes(doc, { generation = this._sceneGeneration, sceneId = this._sceneId || this._getActiveSceneId(), attempts = 60, delay = 100 } = {}) {
     for (let i = 0; i < attempts; i++) {
+      if (!this._isCurrentSceneScope(generation, sceneId)) return null;
+      if (!this._isActiveSceneDocument(doc, { phase: 'waitForDoorMeshes', log: false })) return null;
       const wall = canvas?.walls?.get?.(doc?.id);
       const meshes = wall?.doorMeshes ? Array.from(wall.doorMeshes) : [];
       if (meshes.length) return meshes;
+      const proxyMeshes = DoorVisualProxyManager.peek()?.getDoorMeshes?.(doc?.id) || [];
+      if (proxyMeshes.length) return proxyMeshes;
       await sleep(delay);
     }
     return [];
+  }
+
+  _applyAnimatedWindowMeshScaling(doc, meshes = []) {
+    const smallWindow = isSmallAnimatedWindowDocument(doc);
+    const animation = doc?.animation || doc?._source?.animation || doc?.data?.animation || {};
+    for (const mesh of Array.isArray(meshes) ? meshes : []) {
+      if (!mesh || mesh.destroyed) continue;
+      const padding = smallWindow ? getTextureWidth(mesh.texture) * 0.25 : 0;
+      const current = Number(mesh.faNexusSmallWindowTexturePadding || 0);
+      if (Math.abs(current - padding) < 0.001) continue;
+      const previous = {
+        elevation: Number(mesh.elevation),
+        sort: Number(mesh.sort),
+        sortLayer: Number(mesh.sortLayer)
+      };
+      try {
+        mesh.texturePadding = padding;
+        mesh.faNexusSmallWindowTexturePadding = padding;
+        if (typeof mesh.initialize === 'function') mesh.initialize({ ...animation, sort: Number.isFinite(previous.sort) ? previous.sort : undefined });
+        if (Number.isFinite(previous.elevation)) {
+          if (mesh._closedPosition) mesh._closedPosition.elevation = previous.elevation;
+          if (mesh._animatedPosition) mesh._animatedPosition.elevation = previous.elevation;
+          mesh.elevation = previous.elevation;
+        }
+        if (Number.isFinite(previous.sort)) {
+          if (mesh._closedPosition) mesh._closedPosition.sort = previous.sort;
+          if (mesh._animatedPosition) mesh._animatedPosition.sort = previous.sort;
+          mesh.sort = previous.sort;
+          mesh.zIndex = previous.sort;
+        }
+        if (Number.isFinite(previous.sortLayer)) mesh.sortLayer = previous.sortLayer;
+        Logger.debug?.('DoorShadow.smallWindowPadding.applied', {
+          wallId: doc?.id || null,
+          padding
+        });
+      } catch (error) {
+        Logger.warn?.('DoorShadow.smallWindowPadding.failed', {
+          wallId: doc?.id || null,
+          padding,
+          error: String(error?.message || error)
+        });
+      }
+    }
   }
 
   _removeEntry(id, { preserveState = false } = {}) {
@@ -541,6 +824,9 @@ export class DoorShadowManager {
       if (sub?.blurFilter && !sub.blurFilter.destroyed) {
         try { sub.blurFilter.destroy(); } catch (_) { }
       }
+      if (sub?.occlusionFilter && !sub.occlusionFilter.destroyed) {
+        try { sub.occlusionFilter.destroy(); } catch (_) { }
+      }
       if (sub?.renderTexture && !sub.renderTexture.destroyed) {
         try { sub.renderTexture.destroy(true); } catch (_) { }
       }
@@ -550,6 +836,7 @@ export class DoorShadowManager {
   }
 
   _clearAll() {
+    this._pendingBuilds.clear();
     for (const id of Array.from(this._entries.keys())) {
       this._removeEntry(id);
     }
@@ -582,9 +869,62 @@ export class DoorShadowManager {
     return -Infinity;
   }
 
+  _syncShadowOcclusion(sub, mesh, sprite) {
+    if (!sub || !mesh || !sprite || sprite.destroyed) return;
+    if (!hasActiveOcclusionState(mesh)) {
+      try { sprite.filters = null; } catch (_) { /* ignore */ }
+      if (sub.occlusionFilter && !sub.occlusionFilter.destroyed) {
+        try { sub.occlusionFilter.destroy(); } catch (_) { /* ignore */ }
+      }
+      sub.occlusionFilter = null;
+      return;
+    }
+
+    const filter = sub.occlusionFilter && !sub.occlusionFilter.destroyed
+      ? sub.occlusionFilter
+      : createDoorShadowOcclusionFilter();
+    if (!filter) {
+      Logger.error?.('DoorShadow.occlusionFilter.unavailable', {
+        meshName: mesh?.name || null,
+        wallId: mesh?.faNexusSourceWallId || null
+      });
+      return;
+    }
+
+    const occlusionMask = canvas?.masks?.occlusion || null;
+    const uniforms = filter.uniforms || {};
+    const state = mesh?._occlusionState || {};
+    uniforms.screenDimensions = canvas?.screenDimensions || [1, 1];
+    uniforms.occlusionTexture = occlusionMask?.renderTexture || getTransparentTexture();
+    uniforms.occlusionElevation = occlusionMask?.mapElevation?.(mesh?.elevation ?? 0) ?? 0;
+    uniforms.unoccludedAlpha = 1;
+    uniforms.occludedAlpha = clampUnit(mesh?.occludedAlpha, 0);
+    uniforms.fadeOcclusion = clampUnit(state.fade, 0);
+    uniforms.radialOcclusion = clampUnit(state.radial, 0);
+    uniforms.visionOcclusion = clampUnit(state.vision, 0);
+    uniforms.surfaceOcclusion = clampUnit(state.surface, 0);
+    sub.occlusionFilter = filter;
+    try { sprite.filters = [filter]; } catch (error) {
+      Logger.warn?.('DoorShadow.occlusionFilter.applyFailed', {
+        meshName: mesh?.name || null,
+        wallId: mesh?.faNexusSourceWallId || null,
+        error: String(error?.message || error)
+      });
+    }
+  }
+
   _onTick() {
     if (!this._entries.size || !canvas?.ready) return;
-    for (const entry of this._entries.values()) {
+    for (const entry of Array.from(this._entries.values())) {
+      if (!this._isActiveSceneDocument(entry?.doc, { phase: 'tick', log: false })) {
+        Logger.debug?.('DoorShadow.tick.foreignEntryRemoved', {
+          wallId: entry?.id || null,
+          sceneId: this._getDocumentSceneId(entry?.doc),
+          activeSceneId: this._sceneId || this._getActiveSceneId()
+        });
+        if (entry?.id) this._removeEntry(entry.id);
+        continue;
+      }
       if (!entry?.subs?.length) continue;
       const cfg = entry.config || {};
       const blurEnabled = cfg.blur > 0;
@@ -711,20 +1051,19 @@ export class DoorShadowManager {
         const visible = cfg.enabled !== false && mesh.visible !== false;
         sprite.visible = visible;
         sprite.renderable = visible;
+        this._syncShadowOcclusion(sub, mesh, sprite);
 
         // Sorting
         const sort = this._computeSort(mesh);
+        const renderElevation = resolveShadowRenderElevation(entry.doc, mesh, entry.elevation);
+        entry.elevation = renderElevation;
         container.sort = sort;
         container.zIndex = sort;
-        container.elevation = entry.elevation;
-        container.faNexusElevation = entry.elevation;
+        container.elevation = renderElevation;
+        container.faNexusElevation = renderElevation;
       }
     }
   }
-}
-
-export function getDoorShadowManager() {
-  return DoorShadowManager.getInstance();
 }
 
 // Auto-initialize when Foundry is ready so shadows appear without manual imports.

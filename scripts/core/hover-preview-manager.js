@@ -34,12 +34,70 @@ export class HoverPreviewManager {
     this._imgResizeObserver = null;
   }
 
-  /** Ensure preview element exists (reuses existing singleton if already on DOM) */
-  initialize() {
-    if (this._previewEl) return;
+  _getHostDocument(anchor = null) {
+    return anchor?.ownerDocument
+      || this._previewEl?.ownerDocument
+      || (typeof document !== 'undefined' ? document : null);
+  }
+
+  _getHostWindow(anchor = null) {
+    const doc = this._getHostDocument(anchor);
+    return doc?.defaultView || (typeof window !== 'undefined' ? window : null);
+  }
+
+  _requestAnimationFrame(anchor, callback) {
+    const hostWindow = this._getHostWindow(anchor);
+    if (typeof hostWindow?.requestAnimationFrame === 'function') {
+      return hostWindow.requestAnimationFrame(callback);
+    }
+    if (typeof requestAnimationFrame === 'function') return requestAnimationFrame(callback);
+    return this._setTimeout(callback, 16);
+  }
+
+  _cancelAnimationFrame(id, anchor = null) {
+    if (!id) return;
+    const hostWindow = this._getHostWindow(anchor);
+    if (typeof hostWindow?.cancelAnimationFrame === 'function') {
+      hostWindow.cancelAnimationFrame(id);
+      return;
+    }
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(id);
+      return;
+    }
+    this._clearTimeout(id);
+  }
+
+  _resetPreviewElements() {
+    this._previewEl = null;
+    this._imgEl = null;
+    this._videoEl = null;
+    this._activeMediaEl = null;
+    this._activeMediaKind = 'image';
+    this._filenameEl = null;
+    this._pathEl = null;
+    this._dimsEl = null;
+  }
+
+  /** Ensure preview element exists in the same document as the hovered card */
+  initialize(hostDocument = null) {
+    const doc = hostDocument || this._getHostDocument();
+    if (!doc?.body) {
+      try { Logger.debug('Preview.init.noHostDocument'); } catch (_) {}
+      return;
+    }
+    if (this._previewEl?.ownerDocument === doc) return;
+
+    if (this._previewEl && this._previewEl.ownerDocument !== doc) {
+      try { this._previewEl.remove(); } catch (_) {}
+      try { this._imgResizeObserver?.disconnect?.(); } catch (_) {}
+      this._imgResizeObserver = null;
+      this._resetPreviewElements();
+    }
+
     try { Logger.debug('Preview.init'); } catch (_) {}
 
-    const existing = Array.from(document.querySelectorAll('.fa-nexus-hover-preview'));
+    const existing = Array.from(doc.querySelectorAll('.fa-nexus-hover-preview'));
     if (existing.length > 0) {
       const keep = existing[0];
       for (let i = 1; i < existing.length; i++) {
@@ -49,7 +107,7 @@ export class HoverPreviewManager {
       this._imgEl = keep.querySelector('img');
       let video = keep.querySelector('video');
       if (!video) {
-        video = document.createElement('video');
+        video = doc.createElement('video');
         video.muted = true;
         video.defaultMuted = true;
         video.autoplay = false;
@@ -81,24 +139,24 @@ export class HoverPreviewManager {
       return;
     }
 
-    const el = document.createElement('div');
+    const el = doc.createElement('div');
     el.className = 'fa-nexus-hover-preview';
     el.style.display = 'none';
 
-    const img = document.createElement('img');
-    const info = document.createElement('div');
+    const img = doc.createElement('img');
+    const info = doc.createElement('div');
     info.className = 'preview-info';
-    const name = document.createElement('div');
+    const name = doc.createElement('div');
     name.className = 'preview-filename';
-    const path = document.createElement('div');
+    const path = doc.createElement('div');
     path.className = 'preview-path';
-    const meta = document.createElement('div');
+    const meta = doc.createElement('div');
     meta.className = 'preview-meta';
     info.appendChild(name);
     info.appendChild(path);
     info.appendChild(meta);
 
-    const video = document.createElement('video');
+    const video = doc.createElement('video');
     video.muted = true;
     video.defaultMuted = true;
     video.autoplay = false;
@@ -117,7 +175,7 @@ export class HoverPreviewManager {
     el.appendChild(img);
     el.appendChild(video);
     el.appendChild(info);
-    document.body.appendChild(el);
+    doc.body.appendChild(el);
 
     this._previewEl = el;
     this._imgEl = img;
@@ -132,9 +190,9 @@ export class HoverPreviewManager {
   /** Dispose timers/observers and remove the preview element */
   destroy() {
     if (this._delayId) this._clearTimeout(this._delayId);
-    if (this._showRaf) cancelAnimationFrame(this._showRaf);
-    if (this._posRaf) cancelAnimationFrame(this._posRaf);
-    if (this._overlayRaf) cancelAnimationFrame(this._overlayRaf);
+    if (this._showRaf) this._cancelAnimationFrame(this._showRaf);
+    if (this._posRaf) this._cancelAnimationFrame(this._posRaf);
+    if (this._overlayRaf) this._cancelAnimationFrame(this._overlayRaf);
     this._showRaf = this._posRaf = this._overlayRaf = null;
 
     try {
@@ -148,14 +206,7 @@ export class HoverPreviewManager {
       this._previewEl.parentNode.removeChild(this._previewEl);
     }
 
-    this._previewEl = null;
-    this._imgEl = null;
-    this._videoEl = null;
-    this._activeMediaEl = null;
-    this._activeMediaKind = 'image';
-    this._filenameEl = null;
-    this._pathEl = null;
-    this._dimsEl = null;
+    this._resetPreviewElements();
     this._eventManager = null;
   }
 
@@ -163,6 +214,8 @@ export class HoverPreviewManager {
   showPreviewWithDelay(mediaEl, cardEl, delay = 300) {
     if (!mediaEl || !cardEl) return;
     if (!this.canPreviewCard(cardEl)) return;
+    this.initialize(cardEl.ownerDocument || mediaEl.ownerDocument || null);
+    if (!this._previewEl) return;
     if (this._delayId) this._clearTimeout(this._delayId);
     this._delayId = this._setTimeout(() => {
       this._delayId = null;
@@ -188,7 +241,7 @@ export class HoverPreviewManager {
       }
     } catch (_) {}
     if (this._overlayRaf) {
-      cancelAnimationFrame(this._overlayRaf);
+      this._cancelAnimationFrame(this._overlayRaf);
       this._overlayRaf = null;
     }
     if (this._imgEl) {
@@ -244,6 +297,7 @@ export class HoverPreviewManager {
 
   /** Core display routine shared by subclasses */
   async _show(mediaTriggerEl, cardEl) {
+    this.initialize(cardEl?.ownerDocument || mediaTriggerEl?.ownerDocument || null);
     if (!this._previewEl) return;
     try { Logger.debug('Preview.show', { file: cardEl?.getAttribute?.('data-filename') }); } catch (_) {}
 
@@ -279,11 +333,11 @@ export class HoverPreviewManager {
     this._previewEl.classList.remove('visible');
     this._updateGridOverlay(cardEl, 0);
 
-    if (this._posRaf) cancelAnimationFrame(this._posRaf);
-    this._posRaf = requestAnimationFrame(() => {
+    if (this._posRaf) this._cancelAnimationFrame(this._posRaf, cardEl);
+    this._posRaf = this._requestAnimationFrame(cardEl, () => {
       this._positionRelativeToCard(this._previewEl, cardEl);
       this._posRaf = null;
-      this._showRaf = requestAnimationFrame(() => {
+      this._showRaf = this._requestAnimationFrame(cardEl, () => {
         if (this._currentId === id) this._previewEl.classList.add('visible');
         this._showRaf = null;
       });
@@ -345,7 +399,7 @@ export class HoverPreviewManager {
         this._startPreviewVideo(mediaEl);
       }
 
-      this._posRaf = requestAnimationFrame(() => {
+      this._posRaf = this._requestAnimationFrame(cardEl, () => {
         this._positionRelativeToCard(this._previewEl, cardEl);
         this._posRaf = null;
       });
@@ -357,7 +411,10 @@ export class HoverPreviewManager {
 
       try {
         if (this._imgResizeObserver) this._imgResizeObserver.disconnect();
-        this._imgResizeObserver = new ResizeObserver(() => this._updateGridOverlay(cardEl, 0));
+        const hostWindow = this._getHostWindow(mediaEl);
+        const ResizeObserverCtor = hostWindow?.ResizeObserver || (typeof ResizeObserver !== 'undefined' ? ResizeObserver : null);
+        if (!ResizeObserverCtor) return;
+        this._imgResizeObserver = new ResizeObserverCtor(() => this._updateGridOverlay(cardEl, 0));
         this._imgResizeObserver.observe(mediaEl);
       } catch (_) {}
     };
@@ -449,8 +506,9 @@ export class HoverPreviewManager {
     const numericHeight = parseFloat(String(meta.heightAttr).replace(/[^0-9.]/g, '')) || 0;
 
     if (numericWidth > 0 && numericHeight > 0) {
-      const viewportW = window.innerWidth || 1920;
-      const viewportH = window.innerHeight || 1080;
+      const hostWindow = this._getHostWindow(this._imgEl);
+      const viewportW = hostWindow?.innerWidth || 1920;
+      const viewportH = hostWindow?.innerHeight || 1080;
       const maxW = Math.max(120, Math.min(600, Math.floor(viewportW * 0.45)));
       const maxH = Math.max(120, Math.min(600, Math.floor(viewportH * 0.9)));
       const scaleFactor = Math.min(1, maxW / numericWidth, maxH / numericHeight);
@@ -532,8 +590,9 @@ export class HoverPreviewManager {
     if (!el) return;
     const { naturalWidth, naturalHeight } = metrics || {};
     if (naturalWidth > 0 && naturalHeight > 0) {
-      const viewportW = window.innerWidth || 1920;
-      const viewportH = window.innerHeight || 1080;
+      const hostWindow = this._getHostWindow(el);
+      const viewportW = hostWindow?.innerWidth || 1920;
+      const viewportH = hostWindow?.innerHeight || 1080;
       const maxW = Math.max(120, Math.min(600, Math.floor(viewportW * 0.45)));
       const maxH = Math.max(120, Math.min(600, Math.floor(viewportH * 0.9)));
       const scaleFactor = Math.min(1, maxW / naturalWidth, maxH / naturalHeight);
@@ -586,10 +645,10 @@ export class HoverPreviewManager {
   _updateGridOverlay(cardEl, attempt = 0) {
     try {
       if (this._overlayRaf) {
-        cancelAnimationFrame(this._overlayRaf);
+        this._cancelAnimationFrame(this._overlayRaf, cardEl);
         this._overlayRaf = null;
       }
-      this._overlayRaf = requestAnimationFrame(() => {
+      this._overlayRaf = this._requestAnimationFrame(cardEl, () => {
         const mediaEl = this._activeMediaEl || this._imgEl || this._videoEl;
         const imageRect = mediaEl?.getBoundingClientRect?.();
         if (!imageRect || imageRect.width < 2 || imageRect.height < 2) {
@@ -692,17 +751,22 @@ export class HoverPreviewManager {
   async _loadImageWithFetch(url, id, alt = '') {
     if (!url) return null;
     if (this._currentId !== id) return null;
-    const res = await fetch(url);
+    const hostWindow = this._getHostWindow(this._imgEl);
+    const fetchFn = hostWindow?.fetch?.bind(hostWindow) || (typeof fetch === 'function' ? fetch : null);
+    if (!fetchFn) throw new Error('Preview fetch unavailable in host window');
+    const res = await fetchFn(url);
     if (!res.ok) throw new Error(`Preview fetch failed: ${res.status}`);
     if (this._currentId !== id) return null;
     const blob = await res.blob();
-    const metrics = await this._measureImageBlob(blob);
-    const objectURL = URL.createObjectURL(blob);
+    const metrics = await this._measureImageBlob(blob, hostWindow);
+    const URLApi = hostWindow?.URL || (typeof URL !== 'undefined' ? URL : null);
+    if (!URLApi?.createObjectURL) throw new Error('Preview object URL unavailable in host window');
+    const objectURL = URLApi.createObjectURL(blob);
     await new Promise((resolve, reject) => {
       const onLoad = () => { cleanupListeners(); resolve(); };
       const onError = (e) => { cleanupListeners(); reject(e); };
       const cleanupListeners = () => {
-        try { URL.revokeObjectURL(objectURL); } catch (_) {}
+        try { URLApi.revokeObjectURL(objectURL); } catch (_) {}
         if (!this._imgEl) return;
         this._imgEl.removeEventListener('load', onLoad);
         this._imgEl.removeEventListener('error', onError);
@@ -721,11 +785,13 @@ export class HoverPreviewManager {
     return metrics;
   }
 
-  async _measureImageBlob(blob) {
+  async _measureImageBlob(blob, hostWindow = null) {
     if (!blob) return null;
-    if (typeof createImageBitmap === 'function') {
+    const win = hostWindow || this._getHostWindow(this._imgEl);
+    const createBitmap = win?.createImageBitmap || (typeof createImageBitmap === 'function' ? createImageBitmap : null);
+    if (typeof createBitmap === 'function') {
       try {
-        const bitmap = await createImageBitmap(blob);
+        const bitmap = await createBitmap.call(win || globalThis, blob);
         const dims = {
           naturalWidth: bitmap.width || 0,
           naturalHeight: bitmap.height || 0
@@ -736,11 +802,21 @@ export class HoverPreviewManager {
     }
 
     return new Promise((resolve) => {
-      const probe = new Image();
+      const ImageCtor = win?.Image || (typeof Image !== 'undefined' ? Image : null);
+      if (!ImageCtor) {
+        resolve(null);
+        return;
+      }
+      const URLApi = win?.URL || (typeof URL !== 'undefined' ? URL : null);
+      if (!URLApi?.createObjectURL) {
+        resolve(null);
+        return;
+      }
+      const probe = new ImageCtor();
       let tempUrl = '';
       const cleanup = () => {
         try {
-          if (tempUrl) URL.revokeObjectURL(tempUrl);
+          if (tempUrl) URLApi.revokeObjectURL(tempUrl);
         } catch (_) {}
         probe.onload = null;
         probe.onerror = null;
@@ -758,7 +834,7 @@ export class HoverPreviewManager {
         resolve(null);
       };
       try {
-        tempUrl = URL.createObjectURL(blob);
+        tempUrl = URLApi.createObjectURL(blob);
         probe.src = tempUrl;
       } catch (_) {
         cleanup();
@@ -769,6 +845,8 @@ export class HoverPreviewManager {
 
   /** Load image via direct src assignment with load/error guards */
   async _loadImageWithImgSrc(url, id, alt = '') {
+    const hostWindow = this._getHostWindow(this._imgEl);
+    const ImageCtor = hostWindow?.Image || (typeof Image !== 'undefined' ? Image : null);
     const metrics = await new Promise((resolve, reject) => {
       if (!this._imgEl) { resolve(null); return; }
       if (!url) {
@@ -777,7 +855,11 @@ export class HoverPreviewManager {
         resolve(null);
         return;
       }
-      const loader = new Image();
+      if (!ImageCtor) {
+        reject(new Error('Preview Image constructor unavailable in host window'));
+        return;
+      }
+      const loader = new ImageCtor();
       const cleanupLoader = () => {
         loader.onload = null;
         loader.onerror = null;
@@ -823,8 +905,9 @@ export class HoverPreviewManager {
   _positionRelativeToCard(preview, card) {
     if (!preview || !card) return;
     const rect = card.getBoundingClientRect();
-    const viewportW = window.innerWidth;
-    const viewportH = window.innerHeight;
+    const hostWindow = this._getHostWindow(card);
+    const viewportW = hostWindow?.innerWidth || 1920;
+    const viewportH = hostWindow?.innerHeight || 1080;
     const pRect = preview.getBoundingClientRect();
 
     let left = rect.right + 10;

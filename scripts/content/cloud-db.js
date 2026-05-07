@@ -3,6 +3,15 @@
 
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusFolderCountEntry} FaNexusFolderCountEntry
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryDeltaOperation} FaNexusInventoryDeltaOperation
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryListResult} FaNexusInventoryListResult
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusManifestMeta} FaNexusManifestMeta
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusStreamAllResult} FaNexusStreamAllResult
+ */
+
 function abortError() {
   return new DOMException('Operation aborted', 'AbortError');
 }
@@ -112,7 +121,7 @@ export class CloudDB {
   /**
    * Replace all items for a kind
    * @param {'tokens'|'assets'} kind
-   * @param {Array<object>} items - Canonical inventory records
+   * @param {FaNexusInventoryRecord[]} items - Canonical inventory records
    * @param {{onProgress?:(count:number,total:number)=>void,progressBatch?:number,signal?:AbortSignal}} [options]
    * @returns {Promise<boolean>}
    */
@@ -236,7 +245,7 @@ export class CloudDB {
   /**
    * Apply a JSON-lines delta operation
    * @param {'tokens'|'assets'} kind
-   * @param {{op:'add'|'up'|'del', item?:object, file_path?:string}} op
+   * @param {FaNexusInventoryDeltaOperation} op
    * @returns {Promise<boolean>}
    */
   async applyDelta(kind, op) {
@@ -308,7 +317,7 @@ export class CloudDB {
   /**
    * Persist meta info for a kind
    * @param {'tokens'|'assets'} kind
-   * @param {{id?:'meta',latest?:string,count?:number,builtAt?:string}} meta
+   * @param {FaNexusManifestMeta} meta
    * @returns {Promise<boolean>}
    */
   async setMeta(kind, meta) {
@@ -325,7 +334,7 @@ export class CloudDB {
   /**
    * Read meta info for a kind
    * @param {'tokens'|'assets'} kind
-   * @returns {Promise<object|null>}
+   * @returns {Promise<FaNexusManifestMeta|null>}
    */
   async getMeta(kind) {
     const db = await this._open();
@@ -369,8 +378,8 @@ export class CloudDB {
    * Uses chunked storage when fresh, otherwise falls back to batched cursor reads
    * from the per-item store and schedules a chunk rebuild in the background.
    * @param {'tokens'|'assets'} kind
-   * @param {{onChunk?:(records:Array<object>,info:{kind:string,mode:string,batch:number,totalHint:number})=>Promise<void>|void,preferChunks?:boolean,chunkSize?:number,signal?:AbortSignal}} [options]
-   * @returns {Promise<{items:Array<object>,total:number,latest:string|null,mode:'chunks'|'cursor'}>}
+   * @param {{onChunk?:(records:FaNexusInventoryRecord[],info:{kind:string,mode:string,batch:number,totalHint:number})=>Promise<void>|void,preferChunks?:boolean,chunkSize?:number,signal?:AbortSignal}} [options]
+   * @returns {Promise<FaNexusStreamAllResult>}
    */
   async streamAll(kind, options = {}) {
     const db = await this._open();
@@ -510,7 +519,7 @@ export class CloudDB {
    * Query items with simple client-side filtering and pagination
    * @param {'tokens'|'assets'} kind
    * @param {{text?:string,tier?:string,pathPrefix?:string,offset?:number,limit?:number,onProgress?:(count:number,total:number)=>void,progressBatch?:number,signal?:AbortSignal}} [opts]
-   * @returns {Promise<{items:Array<object>, total:number}>}
+   * @returns {Promise<FaNexusInventoryListResult>}
    */
   async query(kind, opts = {}) {
     const db = await this._open();

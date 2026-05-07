@@ -1,10 +1,174 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { TileFlattenManager } from '../canvas/tile-flatten-manager.js';
-import { getFaNexusTileEditMode, openFaNexusTileEditor } from '../canvas/tile-hud-edit.js';
+import { TileFlattenManager } from '../flatten/flatten-manager.js';
+import {
+  canLaunchFaNexusTileMask,
+  getFaNexusTileEditMode,
+  openFaNexusTileMaskEditor
+} from '../canvas/tile-hud-edit.js';
 import { createCanvasGestureSession } from '../canvas/canvas-gesture-session.js';
-import { computeNextSortAtElevation } from '../canvas/canvas-interaction-controller.js';
-import { isKeepTokensAboveTileElevationsEnabled } from '../canvas/elevation-band-utils.js';
+import {
+  computeNextSortAtElevation,
+  normalizeTileDocumentSortForPlacement,
+  resolvePlacementSortAtElevation
+} from '../canvas/canvas-interaction-controller.js';
+import {
+  getCurrentLevelElevationRange,
+  getCurrentSceneLevel,
+  getSceneLevelElevationRanges,
+  isElevationWithinCurrentLevelEditScope
+} from '../canvas/elevation-band-utils.js';
+import {
+  analyzeTileBandState,
+  getDefaultTilePlacementLevelId,
+  resolveTileRenderOrder
+} from '../canvas/tile-band-utils.js';
+import { onCanvasReady } from '../canvas/canvas-readiness.js';
+import {
+  collectTileDocuments,
+  collectTilePlaceables,
+  mapTilePlaceablesById,
+  resolveTileDocument,
+  resolveTilePlaceable
+} from '../canvas/tile-targets.js';
+import {
+  clearNexusTileSelectionContext,
+  preserveTileSelectionDocumentsForNexus
+} from '../canvas/tile-selection-context.js';
+import { getFaNexusTileCapabilities } from '../canvas/tile-capabilities.js';
 import { readDocumentHsbc } from '../core/hsbc.js';
+import { clearStandardTileMask } from '../textures/texture-render.js';
+import {
+  applySceneElevationGroupMetadataLocally,
+  cloneElevationGroupMetadata,
+  elevationGroupKey,
+  getElevationGroupName,
+  getSceneElevationGroupMetadata,
+  mergeElevationGroupMetadataOnBulkMove,
+  mergeElevationGroupMetadataOnMove,
+  normalizeElevationGroupMetadata,
+  parseElevationInput,
+  quantizeElevation,
+  serializeElevationGroupMetadata,
+  setSceneElevationGroupMetadata
+} from './model/elevation-group-metadata.js';
+import {
+  expandElevationGroupsForDocs as expandLayerManagerElevationGroupsForDocs,
+  getFullElevationDocs as getLayerManagerFullElevationDocs,
+  getFullGroupNode as getLayerManagerFullGroupNode,
+  getMatchingElevationDocs as getLayerManagerMatchingElevationDocs,
+  getMatchingElevationGroupKeys as getLayerManagerMatchingElevationGroupKeys,
+  getMatchingGroupNode as getLayerManagerMatchingGroupNode,
+  setMatchingElevationGroupsCollapsed as setLayerManagerMatchingElevationGroupsCollapsed,
+  toggleElevationGroupCollapsed as toggleLayerManagerElevationGroupCollapsed,
+  usesNestedGrouping as usesNestedLayerManagerGrouping
+} from './model/group-state.js';
+import {
+  LIST_FILTER_FLAG_KEYS,
+  buildFilterChipContext,
+  entryMatchesListFilters,
+  listFiltersActive,
+  parseListSearchQuery
+} from './model/list-filters.js';
+import {
+  DEFAULT_PRIMARY_SORT_LAYERS,
+  applyGroupSearchTextToEntries as applyLayerManagerGroupSearchTextModel,
+  buildLayerManagerTileEntry as buildLayerManagerTileEntryModel,
+  getPrimaryCanvasSortLayers,
+  normalizeRenderOrderValue,
+  sortLayerManagerRenderEntries,
+  sortLayerManagerTileDocs
+} from './model/render-entries.js';
+import {
+  COLLAPSED_STATE_SETTING,
+  getDocumentLevelIds,
+  getCurrentSceneSessionKey,
+  getLayerManagerSessionState,
+  isDocumentInActiveLevelListScope,
+  reconcileLayerManagerCollapsedState,
+  queuePersistLayerManagerCollapsedState,
+  syncLayerManagerCollapsedStateFromSettings
+} from './model/session-state.js';
+import {
+  applyLayerManagerFlattenFooterState,
+  applyLayerManagerSelectionActionState,
+  buildLayerManagerFlattenState,
+  buildLayerManagerSelectionActionState
+} from './view/action-controls.js';
+import {
+  buildFlattenContextMenuItem as buildLayerManagerFlattenContextMenuItem,
+  deconstructContextMenuDoc,
+  flattenContextMenuDocs,
+  getContextMenuTileDocs as getLayerManagerContextMenuTileDocs,
+  getGroupContextMenuDocs as getLayerManagerGroupContextMenuDocs,
+  openContextMenuNexusTileEditor
+} from './actions/context-actions.js';
+import {
+  activateTilesLayer as activateLayerManagerTilesLayer,
+  applyRangeFilterChange,
+  applySelectionBooleanFilterChange,
+  applySkipFilteredChange,
+  deleteSelectedDocs,
+  getSelectedTileDocs as getLayerManagerSelectedTileDocs,
+  handleSelectionListFilterStateChange as handleLayerManagerSelectionListFilterStateChange,
+  setLayerManagerActiveClass,
+  setSelectionFilterActive
+} from './actions/selection-controls.js';
+import {
+  applyDropIndicator as applyLayerManagerDropIndicator,
+  applyDropReorder as applyLayerManagerDropReorder,
+  clearDraggedRowState as clearLayerManagerDraggedRowState,
+  clearDropIndicator as clearLayerManagerDropIndicator,
+  getOrderedDocsByIds as getLayerManagerOrderedDocsByIds,
+  handleListDragOver as handleLayerManagerListDragOver,
+  prepareListDragStart as prepareLayerManagerListDragStart,
+  resolveDraggedTileIds as resolveLayerManagerDraggedTileIds,
+  resolveDropTarget as resolveLayerManagerDropTarget,
+  setDraggedRowState as setLayerManagerDraggedRowState,
+  shouldIgnoreListDragLeave
+} from './actions/drag-reorder.js';
+import {
+  adjustElevationSelection as adjustLayerManagerElevationSelection,
+  applyDocsElevationChange as applyLayerManagerDocsElevationChange,
+  commitElevationGroupElevationEdit as commitLayerManagerElevationGroupElevationEdit,
+  getElevationAnnouncePoint as getLayerManagerElevationAnnouncePoint,
+  getElevationShortcutDirection as getLayerManagerElevationShortcutDirection,
+  promptDocsElevationChange as promptLayerManagerDocsElevationChange,
+  resolveElevationStep as resolveLayerManagerElevationStep,
+  resolveTileElevationMove as resolveLayerManagerTileElevationMove,
+  restoreSelectionAfterElevationMove as restoreLayerManagerSelectionAfterElevationMove
+} from './actions/elevation-controls.js';
+import {
+  adjustSceneMarkerElevationBlocked,
+  clearSceneMarkerSelection as clearLayerManagerSceneMarkerSelection,
+  openSceneSettings as openLayerManagerSceneSettings,
+  openTileSettings as openLayerManagerTileSettings,
+  resolveDoubleContextClick as resolveLayerManagerDoubleContextClick,
+  selectSceneMarker as selectLayerManagerSceneMarker
+} from './actions/row-actions.js';
+import {
+  beginElevationGroupElevationEdit as beginLayerManagerElevationGroupElevationEdit,
+  beginElevationGroupNameEdit as beginLayerManagerElevationGroupNameEdit,
+  beginRename as beginLayerManagerRename,
+  cancelElevationGroupElevationEdit as cancelLayerManagerElevationGroupElevationEdit,
+  cancelElevationGroupNameEdit as cancelLayerManagerElevationGroupNameEdit,
+  cancelRename as cancelLayerManagerRename,
+  commitElevationGroupNameEdit as commitLayerManagerElevationGroupNameEdit,
+  commitRename as commitLayerManagerRename,
+  handleElevationGroupElevationInputKeyDown as handleLayerManagerElevationGroupElevationInputKeyDown,
+  handleElevationGroupNameInputKeyDown as handleLayerManagerElevationGroupNameInputKeyDown,
+  handleRenameInputKeyDown as handleLayerManagerRenameInputKeyDown,
+  isEditableLayerManagerElement,
+  resolveRenameTargetId as resolveLayerManagerRenameTargetId,
+  shouldHandleRenameHotkey as shouldHandleLayerManagerRenameHotkey
+} from './actions/edit-actions.js';
+import {
+  queueScrollToPreview as queueLayerManagerScrollToPreview,
+  queueScrollToTile as queueLayerManagerScrollToTile,
+  scrollToPreview as scrollLayerManagerToPreview,
+  scrollToTile as scrollLayerManagerToTile,
+  syncPreviewScroll as syncLayerManagerPreviewScroll,
+  syncSelectionFromCanvas as syncLayerManagerSelectionFromCanvas
+} from './selection-sync.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 const { AbstractSidebarTab, Sidebar } = foundry.applications.sidebar;
@@ -17,35 +181,24 @@ const SKIP_LOCKED_SETTING = 'layerManagerSkipLocked';
 const SKIP_HIDDEN_SETTING = 'layerManagerSkipHidden';
 const SKIP_FILTERED_SETTING = 'layerManagerSkipFiltered';
 const IGNORE_FOREGROUND_SETTING = 'layerManagerIgnoreForeground';
-const COLLAPSED_STATE_SETTING = 'layerManagerCollapsedState';
 const NESTED_GROUPING_SETTING = 'layerManagerNestedGrouping';
 const LAYER_HIDDEN_FLAG = 'layerHidden';
-const ELEVATION_GROUPS_FLAG = 'layerManagerElevationGroups';
+const LEVEL_BACKGROUND_IMAGE_HIDDEN_FLAG = 'layerManagerBackgroundImageHidden';
+const LEVEL_FOREGROUND_IMAGE_HIDDEN_FLAG = 'layerManagerForegroundImageHidden';
 const CONTEXT_DOUBLE_CLICK_MS = 350;
-const SEPARATOR_RENAME_CLICK_DELAY_MS = 180;
-const BG_RENDER_OVERRIDE_KEY = 'faNexusBgBandRenderElevation';
 const MAX_ELEVATION_DECIMALS = 4;
 const ELEVATION_SCALE = 10 ** MAX_ELEVATION_DECIMALS;
 const ELEVATION_STEP_DEFAULT = 0.01;
 const ELEVATION_STEP_FINE = 0.001;
 const ELEVATION_STEP_COARSE = 0.1;
+const TILE_SORT_STEP = 2;
+const LEVEL_BOUNDARY_TOP_BLOCK_RANK = 0;
+const LEVEL_BOUNDARY_BOTTOM_BLOCK_RANK = 9;
 const EDITING_TILE_SET_KEYS = [
   '__faNexusTextureEditingTileIds',
   '__faNexusBuildingEditingTileIds',
   '__faNexusPathEditingTiles'
 ];
-const LIST_FILTER_FLAG_KEYS = Object.freeze(['locked', 'hidden', 'hsbc', 'mask']);
-const LIST_FILTER_CHIPS = Object.freeze([
-  { key: 'asset', kind: 'type', label: 'Asset', icon: 'fa-solid fa-image' },
-  { key: 'scatter', kind: 'type', label: 'Scatter', icon: 'fa-solid fa-braille' },
-  { key: 'building', kind: 'type', label: 'Wall/Building', icon: 'fa-solid fa-building' },
-  { key: 'path', kind: 'type', label: 'Path', icon: 'fa-solid fa-route' },
-  { key: 'texture', kind: 'type', label: 'Texture', icon: 'fa-solid fa-paint-roller' },
-  { key: 'locked', kind: 'flag', label: 'Locked', icon: 'fa-solid fa-lock' },
-  { key: 'hidden', kind: 'flag', label: 'Hidden', icon: 'fa-solid fa-eye-slash' },
-  { key: 'hsbc', kind: 'flag', label: 'HSBC', icon: 'fa-solid fa-sliders' },
-  /* { key: 'mask', kind: 'flag', label: 'Mask', icon: 'fa-solid fa-mask' } */
-]);
 
 const selectionFilterState = {
   active: false,
@@ -60,6 +213,10 @@ const selectionFilterState = {
   ignoreForeground: false
 };
 const SELECTION_FILTER_BLOCK_KEY = '_faNexusSelectionFilterBlocked';
+const TILE_EVENT_MODE_BASE_KEY = '_faNexusForcedEventModeBase';
+const TILE_EVENT_MODE_EDIT_BLOCK_KEY = '_faNexusEditEventModeBlocked';
+const TILE_EVENT_MODE_SELECTION_BLOCK_KEY = '_faNexusSelectionEventModeBlocked';
+const TILE_EVENT_MODE_HIDDEN_BLOCK_KEY = '_faNexusHiddenEventModeBlocked';
 const layerHiddenState = {
   hooksBound: false
 };
@@ -72,20 +229,46 @@ const clickEventStub = { shiftKey: false, stopPropagation: () => {} };
 
 let _tileFlattenManager = null;
 let _altKeyHeld = false;
-const _layerManagerSessionState = new Map();
-let _layerManagerCollapsedStateSyncPending = false;
-let _layerManagerCollapsedStateSyncQueued = false;
 
 function getTileFlattenManager() {
   if (!_tileFlattenManager) _tileFlattenManager = new TileFlattenManager();
   return _tileFlattenManager;
 }
 
-function parseElevationInput(value) {
-  const raw = String(value ?? '').trim();
-  if (!raw) return null;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : null;
+function hasForcedTileEventModeBlock(tile) {
+  return !!(
+    tile?.[TILE_EVENT_MODE_EDIT_BLOCK_KEY]
+    || tile?.[TILE_EVENT_MODE_SELECTION_BLOCK_KEY]
+    || tile?.[TILE_EVENT_MODE_HIDDEN_BLOCK_KEY]
+  );
+}
+
+function markTileEventModeBlocked(tile, reasonKey) {
+  if (!tile || typeof tile.eventMode === 'undefined' || !reasonKey) return;
+  if (!hasForcedTileEventModeBlock(tile) && !Object.prototype.hasOwnProperty.call(tile, TILE_EVENT_MODE_BASE_KEY)) {
+    try { tile[TILE_EVENT_MODE_BASE_KEY] = tile.eventMode; } catch (_) {}
+  }
+  try { tile[reasonKey] = true; } catch (_) {}
+  if (tile.eventMode !== 'none') {
+    try { tile.eventMode = 'none'; } catch (_) {}
+  }
+}
+
+function clearTileEventModeBlocked(tile, reasonKey) {
+  if (!tile || typeof tile.eventMode === 'undefined') return;
+  if (reasonKey) {
+    try { delete tile[reasonKey]; } catch (_) { tile[reasonKey] = false; }
+  }
+  if (hasForcedTileEventModeBlock(tile)) {
+    if (tile.eventMode !== 'none') {
+      try { tile.eventMode = 'none'; } catch (_) {}
+    }
+    return;
+  }
+  if (!Object.prototype.hasOwnProperty.call(tile, TILE_EVENT_MODE_BASE_KEY)) return;
+  const baseEventMode = tile[TILE_EVENT_MODE_BASE_KEY];
+  try { delete tile[TILE_EVENT_MODE_BASE_KEY]; } catch (_) {}
+  try { tile.eventMode = baseEventMode; } catch (_) {}
 }
 
 function formatElevation(value) {
@@ -95,234 +278,9 @@ function formatElevation(value) {
   return fixed || '0';
 }
 
-function quantizeElevation(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return 0;
-  const quantized = Math.round(numeric * 10000) / 10000;
-  return Object.is(quantized, -0) ? 0 : quantized;
-}
-
-function elevationGroupKey(value) {
-  const quantized = quantizeElevation(value);
-  const key = quantized.toFixed(4);
-  return key === '-0.0000' ? '0.0000' : key;
-}
-
-function getCurrentSceneSessionKey() {
-  const sceneId = canvas?.scene?.id || game?.scenes?.current?.id || 'default';
-  return String(sceneId);
-}
-
-function normalizeCollapsedElevationKey(value) {
-  const parsed = parseElevationInput(value);
-  return Number.isFinite(parsed) ? elevationGroupKey(parsed) : null;
-}
-
-function readPersistedLayerManagerCollapsedState() {
-  const raw = String(readSetting(COLLAPSED_STATE_SETTING) ?? '').trim();
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('Expected a scene-keyed object.');
-    }
-    const normalized = {};
-    for (const [sceneKey, rawKeys] of Object.entries(parsed)) {
-      if (!Array.isArray(rawKeys)) continue;
-      const collapsedKeys = Array.from(new Set(rawKeys
-        .map((key) => normalizeCollapsedElevationKey(key))
-        .filter(Boolean)))
-        .sort((a, b) => Number(parseElevationInput(a) ?? 0) - Number(parseElevationInput(b) ?? 0));
-      if (collapsedKeys.length) normalized[String(sceneKey)] = collapsedKeys;
-    }
-    return normalized;
-  } catch (error) {
-    Logger.error('LayerManager.collapsedState.read.failed', {
-      error: String(error?.message || error)
-    });
-    return {};
-  }
-}
-
-function syncLayerManagerCollapsedStateFromSettings() {
-  const persisted = readPersistedLayerManagerCollapsedState();
-  for (const [sceneKey, state] of _layerManagerSessionState.entries()) {
-    state.collapsedElevations = new Set(persisted[String(sceneKey)] || []);
-  }
-}
-
-function serializeLayerManagerCollapsedState() {
-  const serialized = {};
-  for (const [sceneKey, state] of _layerManagerSessionState.entries()) {
-    const collapsedKeys = state?.collapsedElevations instanceof Set
-      ? Array.from(new Set(Array.from(state.collapsedElevations)
-        .map((key) => normalizeCollapsedElevationKey(key))
-        .filter(Boolean)))
-          .sort((a, b) => Number(parseElevationInput(a) ?? 0) - Number(parseElevationInput(b) ?? 0))
-      : [];
-    if (collapsedKeys.length) serialized[String(sceneKey)] = collapsedKeys;
-  }
-  return serialized;
-}
-
-function queuePersistLayerManagerCollapsedState() {
-  if (_layerManagerCollapsedStateSyncPending) {
-    _layerManagerCollapsedStateSyncQueued = true;
-    return;
-  }
-  const serialized = serializeLayerManagerCollapsedState();
-  _layerManagerCollapsedStateSyncPending = true;
-  Promise.resolve(writeSetting(COLLAPSED_STATE_SETTING, JSON.stringify(serialized)))
-    .catch((error) => {
-      Logger.error('LayerManager.collapsedState.persist.failed', {
-        error: String(error?.message || error)
-      });
-    })
-    .finally(() => {
-      _layerManagerCollapsedStateSyncPending = false;
-      if (_layerManagerCollapsedStateSyncQueued) {
-        _layerManagerCollapsedStateSyncQueued = false;
-        queuePersistLayerManagerCollapsedState();
-      }
-    });
-}
-
-function createLayerManagerSessionState(sceneKey = getCurrentSceneSessionKey()) {
-  const persisted = readPersistedLayerManagerCollapsedState();
-  return {
-    searchQuery: '',
-    typeFilters: new Set(),
-    flagFilters: {
-      locked: false,
-      hidden: false,
-      hsbc: false,
-      mask: false
-    },
-    collapsedElevations: new Set(persisted[String(sceneKey)] || []),
-    selectionOptionsCollapsed: true
-  };
-}
-
-function getLayerManagerSessionState(sceneKey = getCurrentSceneSessionKey()) {
-  const key = String(sceneKey || 'default');
-  let state = _layerManagerSessionState.get(key);
-  if (!state) {
-    state = createLayerManagerSessionState(key);
-    _layerManagerSessionState.set(key, state);
-  }
-  return state;
-}
-
-function normalizeTileTypeKey(value) {
-  const normalized = String(value ?? '').trim().toLowerCase();
-  if (!normalized) return null;
-  if (normalized === 'asset' || normalized === 'image') return 'asset';
-  if (normalized === 'scatter') return 'scatter';
-  if (normalized === 'building' || normalized === 'wall' || normalized === 'wall/building') return 'building';
-  if (normalized === 'path' || normalized === 'paths') return 'path';
-  if (normalized === 'texture' || normalized === 'paint') return 'texture';
-  return null;
-}
-
-function isFilterFlagKey(value) {
-  return LIST_FILTER_FLAG_KEYS.includes(String(value ?? '').trim().toLowerCase());
-}
-
-function createParsedListSearchClause() {
-  return {
-    includeText: [],
-    excludeText: [],
-    includeTypes: new Set(),
-    excludeTypes: new Set(),
-    includeFlags: new Set(),
-    excludeFlags: new Set()
-  };
-}
-
-function isParsedListSearchClauseEmpty(parsed) {
-  return !parsed
-    || (
-      !(parsed.includeText?.length)
-      && !(parsed.excludeText?.length)
-      && !(parsed.includeTypes?.size)
-      && !(parsed.excludeTypes?.size)
-      && !(parsed.includeFlags?.size)
-      && !(parsed.excludeFlags?.size)
-    );
-}
-
-function parseListSearchClause(tokens = []) {
-  const parsed = createParsedListSearchClause();
-  let negateNext = false;
-  for (const rawToken of tokens) {
-    if (!rawToken) continue;
-    if (/^not$/i.test(rawToken)) {
-      negateNext = true;
-      continue;
-    }
-    let token = String(rawToken).trim();
-    let negated = negateNext;
-    negateNext = false;
-    if (token.startsWith('-') && token.length > 1) {
-      negated = true;
-      token = token.slice(1);
-    }
-    if (
-      (token.startsWith('"') && token.endsWith('"'))
-      || (token.startsWith('\'') && token.endsWith('\''))
-    ) {
-      token = token.slice(1, -1);
-    }
-    const normalized = token.trim().toLowerCase();
-    if (!normalized) continue;
-    const typeMatch = normalized.match(/^(?:type|kind):(.+)$/);
-    if (typeMatch) {
-      const typeKey = normalizeTileTypeKey(typeMatch[1]);
-      if (typeKey) {
-        (negated ? parsed.excludeTypes : parsed.includeTypes).add(typeKey);
-        continue;
-      }
-    }
-    if (isFilterFlagKey(normalized)) {
-      (negated ? parsed.excludeFlags : parsed.includeFlags).add(normalized);
-      continue;
-    }
-    (negated ? parsed.excludeText : parsed.includeText).push(normalized);
-  }
-  return parsed;
-}
-
-function isListSearchOrToken(rawToken) {
-  const token = String(rawToken ?? '').trim();
-  return /^or$/i.test(token) || token === '|' || token === '||';
-}
-
-function parseListSearchQuery(query) {
-  const rawTokens = String(query ?? '').match(/"[^"]+"|\S+/g) || [];
-  const clauseTokens = [];
-  let currentClause = [];
-  for (const rawToken of rawTokens) {
-    if (!rawToken) continue;
-    if (isListSearchOrToken(rawToken)) {
-      if (currentClause.length) clauseTokens.push(currentClause);
-      currentClause = [];
-      continue;
-    }
-    currentClause.push(rawToken);
-  }
-  if (currentClause.length) clauseTokens.push(currentClause);
-  const clauses = clauseTokens
-    .map((tokens) => parseListSearchClause(tokens))
-    .filter((parsed) => !isParsedListSearchClauseEmpty(parsed));
-  if (!clauses.length) {
-    const empty = createParsedListSearchClause();
-    return { ...empty, clauses: [empty] };
-  }
-  if (clauses.length === 1) {
-    return { ...clauses[0], clauses };
-  }
-  const empty = createParsedListSearchClause();
-  return { ...empty, clauses };
+function waitForUiFrame(ms = 0) {
+  if (foundry?.utils?.sleep) return foundry.utils.sleep(ms);
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
 function hasTileHsbc(doc) {
@@ -330,327 +288,43 @@ function hasTileHsbc(doc) {
 }
 
 function hasTileMask(doc) {
-  return !!readFaFlag(doc, 'standardTileMask');
+  return !!getFaNexusTileCapabilities(doc)?.hasStandardTileMask;
 }
 
-function cloneElevationGroupMetadata(metadata = {}) {
-  const normalized = normalizeElevationGroupMetadata(metadata);
-  const clone = {};
-  for (const [key, value] of Object.entries(normalized)) {
-    clone[key] = { ...value };
-  }
-  return clone;
-}
-
-function serializeElevationGroupMetadata(metadata = {}) {
-  const normalized = normalizeElevationGroupMetadata(metadata);
-  return Object.entries(normalized)
-    .map(([key, value]) => ({
-      elevation: parseElevationInput(key),
-      name: String(value?.name ?? '').trim(),
-      ...(value?.synthetic === true ? { synthetic: true } : {})
-    }))
-    .filter((entry) => Number.isFinite(entry.elevation) && entry.name)
-    .sort((a, b) => Number(a.elevation) - Number(b.elevation));
-}
-
-function collectElevationGroupMetadataEntries(raw, prefix = '', output = []) {
-  if (Array.isArray(raw)) {
-    for (const entry of raw) {
-      const elevation = parseElevationInput(entry?.elevation ?? entry?.key ?? entry?.elevationKey);
-      const name = String(entry?.name ?? '').trim();
-      const synthetic = entry?.synthetic === true;
-      if (Number.isFinite(elevation) && name) output.push({ elevation, name, synthetic });
-    }
-    return output;
-  }
-  if (!raw || typeof raw !== 'object') return output;
-  for (const [rawKey, rawValue] of Object.entries(raw)) {
-    const joinedKey = prefix ? `${prefix}.${rawKey}` : rawKey;
-    const parsedKey = parseElevationInput(joinedKey);
-    const name = typeof rawValue === 'string'
-      ? rawValue.trim()
-      : String(rawValue?.name ?? '').trim();
-    const synthetic = rawValue?.synthetic === true;
-    if (Number.isFinite(parsedKey)) {
-      if (name) {
-        output.push({ elevation: parsedKey, name, synthetic });
-        continue;
-      }
-      if (rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue)) {
-        collectElevationGroupMetadataEntries(rawValue, joinedKey, output);
-      }
-      continue;
-    }
-    if (rawValue && typeof rawValue === 'object') {
-      const embeddedElevation = parseElevationInput(rawValue?.elevation ?? rawValue?.key ?? rawValue?.elevationKey);
-      if (Number.isFinite(embeddedElevation) && name) {
-        output.push({ elevation: embeddedElevation, name, synthetic });
-        continue;
-      }
-      collectElevationGroupMetadataEntries(rawValue, '', output);
-    }
-  }
-  return output;
-}
-
-function normalizeElevationGroupMetadata(raw) {
-  const normalized = {};
-  const entries = collectElevationGroupMetadataEntries(raw);
-  for (const entry of entries) {
-    const key = elevationGroupKey(entry.elevation);
-    const name = String(entry.name ?? '').trim();
-    if (!name) continue;
-    normalized[key] = {
-      name,
-      ...(entry?.synthetic === true ? { synthetic: true } : {})
-    };
-  }
-  return normalized;
-}
-
-function getSceneElevationGroupMetadata(scene = canvas?.scene) {
-  return cloneElevationGroupMetadata(readFaFlag(scene, ELEVATION_GROUPS_FLAG));
-}
-
-function getElevationGroupName(metadata, elevationKey) {
-  const key = String(elevationKey || '').trim();
-  if (!key) return '';
-  return String(metadata?.[key]?.name ?? '').trim();
+function hasTileShadowOnly(doc) {
+  return !!(readFaFlag(doc, 'shadow') && readFaFlag(doc, 'shadowOnly'));
 }
 
 function isNestedLayerManagerGroupingEnabled() {
   return readSetting(NESTED_GROUPING_SETTING) === true;
 }
 
-function applySceneElevationGroupMetadataLocally(scene, metadata) {
-  const targetScene = scene || canvas?.scene;
-  if (!targetScene) return;
-  const normalized = cloneElevationGroupMetadata(metadata);
-  const serialized = serializeElevationGroupMetadata(normalized);
-  const hasGroups = serialized.length > 0;
-  const assign = (target) => {
-    if (!target || typeof target !== 'object') return;
-    if (!target.flags || typeof target.flags !== 'object') target.flags = {};
-    if (!target.flags[MODULE_ID] || typeof target.flags[MODULE_ID] !== 'object') target.flags[MODULE_ID] = {};
-    if (hasGroups) target.flags[MODULE_ID][ELEVATION_GROUPS_FLAG] = serialized.map((entry) => ({ ...entry }));
-    else delete target.flags[MODULE_ID][ELEVATION_GROUPS_FLAG];
-  };
-  try { assign(targetScene); } catch (_) {}
-  try { assign(targetScene._source); } catch (_) {}
-}
-
-async function setSceneElevationGroupMetadata(scene, metadata) {
-  const targetScene = scene || canvas?.scene;
-  if (!targetScene) throw new Error('No active scene available for elevation group update.');
-  if (!targetScene?.canUserModify?.(game.user, 'update')) {
-    throw new Error('You do not have permission to edit elevation groups.');
-  }
-  const normalized = normalizeElevationGroupMetadata(metadata);
-  const groupKeys = Object.keys(normalized);
-  const serialized = serializeElevationGroupMetadata(normalized);
-  Logger.info('LayerManager.elevationGroups.persist', {
-    sceneId: targetScene.id || null,
-    groupKeys,
-    storageEntries: serialized.length
-  });
-  if (!groupKeys.length) {
-    if (typeof targetScene.unsetFlag === 'function') {
-      await targetScene.unsetFlag(MODULE_ID, ELEVATION_GROUPS_FLAG);
-    } else {
-      await targetScene.update({ [`flags.${MODULE_ID}.-=${ELEVATION_GROUPS_FLAG}`]: null });
-    }
-    applySceneElevationGroupMetadataLocally(targetScene, {});
-    return;
-  }
-  if (typeof targetScene.setFlag === 'function') {
-    await targetScene.setFlag(MODULE_ID, ELEVATION_GROUPS_FLAG, serialized);
-  } else {
-    await targetScene.update({ [`flags.${MODULE_ID}.${ELEVATION_GROUPS_FLAG}`]: serialized });
-  }
-  applySceneElevationGroupMetadataLocally(targetScene, normalized);
-}
-
-function mergeElevationGroupMetadataOnMove({ metadata = {}, sourceKey, targetKey } = {}) {
-  const normalized = cloneElevationGroupMetadata(metadata);
-  const fromKey = String(sourceKey || '').trim();
-  const toKey = String(targetKey || '').trim();
-  if (!fromKey || !toKey || fromKey === toKey) return normalized;
-  const sourceEntry = normalized[fromKey] ? { ...normalized[fromKey] } : null;
-  const sourceName = String(sourceEntry?.name ?? '').trim();
-  const targetName = getElevationGroupName(normalized, toKey);
-  if (!targetName && sourceName) {
-    normalized[toKey] = { ...(sourceEntry || {}), name: sourceName };
-  }
-  delete normalized[fromKey];
-  return normalizeElevationGroupMetadata(normalized);
-}
-
-function mergeElevationGroupMetadataOnBulkMove({ metadata = {}, moves = [] } = {}) {
-  const normalized = cloneElevationGroupMetadata(metadata);
-  const moveList = Array.isArray(moves)
-    ? moves
-      .map((move) => ({
-        sourceKey: String(move?.sourceKey || '').trim(),
-        targetKey: String(move?.targetKey || '').trim()
-      }))
-      .filter((move) => move.sourceKey && move.targetKey && move.sourceKey !== move.targetKey)
-    : [];
-  if (!moveList.length) return normalizeElevationGroupMetadata(normalized);
-
-  const sourceEntries = new Map(moveList.map((move) => [move.sourceKey, normalized[move.sourceKey] ? { ...normalized[move.sourceKey] } : null]));
-  for (const move of moveList) {
-    delete normalized[move.sourceKey];
-  }
-  for (const move of moveList) {
-    const sourceEntry = sourceEntries.get(move.sourceKey) || null;
-    const sourceName = String(sourceEntry?.name ?? '').trim();
-    const targetName = getElevationGroupName(normalized, move.targetKey);
-    if (!targetName && sourceName) {
-      normalized[move.targetKey] = { ...(sourceEntry || {}), name: sourceName };
-    }
-  }
-  return normalizeElevationGroupMetadata(normalized);
-}
-
-function buildTileSearchText(entry) {
-  const tokens = [
-    entry?.name,
-    entry?.typeLabel,
-    entry?.typeKey,
-    entry?.elevationLabel,
-    entry?.locked ? 'locked' : 'unlocked',
-    entry?.hidden ? 'hidden' : 'visible',
-    entry?.hasHsbc ? 'hsbc hue saturation brightness contrast' : '',
-    entry?.hasMask ? 'mask masked masking standard tile mask' : '',
-    entry?.typeKey === 'building' ? 'wall building' : ''
-  ];
-  return tokens
-    .map((value) => String(value ?? '').trim().toLowerCase())
-    .filter(Boolean)
-    .join(' ');
-}
-
-function collectEntryGroupSearchTokens(entry, {
-  elevationGroupMetadata = {},
-  nestedGrouping = false
-} = {}) {
-  const elevation = Number(entry?.elevation ?? 0);
-  const exactKey = String(entry?.elevationKey || elevationGroupKey(elevation)).trim();
-  if (!exactKey) return [];
-  const keys = nestedGrouping
-    ? buildNestedElevationPath(elevation)
-    : [exactKey];
-  const tokens = [];
-  for (const key of keys) {
-    const groupName = getElevationGroupName(elevationGroupMetadata, key);
-    if (!groupName) continue;
-    tokens.push(groupName);
-  }
-  return tokens;
-}
-
 function applyGroupSearchTextToEntries(entries = [], {
   elevationGroupMetadata = {},
   nestedGrouping = false
 } = {}) {
-  if (!Array.isArray(entries) || !entries.length) return entries;
-  for (const entry of entries) {
-    if (!entry || entry.preview || entry.marker || entry.separator) continue;
-    const baseSearchText = buildTileSearchText(entry);
-    const groupTokens = collectEntryGroupSearchTokens(entry, {
-      elevationGroupMetadata,
-      nestedGrouping
-    });
-    entry.searchText = [baseSearchText, ...groupTokens]
-      .map((value) => String(value ?? '').trim().toLowerCase())
-      .filter(Boolean)
-      .join(' ');
-  }
-  return entries;
+  return applyLayerManagerGroupSearchTextModel(entries, {
+    elevationGroupMetadata,
+    nestedGrouping,
+    getElevationGroupName,
+    elevationGroupKey,
+    resolveGroupKeys: buildNestedElevationPath
+  });
 }
 
 function buildLayerManagerTileEntry(doc, index, { selected = false } = {}) {
-  const safeIndex = Number.isFinite(index) ? index : 0;
-  const elevation = quantizeElevation(Number(doc?.elevation ?? 0));
-  const elevationKey = elevationGroupKey(elevation);
-  const id = doc?.id || doc?._id;
-  const typeInfo = resolveTileType(doc);
-  const entry = {
-    id,
-    name: computeTileName({ document: doc }, safeIndex),
-    elevation,
-    elevationKey,
-    elevationLabel: formatElevation(elevation),
-    sort: Number(doc?.sort ?? 0),
-    selected: !!selected,
-    hidden: isLayerHidden(doc),
-    locked: !!doc?.locked,
-    canToggleVisibility: !!doc?.canUserModify?.(game.user, 'update'),
-    canToggleLock: !!doc?.canUserModify?.(game.user, 'update'),
-    canReorder: !!doc?.canUserModify?.(game.user, 'update'),
-    typeIcon: typeInfo.icon,
-    typeLabel: typeInfo.label,
-    typeKey: typeInfo.key || normalizeTileTypeKey(typeInfo.label) || 'asset',
-    hasHsbc: hasTileHsbc(doc),
-    hasMask: hasTileMask(doc),
-    index: safeIndex
-  };
-  entry.searchText = buildTileSearchText(entry);
-  return entry;
-}
-
-function entryMatchesFilterFlag(entry, flag) {
-  switch (flag) {
-    case 'locked': return !!entry?.locked;
-    case 'hidden': return !!entry?.hidden;
-    case 'hsbc': return !!entry?.hasHsbc;
-    case 'mask': return !!entry?.hasMask;
-    default: return false;
-  }
-}
-
-function entryMatchesParsedSearchClause(entry, parsedQuery) {
-  if (!entry || entry.preview || entry.marker || entry.separator) return true;
-  if (parsedQuery?.includeTypes?.size && !parsedQuery.includeTypes.has(entry.typeKey)) return false;
-  if (parsedQuery?.excludeTypes?.has(entry.typeKey)) return false;
-  for (const key of parsedQuery?.includeFlags || []) {
-    if (!entryMatchesFilterFlag(entry, key)) return false;
-  }
-  for (const key of parsedQuery?.excludeFlags || []) {
-    if (entryMatchesFilterFlag(entry, key)) return false;
-  }
-  const haystack = String(entry?.searchText || '').toLowerCase();
-  for (const term of parsedQuery?.includeText || []) {
-    if (!haystack.includes(term)) return false;
-  }
-  for (const term of parsedQuery?.excludeText || []) {
-    if (haystack.includes(term)) return false;
-  }
-  return true;
-}
-
-function entryMatchesListFilters(entry, sessionState, parsedQuery) {
-  if (!entry || entry.preview || entry.marker || entry.separator) return true;
-  if (sessionState?.typeFilters instanceof Set && sessionState.typeFilters.size) {
-    if (!sessionState.typeFilters.has(entry.typeKey)) return false;
-  }
-  const chipFlags = sessionState?.flagFilters || {};
-  for (const key of LIST_FILTER_FLAG_KEYS) {
-    if (!chipFlags[key]) continue;
-    if (!entryMatchesFilterFlag(entry, key)) return false;
-  }
-  const clauses = Array.isArray(parsedQuery?.clauses) && parsedQuery.clauses.length
-    ? parsedQuery.clauses
-    : [parsedQuery];
-  return clauses.some((clause) => entryMatchesParsedSearchClause(entry, clause));
-}
-
-function listFiltersActive(sessionState) {
-  if (!sessionState) return false;
-  if (String(sessionState.searchQuery ?? '').trim()) return true;
-  if (sessionState.typeFilters instanceof Set && sessionState.typeFilters.size) return true;
-  return LIST_FILTER_FLAG_KEYS.some((key) => !!sessionState.flagFilters?.[key]);
+  return buildLayerManagerTileEntryModel(doc, index, {
+    selected,
+    computeTileName,
+    formatElevation,
+    resolveTileType,
+    isLayerHidden,
+    hasTileHsbc,
+    hasTileMask,
+    hasTileShadowOnly,
+    quantizeElevation,
+    elevationGroupKey
+  });
 }
 
 function buildSelectionListFilterSignature(sessionState) {
@@ -666,25 +340,19 @@ function invalidateSelectionListFilterCache(reason = 'unknown') {
   selectionFilterState.listFilterSignature = '';
   selectionFilterState.listFilterActive = false;
   selectionFilterState.matchingListTileIds = new Set();
-  Logger.debug('LayerManager.selectionFilter.listCache.invalidated', { reason });
+  Logger.trace('layerSelectionFilter', 'LayerManager.selectionFilter.listCache.invalidated', { reason });
 }
 
 function getLayerManagerSortedTileDocs() {
   if (!canvas?.ready || !canvas?.tiles) return [];
   const hiddenIds = collectEditedTileIds();
-  const tiles = Array.isArray(canvas.tiles.placeables) ? canvas.tiles.placeables : [];
-  const placeablesById = new Map();
-  for (const tile of tiles) {
-    const id = tile?.document?.id || tile?.id;
-    if (id) placeablesById.set(id, tile);
-  }
-  const sceneDocs = canvas?.scene?.tiles ? Array.from(canvas.scene.tiles) : [];
-  const sourceDocs = sceneDocs.length
-    ? sceneDocs
-    : tiles.map((tile) => tile?.document).filter(Boolean);
+  const tiles = collectTilePlaceables();
+  const placeablesById = mapTilePlaceablesById(tiles);
+  const sourceDocs = collectTileDocuments({ placeables: tiles });
   return sourceDocs
     .filter((doc) => {
       if (!doc) return false;
+      if (!isDocumentInActiveLevelListScope(doc)) return false;
       const id = doc?.id || doc?._id;
       if (id && hiddenIds instanceof Set && hiddenIds.has(id)) return false;
       const placeable = id ? placeablesById.get(id) : null;
@@ -712,7 +380,7 @@ function syncSelectionListFilterCache({ reason = 'unknown', force = false } = {}
   selectionFilterState.matchingListTileIds = new Set();
 
   if (!active) {
-    Logger.debug('LayerManager.selectionFilter.listCache.synced', {
+    Logger.trace('layerSelectionFilter', 'LayerManager.selectionFilter.listCache.synced', {
       reason,
       active: false,
       matchingCount: 0
@@ -738,7 +406,7 @@ function syncSelectionListFilterCache({ reason = 'unknown', force = false } = {}
     if (entry.id) selectionFilterState.matchingListTileIds.add(entry.id);
   }
 
-  Logger.debug('LayerManager.selectionFilter.listCache.synced', {
+  Logger.trace('layerSelectionFilter', 'LayerManager.selectionFilter.listCache.synced', {
     reason,
     active: true,
     matchingCount: selectionFilterState.matchingListTileIds.size,
@@ -762,45 +430,6 @@ function placeableMatchesSelectionListFilters(placeable) {
   const id = placeable?.document?.id || placeable?.id;
   if (!id) return false;
   return matcher.matchingIds.has(id);
-}
-
-function buildFilterChipContext(sessionState) {
-  return LIST_FILTER_CHIPS.map((chip) => ({
-    ...chip,
-    active: chip.kind === 'type'
-      ? !!sessionState?.typeFilters?.has?.(chip.key)
-      : !!sessionState?.flagFilters?.[chip.key]
-  }));
-}
-
-function sortLayerManagerRenderEntries(a, b) {
-  const elevDiff = (Number(b?.elevation ?? 0) - Number(a?.elevation ?? 0));
-  if (elevDiff) return elevDiff;
-  const sortDiff = (Number(b?.sort ?? 0) - Number(a?.sort ?? 0));
-  if (sortDiff) return sortDiff;
-  const aRank = a?.marker ? 2 : (a?.preview ? 1 : 0);
-  const bRank = b?.marker ? 2 : (b?.preview ? 1 : 0);
-  if (aRank !== bRank) return aRank - bRank;
-  const aIndex = Number.isFinite(a?.index) ? a.index : null;
-  const bIndex = Number.isFinite(b?.index) ? b.index : null;
-  if (aIndex !== null && bIndex !== null && aIndex !== bIndex) return aIndex - bIndex;
-  const aKey = String(a?.previewId ?? a?.markerId ?? a?.id ?? '');
-  const bKey = String(b?.previewId ?? b?.markerId ?? b?.id ?? '');
-  if (aKey && bKey) return aKey.localeCompare(bKey);
-  return 0;
-}
-
-function sortLayerManagerTileDocs(a, b) {
-  const elevDiff = (Number(b?.elevation ?? 0) - Number(a?.elevation ?? 0));
-  if (elevDiff) return elevDiff;
-  const sortDiff = (Number(b?.sort ?? 0) - Number(a?.sort ?? 0));
-  if (sortDiff) return sortDiff;
-  const aId = String(a?.id ?? a?._id ?? '');
-  const bId = String(b?.id ?? b?._id ?? '');
-  if (aId && bId) return aId.localeCompare(bId);
-  if (aId) return -1;
-  if (bId) return 1;
-  return 0;
 }
 
 function elevationKeyToUnits(value) {
@@ -840,10 +469,275 @@ function buildNestedElevationPath(value) {
   return path;
 }
 
-function createLayerManagerHierarchyNode(key) {
+function buildPrefixedNestedElevationPath(value, prefix = '') {
+  const normalizedPrefix = String(prefix || '').trim();
+  if (!normalizedPrefix) {
+    return buildNestedElevationPath(value).map((key) => ({
+      key,
+      elevation: parseElevationInput(key)
+    }));
+  }
+  return buildNestedElevationPath(value).map((key) => ({
+    key: `${normalizedPrefix}:${key}`,
+    elevation: parseElevationInput(key)
+  }));
+}
+
+function buildGroundBandGroupKey({ placementLevelId = null, renderElevation = 0 } = {}) {
+  const levelKey = String(placementLevelId || 'none').trim() || 'none';
+  return `ground-band:${levelKey}:${elevationGroupKey(renderElevation)}`;
+}
+
+function buildGroundExactGroupKey({ placementLevelId = null, groupElevation = 0 } = {}) {
+  const levelKey = String(placementLevelId || 'none').trim() || 'none';
+  return `ground:${levelKey}:${elevationGroupKey(groupElevation)}`;
+}
+
+function buildForegroundBandGroupKey({ placementLevelId = null, renderElevation = 0 } = {}) {
+  const levelKey = String(placementLevelId || 'none').trim() || 'none';
+  return `foreground-band:${levelKey}:${elevationGroupKey(renderElevation)}`;
+}
+
+function buildForegroundExactGroupKey({ placementLevelId = null, groupElevation = 0 } = {}) {
+  const levelKey = String(placementLevelId || 'none').trim() || 'none';
+  return `foreground:${levelKey}:${elevationGroupKey(groupElevation)}`;
+}
+
+function getSharedTopBoundaryUpperGroundBandKey({
+  scene = canvas?.scene,
+  levelId = null,
+  elevation = 0
+} = {}) {
+  const normalizedLevelId = String(levelId || '').trim();
+  if (!normalizedLevelId) return null;
+  const boundaryKey = elevationGroupKey(elevation);
+  const ranges = getSceneLevelElevationRanges(scene);
+  const currentRange = ranges.find((range) => String(range?.levelId || '').trim() === normalizedLevelId) || null;
+  if (!currentRange || elevationGroupKey(currentRange?.top) !== boundaryKey) return null;
+  const upperRanges = ranges.filter((range) => {
+    const rangeLevelId = String(range?.levelId || '').trim();
+    if (!rangeLevelId || rangeLevelId === normalizedLevelId) return false;
+    return elevationGroupKey(range?.bottom) === boundaryKey;
+  });
+  upperRanges.sort((left, right) => Number(left?.top ?? 0) - Number(right?.top ?? 0)
+    || String(left?.levelName || left?.levelId || '').localeCompare(String(right?.levelName || right?.levelId || '')));
+  const upperRange = upperRanges[0] || null;
+  const upperLevelId = String(upperRange?.levelId || '').trim();
+  if (!upperLevelId) return null;
+  return buildGroundBandGroupKey({
+    placementLevelId: upperLevelId,
+    renderElevation: elevation
+  });
+}
+
+function blockMatchesKey(block, key) {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey) return false;
+  return String(block?.groupKey || '').trim() === normalizedKey
+    || String(block?.blockKey || '').trim() === normalizedKey;
+}
+
+function findTopLevelBlockIndexByKey(blocks = [], key = '') {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey) return -1;
+  const groupIndex = blocks.findIndex((block) => String(block?.groupKey || '').trim() === normalizedKey);
+  if (groupIndex >= 0) return groupIndex;
+  return blocks.findIndex((block) => String(block?.blockKey || '').trim() === normalizedKey);
+}
+
+function findTopLevelBlockEndIndexByKey(blocks = [], key = '') {
+  const startIndex = findTopLevelBlockIndexByKey(blocks, key);
+  if (startIndex < 0) return -1;
+  let endIndex = startIndex;
+  while ((endIndex + 1) < blocks.length && blockMatchesKey(blocks[endIndex + 1], key)) {
+    endIndex += 1;
+  }
+  return endIndex;
+}
+
+function getSyntheticBandGroupBlockRank(groupKey, fallbackRank = 2) {
+  const normalizedKey = String(groupKey || '').trim();
+  if (normalizedKey.startsWith('ground-band:')) return 2;
+  if (normalizedKey.startsWith('foreground-band:')) return 4;
+  return fallbackRank;
+}
+
+function getSyntheticBandSupplementalBlockRank(groupKey, fallbackRank = 1) {
+  const normalizedKey = String(groupKey || '').trim();
+  if (normalizedKey.startsWith('ground-band:')) return 3;
+  if (normalizedKey.startsWith('foreground-band:')) return 5;
+  return fallbackRank;
+}
+
+function isSyntheticDisplayGroupKey(value) {
+  return !Number.isFinite(parseElevationInput(value));
+}
+
+function isEditableElevationGroupKey(value) {
+  const key = String(value || '').trim();
+  if (!key) return false;
+  if (Number.isFinite(parseElevationInput(key))) return true;
+  const match = /^(foreground|ground):([^:]+):(.+)$/.exec(key);
+  return !!match && Number.isFinite(parseElevationInput(match[3]));
+}
+
+function buildBandDisplayLabel(kind, levelName = '') {
+  const normalizedKind = String(kind || '').trim().toLowerCase();
+  const normalizedLevelName = String(levelName || '').trim();
+  const suffix = normalizedKind === 'foreground'
+    ? 'Foreground'
+    : 'Background';
+  if (normalizedLevelName) return `${normalizedLevelName} ${suffix}`;
+  return normalizedKind === 'foreground' ? 'Foreground Band' : 'Background Band';
+}
+
+function buildDisplayGroupingForEntry(entry, { nestedGrouping = false } = {}) {
+  const groupElevation = quantizeElevation(Number(entry?.documentElevation ?? entry?.elevation ?? 0) || 0);
+  const defaultNumericName = `Elev ${formatElevation(groupElevation)}`;
+  const renderKind = String(entry?.renderKind || 'normal').trim().toLowerCase();
+  if (renderKind !== 'foreground' && renderKind !== 'ground') {
+    const exactKey = String(entry?.documentElevationKey || elevationGroupKey(groupElevation)).trim() || elevationGroupKey(groupElevation);
+    const path = nestedGrouping
+      ? buildPrefixedNestedElevationPath(groupElevation)
+      : [{ key: exactKey, elevation: groupElevation }];
+    return {
+      exactKey,
+      groupElevation,
+      path: path.map((segment) => ({
+        ...segment,
+        defaultName: `Elev ${formatElevation(segment.elevation)}`,
+        canRename: true,
+        canEditElevation: true,
+        canHeaderDrop: true,
+        showElevationLabel: true
+      })),
+      defaultName: defaultNumericName,
+      canRename: true,
+      canEditElevation: true,
+      canHeaderDrop: true,
+      showElevationLabel: true
+    };
+  }
+
+  const placementLevelId = String(entry?.placementLevelId || 'none').trim() || 'none';
+  const rawRenderElevation = Number(entry?.renderElevation ?? entry?.elevation ?? groupElevation);
+  const renderElevation = quantizeElevation(Number.isFinite(rawRenderElevation) ? rawRenderElevation : groupElevation);
+  const bandKey = renderKind === 'foreground'
+    ? buildForegroundBandGroupKey({ placementLevelId, renderElevation })
+    : buildGroundBandGroupKey({ placementLevelId, renderElevation });
+  const exactKey = renderKind === 'foreground'
+    ? buildForegroundExactGroupKey({ placementLevelId, groupElevation })
+    : buildGroundExactGroupKey({ placementLevelId, groupElevation });
+  const bandLabel = String(entry?.bandVisualizationLabel || buildBandDisplayLabel(renderKind, entry?.placementLevelName)).trim()
+    || buildBandDisplayLabel(renderKind);
+  const bandSegment = {
+    key: bandKey,
+    elevation: renderElevation,
+    defaultName: bandLabel,
+    forceVisible: true,
+    syntheticBand: true,
+    canRename: false,
+    canEditElevation: false,
+    canHeaderDrop: false,
+    showElevationLabel: false,
+    groupClass: renderKind === 'foreground'
+      ? 'fa-nexus-layer-manager__separator--foreground-band'
+      : 'fa-nexus-layer-manager__separator--ground-band'
+  };
+  if (!nestedGrouping) {
+    return {
+      exactKey,
+      groupElevation,
+      path: [bandSegment],
+      defaultName: bandLabel,
+      bandKey,
+      canRename: false,
+      canEditElevation: false,
+      canHeaderDrop: false,
+      showElevationLabel: false
+    };
+  }
+
+  const bandPath = buildPrefixedNestedElevationPath(groupElevation, `${renderKind}:${placementLevelId}`)
+    .map((segment) => ({
+      ...segment,
+      defaultName: `Elev ${formatElevation(segment.elevation)}`,
+      canRename: true,
+      canEditElevation: true,
+      canHeaderDrop: true,
+      showElevationLabel: true
+    }));
+  return {
+    exactKey,
+    groupElevation,
+    path: [bandSegment, ...bandPath],
+    defaultName: defaultNumericName,
+    bandKey,
+    canRename: true,
+    canEditElevation: true,
+    canHeaderDrop: true,
+    showElevationLabel: true
+  };
+}
+
+function buildSupplementalGroupingPath(item, { nestedGrouping = false } = {}) {
+  if (item?.marker && (item?.markerKind === 'foreground' || item?.markerKind === 'background')) {
+    const markerLevelId = String(item?.markerLevelId || 'none').trim() || 'none';
+    const markerLevelName = String(item?.markerLevelName || '').trim();
+    const markerElevation = Number(item?.elevation ?? 0);
+    const isForeground = item?.markerKind === 'foreground';
+    return [{
+      key: (isForeground ? buildForegroundBandGroupKey : buildGroundBandGroupKey)({
+        placementLevelId: markerLevelId,
+        renderElevation: Number.isFinite(markerElevation) ? markerElevation : 0
+      }),
+      elevation: Number.isFinite(markerElevation) ? markerElevation : 0,
+      defaultName: buildBandDisplayLabel(isForeground ? 'foreground' : 'ground', markerLevelName),
+      forceVisible: true,
+      syntheticBand: true,
+      canRename: false,
+      canEditElevation: false,
+      canHeaderDrop: false,
+      showElevationLabel: false,
+      groupClass: isForeground
+        ? 'fa-nexus-layer-manager__separator--foreground-band'
+        : 'fa-nexus-layer-manager__separator--ground-band'
+    }];
+  }
+  if (Array.isArray(item?.groupPath) && item.groupPath.length) {
+    return item.groupPath.slice();
+  }
+  const elevation = Number(item?.elevation ?? 0);
+  if (!Number.isFinite(elevation)) return [];
+  const exactKey = String(item?.elevationKey || elevationGroupKey(elevation)).trim() || elevationGroupKey(elevation);
+  if (!nestedGrouping) {
+    return [{ key: exactKey, elevation }];
+  }
+  return buildPrefixedNestedElevationPath(elevation);
+}
+
+function createLayerManagerHierarchyNode(key, {
+  elevation = null,
+  defaultName = '',
+  forceVisible = false,
+  syntheticBand = false,
+  canRename = true,
+  canEditElevation = true,
+  canHeaderDrop = true,
+  showElevationLabel = true,
+  groupClass = ''
+} = {}) {
   return {
     key,
-    elevation: parseElevationInput(key),
+    elevation: Number.isFinite(elevation) ? Number(elevation) : parseElevationInput(key),
+    defaultName: String(defaultName || '').trim(),
+    forceVisible: forceVisible === true,
+    syntheticBand: syntheticBand === true,
+    canRename: canRename !== false,
+    canEditElevation: canEditElevation !== false,
+    canHeaderDrop: canHeaderDrop !== false,
+    showElevationLabel: showElevationLabel !== false,
+    groupClass: String(groupClass || '').trim(),
     children: new Map(),
     sortedChildren: [],
     exactEntries: [],
@@ -857,24 +751,52 @@ function createLayerManagerHierarchyNode(key) {
   };
 }
 
-function buildLayerManagerElevationHierarchy({ fullExactGroups = new Map(), matchingExactGroups = new Map() } = {}) {
-  const root = createLayerManagerHierarchyNode('__root__');
+function buildLayerManagerElevationHierarchy({
+  fullExactGroups = new Map(),
+  matchingExactGroups = new Map(),
+  resolvePathForGroup = null
+} = {}) {
+  const root = createLayerManagerHierarchyNode('__root__', {
+    elevation: Infinity,
+    forceVisible: true,
+    canRename: false,
+    canEditElevation: false,
+    canHeaderDrop: false,
+    showElevationLabel: false
+  });
   const nodeIndex = new Map();
-  const ensureNode = (key) => {
+  const leafNodeByExactKey = new Map();
+  const ensureNode = (segment) => {
+    const key = String(segment?.key || '').trim();
+    if (!key) return null;
     let node = nodeIndex.get(key);
     if (!node) {
-      node = createLayerManagerHierarchyNode(key);
+      node = createLayerManagerHierarchyNode(key, segment || {});
       nodeIndex.set(key, node);
+      return node;
     }
+    if (Number.isFinite(segment?.elevation) && !Number.isFinite(node.elevation)) node.elevation = Number(segment.elevation);
+    if (!node.defaultName && segment?.defaultName) node.defaultName = String(segment.defaultName).trim();
+    if (segment?.forceVisible === true) node.forceVisible = true;
+    if (segment?.syntheticBand === true) node.syntheticBand = true;
+    if (segment?.canRename === false) node.canRename = false;
+    if (segment?.canEditElevation === false) node.canEditElevation = false;
+    if (segment?.canHeaderDrop === false) node.canHeaderDrop = false;
+    if (segment?.showElevationLabel === false) node.showElevationLabel = false;
+    if (!node.groupClass && segment?.groupClass) node.groupClass = String(segment.groupClass).trim();
     return node;
   };
 
   for (const [exactKey, group] of fullExactGroups.entries()) {
-    const path = buildNestedElevationPath(group?.elevation ?? exactKey);
+    const path = typeof resolvePathForGroup === 'function'
+      ? resolvePathForGroup(group) || []
+      : [{ key: exactKey, elevation: Number(group?.groupElevation ?? group?.elevation ?? parseElevationInput(exactKey)) || 0 }];
     if (!path.length) continue;
     let parent = root;
-    for (const key of path) {
-      const node = ensureNode(key);
+    for (const segment of path) {
+      const node = ensureNode(segment);
+      if (!node) continue;
+      const key = node.key;
       if (!parent.children.has(key)) parent.children.set(key, node);
       else if (parent.children.get(key) !== node) {
         Logger.error('LayerManager.nestedHierarchy.parentCollision', {
@@ -885,20 +807,22 @@ function buildLayerManagerElevationHierarchy({ fullExactGroups = new Map(), matc
       }
       parent = node;
     }
-    parent.exactEntries = Array.isArray(group?.entries) ? group.entries.slice() : [];
-    parent.exactDocs = Array.isArray(group?.docs) ? group.docs.slice() : [];
+    if (Array.isArray(group?.entries) && group.entries.length) parent.exactEntries.push(...group.entries);
+    if (Array.isArray(group?.docs) && group.docs.length) parent.exactDocs.push(...group.docs);
+    leafNodeByExactKey.set(exactKey, parent.key);
   }
 
   for (const [exactKey, group] of matchingExactGroups.entries()) {
-    const node = nodeIndex.get(exactKey);
+    const leafKey = leafNodeByExactKey.get(exactKey) || exactKey;
+    const node = nodeIndex.get(leafKey);
     if (!node) {
       Logger.error('LayerManager.nestedHierarchy.matchingNodeMissing', {
         elevationKey: exactKey
       });
       continue;
     }
-    node.matchingExactEntries = Array.isArray(group?.entries) ? group.entries.slice() : [];
-    node.matchingExactDocs = Array.isArray(group?.docs) ? group.docs.slice() : [];
+    if (Array.isArray(group?.entries) && group.entries.length) node.matchingExactEntries.push(...group.entries);
+    if (Array.isArray(group?.docs) && group.docs.length) node.matchingExactDocs.push(...group.docs);
   }
 
   const annotate = (node) => {
@@ -932,7 +856,7 @@ function buildLayerManagerElevationHierarchy({ fullExactGroups = new Map(), matc
       if (!node?.[modeHasDataKey]) return;
       const childNodes = node.sortedChildren.filter((child) => child?.[modeHasDataKey]);
       const hasExactEntries = Array.isArray(node?.[modeExactEntriesKey]) && node[modeExactEntriesKey].length > 0;
-      if (!hasExactEntries && childNodes.length === 1) {
+      if (!node.forceVisible && !hasExactEntries && childNodes.length === 1) {
         visit(childNodes[0], parentKey, depth);
         return;
       }
@@ -944,7 +868,15 @@ function buildLayerManagerElevationHierarchy({ fullExactGroups = new Map(), matc
         depth,
         childKeys: [],
         visibleSubtreeKeys: [],
-        isSynthetic: node.exactDocs.length === 0,
+        isSynthetic: node.syntheticBand || node.exactDocs.length === 0,
+        defaultName: node.defaultName,
+        forceVisible: node.forceVisible,
+        syntheticBand: node.syntheticBand,
+        canRename: node.canRename,
+        canEditElevation: node.canEditElevation,
+        canHeaderDrop: node.canHeaderDrop,
+        showElevationLabel: node.showElevationLabel,
+        groupClass: node.groupClass,
         exactEntries: node.exactEntries.slice(),
         exactDocs: node.exactDocs.slice(),
         matchingExactEntries: node.matchingExactEntries.slice(),
@@ -1048,9 +980,7 @@ function collectEditedTileIds() {
 
     const wallGroupIds = new Set();
     const primaryIds = new Set();
-    const tiles = canvas?.scene?.tiles
-      ? Array.from(canvas.scene.tiles)
-      : (Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables.map(tile => tile?.document).filter(Boolean) : []);
+    const tiles = collectTileDocuments();
 
     for (const doc of tiles) {
       const id = doc?.id;
@@ -1094,6 +1024,15 @@ function collectEditedTileIds() {
       const frame = doc.getFlag?.('fa-nexus', 'buildingWindowFrame');
       const windowFlag = sill || window || frame;
       if (windowFlag?.wallGroupId && wallGroupIds.has(windowFlag.wallGroupId)) {
+        hiddenIds.add(id);
+        continue;
+      }
+      const composite = doc.getFlag?.('fa-nexus', 'buildingComposite');
+      if (composite?.wallGroupIds?.some?.((groupId) => wallGroupIds.has(groupId))) {
+        hiddenIds.add(id);
+        continue;
+      }
+      if (composite?.wallTileId && primaryIds.has(composite.wallTileId)) {
         hiddenIds.add(id);
       }
     }
@@ -1141,11 +1080,8 @@ function forceHideEditedTile(tile) {
     }
     if (tile.frame) {
       try { if (tile.frame.border) tile.frame.border.visible = false; } catch (_) {}
-      try { if (tile.frame.handle) tile.frame.handle.visible = false; } catch (_) {}
     }
-    if (typeof tile.eventMode !== 'undefined') {
-      try { tile.eventMode = 'none'; } catch (_) {}
-    }
+    markTileEventModeBlocked(tile, TILE_EVENT_MODE_EDIT_BLOCK_KEY);
   } catch (_) {}
 }
 
@@ -1153,6 +1089,7 @@ function restoreEditedTileFrame(tile) {
   try {
     if (!tile || tile.destroyed) return;
     if (isTileBeingEdited(tile)) return;
+    clearTileEventModeBlocked(tile, TILE_EVENT_MODE_EDIT_BLOCK_KEY);
     if (isLayerHidden(tile?.document)) return;
     if (tile.frame && tile.frame.visible === false) {
       try { tile.frame.visible = true; } catch (_) {}
@@ -1164,10 +1101,46 @@ function shouldSuppressTileHover() {
   return !!selectionFilterState.active && isAltModifierActive() && isTilesLayerActive();
 }
 
-function clearTileHover() {
-  const hover = canvas?.tiles?.hover;
-  if (!hover) return;
-  try { hover._onHoverOut?.(hoverEventStub); } catch (_) {}
+function clearTileHover({ source = 'unknown', updateLegend = true } = {}) {
+  if (!canvas?.tiles) return 0;
+  const tiles = [];
+  const seen = new Set();
+  const addTile = (tile) => {
+    if (!tile) return;
+    const id = tile?.document?.id || tile?.id || null;
+    const key = id || tile;
+    if (seen.has(key)) return;
+    seen.add(key);
+    tiles.push(tile);
+  };
+  addTile(canvas.tiles.hover);
+  try {
+    for (const tile of collectTilePlaceables()) {
+      if (tile?.hover) addTile(tile);
+    }
+  } catch (error) {
+    Logger.error('LayerManager.tileHover.collectFailed', {
+      source,
+      error: String(error?.message || error)
+    });
+  }
+
+  let cleared = 0;
+  for (const tile of tiles) {
+    try {
+      const wasHover = !!tile?.hover || canvas.tiles.hover === tile;
+      tile?._onHoverOut?.(hoverEventStub, { updateLegend });
+      if (canvas.tiles.hover === tile && !tile?.hover) canvas.tiles.hover = null;
+      if (wasHover) cleared += 1;
+    } catch (error) {
+      Logger.error('LayerManager.tileHover.clearFailed', {
+        source,
+        tileId: tile?.document?.id || tile?.id || null,
+        error: String(error?.message || error)
+      });
+    }
+  }
+  return cleared;
 }
 
 function setAltKeyHeld(active) {
@@ -1181,142 +1154,42 @@ function setAltKeyHeld(active) {
   }
 }
 
-function getForegroundElevation() {
-  try {
-    const fg = canvas?.scene?.foregroundElevation ?? canvas?.scene?._source?.foregroundElevation;
-    const numeric = Number(fg);
-    if (Number.isFinite(numeric)) return numeric;
-  } catch (_) {}
-  try {
-    const gridDistance = Number(canvas?.scene?.grid?.distance || 0);
-    if (Number.isFinite(gridDistance)) return gridDistance * 4;
-  } catch (_) {}
-  return 0;
-}
-
-function sceneHasBackgroundImage() {
-  try {
-    const scene = canvas?.scene;
-    const raw = scene?.background?.src
-      ?? scene?.background?.texture?.src
-      ?? scene?._source?.background?.src
-      ?? scene?._source?.background?.texture?.src;
-    return !!String(raw ?? '').trim();
-  } catch (_) {
-    return false;
-  }
-}
-
-function sceneHasForegroundImage() {
-  try {
-    const scene = canvas?.scene;
-    const raw = scene?.foreground
-      ?? scene?.foreground?.src
-      ?? scene?._source?.foreground
-      ?? scene?._source?.foreground?.src;
-    return !!String(raw ?? '').trim();
-  } catch (_) {
-    return false;
-  }
-}
-
-function resolveBackgroundBaseElevation() {
-  const extract = (target) => {
-    if (!target) return null;
-    const base = Number(target.faNexusBgBandBaseElevation);
-    return Number.isFinite(base) ? base : null;
-  };
-  const roots = [];
-  if (canvas?.primary?.background) roots.push(canvas.primary.background);
-  if (canvas?.background) roots.push(canvas.background);
-  for (const root of roots) {
-    const direct = extract(root);
-    if (direct !== null) return direct;
-    const candidates = [root.mesh, root.sprite, root.background, root._background];
-    for (const candidate of candidates) {
-      const base = extract(candidate);
-      if (base !== null) return base;
+function getVisibleLevelTextures() {
+  const scene = canvas?.scene;
+  if (!scene?._view) return [];
+  const viewedLevel = scene.levels.get(scene._view);
+  if (!viewedLevel) return [];
+  const textures = [];
+  for (const [index, level] of scene.levels.sorted.entries()) {
+    const { isView, isVisible } = level || {};
+    const background = level?.background || {};
+    const foreground = level?.foreground || {};
+    if (String(background?.src || '').trim() && (isView || isVisible)) {
+      textures.push({
+        level,
+        name: 'background',
+        elevation: level?.elevation?.bottom,
+        sort: index,
+        zIndex: 0,
+        isBackground: true,
+        isUpper: !isView && (Number(level?.elevation?.bottom) > Number(viewedLevel?.elevation?.bottom)),
+        ...background
+      });
+    }
+    if (String(foreground?.src || '').trim() && (isView || isVisible)) {
+      textures.push({
+        level,
+        name: 'foreground',
+        elevation: level?.elevation?.top,
+        sort: index,
+        zIndex: 1,
+        isBackground: false,
+        isUpper: !isView && (Number(level?.elevation?.top) > Number(viewedLevel?.elevation?.bottom)),
+        ...foreground
+      });
     }
   }
-  return null;
-}
-
-function resolveBackgroundRenderElevation() {
-  const allowOverride = isKeepTokensAboveTileElevationsEnabled();
-  if (allowOverride) {
-    const sceneOverride = Number(canvas?.scene?.[BG_RENDER_OVERRIDE_KEY]);
-    if (Number.isFinite(sceneOverride)) return sceneOverride;
-  }
-  const extract = (target) => {
-    if (!target) return null;
-    if (allowOverride) {
-      const override = Number(target[BG_RENDER_OVERRIDE_KEY]);
-      if (Number.isFinite(override)) return override;
-    }
-    const elevation = Number(target.elevation);
-    return Number.isFinite(elevation) ? elevation : null;
-  };
-  const roots = [];
-  if (canvas?.primary?.background) roots.push(canvas.primary.background);
-  if (canvas?.background) roots.push(canvas.background);
-  for (const root of roots) {
-    const direct = extract(root);
-    if (direct !== null) return direct;
-    const candidates = [root.mesh, root.sprite, root.background, root._background];
-    for (const candidate of candidates) {
-      const value = extract(candidate);
-      if (value !== null) return value;
-    }
-  }
-  return null;
-}
-
-function getBackgroundElevation() {
-  try {
-    const render = resolveBackgroundRenderElevation();
-    if (render !== null) return render;
-    const base = resolveBackgroundBaseElevation();
-    if (base !== null) return base;
-    const bg = canvas?.scene?.background?.elevation
-      ?? canvas?.scene?.backgroundElevation
-      ?? canvas?.scene?._source?.backgroundElevation;
-    if (bg === null || bg === undefined || bg === '') return 0;
-    const numeric = Number(bg);
-    return Number.isFinite(numeric) ? numeric : 0;
-  } catch (_) {
-    return 0;
-  }
-}
-
-function getBackgroundDisplayElevation() {
-  const render = getBackgroundElevation();
-  if (!Number.isFinite(render)) return render;
-  if (!isKeepTokensAboveTileElevationsEnabled()) return render;
-  return quantizeElevation(render + 1);
-}
-
-function setBackgroundRenderElevation(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return;
-  try {
-    if (canvas?.scene) canvas.scene[BG_RENDER_OVERRIDE_KEY] = numeric;
-  } catch (_) {}
-  const targets = [];
-  if (canvas?.primary?.background) targets.push(canvas.primary.background);
-  if (canvas?.background) targets.push(canvas.background);
-  const apply = (target) => {
-    if (!target) return;
-    try { target[BG_RENDER_OVERRIDE_KEY] = numeric; } catch (_) {}
-    try { if ('elevation' in target) target.elevation = numeric; } catch (_) {}
-  };
-  for (const target of targets) {
-    apply(target);
-    apply(target.mesh);
-    apply(target.sprite);
-    apply(target.background);
-    apply(target._background);
-  }
-  try { if (canvas?.primary) canvas.primary.sortDirty = true; } catch (_) {}
+  return textures;
 }
 
 function readSetting(key) {
@@ -1359,38 +1232,132 @@ function isLayerHidden(doc) {
   return !!readFaFlag(doc, LAYER_HIDDEN_FLAG);
 }
 
+function getLevelTextureHiddenFlagKey(kind = 'background') {
+  return String(kind || '').trim().toLowerCase() === 'foreground'
+    ? LEVEL_FOREGROUND_IMAGE_HIDDEN_FLAG
+    : LEVEL_BACKGROUND_IMAGE_HIDDEN_FLAG;
+}
+
+function isLevelTextureMarkerHidden(level = null, kind = 'background') {
+  return !!readFaFlag(level, getLevelTextureHiddenFlagKey(kind));
+}
+
+function ensureSceneLevelTextureVisibilityPatch() {
+  const SceneDocument = CONFIG?.Scene?.documentClass || foundry?.documents?.Scene || globalThis.Scene;
+  const prototype = SceneDocument?.prototype;
+  if (!prototype) {
+    Logger.error('LayerManager.levelTextureVisibility.patch.missingScenePrototype', {
+      sceneClass: SceneDocument?.name || null
+    });
+    return false;
+  }
+  if (prototype._faNexusLevelTextureVisibilityPatched) return true;
+  const original = prototype._configureLevelTextures;
+  if (typeof original !== 'function') {
+    Logger.error('LayerManager.levelTextureVisibility.patch.missingTarget', {
+      sceneClass: SceneDocument?.name || null
+    });
+    return false;
+  }
+  Object.defineProperty(prototype, '_configureLevelTextures', {
+    configurable: true,
+    writable: true,
+    value: function faNexusConfigureLevelTextures(...args) {
+      const textures = original.apply(this, args);
+      if (!Array.isArray(textures) || !textures.length) return textures;
+      return textures.filter((texture) => {
+        const kind = texture?.isBackground ? 'background' : 'foreground';
+        return !isLevelTextureMarkerHidden(texture?.level || null, kind);
+      });
+    }
+  });
+  Object.defineProperty(prototype, '_faNexusLevelTextureVisibilityPatched', {
+    configurable: true,
+    writable: false,
+    value: true
+  });
+  return true;
+}
+
 function isTileHidden(doc) {
   if (!doc) return false;
   return isLayerHidden(doc);
 }
 
-function setLayerHidden(doc, hidden) {
-  if (!doc) return;
-  try {
-    if (hidden) {
-      if (typeof doc.setFlag === 'function') {
-        doc.setFlag(MODULE_ID, LAYER_HIDDEN_FLAG, true);
-      } else {
-        doc.update({ [`flags.${MODULE_ID}.${LAYER_HIDDEN_FLAG}`]: true });
-      }
-      return;
-    }
-    if (typeof doc.unsetFlag === 'function') {
-      doc.unsetFlag(MODULE_ID, LAYER_HIDDEN_FLAG);
-    } else {
-      doc.update({ [`flags.${MODULE_ID}.${LAYER_HIDDEN_FLAG}`]: false });
-    }
-  } catch (_) {}
+function getTileDocumentId(doc) {
+  return String(doc?.id || doc?._id || '').trim();
+}
+
+function uniqueTileDocuments(docs = []) {
+  const byId = new Map();
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    const id = getTileDocumentId(doc);
+    if (!id || byId.has(id)) continue;
+    byId.set(id, doc);
+  }
+  return [...byId.values()];
+}
+
+function requireMutableTileDocuments(docs = [], {
+  user = game?.user,
+  action = 'update'
+} = {}) {
+  const targets = uniqueTileDocuments(docs);
+  const blocked = targets.filter((doc) => !doc?.canUserModify?.(user, 'update'));
+  if (blocked.length) {
+    const ids = blocked.map((doc) => getTileDocumentId(doc)).filter(Boolean);
+    throw new Error(`You do not have permission to ${action} every targeted layer. Blocked: ${ids.join(', ')}`);
+  }
+  return targets;
+}
+
+function isDocumentInCurrentLevelElevationBand(doc, { scene = canvas?.scene } = {}) {
+  if (!doc) return false;
+  const currentLevelId = String(getCurrentSceneLevel(scene)?.id || '').trim();
+  if (!currentLevelId) return true;
+  const visibleLevelIds = getDocumentLevelIds(doc);
+  if (visibleLevelIds.length && !visibleLevelIds.includes(currentLevelId)) return false;
+
+  const analysis = analyzeTileBandState(doc, {
+    scene,
+    visibleLevelIds,
+    requireVisibleMembership: false,
+    allowSingleLevelInference: true,
+    allowCurrentLevelFallback: false
+  });
+  if (analysis?.inSpecialBand) {
+    const placementLevelId = String(analysis?.placementLevelId || '').trim();
+    if (placementLevelId) return placementLevelId === currentLevelId;
+    const candidates = Array.isArray(analysis?.candidates) ? analysis.candidates : [];
+    return candidates.some((candidate) => String(candidate?.placementLevelId || '').trim() === currentLevelId);
+  }
+
+  return isElevationWithinCurrentLevelEditScope(doc?.elevation ?? 0, { scene });
+}
+
+function buildLayerHiddenUpdate(doc, hidden) {
+  const id = getTileDocumentId(doc);
+  if (!id) return null;
+  return hidden
+    ? { _id: id, flags: { [MODULE_ID]: { [LAYER_HIDDEN_FLAG]: true } } }
+    : { _id: id, flags: { [MODULE_ID]: { [`-=${LAYER_HIDDEN_FLAG}`]: null } } };
+}
+
+function buildLayerLockUpdate(doc, locked) {
+  const id = getTileDocumentId(doc);
+  if (!id) return null;
+  return { _id: id, locked };
 }
 
 function resolveTileType(doc) {
   if (!doc) return { icon: 'fa-solid fa-image', label: 'Asset', key: 'asset' };
-  if (readFaFlag(doc, 'assetScatter')) return { icon: 'fa-solid fa-braille', label: 'Scatter', key: 'scatter' };
-  if (readFaFlag(doc, 'building')) return { icon: 'fa-solid fa-building', label: 'Wall/Building', key: 'building' };
-  if (readFaFlag(doc, 'pathsV2') || readFaFlag(doc, 'pathV2') || readFaFlag(doc, 'path')) {
+  const capabilities = getFaNexusTileCapabilities(doc);
+  if (capabilities?.hasAssetScatter) return { icon: 'fa-solid fa-braille', label: 'Scatter', key: 'scatter' };
+  if (capabilities?.isBuildingRelated) return { icon: 'fa-solid fa-building', label: 'Wall/Building', key: 'building' };
+  if (capabilities?.hasPathData) {
     return { icon: 'fa-solid fa-route', label: 'Path', key: 'path' };
   }
-  if (readFaFlag(doc, 'maskedTiling')) return { icon: 'fa-solid fa-paint-roller', label: 'Texture', key: 'texture' };
+  if (capabilities?.hasMaskData) return { icon: 'fa-solid fa-paint-roller', label: 'Texture', key: 'texture' };
   return { icon: 'fa-solid fa-image', label: 'Asset', key: 'asset' };
 }
 
@@ -1435,11 +1402,11 @@ function selectionIgnoresForeground() {
 
 function canSelectPlaceable(placeable, { ignoreForeground = false, filterActive = false } = {}) {
   if (!placeable) return false;
+  const elevation = Number(placeable?.document?.elevation ?? 0);
   if (ignoreForeground) {
     if (!placeable.visible || !placeable.renderable) return false;
   }
   if (filterActive) {
-    const elevation = Number(placeable?.document?.elevation ?? 0);
     if (!elevationInRange(elevation)) return false;
     if (selectionFilterState.skipLocked) {
       const doc = placeable?.document;
@@ -1449,6 +1416,62 @@ function canSelectPlaceable(placeable, { ignoreForeground = false, filterActive 
     }
     if (selectionFilterState.skipHidden && isTileHidden(placeable?.document)) return false;
     if (selectionFilterState.skipFiltered && !placeableMatchesSelectionListFilters(placeable)) return false;
+  }
+  return true;
+}
+
+function canLayerManagerSelectLockedTile(tile, {
+  ignoreForeground = selectionIgnoresForeground(),
+  filterActive = selectionFilterActive()
+} = {}) {
+  if (!selectionFilterState.active || selectionFilterState.skipLocked) return false;
+  if (!isTilesLayerActive()) return false;
+  if (!tile?.document?.locked) return false;
+  if (isTileBeingEdited(tile)) return false;
+  if (isLayerHidden(tile.document)) return false;
+  return canSelectPlaceable(tile, { ignoreForeground, filterActive });
+}
+
+function applyLockedTileSelectionInteractivity(tile, {
+  ignoreForeground = selectionIgnoresForeground(),
+  filterActive = selectionFilterActive(),
+  source = 'unknown'
+} = {}) {
+  if (!canLayerManagerSelectLockedTile(tile, { ignoreForeground, filterActive })) return false;
+  let changed = false;
+  try {
+    if (tile.eventMode !== 'static') {
+      tile.eventMode = 'static';
+      changed = true;
+    }
+  } catch (error) {
+    Logger.error('LayerManager.lockedTileSelection.eventModeFailed', {
+      source,
+      tileId: tile?.document?.id || tile?.id || null,
+      error: String(error?.message || error)
+    });
+    throw error;
+  }
+  if (typeof tile.interactiveChildren !== 'undefined' && tile.interactiveChildren !== true) {
+    try {
+      tile.interactiveChildren = true;
+      changed = true;
+    } catch (error) {
+      Logger.error('LayerManager.lockedTileSelection.interactiveChildrenFailed', {
+        source,
+        tileId: tile?.document?.id || tile?.id || null,
+        error: String(error?.message || error)
+      });
+      throw error;
+    }
+  }
+  if (changed) {
+    Logger.trace('layerSelectionFilter', 'LayerManager.lockedTileSelection.interactivityEnabled', {
+      source,
+      tileId: tile?.document?.id || tile?.id || null,
+      eventMode: tile?.eventMode ?? null,
+      skipLocked: selectionFilterState.skipLocked
+    });
   }
   return true;
 }
@@ -1470,6 +1493,100 @@ function getMouseInteractionManager() {
   return globalThis?.foundry?.canvas?.interaction?.MouseInteractionManager || globalThis?.MouseInteractionManager || null;
 }
 
+const bulkTileSelectionState = {
+  depth: 0,
+  pendingMouseRefresh: false
+};
+
+const bulkLayerDocumentUpdateState = {
+  depth: 0,
+  renderPending: false
+};
+
+function flushBulkTileSelectionMouseRefresh() {
+  if (!bulkTileSelectionState.pendingMouseRefresh) return;
+  bulkTileSelectionState.pendingMouseRefresh = false;
+  try {
+    getMouseInteractionManager()?.emulateMoveEvent?.();
+  } catch (error) {
+    Logger.error('LayerManager.bulkTileSelection.mouseRefresh.failed', {
+      error: String(error?.message || error)
+    });
+  }
+}
+
+function ensureBulkTileSelectionMousePatch() {
+  const mouseManager = getMouseInteractionManager();
+  if (!mouseManager || typeof mouseManager.emulateMoveEvent !== 'function') return;
+  if (mouseManager._faNexusBulkSelectionMousePatched) return;
+  mouseManager._faNexusBulkSelectionMousePatched = true;
+  const original = mouseManager.emulateMoveEvent;
+  mouseManager._faNexusBulkSelectionMouseOriginal = original;
+  mouseManager.emulateMoveEvent = function (...args) {
+    if (bulkTileSelectionState.depth > 0) {
+      bulkTileSelectionState.pendingMouseRefresh = true;
+      return null;
+    }
+    return original.apply(this, args);
+  };
+}
+
+function withBulkTileSelectionBatch(operation) {
+  if (typeof operation !== 'function') return undefined;
+  ensureBulkTileSelectionMousePatch();
+  bulkTileSelectionState.depth += 1;
+  try {
+    return operation();
+  } finally {
+    bulkTileSelectionState.depth = Math.max(0, bulkTileSelectionState.depth - 1);
+    if (bulkTileSelectionState.depth === 0) flushBulkTileSelectionMouseRefresh();
+  }
+}
+
+function clearSelectionFilterInteractivityBlock(tile) {
+  if (!tile) return;
+  tile[SELECTION_FILTER_BLOCK_KEY] = false;
+  if (typeof tile.interactiveChildren !== 'undefined') {
+    try { tile.interactiveChildren = true; } catch (_) {}
+  }
+  clearTileEventModeBlocked(tile, TILE_EVENT_MODE_SELECTION_BLOCK_KEY);
+}
+
+function getTileSelectionInteractionState(tile) {
+  const manager = tile?.mouseInteractionManager || null;
+  const managerState = Number(manager?.state ?? 0) || 0;
+  const grabbedState = Number(manager?.states?.GRABBED ?? 3) || 3;
+  const currentManagerObject = canvas?.currentMouseManager?.object || null;
+  const currentManagerTile = currentManagerObject?._original || currentManagerObject;
+  const currentManagerTileId = currentManagerTile?.document?.id || currentManagerTile?.id || null;
+  const tileId = tile?.document?.id || tile?.id || null;
+  return {
+    tileId,
+    controlled: !!tile?.controlled,
+    hovered: !!tile?.hover,
+    visible: tile?.visible !== false,
+    renderable: tile?.renderable !== false,
+    dragging: !!manager?.isDragging,
+    managerState,
+    grabbedState,
+    currentManagerOwnsTile: !!tileId && currentManagerTileId === tileId
+  };
+}
+
+function shouldProtectTileSelectionInteraction(tile, interaction = null) {
+  const state = interaction || getTileSelectionInteractionState(tile);
+  return !!(state.controlled || state.dragging || state.managerState >= state.grabbedState || state.currentManagerOwnsTile);
+}
+
+function shouldProtectTileSelectionRelease(tile, interaction = null, { ignoreForeground = false, filterActive = false } = {}) {
+  const state = interaction || getTileSelectionInteractionState(tile);
+  if (state.dragging || state.managerState >= state.grabbedState || state.currentManagerOwnsTile) return true;
+  if (!state.controlled) return false;
+  if (!filterActive) return true;
+  if (ignoreForeground && (!state.visible || !state.renderable || state.hovered)) return true;
+  return false;
+}
+
 function scheduleSelectionFilterRefresh({
   reason = 'unknown',
   source = 'unknown',
@@ -1487,7 +1604,7 @@ function scheduleSelectionFilterRefresh({
       if (resyncSettings) syncSelectionFilterFromSettings();
       const filterActive = selectionFilterActive();
       const ignoreForeground = selectionIgnoresForeground();
-      const tiles = Array.isArray(canvas.tiles.placeables) ? canvas.tiles.placeables : [];
+      const tiles = collectTilePlaceables();
       for (const tile of tiles) {
         const id = tile?.document?.id || tile?.id;
         if (targetIds && !targetIds.has(id)) continue;
@@ -1499,7 +1616,7 @@ function scheduleSelectionFilterRefresh({
       refreshTileInteractionState();
       pruneSelectionForFilter();
       try { getMouseInteractionManager()?.emulateMoveEvent?.(); } catch (_) {}
-      Logger.info('LayerManager.selectionFilter.refresh', {
+      Logger.trace('layerSelectionFilter', 'LayerManager.selectionFilter.refresh', {
         reason,
         source,
         tileIds: normalizedTileIds,
@@ -1545,27 +1662,67 @@ function ensureSelectionFilterRefreshHook() {
 }
 
 function pruneSelectionForFilter() {
-  if (!selectionFilterActive()) return;
   const selection = Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled : [];
   if (!selection.length) return;
   const filterActive = selectionFilterActive();
   const ignoreForeground = selectionIgnoresForeground();
-  for (const tile of selection) {
-    if (canSelectPlaceable(tile, { ignoreForeground, filterActive })) continue;
-    try { tile?.release?.(); } catch (_) {}
-  }
+  let released = 0;
+  withBulkTileSelectionBatch(() => {
+    for (const tile of selection) {
+      if (canSelectPlaceable(tile, { ignoreForeground, filterActive })) continue;
+      const interaction = getTileSelectionInteractionState(tile);
+      const protectRelease = shouldProtectTileSelectionRelease(tile, interaction, { ignoreForeground, filterActive });
+      if (protectRelease) {
+        Logger.trace('layerSelectionFilter', 'LayerManager.selectionFilter.skipProtectedTileRelease', {
+          tileId: interaction.tileId,
+          controlled: interaction.controlled,
+          hovered: interaction.hovered,
+          visible: interaction.visible,
+          renderable: interaction.renderable,
+          dragging: interaction.dragging,
+          managerState: interaction.managerState,
+          ignoreForeground,
+          filterActive
+        });
+        continue;
+      }
+      try {
+        tile?.release?.({ renderSidebar: false });
+        released += 1;
+      } catch (error) {
+        Logger.error('LayerManager.selectionFilter.release.failed', {
+          tileId: interaction.tileId,
+          error: String(error?.message || error)
+        });
+        throw error;
+      }
+    }
+  });
+  if (released) renderTileSelectionSidebar();
 }
 
 function applySelectionFilterInteractivity(tile, { ignoreForeground = false, filterActive = false } = {}) {
   if (!tile) return;
-  const blocked = !!filterActive && !canSelectPlaceable(tile, { ignoreForeground, filterActive });
+  const blocked = !canSelectPlaceable(tile, { ignoreForeground, filterActive });
   const wasBlocked = !!tile[SELECTION_FILTER_BLOCK_KEY];
-  if (!blocked) {
-    if (wasBlocked) {
-      tile[SELECTION_FILTER_BLOCK_KEY] = false;
-      if (typeof tile.interactiveChildren !== 'undefined') {
-        try { tile.interactiveChildren = true; } catch (_) {}
-      }
+  const interaction = getTileSelectionInteractionState(tile);
+  const protectInteraction = blocked && shouldProtectTileSelectionInteraction(tile, interaction);
+  if (!blocked || protectInteraction) {
+    if (wasBlocked || tile[TILE_EVENT_MODE_SELECTION_BLOCK_KEY] || protectInteraction) {
+      clearSelectionFilterInteractivityBlock(tile);
+    }
+    if (protectInteraction) {
+      Logger.trace('layerSelectionFilter', 'LayerManager.selectionFilter.skipProtectedTileBlock', {
+        tileId: interaction.tileId,
+        controlled: interaction.controlled,
+        hovered: interaction.hovered,
+        visible: interaction.visible,
+        renderable: interaction.renderable,
+        dragging: interaction.dragging,
+        managerState: interaction.managerState,
+        ignoreForeground,
+        filterActive
+      });
     }
     return;
   }
@@ -1573,11 +1730,124 @@ function applySelectionFilterInteractivity(tile, { ignoreForeground = false, fil
   if (typeof tile.interactiveChildren !== 'undefined') {
     try { tile.interactiveChildren = false; } catch (_) {}
   }
-  if (tile.eventMode !== 'none') {
-    try { tile.eventMode = 'none'; } catch (_) {}
+  if (tile.eventMode !== 'none' || !tile[TILE_EVENT_MODE_SELECTION_BLOCK_KEY]) {
+    markTileEventModeBlocked(tile, TILE_EVENT_MODE_SELECTION_BLOCK_KEY);
     const mouseManager = globalThis?.foundry?.canvas?.interaction?.MouseInteractionManager || globalThis?.MouseInteractionManager;
     try { mouseManager?.emulateMoveEvent?.(); } catch (_) {}
   }
+}
+
+function renderTileSelectionSidebar() {
+  try {
+    ui?.placeables?.render?.();
+    if (game?.activeTool === 'select') ui?.placeablesPalette?.render?.();
+  } catch (error) {
+    Logger.error('LayerManager.tileSelection.sidebarRender.failed', {
+      error: String(error?.message || error)
+    });
+  }
+}
+
+function ensureTileReleaseAllPatch() {
+  const TilesLayer = globalThis?.foundry?.canvas?.layers?.TilesLayer || canvas?.tiles?.constructor;
+  if (!TilesLayer?.prototype?.releaseAll) return;
+  if (TilesLayer.prototype._faNexusReleaseAllPatched) return;
+  TilesLayer.prototype._faNexusReleaseAllPatched = true;
+  const original = TilesLayer.prototype.releaseAll;
+  TilesLayer.prototype._faNexusReleaseAllOriginal = original;
+
+  TilesLayer.prototype.releaseAll = function (options = {}) {
+    return withBulkTileSelectionBatch(() => {
+      if (!this?.placeables) return original.call(this, options);
+      const renderSidebar = options?.renderSidebar !== false;
+      const releaseOptions = { ...options, renderSidebar: false };
+      let released = 0;
+      for (const placeable of this.placeables) {
+        if (!placeable?.controlled) continue;
+        placeable.release(releaseOptions);
+        released += 1;
+      }
+      if (released && renderSidebar) renderTileSelectionSidebar();
+      return released;
+    });
+  };
+}
+
+function ensureTileReleasePatch() {
+  const Tile = globalThis?.foundry?.canvas?.placeables?.Tile
+    || canvas?.tiles?.constructor?.placeableClass
+    || globalThis?.CONFIG?.Tile?.objectClass;
+  if (!Tile?.prototype?.release) return;
+  if (Tile.prototype._faNexusReleasePatched) return;
+  Tile.prototype._faNexusReleasePatched = true;
+  const original = Tile.prototype.release;
+  Tile.prototype._faNexusReleaseOriginal = original;
+
+  Tile.prototype.release = function (options = {}) {
+    if (bulkLayerDocumentUpdateState.depth <= 0) return original.call(this, options);
+    const normalizedOptions = (options && typeof options === 'object') ? options : {};
+    return original.call(this, {
+      ...normalizedOptions,
+      renderSidebar: false
+    });
+  };
+}
+
+function ensureTileControlReleaseOthersPatch() {
+  const Tile = globalThis?.foundry?.canvas?.placeables?.Tile
+    || canvas?.tiles?.constructor?.placeableClass
+    || globalThis?.CONFIG?.Tile?.objectClass;
+  if (!Tile?.prototype?.control) return;
+  if (Tile.prototype._faNexusControlReleaseOthersPatched) return;
+  Tile.prototype._faNexusControlReleaseOthersPatched = true;
+  const original = Tile.prototype.control;
+  Tile.prototype._faNexusControlReleaseOthersOriginal = original;
+
+  Tile.prototype.control = function (options = {}) {
+    const normalizedOptions = (options && typeof options === 'object') ? options : {};
+    const controlOptions = canLayerManagerSelectLockedTile(this)
+      ? { ...normalizedOptions, force: true }
+      : normalizedOptions;
+    if (controlOptions.force && !normalizedOptions.force) {
+      Logger.trace('layerSelectionFilter', 'LayerManager.lockedTileSelection.forceControl', {
+        tileId: this?.document?.id || this?.id || null,
+        source: 'Tile.control',
+        releaseOthers: controlOptions.releaseOthers !== false
+      });
+    }
+    if (controlOptions.releaseOthers === false) return original.call(this, controlOptions);
+    if (this?.isPreview || !this?.layer?.options?.controllableObjects || !this?.layer?.active) {
+      return original.call(this, controlOptions);
+    }
+
+    const controlled = Array.isArray(this.layer?.controlled) ? this.layer.controlled : [];
+    const others = controlled.filter((object) => object && object !== this);
+    if (!others.length) return original.call(this, controlOptions);
+
+    return withBulkTileSelectionBatch(() => {
+      const renderSidebar = controlOptions.renderSidebar !== false;
+      for (const object of others) {
+        try {
+          object.release({ renderSidebar: false });
+        } catch (error) {
+          Logger.error('LayerManager.tileControl.releaseOthers.failed', {
+            tileId: object?.document?.id || object?.id || null,
+            targetTileId: this?.document?.id || this?.id || null,
+            error: String(error?.message || error)
+          });
+          throw error;
+        }
+      }
+
+      const controlledTarget = original.call(this, {
+        ...controlOptions,
+        releaseOthers: false,
+        renderSidebar: false
+      });
+      if (renderSidebar) renderTileSelectionSidebar();
+      return controlledTarget;
+    });
+  };
 }
 
 function ensureTileSelectionPatch() {
@@ -1591,27 +1861,36 @@ function ensureTileSelectionPatch() {
   TilesLayer.prototype.selectObjects = function ({ x, y, width, height, releaseOptions = {}, controlOptions = {} } = {}, { releaseOthers = true } = {}) {
     const filterActive = selectionFilterActive();
     const ignoreForeground = selectionIgnoresForeground();
-    if (!filterActive && !ignoreForeground) return original.call(this, { x, y, width, height, releaseOptions, controlOptions }, { releaseOthers });
-    if (!this.options.controllableObjects) return false;
+    return withBulkTileSelectionBatch(() => {
+      if (!filterActive && !ignoreForeground) return original.call(this, { x, y, width, height, releaseOptions, controlOptions }, { releaseOthers });
+      if (!this.options.controllableObjects) return false;
 
-    const oldSet = new Set(this.controlled);
-    const newSet = new Set();
-    const rectangle = new PIXI.Rectangle(x, y, width, height);
+      const oldSet = new Set(this.controlled);
+      const newSet = new Set();
+      const rectangle = new PIXI.Rectangle(x, y, width, height);
 
-    const placeables = ignoreForeground ? this.placeables : this.controllableObjects();
-    for (const placeable of placeables) {
-      if (!canSelectPlaceable(placeable, { ignoreForeground, filterActive })) continue;
-      if (placeable._overlapsSelection(rectangle)) newSet.add(placeable);
-    }
+      const placeables = ignoreForeground ? this.placeables : this.controllableObjects();
+      for (const placeable of placeables) {
+        if (!canSelectPlaceable(placeable, { ignoreForeground, filterActive })) continue;
+        if (placeable._overlapsSelection(rectangle)) newSet.add(placeable);
+      }
 
-    const toRelease = oldSet.difference(newSet);
-    if (releaseOthers) toRelease.forEach(placeable => placeable.release(releaseOptions));
+      const toRelease = oldSet.difference(newSet);
+      const batchedReleaseOptions = { ...releaseOptions, renderSidebar: false };
+      if (releaseOthers) toRelease.forEach(placeable => placeable.release(batchedReleaseOptions));
 
-    if (foundry.utils.isEmpty(controlOptions)) controlOptions.releaseOthers = false;
-    const toControl = newSet.difference(oldSet);
-    toControl.forEach(placeable => placeable.control(controlOptions));
+      const batchedControlOptions = {
+        ...controlOptions,
+        releaseOthers: false,
+        renderSidebar: false
+      };
+      const toControl = newSet.difference(oldSet);
+      toControl.forEach(placeable => placeable.control(batchedControlOptions));
 
-    return (releaseOthers && (toRelease.size > 0)) || (toControl.size > 0);
+      const controlChanged = (releaseOthers && (toRelease.size > 0)) || (toControl.size > 0);
+      if (controlChanged) renderTileSelectionSidebar();
+      return controlChanged;
+    });
   };
 }
 
@@ -1626,26 +1905,29 @@ function ensureTileSelectAllPatch() {
   TilesLayer.prototype._onSelectAllKey = function (event) {
     const filterActive = selectionFilterActive();
     const ignoreForeground = selectionIgnoresForeground();
-    if (!filterActive && !ignoreForeground) return original.call(this, event);
-    if (!this.options.controllableObjects) return false;
+    return withBulkTileSelectionBatch(() => {
+      if (!filterActive && !ignoreForeground) return original.call(this, event);
+      if (!this.options.controllableObjects) return false;
 
-    const oldSet = new Set(this.controlled);
-    const newSet = new Set();
-    const placeables = ignoreForeground ? this.placeables : this.controllableObjects();
+      const oldSet = new Set(this.controlled);
+      const newSet = new Set();
+      const placeables = ignoreForeground ? this.placeables : this.controllableObjects();
 
-    for (const placeable of placeables) {
-      if (!canSelectPlaceable(placeable, { ignoreForeground, filterActive })) continue;
-      newSet.add(placeable);
-    }
+      for (const placeable of placeables) {
+        if (!canSelectPlaceable(placeable, { ignoreForeground, filterActive })) continue;
+        newSet.add(placeable);
+      }
 
-    const toRelease = oldSet.difference(newSet);
-    toRelease.forEach(placeable => placeable.release());
+      const toRelease = oldSet.difference(newSet);
+      toRelease.forEach(placeable => placeable.release({ renderSidebar: false }));
 
-    const toControl = newSet.difference(oldSet);
-    const controlOptions = { releaseOthers: false };
-    toControl.forEach(placeable => placeable.control(controlOptions));
+      const toControl = newSet.difference(oldSet);
+      const controlOptions = { releaseOthers: false, renderSidebar: false };
+      toControl.forEach(placeable => placeable.control(controlOptions));
 
-    return true;
+      if (toRelease.size || toControl.size) renderTileSelectionSidebar();
+      return true;
+    });
   };
 }
 
@@ -1667,6 +1949,7 @@ function ensureTileForegroundSelectionPatch() {
       try { forceHideEditedTile(this); } catch (_) {}
       try { restoreEditedTileFrame(this); } catch (_) {}
       applySelectionFilterInteractivity(this, { ignoreForeground, filterActive });
+      applyLockedTileSelectionInteractivity(this, { ignoreForeground, filterActive, source: 'refreshState' });
       return result;
     }
     const fgTool = ui?.controls?.control?.tools?.foreground;
@@ -1676,16 +1959,20 @@ function ensureTileForegroundSelectionPatch() {
       try { forceHideEditedTile(this); } catch (_) {}
       try { restoreEditedTileFrame(this); } catch (_) {}
       applySelectionFilterInteractivity(this, { ignoreForeground, filterActive });
+      applyLockedTileSelectionInteractivity(this, { ignoreForeground, filterActive, source: 'refreshState:noForegroundTool' });
       return result;
     }
     const prev = fgTool.active;
-    const overhead = Number(this.document?.elevation ?? 0) >= Number(this.document?.parent?.foregroundElevation ?? 0);
+    const currentLevelRange = getCurrentLevelElevationRange(this.document?.parent);
+    const foregroundThreshold = Number(currentLevelRange?.top ?? 0);
+    const overhead = Number(this.document?.elevation ?? 0) >= foregroundThreshold;
     fgTool.active = overhead;
     try {
       const result = original.apply(this, args);
       try { forceHideEditedTile(this); } catch (_) {}
       try { restoreEditedTileFrame(this); } catch (_) {}
       applySelectionFilterInteractivity(this, { ignoreForeground, filterActive });
+      applyLockedTileSelectionInteractivity(this, { ignoreForeground, filterActive, source: 'refreshState:foregroundScope' });
       return result;
     } finally {
       fgTool.active = prev;
@@ -1736,15 +2023,14 @@ function applyLayerHiddenState(tile) {
   if (tile.frame && tile.frame.visible !== false) {
     try { tile.frame.visible = false; } catch (_) {}
   }
-  if (typeof tile.eventMode !== 'undefined') {
-    try { tile.eventMode = 'none'; } catch (_) {}
-  }
+  markTileEventModeBlocked(tile, TILE_EVENT_MODE_HIDDEN_BLOCK_KEY);
 }
 
 function restoreLayerHiddenState(tile) {
   if (!tile || tile.destroyed) return;
   const doc = tile.document;
   if (isLayerHidden(doc)) return;
+  clearTileEventModeBlocked(tile, TILE_EVENT_MODE_HIDDEN_BLOCK_KEY);
   if (tile.mesh && tile.mesh.visible === false) {
     try { tile.mesh.visible = tile.isVisible; } catch (_) {}
   }
@@ -1781,7 +2067,7 @@ function handleLayerHiddenUpdate(doc, changes) {
 
 function applyLayerHiddenToCanvas() {
   if (!canvas?.ready || !canvas?.tiles) return;
-  const placeables = Array.isArray(canvas.tiles.placeables) ? canvas.tiles.placeables : [];
+  const placeables = collectTilePlaceables();
   for (const tile of placeables) {
     if (isLayerHidden(tile?.document)) applyLayerHiddenState(tile);
     else restoreLayerHiddenState(tile);
@@ -1797,19 +2083,20 @@ function ensureLayerHiddenHooks() {
     try { hooks.on('refreshTile', (tile) => applyLayerHiddenState(tile)); } catch (_) {}
     try { hooks.on('updateTile', (doc, changes) => handleLayerHiddenUpdate(doc, changes)); } catch (_) {}
     try { hooks.on('controlTile', (tile) => applyLayerHiddenState(tile)); } catch (_) {}
-    try { hooks.on('canvasReady', () => applyLayerHiddenToCanvas()); } catch (_) {}
   }
-  if (canvas?.ready) queueMicrotask(() => applyLayerHiddenToCanvas());
+  try { onCanvasReady(() => applyLayerHiddenToCanvas(), { hooks }); } catch (_) {}
 }
 
 function computeTileName(tile, index) {
   const doc = tile?.document;
+  const documentName = String(doc?.name ?? '').trim();
+  if (documentName) return documentName;
   const explicitName = readFaFlag(doc, 'name');
   if (explicitName !== null && explicitName !== undefined && String(explicitName).trim()) {
     return String(explicitName).trim();
   }
   const flags = doc?.flags?.[MODULE_ID] || doc?._source?.flags?.[MODULE_ID];
-  const legacyLabel = flags?.label || doc?.name || doc?.label;
+  const legacyLabel = flags?.label || doc?.label;
   if (legacyLabel) return String(legacyLabel);
   const masked = readFaFlag(doc, 'maskedTiling');
   if (masked?.baseColor) return 'Solid Color';
@@ -1827,53 +2114,221 @@ function resolvePreviewElevation(container) {
   const candidate = Number(
     container.faNexusPathPreviewElevation
     ?? container.faNexusElevationDoc
+    ?? container.faNexusElevation
     ?? container.elevation
     ?? 0
   );
   return quantizeElevation(candidate);
 }
 
-function resolvePreviewSort(container) {
+function resolvePreviewPlacementSort(container) {
   if (!container) return 0;
-  const candidate = Number(container.faNexusSort ?? container.sort ?? container.zIndex ?? 0);
+  const candidate = Number(
+    container.faNexusPlacementSort
+    ?? container.zIndex
+    ?? container.faNexusSort
+    ?? container.sort
+    ?? 0
+  );
   return Number.isFinite(candidate) ? candidate : 0;
 }
 
-function buildPreviewEntry(container, { label, icon, kind, previewActiveOverride }) {
+function resolvePreviewRenderSort(container, fallback = 0) {
+  if (!container) return normalizeRenderOrderValue(fallback);
+  return normalizeRenderOrderValue(
+    container.faNexusSort
+    ?? container.sort
+    ?? fallback
+  );
+}
+
+function resolvePreviewPlacementLevelId(container) {
+  const normalized = String(container?.faNexusPlacementLevelId || '').trim();
+  return normalized || null;
+}
+
+function resolvePreviewBandKind(container) {
+  const normalized = String(container?.faNexusBandKind || '').trim().toLowerCase();
+  return normalized === 'foreground' || normalized === 'ground' ? normalized : null;
+}
+
+function resolveSceneLevelName(levelId, scene = canvas?.scene) {
+  const normalizedId = String(levelId || '').trim();
+  if (!normalizedId) return null;
+  const range = getSceneLevelElevationRanges(scene).find((entry) => String(entry?.levelId || '').trim() === normalizedId) || null;
+  const normalizedName = String(range?.levelName || '').trim();
+  return normalizedName || null;
+}
+
+function buildPreviewEntry(container, { label, icon, kind, previewActiveOverride, canDragPreviewOverride }) {
   if (!container || container.destroyed) return null;
-  const elevation = resolvePreviewElevation(container);
+  const documentElevation = resolvePreviewElevation(container);
+  const placementSort = resolvePreviewPlacementSort(container);
+  const previewKey = String(
+    container?.faNexusPathPreviewKey
+    || container?.faNexusScatterPreviewKey
+    || container?.faNexusTexturePreviewKey
+    || container?.faNexusBuildingPreviewKey
+    || container?.name
+    || String(documentElevation)
+  ).trim();
   const previewActive = previewActiveOverride !== undefined
     ? !!previewActiveOverride
     : !!container?.faNexusPreviewActive;
+  const previewHasContent = !!container?.faNexusPreviewHasContent;
+  const explicitPlacementLevelId = resolvePreviewPlacementLevelId(container);
+  const derivedRenderOrder = resolveTileRenderOrder({ elevation: documentElevation, sort: placementSort }, {
+    elevation: documentElevation,
+    sort: placementSort,
+    placementLevelId: explicitPlacementLevelId || getDefaultTilePlacementLevelId(),
+    allowCurrentLevelFallback: true
+  });
+  const renderKind = resolvePreviewBandKind(container)
+    || String(derivedRenderOrder?.kind || 'normal').trim().toLowerCase()
+    || 'normal';
+  const placementLevelId = explicitPlacementLevelId
+    || String(derivedRenderOrder?.placementLevelId || '').trim()
+    || null;
+  const placementLevelName = resolveSceneLevelName(placementLevelId)
+    || String(derivedRenderOrder?.analysis?.placementRange?.levelName || '').trim()
+    || null;
+  const renderElevation = quantizeElevation(Number(
+    container.faNexusElevation
+    ?? container.elevation
+    ?? derivedRenderOrder?.elevation
+    ?? documentElevation
+  ) || 0);
+  const renderElevationKey = elevationGroupKey(renderElevation);
+  const documentElevationKey = elevationGroupKey(documentElevation);
+  const sortLayers = getPrimaryCanvasSortLayers();
+  const explicitRenderSort = resolvePreviewRenderSort(container, derivedRenderOrder?.sort);
+  const explicitSortLayer = normalizeRenderOrderValue(container?.sortLayer, derivedRenderOrder?.sortLayer ?? sortLayers.TILES);
+  const explicitZIndex = normalizeRenderOrderValue(container?.zIndex ?? derivedRenderOrder?.zIndex ?? 0);
+  const bandVisualizationLabel = renderKind === 'foreground'
+    ? (placementLevelName ? `${placementLevelName} Foreground` : 'Foreground Band')
+    : (renderKind === 'ground'
+      ? (placementLevelName ? `${placementLevelName} Background` : 'Background Band')
+      : null);
+  const isSpecialBand = renderKind === 'foreground' || renderKind === 'ground';
   return {
     preview: true,
-    previewId: `${kind}-${container?.faNexusPathPreviewKey || container?.faNexusScatterPreviewKey || container?.name || String(elevation)}`,
+    previewKind: kind,
+    previewKey,
+    previewId: `${kind}-${previewKey}`,
     previewActive,
+    previewHasContent,
+    canDragPreview: canDragPreviewOverride !== undefined
+      ? !!canDragPreviewOverride
+      : (previewActive || previewHasContent),
     name: label,
-    elevation,
-    elevationKey: elevationGroupKey(elevation),
-    sort: resolvePreviewSort(container),
+    baseName: label,
+    elevation: renderElevation,
+    documentElevation,
+    documentElevationKey,
+    renderElevation,
+    renderElevationKey,
+    placementSort,
+    sort: isSpecialBand
+      ? normalizeRenderOrderValue(explicitRenderSort, derivedRenderOrder?.sort)
+      : explicitRenderSort,
+    sortLayer: isSpecialBand
+      ? normalizeRenderOrderValue(explicitSortLayer, derivedRenderOrder?.sortLayer)
+      : explicitSortLayer,
+    zIndex: isSpecialBand
+      ? normalizeRenderOrderValue(explicitZIndex, derivedRenderOrder?.zIndex)
+      : explicitZIndex,
+    lastSortedIndex: normalizeRenderOrderValue(container?._lastSortedIndex ?? 0),
+    renderKind,
+    placementLevelId,
+    placementLevelName,
+    bandVisualizationLabel,
     typeIcon: icon,
     typeLabel: label
   };
 }
 
-function buildSceneMarkerEntry(kind, elevation) {
-  const numeric = Number(elevation);
+function buildSceneMarkerEntry(texture, index = 0) {
+  const kind = texture?.isBackground ? 'background' : 'foreground';
+  const numeric = Number(texture?.elevation);
   if (!Number.isFinite(numeric)) return null;
-  const label = kind === 'foreground' ? 'Scene Foreground' : 'Scene Background';
+  const level = texture?.level || null;
+  const rawLevelName = String(level?.name || '').trim();
+  const levelLabel = rawLevelName || (Number.isFinite(level?.index) ? `Level ${Number(level.index) + 1}` : 'Level');
+  const label = `${levelLabel} ${kind === 'foreground' ? 'Foreground' : 'Background'} Image`;
   const icon = kind === 'foreground' ? 'fa-solid fa-layer-group' : 'fa-solid fa-image';
+  const sortLayers = getPrimaryCanvasSortLayers();
   return {
     marker: true,
     markerKind: kind,
-    markerId: `scene-${kind}`,
+    markerId: `scene-${String(level?.id || texture?.sort || 'unknown')}-${kind}`,
+    markerLevelId: String(level?.id || ''),
+    markerLevelName: levelLabel,
+    markerScope: texture?.isUpper ? 'upper' : (level?.isView ? 'viewed' : 'visible'),
     name: label,
+    hidden: isLevelTextureMarkerHidden(level, kind),
+    canToggleVisibility: !!level?.canUserModify?.(game.user, 'update'),
     elevation: quantizeElevation(numeric),
     elevationKey: elevationGroupKey(numeric),
-    sort: Number.NEGATIVE_INFINITY,
+    sort: normalizeRenderOrderValue(texture?.sort ?? 0),
+    sortLayer: normalizeRenderOrderValue(sortLayers.SCENE),
+    zIndex: normalizeRenderOrderValue(texture?.zIndex ?? 0),
+    lastSortedIndex: normalizeRenderOrderValue(index),
     typeIcon: icon,
     typeLabel: label
   };
+}
+
+function buildLevelBoundarySeparatorEntries(scene = canvas?.scene) {
+  const currentLevel = getCurrentSceneLevel(scene);
+  const currentLevelId = String(currentLevel?.id || '').trim();
+  if (!currentLevelId) return [];
+  const levelRanges = getSceneLevelElevationRanges(scene);
+  const currentRange = levelRanges.find((range) => String(range?.levelId || '').trim() === currentLevelId)
+    || getCurrentLevelElevationRange(scene);
+  if (!currentRange) return [];
+  const sortLayers = getPrimaryCanvasSortLayers();
+  const separatorSortLayer = normalizeRenderOrderValue(sortLayers?.SCENE, DEFAULT_PRIMARY_SORT_LAYERS.SCENE) - 1;
+  const levelName = String(currentRange?.levelName || currentLevel?.name || '').trim() || 'Level';
+  const entries = [{
+    kind: 'T',
+    elevation: Number(currentRange?.top),
+    fallbackOrder: 0
+  }, {
+    kind: 'B',
+    elevation: Number(currentRange?.bottom),
+    fallbackOrder: 1
+  }]
+    .filter((entry) => Number.isFinite(entry?.elevation))
+    .sort((left, right) => Number(right?.elevation ?? 0) - Number(left?.elevation ?? 0)
+      || Number(left?.fallbackOrder ?? 0) - Number(right?.fallbackOrder ?? 0));
+
+  return entries.map((entry, index) => {
+    const boundaryKey = elevationGroupKey(entry.elevation);
+    const boundaryKind = String(entry?.kind || '').trim().toUpperCase() || '?';
+    const boundaryIconClass = boundaryKind === 'T' ? 'fa-solid fa-arrow-down' : 'fa-solid fa-arrow-up';
+    return {
+      separator: true,
+      levelBoundarySeparator: true,
+      levelBoundaryId: `level-boundary-${boundaryKey}-${boundaryKind}`,
+      levelBoundaryKey: boundaryKey,
+      levelBoundaryLevelIds: currentLevelId,
+      levelBoundaryMembers: [{
+        levelId: currentLevelId,
+        levelName,
+        kind: boundaryKind,
+        iconClass: boundaryIconClass
+      }],
+      levelBoundaryLabel: `${levelName}`,
+      levelBoundaryElevationLabel: formatElevation(entry.elevation),
+      elevation: entry.elevation,
+      elevationValue: entry.elevation,
+      elevationKey: `level-boundary-${boundaryKey}-${boundaryKind}`,
+      sortLayer: separatorSortLayer,
+      sort: 0,
+      zIndex: 0,
+      lastSortedIndex: normalizeRenderOrderValue(index, 0)
+    };
+  });
 }
 
 function collectPreviewEntries() {
@@ -1908,7 +2363,11 @@ function collectPreviewEntries() {
   };
   const walk = (container, depth = 0) => {
     if (!container || container.destroyed) return;
-    if (container.faNexusScatterPreview) {
+    if (container.faNexusAssetPlacementPreview || container.name === 'fa-nexus-asset-preview') {
+      if (shouldInclude(container)) {
+        push(container, { label: 'Asset Placement Preview', icon: 'fa-solid fa-image', kind: 'asset-placement-preview' });
+      }
+    } else if (container.faNexusScatterPreview) {
       if (shouldInclude(container)) {
         push(container, { label: 'Scatter Preview', icon: 'fa-solid fa-braille', kind: 'scatter-preview' });
       } else {
@@ -1947,12 +2406,16 @@ function collectPreviewEntries() {
   const buildingActive = buildingManagerActive || [...buildingPreviewRoots, ...buildingFillRoots].some(
     (container) => !!container?.faNexusPreviewActive
   );
+  const hasSpecificBuildingActivePreview = [...buildingPreviewRoots, ...buildingFillRoots].some(
+    (container) => !!container?.faNexusPreviewActive
+  );
   for (const container of buildingPreviewRoots) {
     push(container, {
       label: 'Building Preview',
       icon: 'fa-solid fa-building',
       kind: 'building-preview',
-      previewActiveOverride: buildingActive ? true : undefined
+      previewActiveOverride: buildingActive && !hasSpecificBuildingActivePreview ? true : undefined,
+      canDragPreviewOverride: buildingActive ? true : undefined
     });
   }
   for (const container of buildingFillRoots) {
@@ -1960,7 +2423,8 @@ function collectPreviewEntries() {
       label: 'Building Fill Preview',
       icon: 'fa-solid fa-fill-drip',
       kind: 'building-fill-preview',
-      previewActiveOverride: buildingActive ? true : undefined
+      previewActiveOverride: undefined,
+      canDragPreviewOverride: buildingActive ? true : undefined
     });
   }
 
@@ -1968,7 +2432,7 @@ function collectPreviewEntries() {
     let fallback = scatterCandidates[0];
     for (const candidate of scatterCandidates) {
       if (!candidate || candidate.destroyed) continue;
-      if (resolvePreviewSort(candidate) > resolvePreviewSort(fallback)) {
+      if (resolvePreviewPlacementSort(candidate) > resolvePreviewPlacementSort(fallback)) {
         fallback = candidate;
       }
     }
@@ -1980,7 +2444,82 @@ function collectPreviewEntries() {
     });
   }
 
+  const numberedKinds = new Set(['path-preview', 'scatter-preview']);
+  const grouped = new Map();
+  for (const entry of entries) {
+    const kind = String(entry?.previewKind || '').trim();
+    if (!numberedKinds.has(kind)) continue;
+    const list = grouped.get(kind) || [];
+    list.push(entry);
+    grouped.set(kind, list);
+  }
+  for (const list of grouped.values()) {
+    if (list.length <= 1) continue;
+    const ordered = list.slice().sort((left, right) => {
+      const elevationDelta = Number(left?.documentElevation ?? left?.elevation ?? 0) - Number(right?.documentElevation ?? right?.elevation ?? 0);
+      if (Math.abs(elevationDelta) > 0.0001) return elevationDelta;
+      return Number(left?.placementSort ?? left?.sort ?? 0) - Number(right?.placementSort ?? right?.sort ?? 0);
+    });
+    for (let index = 0; index < ordered.length; index += 1) {
+      const entry = ordered[index];
+      entry.previewOrdinal = index + 1;
+      entry.name = `${entry.baseName || entry.name || 'Preview'} ${index + 1}`;
+    }
+  }
+
   return entries;
+}
+
+function getFaNexusAppInstance() {
+  try {
+    return foundry?.applications?.instances?.get?.('fa-nexus-app') || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getFaNexusTabs() {
+  const app = getFaNexusAppInstance();
+  const tabManager = app?._tabManager || null;
+  try { tabManager?.initializeTabs?.(); } catch (_) {}
+  try {
+    return tabManager?.getTabs?.() || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolvePreviewSessionController(previewKind = '') {
+  const kind = String(previewKind || '').trim();
+  const tabs = getFaNexusTabs();
+  if (!tabs) return null;
+  if (kind === 'asset-placement-preview' || kind === 'scatter-preview') {
+    return tabs.assets?.placementManager || null;
+  }
+  if (kind === 'path-preview') {
+    return tabs.paths?.pathManagerV2 || null;
+  }
+  if (kind === 'texture-preview') {
+    return tabs.textures?.texturePaintManager || null;
+  }
+  if (kind === 'building-preview' || kind === 'building-fill-preview') {
+    return tabs.buildings?.buildingManager || null;
+  }
+  return null;
+}
+
+function resolveTexturePaintManager() {
+  const tabs = getFaNexusTabs();
+  return tabs?.textures?.texturePaintManager || null;
+}
+
+function resolveSyntheticTargetPlacementLevelId(elevationKey = '') {
+  const normalizedKey = String(elevationKey || '').trim();
+  if (!normalizedKey) return undefined;
+  const match = /^(foreground|ground)(?:-band)?:([^:]+):.+$/.exec(normalizedKey);
+  if (!match) return undefined;
+  const placementLevelId = String(match[2] || '').trim();
+  return placementLevelId && placementLevelId !== 'none' ? placementLevelId : '';
 }
 
 function buildEntriesFromCanvas(options = {}) {
@@ -1999,7 +2538,9 @@ function buildEntriesFromCanvas(options = {}) {
       entries: [],
       matchingTileIdsByElevation: new Map(),
       fullTileDocsById: new Map(),
+      fullTileGroupKeyById: new Map(),
       fullTileIdsInOrder: [],
+      fullExactGroupElevationsByKey: new Map(),
       fullElevationGroups: new Map(),
       fullGroupDocsByKey: new Map(),
       fullGroupHierarchy: emptyHierarchy,
@@ -2016,7 +2557,9 @@ function buildEntriesFromCanvas(options = {}) {
   const sortedDocs = getLayerManagerSortedTileDocs();
   const controlled = new Set((canvas.tiles.controlled || []).map(tile => tile.document?.id || tile.id));
   const fullTileDocsById = new Map();
+  const fullTileGroupKeyById = new Map();
   const fullTileIdsInOrder = [];
+  const fullExactGroupElevationsByKey = new Map();
   const fullExactGroups = new Map();
   const tileEntries = [];
   for (let i = 0; i < sortedDocs.length; i += 1) {
@@ -2024,11 +2567,21 @@ function buildEntriesFromCanvas(options = {}) {
     const entry = buildLayerManagerTileEntry(doc, i, {
       selected: controlled.has(doc?.id || doc?._id)
     });
-    const elevation = entry.elevation;
-    const elevationKey = entry.elevationKey;
+    const displayGrouping = buildDisplayGroupingForEntry(entry, { nestedGrouping });
+    const elevation = Number(displayGrouping?.groupElevation ?? entry?.documentElevation ?? entry?.elevation ?? 0) || 0;
+    const elevationKey = String(displayGrouping?.exactKey || entry?.elevationKey || '').trim() || elevationGroupKey(elevation);
+    entry.elevationKey = elevationKey;
+    entry.groupElevation = elevation;
+    entry.groupElevationLabel = formatElevation(elevation);
+    entry.groupPath = Array.isArray(displayGrouping?.path) ? displayGrouping.path.slice() : [];
+    entry.groupCanRename = displayGrouping?.canRename !== false;
+    entry.groupCanEditElevation = displayGrouping?.canEditElevation !== false;
+    entry.groupCanHeaderDrop = displayGrouping?.canHeaderDrop !== false;
+    entry.groupShowElevationLabel = displayGrouping?.showElevationLabel !== false;
     const id = entry.id;
     if (id) {
       fullTileDocsById.set(id, doc);
+      fullTileGroupKeyById.set(id, elevationKey);
       fullTileIdsInOrder.push(id);
     }
     let fullGroup = fullExactGroups.get(elevationKey);
@@ -2036,11 +2589,18 @@ function buildEntriesFromCanvas(options = {}) {
       fullGroup = {
         key: elevationKey,
         elevation,
+        renderElevation: Number(entry?.renderElevation ?? entry?.elevation ?? 0) || 0,
+        path: Array.isArray(entry?.groupPath) ? entry.groupPath.slice() : [],
         entries: [],
-        docs: []
+        docs: [],
+        canRename: entry.groupCanRename !== false,
+        canEditElevation: entry.groupCanEditElevation !== false,
+        canHeaderDrop: entry.groupCanHeaderDrop !== false,
+        showElevationLabel: entry.groupShowElevationLabel !== false
       };
       fullExactGroups.set(elevationKey, fullGroup);
     }
+    fullExactGroupElevationsByKey.set(elevationKey, elevation);
     fullGroup.docs.push(doc);
     tileEntries.push(entry);
     fullGroup.entries.push(entry);
@@ -2059,9 +2619,15 @@ function buildEntriesFromCanvas(options = {}) {
     if (!group) {
       group = {
         key,
-        elevation: Number(entry.elevation ?? 0),
+        elevation: Number(entry.groupElevation ?? entry.documentElevation ?? entry.elevation ?? 0) || 0,
+        renderElevation: Number(entry?.renderElevation ?? entry?.elevation ?? 0) || 0,
+        path: Array.isArray(entry?.groupPath) ? entry.groupPath.slice() : [],
         entries: [],
-        docs: []
+        docs: [],
+        canRename: entry.groupCanRename !== false,
+        canEditElevation: entry.groupCanEditElevation !== false,
+        canHeaderDrop: entry.groupCanHeaderDrop !== false,
+        showElevationLabel: entry.groupShowElevationLabel !== false
       };
       matchingExactGroups.set(key, group);
     }
@@ -2071,19 +2637,19 @@ function buildEntriesFromCanvas(options = {}) {
   }
 
   const previewEntries = collectPreviewEntries();
-  const hasBackground = sceneHasBackgroundImage();
-  const hasForeground = sceneHasForegroundImage();
-  const foregroundElevation = getForegroundElevation();
-  const backgroundElevation = hasBackground ? getBackgroundDisplayElevation() : null;
-  const markerEntries = [];
-  if (hasBackground) {
-    const entry = buildSceneMarkerEntry('background', backgroundElevation);
-    if (entry) markerEntries.push(entry);
+  for (const entry of previewEntries) {
+    const displayGrouping = buildDisplayGroupingForEntry(entry, { nestedGrouping });
+    const elevation = Number(displayGrouping?.groupElevation ?? entry?.documentElevation ?? entry?.elevation ?? 0) || 0;
+    const elevationKey = String(displayGrouping?.exactKey || entry?.documentElevationKey || entry?.elevationKey || '').trim()
+      || elevationGroupKey(elevation);
+    entry.elevationKey = elevationKey;
+    entry.groupElevation = elevation;
+    entry.groupElevationLabel = formatElevation(elevation);
+    entry.groupPath = Array.isArray(displayGrouping?.path) ? displayGrouping.path.slice() : [];
   }
-  if (hasForeground) {
-    const entry = buildSceneMarkerEntry('foreground', foregroundElevation);
-    if (entry) markerEntries.push(entry);
-  }
+  const sceneTextureEntries = getVisibleLevelTextures();
+  const markerEntries = sceneTextureEntries.map((texture, index) => buildSceneMarkerEntry(texture, index)).filter(Boolean);
+  const levelBoundaryEntries = buildLevelBoundarySeparatorEntries(canvas?.scene);
   const supplementalEntries = previewEntries.concat(markerEntries).sort(sortLayerManagerRenderEntries);
   const fullElevationGroups = new Map(
     Array.from(fullExactGroups.entries()).map(([key, group]) => [key, group.docs.slice()])
@@ -2096,247 +2662,303 @@ function buildEntriesFromCanvas(options = {}) {
   let staleSyntheticMetadataKeys = [];
   let fullGroupHierarchy = emptyHierarchy;
   let matchingGroupHierarchy = emptyHierarchy;
-
-  if (nestedGrouping) {
-    const hierarchy = buildLayerManagerElevationHierarchy({
-      fullExactGroups,
-      matchingExactGroups
+  const hierarchy = buildLayerManagerElevationHierarchy({
+    fullExactGroups,
+    matchingExactGroups,
+    resolvePathForGroup: (group) => Array.isArray(group?.path) ? group.path.slice() : []
+  });
+  const metadataSync = synchronizeElevationGroupMetadataWithHierarchy(rawElevationGroupMetadata, hierarchy.fullVisible);
+  elevationGroupMetadata = metadataSync.metadata;
+  elevationGroupMetadataDirty = metadataSync.changed;
+  staleSyntheticMetadataKeys = metadataSync.staleSyntheticKeys.slice();
+  fullGroupHierarchy = hierarchy.fullVisible;
+  matchingGroupHierarchy = hierarchy.matchingVisible;
+  const collapsedStateSync = reconcileLayerManagerCollapsedState({
+    sessionState,
+    hierarchy: hierarchy.fullVisible
+  });
+  if (collapsedStateSync.changed) {
+    Logger.info('LayerManager.collapsedState.reconciled', {
+      sceneId: canvas?.scene?.id || null,
+      staleSyntheticKeys: collapsedStateSync.staleSyntheticKeys
     });
-    const metadataSync = synchronizeElevationGroupMetadataWithHierarchy(rawElevationGroupMetadata, hierarchy.fullVisible);
-    elevationGroupMetadata = metadataSync.metadata;
-    elevationGroupMetadataDirty = metadataSync.changed;
-    staleSyntheticMetadataKeys = metadataSync.staleSyntheticKeys.slice();
-    fullGroupHierarchy = hierarchy.fullVisible;
-    matchingGroupHierarchy = hierarchy.matchingVisible;
+    queuePersistLayerManagerCollapsedState();
+  }
 
-    for (const [key, node] of hierarchy.fullVisible.nodesByKey.entries()) {
-      fullGroupDocsByKey.set(key, node.fullSubtreeDocs.slice());
+  for (const [key, node] of hierarchy.fullVisible.nodesByKey.entries()) {
+    fullGroupDocsByKey.set(key, node.fullSubtreeDocs.slice());
+  }
+  for (const [key, node] of hierarchy.matchingVisible.nodesByKey.entries()) {
+    matchingTileIdsByElevation.set(key, node.matchingSubtreeDocs.map((doc) => doc?.id).filter(Boolean));
+  }
+
+  const persistentSupplementalsByGroupKey = new Map();
+  const exactSupplementalsByGroupKey = new Map();
+  const orphanSupplementalsByGroupKey = new Map();
+  const topLevelSupplementals = new Map();
+  const visibleGroupKeys = hierarchy.matchingVisible.visibleKeys;
+  const resolveSupplementalGroupingElevation = (item, path = null) => {
+    const resolvedPath = Array.isArray(path) ? path : buildSupplementalGroupingPath(item, { nestedGrouping });
+    const pathElevation = Number(resolvedPath.at(-1)?.elevation);
+    if (Number.isFinite(pathElevation)) return pathElevation;
+    const groupedElevation = Number(item?.groupElevation ?? item?.documentElevation ?? item?.elevation ?? 0);
+    return Number.isFinite(groupedElevation) ? groupedElevation : 0;
+  };
+  const attachSupplemental = (targetMap, ownerKey, item) => {
+    if (!ownerKey) return;
+    let exactMap = targetMap.get(ownerKey);
+    if (!exactMap) {
+      exactMap = new Map();
+      targetMap.set(ownerKey, exactMap);
     }
-    for (const [key, node] of hierarchy.matchingVisible.nodesByKey.entries()) {
-      matchingTileIdsByElevation.set(key, node.matchingSubtreeDocs.map((doc) => doc?.id).filter(Boolean));
+    const path = buildSupplementalGroupingPath(item, { nestedGrouping });
+    const exactKey = String(path.at(-1)?.key || item?.elevationKey || '').trim() || elevationGroupKey(item?.elevation ?? 0);
+    const groupingElevation = resolveSupplementalGroupingElevation(item, path);
+    let block = exactMap.get(exactKey);
+    if (!block) {
+      block = {
+        key: exactKey,
+        elevation: groupingElevation,
+        items: []
+      };
+      exactMap.set(exactKey, block);
     }
+    if (Number.isFinite(groupingElevation)) block.elevation = groupingElevation;
+    block.items.push(item);
+  };
+  const findVisibleAncestorKey = (item) => {
+    const path = buildSupplementalGroupingPath(item, { nestedGrouping });
+    let nearest = null;
+    for (const segment of path) {
+      const key = String(segment?.key || '').trim();
+      if (!key || !visibleGroupKeys.has(key)) continue;
+      nearest = key;
+    }
+    return nearest;
+  };
 
-    const exactSupplementalsByGroupKey = new Map();
-    const orphanSupplementalsByGroupKey = new Map();
-    const topLevelSupplementals = new Map();
-    const visibleGroupKeys = hierarchy.matchingVisible.visibleKeys;
-    const attachSupplemental = (targetMap, ownerKey, item) => {
-      if (!ownerKey) return;
-      let exactMap = targetMap.get(ownerKey);
-      if (!exactMap) {
-        exactMap = new Map();
-        targetMap.set(ownerKey, exactMap);
-      }
-      const exactKey = String(item?.elevationKey || '').trim() || elevationGroupKey(item?.elevation ?? 0);
-      let block = exactMap.get(exactKey);
-      if (!block) {
-        block = {
-          elevation: Number(item?.elevation ?? 0),
-          items: []
-        };
-        exactMap.set(exactKey, block);
-      }
-      block.items.push(item);
-    };
-    const findVisibleAncestorKey = (item) => {
-      const path = buildNestedElevationPath(item?.elevation ?? 0);
-      let nearest = null;
-      for (const key of path) {
-        if (!visibleGroupKeys.has(key)) continue;
-        nearest = key;
-      }
-      return nearest;
-    };
-
-    for (const item of supplementalEntries) {
-      const exactKey = String(item?.elevationKey || '').trim() || elevationGroupKey(item?.elevation ?? 0);
+  for (const item of supplementalEntries) {
+    const path = buildSupplementalGroupingPath(item, { nestedGrouping });
+    const exactKey = String(path.at(-1)?.key || item?.elevationKey || '').trim() || elevationGroupKey(item?.elevation ?? 0);
+    if (item?.marker) {
       if (visibleGroupKeys.has(exactKey)) {
-        attachSupplemental(exactSupplementalsByGroupKey, exactKey, item);
+        attachSupplemental(persistentSupplementalsByGroupKey, exactKey, item);
         continue;
       }
       const ancestorKey = findVisibleAncestorKey(item);
       if (ancestorKey) {
-        attachSupplemental(orphanSupplementalsByGroupKey, ancestorKey, item);
+        attachSupplemental(persistentSupplementalsByGroupKey, ancestorKey, item);
         continue;
       }
       attachSupplemental(topLevelSupplementals, '__root__', item);
+      continue;
     }
+    if (visibleGroupKeys.has(exactKey)) {
+      attachSupplemental(exactSupplementalsByGroupKey, exactKey, item);
+      continue;
+    }
+    const ancestorKey = findVisibleAncestorKey(item);
+    if (ancestorKey) {
+      attachSupplemental(orphanSupplementalsByGroupKey, ancestorKey, item);
+      continue;
+    }
+    attachSupplemental(topLevelSupplementals, '__root__', item);
+  }
 
-    const materializeSupplementalBlocks = (blockMap = null) => {
-      if (!(blockMap instanceof Map)) return [];
-      return Array.from(blockMap.values())
-        .map((block) => ({
-          elevation: Number(block?.elevation ?? 0),
-          items: (Array.isArray(block?.items) ? block.items.slice() : []).sort(sortLayerManagerRenderEntries)
-        }))
-        .sort((a, b) => Number(b?.elevation ?? 0) - Number(a?.elevation ?? 0));
-    };
-    const applyTreeDepth = (items, depth) => items.map((item) => ({
-      ...item,
-      treeDepth: depth,
-      indentPx: depth * 12
-    }));
+  const materializeSupplementalBlocks = (blockMap = null, depth = 0) => {
+    if (!(blockMap instanceof Map)) return [];
+    return Array.from(blockMap.values())
+      .map((block) => ({
+        blockKey: String(block?.key || '').trim(),
+        blockElevation: Number(block?.elevation ?? 0),
+        blockRank: getSyntheticBandSupplementalBlockRank(block?.key, 1),
+        entries: applyTreeDepth(
+          (Array.isArray(block?.items) ? block.items.slice() : []).sort(sortLayerManagerRenderEntries),
+          depth
+        )
+      }))
+      .sort((a, b) => Number(b?.blockElevation ?? 0) - Number(a?.blockElevation ?? 0)
+        || Number(a?.blockRank ?? 0) - Number(b?.blockRank ?? 0));
+  };
+  const applyTreeDepth = (items, depth) => items.map((item) => ({
+    ...item,
+    treeDepth: depth,
+    indentPx: depth * 12
+  }));
+  const sortBlocks = (left, right) => Number(right?.blockElevation ?? 0) - Number(left?.blockElevation ?? 0)
+    || Number(left?.blockRank ?? 0) - Number(right?.blockRank ?? 0);
 
-    const renderGroupBlock = (groupKey) => {
-      const node = hierarchy.matchingVisible.nodesByKey.get(groupKey);
-      if (!node) return null;
-      const matchingDocs = node.matchingSubtreeDocs.filter(Boolean);
-      const groupName = getElevationGroupName(elevationGroupMetadata, groupKey);
-      const blockEntries = [{
-        separator: true,
-        elevation: formatElevation(node.elevation),
-        elevationValue: node.elevation,
-        elevationKey: groupKey,
-        groupHasCustomName: !!groupName,
-        groupName: groupName || '',
-        groupDisplayName: groupName || `Elev ${formatElevation(node.elevation)}`,
-        groupHidden: matchingDocs.length ? matchingDocs.every((doc) => isLayerHidden(doc)) : false,
-        groupLocked: matchingDocs.length ? matchingDocs.every((doc) => !!doc?.locked) : false,
-        canToggleVisibility: matchingDocs.some((doc) => doc?.canUserModify?.(game.user, 'update')),
-        matchingCount: matchingDocs.length,
-        collapsed: !!sessionState?.collapsedElevations?.has?.(groupKey),
-        treeDepth: node.depth,
-        indentPx: node.depth * 12,
-        groupSynthetic: !!node.isSynthetic,
-        hasChildGroups: node.childKeys.length > 0
-      }];
-      if (sessionState?.collapsedElevations?.has?.(groupKey)) {
-        return {
-          elevation: node.elevation,
-          entries: blockEntries
-        };
-      }
-
-      const childBlocks = [];
-      const exactItems = node.matchingExactEntries
-        .concat((materializeSupplementalBlocks(exactSupplementalsByGroupKey.get(groupKey))[0]?.items || []))
-        .sort(sortLayerManagerRenderEntries);
-      if (exactItems.length) {
-        childBlocks.push({
-          elevation: node.elevation,
-          entries: applyTreeDepth(exactItems, node.depth + 1)
-        });
-      }
-
-      for (const orphanBlock of materializeSupplementalBlocks(orphanSupplementalsByGroupKey.get(groupKey))) {
-        childBlocks.push({
-          elevation: orphanBlock.elevation,
-          entries: applyTreeDepth(orphanBlock.items, node.depth + 1)
-        });
-      }
-
-      for (const childKey of node.childKeys) {
-        const childBlock = renderGroupBlock(childKey);
-        if (childBlock) childBlocks.push(childBlock);
-      }
-
-      childBlocks.sort((a, b) => Number(b?.elevation ?? 0) - Number(a?.elevation ?? 0));
-      for (const childBlock of childBlocks) {
-        blockEntries.push(...childBlock.entries);
+  const renderGroupBlock = (groupKey) => {
+    const node = hierarchy.matchingVisible.nodesByKey.get(groupKey);
+    if (!node) return null;
+    const matchingDocs = node.matchingSubtreeDocs.filter(Boolean);
+    const canRenameGroup = node.canRename !== false;
+    const canEditElevation = node.canEditElevation !== false && isEditableElevationGroupKey(groupKey);
+    const persistedGroupName = canRenameGroup ? getElevationGroupName(elevationGroupMetadata, groupKey) : '';
+    const defaultElevationDisplayName = Number.isFinite(node.elevation)
+      ? `Elev ${formatElevation(node.elevation)}`
+      : '';
+    const groupDisplayName = persistedGroupName
+      || node.defaultName
+      || defaultElevationDisplayName;
+    const hideDuplicateElevationLabel = !!defaultElevationDisplayName
+      && String(groupDisplayName || '').trim() === defaultElevationDisplayName;
+    const blockEntries = [{
+      separator: true,
+      elevation: formatElevation(node.elevation),
+      elevationValue: node.elevation,
+      elevationKey: groupKey,
+      groupHasCustomName: !!persistedGroupName || (!canRenameGroup && !!node.defaultName),
+      groupName: persistedGroupName || '',
+      groupDisplayName,
+      groupHidden: matchingDocs.length ? matchingDocs.every((doc) => isLayerHidden(doc)) : false,
+      groupLocked: matchingDocs.length ? matchingDocs.every((doc) => !!doc?.locked) : false,
+      canToggleVisibility: matchingDocs.some((doc) => doc?.canUserModify?.(game.user, 'update')),
+      matchingCount: matchingDocs.length,
+      collapsed: !!sessionState?.collapsedElevations?.has?.(groupKey),
+      treeDepth: node.depth,
+      indentPx: node.depth * 12,
+      groupSynthetic: !!node.isSynthetic,
+      hasChildGroups: node.childKeys.length > 0,
+      groupCanRename: canRenameGroup,
+      groupCanEditElevation: canEditElevation,
+      groupCanHeaderDrop: node.canHeaderDrop !== false,
+      groupShowElevationLabel: node.showElevationLabel !== false && Number.isFinite(node.elevation),
+      groupHideDuplicateElevationLabel: hideDuplicateElevationLabel,
+      groupClass: node.groupClass || ''
+    }];
+    const persistentSupplementalEntries = materializeSupplementalBlocks(
+      persistentSupplementalsByGroupKey.get(groupKey),
+      node.depth + 1
+    ).flatMap((block) => Array.isArray(block?.entries) ? block.entries : []);
+    if (sessionState?.collapsedElevations?.has?.(groupKey)) {
+      if (persistentSupplementalEntries.length) {
+        blockEntries.push(...persistentSupplementalEntries);
       }
       return {
-        elevation: node.elevation,
+        groupKey,
+        blockElevation: Number(node.elevation ?? 0),
+        blockRank: getSyntheticBandGroupBlockRank(groupKey, 2),
         entries: blockEntries
       };
+    }
+
+    const childBlocks = [];
+    const exactSupplementalItems = materializeSupplementalBlocks(exactSupplementalsByGroupKey.get(groupKey), node.depth + 1)
+      .flatMap((block) => Array.isArray(block?.entries) ? block.entries : []);
+    const exactItems = node.matchingExactEntries
+      .concat(exactSupplementalItems)
+      .sort(sortLayerManagerRenderEntries);
+    if (exactItems.length) {
+      childBlocks.push({
+        blockElevation: Number(node.elevation ?? 0),
+        blockRank: node.syntheticBand ? 3 : 2,
+        entries: applyTreeDepth(exactItems, node.depth + 1)
+      });
+    }
+
+    childBlocks.push(...materializeSupplementalBlocks(orphanSupplementalsByGroupKey.get(groupKey), node.depth + 1));
+
+    for (const childKey of node.childKeys) {
+      const childBlock = renderGroupBlock(childKey);
+      if (childBlock) childBlocks.push(childBlock);
+    }
+
+    childBlocks.sort(sortBlocks);
+    for (const childBlock of childBlocks) {
+      blockEntries.push(...childBlock.entries);
+    }
+    if (persistentSupplementalEntries.length) {
+      blockEntries.push(...persistentSupplementalEntries);
+    }
+    return {
+      groupKey,
+      blockElevation: Number(node.elevation ?? 0),
+      blockRank: getSyntheticBandGroupBlockRank(groupKey, 2),
+      entries: blockEntries
     };
+  };
 
-    const topLevelBlocks = [];
-    for (const rootKey of hierarchy.matchingVisible.rootKeys) {
-      const block = renderGroupBlock(rootKey);
-      if (block) topLevelBlocks.push(block);
-    }
-    for (const topLevelBlock of materializeSupplementalBlocks(topLevelSupplementals.get('__root__'))) {
-      topLevelBlocks.push({
-        elevation: topLevelBlock.elevation,
-        entries: applyTreeDepth(topLevelBlock.items, 0)
+  const topLevelBlocks = [];
+  const insertBlockSortedWithoutReorderingExisting = (block) => {
+    const insertIndex = topLevelBlocks.findIndex((existing) => sortBlocks(block, existing) < 0);
+    if (insertIndex >= 0) topLevelBlocks.splice(insertIndex, 0, block);
+    else topLevelBlocks.push(block);
+  };
+  for (const rootKey of hierarchy.matchingVisible.rootKeys) {
+    const block = renderGroupBlock(rootKey);
+    if (block) topLevelBlocks.push(block);
+  }
+  topLevelBlocks.push(...materializeSupplementalBlocks(topLevelSupplementals.get('__root__'), 0));
+  topLevelBlocks.sort(sortBlocks);
+  for (const boundaryEntry of levelBoundaryEntries) {
+    const boundaryKind = String(boundaryEntry?.levelBoundaryMembers?.[0]?.kind || '').trim().toUpperCase();
+    const levelId = String(boundaryEntry?.levelBoundaryLevelIds || '').trim();
+    const boundaryBlock = {
+      blockKey: String(boundaryEntry?.levelBoundaryKey || '').trim(),
+      blockElevation: Number(boundaryEntry?.elevation ?? 0),
+      blockRank: boundaryKind === 'B' ? LEVEL_BOUNDARY_BOTTOM_BLOCK_RANK : LEVEL_BOUNDARY_TOP_BLOCK_RANK,
+      entries: applyTreeDepth([boundaryEntry], 0)
+    };
+    if (boundaryKind === 'T' && levelId) {
+      const boundaryElevation = Number(boundaryEntry?.elevation ?? 0);
+      const targetKey = buildForegroundBandGroupKey({
+        placementLevelId: levelId,
+        renderElevation: boundaryElevation
       });
-    }
-    topLevelBlocks.sort((a, b) => Number(b?.elevation ?? 0) - Number(a?.elevation ?? 0));
-    for (const block of topLevelBlocks) {
-      entries.push(...block.entries);
-    }
-  } else {
-    for (const [key, docs] of fullElevationGroups.entries()) {
-      fullGroupDocsByKey.set(key, Array.isArray(docs) ? docs.slice() : []);
-    }
-    const matchingElevationGroups = new Map();
-    for (const [key, group] of matchingExactGroups.entries()) {
-      const matchingDocs = group.docs.filter(Boolean);
-      matchingElevationGroups.set(key, {
-        entries: group.entries.slice(),
-        docs: matchingDocs,
-        canToggleVisibility: matchingDocs.some((doc) => doc?.canUserModify?.(game.user, 'update')),
-        collapsed: !!sessionState?.collapsedElevations?.has?.(key),
-        groupHidden: matchingDocs.length ? matchingDocs.every((doc) => isLayerHidden(doc)) : false,
-        groupLocked: matchingDocs.length ? matchingDocs.every((doc) => !!doc?.locked) : false,
-        matchingCount: matchingDocs.length,
-        groupName: getElevationGroupName(elevationGroupMetadata, key)
-      });
-      matchingTileIdsByElevation.set(key, matchingDocs.map((doc) => doc?.id).filter(Boolean));
-      fullGroupDocsByKey.set(key, fullElevationGroups.get(key)?.slice?.() || []);
-    }
-
-    const items = matchingTileEntries.concat(supplementalEntries).sort(sortLayerManagerRenderEntries);
-    let lastElevationKey = null;
-    for (const item of items) {
-      const elevation = Number(item.elevation ?? 0);
-      const key = elevationGroupKey(elevation);
-      if (lastElevationKey === null || key !== lastElevationKey) {
-        const group = matchingElevationGroups.get(key);
-        if (group) {
-          entries.push({
-            separator: true,
-            elevation: formatElevation(elevation),
-            elevationValue: elevation,
-            elevationKey: key,
-            groupHasCustomName: !!group.groupName,
-            groupName: group.groupName || '',
-            groupDisplayName: group.groupName || `Elev ${formatElevation(elevation)}`,
-            groupHidden: group.groupHidden,
-            groupLocked: group.groupLocked,
-            canToggleVisibility: !!group.canToggleVisibility && group.matchingCount > 0,
-            matchingCount: group.matchingCount,
-            collapsed: !!group.collapsed,
-            treeDepth: 0,
-            indentPx: 0,
-            groupSynthetic: false,
-            hasChildGroups: false
-          });
-        }
-        lastElevationKey = key;
+      const targetIndex = findTopLevelBlockIndexByKey(topLevelBlocks, targetKey);
+      if (targetIndex >= 0) {
+        topLevelBlocks.splice(targetIndex, 0, boundaryBlock);
+        continue;
       }
-      if (matchingElevationGroups.get(key)?.collapsed) continue;
-      entries.push({
-        ...item,
-        treeDepth: 0,
-        indentPx: 0
+      const upperGroundKey = getSharedTopBoundaryUpperGroundBandKey({
+        scene: canvas?.scene,
+        levelId,
+        elevation: boundaryElevation
       });
+      const upperGroundIndex = findTopLevelBlockEndIndexByKey(topLevelBlocks, upperGroundKey);
+      if (upperGroundIndex >= 0) {
+        topLevelBlocks.splice(upperGroundIndex + 1, 0, boundaryBlock);
+        continue;
+      }
     }
+    if (boundaryKind === 'B' && levelId) {
+      const targetKey = buildGroundBandGroupKey({
+        placementLevelId: levelId,
+        renderElevation: Number(boundaryEntry?.elevation ?? 0)
+      });
+      const targetIndex = topLevelBlocks.findIndex((block) => String(block?.groupKey || '').trim() === targetKey);
+      if (targetIndex >= 0) {
+        let insertIndex = targetIndex + 1;
+        while (insertIndex < topLevelBlocks.length && String(topLevelBlocks[insertIndex]?.blockKey || '').trim() === targetKey) {
+          insertIndex += 1;
+        }
+        topLevelBlocks.splice(insertIndex, 0, boundaryBlock);
+        continue;
+      }
+      const fallbackIndex = topLevelBlocks.findIndex((block) => String(block?.blockKey || '').trim() === targetKey);
+      if (fallbackIndex >= 0) {
+        let insertIndex = fallbackIndex + 1;
+        while (insertIndex < topLevelBlocks.length && String(topLevelBlocks[insertIndex]?.blockKey || '').trim() === targetKey) {
+          insertIndex += 1;
+        }
+        topLevelBlocks.splice(insertIndex, 0, boundaryBlock);
+        continue;
+      }
+    }
+    insertBlockSortedWithoutReorderingExisting(boundaryBlock);
+  }
+  for (const block of topLevelBlocks) {
+    entries.push(...block.entries);
   }
 
-  if (Number.isFinite(foregroundElevation)) {
-    const foregroundEntry = {
-      separator: true,
-      foregroundSeparator: true,
-      foregroundElevation: formatElevation(foregroundElevation),
-      foregroundElevationValue: foregroundElevation,
-      elevationKey: elevationGroupKey(foregroundElevation)
-    };
-    const insertIndex = entries.findIndex((entry) => (
-      Number(
-        entry?.separator && !entry?.foregroundSeparator
-          ? entry.elevationValue
-          : entry?.elevation
-      ) < foregroundElevation
-    ));
-    if (insertIndex === -1) entries.push(foregroundEntry);
-    else entries.splice(insertIndex, 0, foregroundEntry);
-  }
   return {
     entries,
     matchingTileIdsByElevation,
     fullTileDocsById,
+    fullTileGroupKeyById,
     fullTileIdsInOrder,
+    fullExactGroupElevationsByKey,
     fullElevationGroups,
     elevationGroupMetadata,
     elevationGroupMetadataDirty,
@@ -2351,9 +2973,10 @@ function buildEntriesFromCanvas(options = {}) {
   };
 }
 
-function insertTabAfterScenes() {
-  const tabs = Sidebar.TABS;
-  if (tabs[TAB_ID]) return;
+function insertLayerManagerTabIntoSidebar(SidebarClass) {
+  const tabs = SidebarClass?.TABS;
+  if (!tabs || typeof tabs !== 'object') return false;
+  if (tabs[TAB_ID]) return false;
   const descriptor = {
     tooltip: 'FA-NEXUS.LayerManager',
     icon: 'fa-solid fa-layer-group',
@@ -2370,7 +2993,62 @@ function insertTabAfterScenes() {
     }
   }
   if (!inserted) next.push([TAB_ID, descriptor]);
-  Sidebar.TABS = Object.fromEntries(next);
+  SidebarClass.TABS = Object.fromEntries(next);
+  return true;
+}
+
+function insertTabAfterScenes() {
+  const sidebarClasses = [
+    CONFIG?.ui?.sidebar,
+    Sidebar
+  ].filter((SidebarClass, index, classes) => (
+    SidebarClass && classes.indexOf(SidebarClass) === index
+  ));
+
+  for (const SidebarClass of sidebarClasses) {
+    insertLayerManagerTabIntoSidebar(SidebarClass);
+  }
+}
+
+function restoreLayerManagerTileInteractivity({ source = 'unknown' } = {}) {
+  if (!canvas?.ready || !canvas?.tiles) return;
+  const hoverCleared = clearTileHover({ source, updateLegend: false });
+  let blocksCleared = 0;
+  let lockedEventModesReset = 0;
+  for (const tile of collectTilePlaceables()) {
+    const hadSelectionBlock = !!(tile?.[SELECTION_FILTER_BLOCK_KEY] || tile?.[TILE_EVENT_MODE_SELECTION_BLOCK_KEY]);
+    if (hadSelectionBlock) {
+      clearSelectionFilterInteractivityBlock(tile);
+      blocksCleared += 1;
+    }
+    if (tile?.document?.locked && !selectionFilterState.active && !hasForcedTileEventModeBlock(tile)) {
+      const expectedEventMode = tile?.isInteractable ? 'static' : 'none';
+      if (typeof tile.eventMode !== 'undefined' && tile.eventMode !== expectedEventMode) {
+        try {
+          tile.eventMode = expectedEventMode;
+          lockedEventModesReset += 1;
+        } catch (error) {
+          Logger.error('LayerManager.selectionFilter.lockedEventModeResetFailed', {
+            source,
+            tileId: tile?.document?.id || tile?.id || null,
+            expectedEventMode,
+            error: String(error?.message || error)
+          });
+        }
+      }
+    }
+    try { requestTileRefresh(tile); } catch (_) {}
+  }
+  try { refreshTileInteractionState(); } catch (_) {}
+  try { getMouseInteractionManager()?.emulateMoveEvent?.(); } catch (_) {}
+  if (hoverCleared || blocksCleared || lockedEventModesReset) {
+    Logger.debug?.('LayerManager.selectionFilter.deactivateCleanup', {
+      source,
+      hoverCleared,
+      blocksCleared,
+      lockedEventModesReset
+    });
+  }
 }
 
 function registerLayerManagerTab() {
@@ -2379,6 +3057,9 @@ function registerLayerManagerTab() {
     if (!CONFIG.ui[TAB_ID]) CONFIG.ui[TAB_ID] = LayerManagerTab;
     syncSelectionFilterFromSettings();
     ensureSelectionFilterRefreshHook();
+    ensureTileReleaseAllPatch();
+    ensureTileReleasePatch();
+    ensureTileControlReleaseOthersPatch();
     ensureTileSelectionPatch();
     ensureTileSelectAllPatch();
     ensureTileForegroundSelectionPatch();
@@ -2391,22 +3072,18 @@ function registerLayerManagerTab() {
 }
 
 class LayerManagerHelpWindow extends HandlebarsApplicationMixin(ApplicationV2) {
-  static DEFAULT_OPTIONS = foundry.utils.mergeObject(
-    foundry.utils.deepClone(super.DEFAULT_OPTIONS ?? {}),
-    {
-      id: 'fa-nexus-layer-manager-help',
-      tag: 'section',
-      position: { width: 460, height: 'auto' },
-      window: {
-        title: 'Layer Manager Help',
-        icon: 'fas fa-circle-question',
-        minimizable: true,
-        resizable: true
-      },
-      classes: ['fa-nexus-tool-help-window']
+  static DEFAULT_OPTIONS = {
+    id: 'fa-nexus-layer-manager-help',
+    tag: 'section',
+    position: { width: 460, height: 'auto' },
+    window: {
+      title: 'Layer Manager Help',
+      icon: 'fas fa-circle-question',
+      minimizable: true,
+      resizable: true
     },
-    { inplace: false }
-  );
+    classes: ['fa-nexus-tool-help-window']
+  };
 
   static PARTS = foundry.utils.mergeObject(
     foundry.utils.deepClone(super.PARTS ?? {}),
@@ -2524,12 +3201,16 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._viewState = null;
     this._dragState = null;
     this._dropIndicator = null;
+    this._lastDropTarget = null;
     this._contextMenuCleanup = null;
-    this._pendingSeparatorSelectTimer = null;
     this._helpWindow = null;
+    this._preservedListScrollTop = null;
+    this._suppressPreviewAutoScrollOnce = false;
     this._searchFocusPending = false;
     this._searchSelectionStart = null;
     this._searchSelectionEnd = null;
+    this._canvasSelectionSyncQueued = false;
+    this._pendingCanvasSelectionSyncOptions = null;
   }
 
   get title() {
@@ -2550,7 +3231,19 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._setActiveClass(false);
     this._setFilterActive(false);
     this._closeContextMenu();
-    this._clearPendingSeparatorSelection();
+    this._clearHover();
+    this._clearRenameState();
+    this._clearElevationGroupEditState();
+    this._clearDropIndicator();
+    this._dragState = null;
+    this._stopWheelSession();
+    this._clearElevationAnnounceTimer();
+    this._selectedSceneMarkers?.clear?.();
+    if (!this.isPopout) this._removeHooks();
+  }
+
+  _onClose(options = {}) {
+    this._closeContextMenu();
     this._clearHover();
     this._clearRenameState();
     this._clearElevationGroupEditState();
@@ -2560,6 +3253,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._clearElevationAnnounceTimer();
     this._selectedSceneMarkers?.clear?.();
     this._removeHooks();
+    return super._onClose(options);
   }
 
   async _prepareContext() {
@@ -2579,7 +3273,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     let groupNameEditFound = false;
     let groupElevationEditFound = false;
     for (const entry of entries) {
-      if (entry?.separator && !entry?.foregroundSeparator) {
+      if (entry?.separator && !entry?.levelBoundarySeparator) {
         if (entry.elevationKey === this._editingElevationGroupNameKey) {
           entry.editingGroupName = true;
           entry.groupNameValue = this._editingElevationGroupNameDraft;
@@ -2612,7 +3306,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     if (this._selectedSceneMarkers?.size) {
       for (const entry of entries) {
         if (!entry?.marker) continue;
-        entry.selected = this._selectedSceneMarkers.has(entry.markerKind);
+        entry.selected = this._selectedSceneMarkers.has(entry.markerId);
       }
     }
     const selectionActionState = this._getSelectionActionState();
@@ -2630,8 +3324,10 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       searchQuery: sessionState.searchQuery,
       filterChips: buildFilterChipContext(sessionState),
       resetFiltersDisabled: !listFiltersActive(sessionState),
-      collapseAllDisabled: !matchingGroupKeys.length || collapsedMatchingGroupCount === matchingGroupKeys.length,
-      expandAllDisabled: !matchingGroupKeys.length || collapsedMatchingGroupCount === 0,
+      groupToggleAllAction: collapsedMatchingGroupCount === matchingGroupKeys.length ? 'expand' : 'collapse',
+      groupToggleAllTitle: collapsedMatchingGroupCount === matchingGroupKeys.length ? 'Expand all visible groups' : 'Collapse all visible groups',
+      groupToggleAllIcon: collapsedMatchingGroupCount === matchingGroupKeys.length ? 'fa-angles-down' : 'fa-angles-up',
+      groupToggleAllDisabled: !matchingGroupKeys.length,
       selectionActionTitle: selectionActionState.lockTitle,
       selectionActionDisabled: selectionActionState.lockDisabled,
       deleteSelectionDisabled: selectionActionState.deleteDisabled,
@@ -2648,18 +3344,19 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   async _onFirstRender(context, options) {
     await super._onFirstRender(context, options);
     this._setActiveClass(this.active);
+    if (this.active || this.isPopout) this._ensureHooks();
   }
 
   _onRender(context, options) {
     super._onRender(context, options);
     this._closeContextMenu();
+    if (this.active || this.isPopout) this._ensureHooks();
     const root = this.element;
     if (!root) return;
     const list = root.querySelector('.fa-nexus-layer-manager__list');
     const searchInput = root.querySelector('input[data-action="search-layers"]');
     const resetFiltersButton = root.querySelector('button[data-action="reset-filters"]');
-    const collapseAllButton = root.querySelector('button[data-action="collapse-all-groups"]');
-    const expandAllButton = root.querySelector('button[data-action="expand-all-groups"]');
+    const toggleAllGroupsButton = root.querySelector('button[data-action="toggle-all-groups"]');
     const selectionLockButton = root.querySelector('button[data-action="toggle-selection-lock"]');
     const selectionDeleteButton = root.querySelector('button[data-action="delete-selection"]');
     const minInput = root.querySelector('input[data-range="min"]');
@@ -2716,19 +3413,11 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       });
     }
 
-    if (collapseAllButton) {
-      collapseAllButton.addEventListener('click', (event) => {
+    if (toggleAllGroupsButton) {
+      toggleAllGroupsButton.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
-        this._collapseAllElevationGroups();
-      });
-    }
-
-    if (expandAllButton) {
-      expandAllButton.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this._expandAllElevationGroups();
+        this._toggleAllElevationGroups(toggleAllGroupsButton);
       });
     }
 
@@ -2838,7 +3527,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
         this._renameFocusPending = false;
         requestAnimationFrame(() => {
           try {
-            renameInput.focus();
+            renameInput.focus({ preventScroll: true });
             renameInput.select();
           } catch (_) {}
         });
@@ -2866,7 +3555,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
         this._editingElevationGroupNameFocusPending = false;
         requestAnimationFrame(() => {
           try {
-            groupNameInput.focus();
+            groupNameInput.focus({ preventScroll: true });
             groupNameInput.select();
           } catch (_) {}
         });
@@ -2894,7 +3583,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
         this._editingElevationGroupElevationFocusPending = false;
         requestAnimationFrame(() => {
           try {
-            groupElevationInput.focus();
+            groupElevationInput.focus({ preventScroll: true });
             groupElevationInput.select();
           } catch (_) {}
         });
@@ -2915,76 +3604,26 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
 
     this._updateSelectionActions();
     this._updateFlattenFooter();
-    this._syncPreviewScroll();
+    if (this._suppressPreviewAutoScrollOnce) this._suppressPreviewAutoScrollOnce = false;
+    else this._syncPreviewScroll();
+    this._restorePreservedListScrollTop();
     this._syncHelpWindow({ suppressRender: false });
   }
 
   _getFlattenState() {
     const selection = TileFlattenManager.getSelectedTiles();
-    const rawCount = Array.isArray(selection) ? selection.length : 0;
-    const flattenableSelection = TileFlattenManager.getFlattenableTiles(selection);
-    const count = Array.isArray(flattenableSelection) ? flattenableSelection.length : 0;
-    const singleDoc = rawCount === 1 ? selection[0] : null;
-    const singleFlattened = !!singleDoc && TileFlattenManager.isFlattenedTile(singleDoc);
-    const singleMerged = count === 1 && TileFlattenManager.isMergedTile(flattenableSelection[0]);
-    const allowExport = rawCount === 0;
-    const allowFlatten = !singleFlattened && count >= 1;
-    const visible = allowExport || allowFlatten || singleFlattened;
-    const manager = getTileFlattenManager();
-    const busy = manager?.isBusy ? manager.isBusy() : false;
-    const action = singleFlattened ? 'deconstruct' : (allowExport ? 'export' : 'flatten');
-    const label = singleFlattened
-      ? 'Deconstruct flattened tile'
-      : (action === 'export'
-        ? 'Export / Flatten Scene'
-        : (count > 1
-          ? `Flatten ${count} selected tile${count === 1 ? '' : 's'}`
-          : (singleMerged ? 'Flatten merged tile' : 'Flatten selected tile')));
-    const ariaLabel = singleFlattened
-      ? 'Deconstruct flattened tile in FA Nexus'
-      : (action === 'export'
-        ? 'Export or flatten scene in FA Nexus'
-        : (count > 1
-          ? `Flatten ${count} selected tile${count === 1 ? '' : 's'} in FA Nexus`
-          : (singleMerged ? 'Flatten merged tile in FA Nexus' : 'Flatten selected tile in FA Nexus')));
-    const iconClass = singleFlattened
-      ? 'fa-object-ungroup'
-      : (action === 'export' ? 'fa-file-export' : 'fa-compress-arrows-alt');
-    const canvasReady = !!canvas?.ready;
-    return {
-      visible,
-      disabled: !visible || busy || !canvasReady,
-      label,
-      ariaLabel,
-      count,
-      action,
-      iconClass
-    };
+    return buildLayerManagerFlattenState({
+      selection,
+      flattenManagerClass: TileFlattenManager,
+      flattenManager: getTileFlattenManager(),
+      canvasReady: !!canvas?.ready
+    });
   }
 
   _updateFlattenFooter() {
     const root = this.element;
     if (!root) return;
-    const footer = root.querySelector('.fa-nexus-layer-manager__footer');
-    const button = root.querySelector('button[data-action="flatten"]');
-    if (!footer || !button) return;
-    const state = this._getFlattenState();
-    if (state.visible) footer.removeAttribute('hidden');
-    else footer.setAttribute('hidden', 'hidden');
-    button.disabled = state.disabled;
-    button.classList.toggle('disabled', state.disabled);
-    const label = state.label || 'Flatten tiles';
-    const labelEl = button.querySelector('.fa-nexus-layer-manager__flatten-label');
-    if (labelEl) labelEl.textContent = label;
-    const iconEl = button.querySelector('.fa-nexus-layer-manager__flatten-icon');
-    if (iconEl && state.iconClass) {
-      iconEl.className = `fas ${state.iconClass} fa-nexus-layer-manager__flatten-icon`;
-    }
-    button.dataset.mode = state.action || 'flatten';
-    button.setAttribute('aria-label', state.ariaLabel || label);
-    button.title = state.ariaLabel || label;
-    if (state.disabled) button.setAttribute('aria-disabled', 'true');
-    else button.removeAttribute('aria-disabled');
+    applyLayerManagerFlattenFooterState(root, this._getFlattenState());
   }
 
   _getSessionState() {
@@ -2996,20 +3635,6 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._contextMenuCleanup = null;
     if (!cleanup) return;
     try { cleanup(); } catch (_) {}
-  }
-
-  _clearPendingSeparatorSelection() {
-    if (!this._pendingSeparatorSelectTimer) return;
-    window.clearTimeout(this._pendingSeparatorSelectTimer);
-    this._pendingSeparatorSelectTimer = null;
-  }
-
-  _queueSeparatorSelection(separatorEl, event = null) {
-    this._clearPendingSeparatorSelection();
-    this._pendingSeparatorSelectTimer = window.setTimeout(() => {
-      this._pendingSeparatorSelectTimer = null;
-      this._selectElevation(separatorEl, event);
-    }, SEPARATOR_RENAME_CLICK_DELAY_MS);
   }
 
   _showLayerContextMenu(event, items = []) {
@@ -3165,7 +3790,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       ],
       notes: [
         'Right-click headers for rename, lock, move, and flatten actions on matching group layers.',
-        'Nested groups remember collapsed state per scene and auto-expand to reveal canvas selections.',
+        'Collapsed elevation groups remember state per scene and auto-expand to reveal canvas selections.',
         'With active filters, group lock and flatten act on matching layers only, and group elevation moves are blocked.',
         'Quick elevation nudging uses 0.01 by default, 0.001 with Ctrl/Cmd, and 0.1 with Shift.'
       ]
@@ -3201,28 +3826,24 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   _getTilePlaceable(tileId) {
     const id = String(tileId || '').trim();
     if (!id) return null;
-    return canvas?.tiles?.placeables?.find?.((tile) => (tile?.document?.id || tile?.id) === id) || null;
+    return resolveTilePlaceable(id);
   }
 
   _getContextMenuTileDocs(tileId) {
-    const id = String(tileId || '').trim();
-    if (!id) return [];
-    const clickedDoc = this._viewState?.fullTileDocsById?.get?.(id)
-      || canvas?.scene?.tiles?.get?.(id)
-      || this._getTilePlaceable(id)?.document
-      || null;
-    if (!clickedDoc) return [];
-    const selectedDocs = this._getSelectedTileDocs();
-    const selectedIds = new Set(selectedDocs.map((doc) => doc?.id).filter(Boolean));
-    if (selectedIds.has(id) && selectedDocs.length > 1) return selectedDocs;
-    return [clickedDoc];
+    return getLayerManagerContextMenuTileDocs({
+      tileId,
+      viewState: this._viewState,
+      selectedDocs: this._getSelectedTileDocs(),
+      resolveTileDocument: (id) => this._getTilePlaceable(id)?.document || null
+    });
   }
 
   _getGroupContextMenuDocs(elevationKey) {
-    const key = String(elevationKey || '').trim();
-    if (!key) return [];
-    const ids = this._getMatchingElevationDocs(key).map((doc) => doc?.id).filter(Boolean);
-    return this._getOrderedDocsByIds(ids);
+    return getLayerManagerGroupContextMenuDocs({
+      elevationKey,
+      getMatchingElevationDocs: (key) => this._getMatchingElevationDocs(key),
+      orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids)
+    });
   }
 
   _triggerTileContextHighlight(tile, event = null) {
@@ -3247,343 +3868,515 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._syncSelectionFromCanvas();
   }
 
-  async _toggleDocsLock(docs = []) {
-    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean));
-    if (!orderedDocs.length || !canvas?.scene?.updateEmbeddedDocuments) return;
-    const blockedDocs = orderedDocs.filter((doc) => !doc?.canUserModify?.(game.user, 'update'));
-    if (blockedDocs.length) {
-      throw new Error('You do not have permission to lock every targeted layer.');
-    }
-    const allLocked = orderedDocs.every((doc) => !!doc?.locked);
-    const nextLocked = !allLocked;
-    await canvas.scene.updateEmbeddedDocuments('Tile', orderedDocs.map((doc) => ({
-      _id: doc.id,
-      locked: nextLocked
-    })));
-    Logger.info('LayerManager.contextMenu.lock.commit', {
+  _notifyLayerManagerActionError(action, error) {
+    const key = String(action || 'action').replace(/[^a-zA-Z0-9]+/g, '.').replace(/^\.+|\.+$/g, '') || 'action';
+    Logger.error(`LayerManager.${key}.failed`, {
       sceneId: canvas?.scene?.id || null,
-      tileCount: orderedDocs.length,
-      locked: nextLocked
+      error: String(error?.message || error)
     });
-    this._updateSelectionActions();
+    ui?.notifications?.error?.(`Failed to ${action}: ${error?.message || error}`);
   }
 
-  _selectTileDocs(docs = []) {
-    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean));
-    if (!orderedDocs.length) return [];
-    this._activateTilesLayer();
-    this._clearSceneMarkerSelection();
-    try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-    const selectedDocs = [];
-    for (const doc of orderedDocs) {
-      const tile = doc?.object || this._getTilePlaceable(doc?.id);
-      if (!tile || tile.destroyed) {
-        Logger.error('LayerManager.contextMenu.selection.missingPlaceable', {
-          tileId: doc?.id || null
-        });
-        continue;
-      }
-      try {
-        tile.control({ releaseOthers: false });
-        if (tile?.document) selectedDocs.push(tile.document);
-      } catch (error) {
-        Logger.error('LayerManager.contextMenu.selection.control.failed', {
-          tileId: doc?.id || null,
-          error: String(error?.message || error)
-        });
-      }
+  _orderTileDocuments(docs = []) {
+    const uniqueDocs = uniqueTileDocuments(docs);
+    const ids = uniqueDocs.map((doc) => getTileDocumentId(doc)).filter(Boolean);
+    if (!ids.length) return [];
+    const orderedDocs = this._getOrderedDocsByIds(ids);
+    return orderedDocs.length ? orderedDocs : uniqueDocs;
+  }
+
+  _preserveTileSelectionContextForNexus(docs = [], source = 'unknown') {
+    const selectedDocs = uniqueTileDocuments(docs);
+    if (!selectedDocs.length) return false;
+    try {
+      return preserveTileSelectionDocumentsForNexus(`LayerManager.${source}`, selectedDocs);
+    } catch (error) {
+      Logger.error('LayerManager.tileSelectionContext.preserveFailed', {
+        sceneId: canvas?.scene?.id || null,
+        source,
+        tileIds: selectedDocs.map((doc) => getTileDocumentId(doc)).filter(Boolean),
+        error: String(error?.message || error)
+      });
+      return false;
     }
-    this._syncSelectionFromCanvas();
+  }
+
+  _clearTileSelectionContextForNexus(source = 'unknown') {
+    try {
+      return clearNexusTileSelectionContext(`LayerManager.${source}`);
+    } catch (error) {
+      Logger.error('LayerManager.tileSelectionContext.clearFailed', {
+        sceneId: canvas?.scene?.id || null,
+        source,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  _getSelectedTileDocIds() {
+    return this._getSelectedTileDocs().map((doc) => getTileDocumentId(doc)).filter(Boolean);
+  }
+
+  _selectTileDocs(docs = [], {
+    retainSelection = false,
+    force = true,
+    source = 'unknown',
+    allowAutoExpand = true,
+    allowScrollToTile = true
+  } = {}) {
+    const orderedDocs = this._orderTileDocuments(docs);
+    if (!orderedDocs.length) return [];
+    const intendedDocs = retainSelection
+      ? this._orderTileDocuments([...this._getSelectedTileDocs(), ...orderedDocs])
+      : orderedDocs;
+    this._activateTilesLayer();
+    if (!retainSelection) this._clearSceneMarkerSelection();
+    this._setPendingCanvasSelectionSyncOptions({
+      allowAutoExpand,
+      allowScrollToTile
+    });
+
+    const selectedDocs = [];
+    withBulkTileSelectionBatch(() => {
+      if (!retainSelection) {
+        try { canvas?.tiles?.releaseAll?.({ renderSidebar: false }); } catch (error) {
+          Logger.error('LayerManager.selection.releaseAll.failed', {
+            sceneId: canvas?.scene?.id || null,
+            source,
+            error: String(error?.message || error)
+          });
+          throw error;
+        }
+      }
+
+      for (const doc of orderedDocs) {
+        const tileId = getTileDocumentId(doc);
+        const tile = this._getTilePlaceable(tileId);
+        if (!tile) {
+          Logger.debug('LayerManager.selection.missingPlaceable', {
+            sceneId: canvas?.scene?.id || null,
+            source,
+            tileId
+          });
+          continue;
+        }
+        try {
+          tile.control({ releaseOthers: false, renderSidebar: false, force });
+          if (tile.controlled && tile.document) selectedDocs.push(tile.document);
+        } catch (error) {
+          Logger.error('LayerManager.selection.control.failed', {
+            sceneId: canvas?.scene?.id || null,
+            source,
+            tileId,
+            force,
+            error: String(error?.message || error)
+          });
+          throw error;
+        }
+      }
+
+      renderTileSelectionSidebar();
+    });
+
+    this._syncSelectionFromCanvas(null, null, {
+      allowAutoExpand,
+      allowScrollToTile
+    });
+    this._queueSelectionSyncFromCanvas({
+      allowAutoExpand,
+      allowScrollToTile
+    });
+    const currentSelectedDocs = this._getSelectedTileDocs();
+    const currentSelectedIds = new Set(currentSelectedDocs.map((doc) => getTileDocumentId(doc)).filter(Boolean));
+    const lockedIntendedDocs = intendedDocs.filter((doc) => {
+      const id = getTileDocumentId(doc);
+      return id && !!doc?.locked && !currentSelectedIds.has(id);
+    });
+    const preservedDocs = uniqueTileDocuments([...currentSelectedDocs, ...lockedIntendedDocs]);
+    if (preservedDocs.length) {
+      this._preserveTileSelectionContextForNexus(preservedDocs, `selection:${source}`);
+    }
+    if (lockedIntendedDocs.length) {
+      Logger.warn('LayerManager.selection.lockedContextPreserved', {
+        sceneId: canvas?.scene?.id || null,
+        source,
+        tileIds: lockedIntendedDocs.map((doc) => getTileDocumentId(doc)).filter(Boolean)
+      });
+    }
     return selectedDocs;
   }
 
-  async _flattenDocs(docs = []) {
-    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean));
-    if (!orderedDocs.length) return;
-    const manager = getTileFlattenManager();
-    if (manager?.isBusy?.()) {
-      throw new Error('Another flattening or deconstruction operation is already in progress.');
-    }
-    this._selectTileDocs(orderedDocs);
-    Logger.info('LayerManager.contextMenu.flatten.begin', {
-      sceneId: canvas?.scene?.id || null,
-      tileCount: orderedDocs.length
+  _releaseTileDocs(docs = [], {
+    source = 'unknown',
+    allowAutoExpand = false,
+    allowScrollToTile = false
+  } = {}) {
+    const orderedDocs = this._orderTileDocuments(docs);
+    if (!orderedDocs.length) return [];
+    this._activateTilesLayer();
+    this._setPendingCanvasSelectionSyncOptions({
+      allowAutoExpand,
+      allowScrollToTile
     });
-    await manager.showFlattenDialog();
+
+    const releasedDocs = [];
+    withBulkTileSelectionBatch(() => {
+      for (const doc of orderedDocs) {
+        const tileId = getTileDocumentId(doc);
+        const tile = this._getTilePlaceable(tileId);
+        if (!tile) {
+          Logger.debug('LayerManager.selection.release.missingPlaceable', {
+            sceneId: canvas?.scene?.id || null,
+            source,
+            tileId
+          });
+          continue;
+        }
+        if (!tile.controlled) continue;
+        try {
+          tile.release({ renderSidebar: false });
+          if (!tile.controlled && tile.document) releasedDocs.push(tile.document);
+        } catch (error) {
+          Logger.error('LayerManager.selection.release.failed', {
+            sceneId: canvas?.scene?.id || null,
+            source,
+            tileId,
+            error: String(error?.message || error)
+          });
+          throw error;
+        }
+      }
+      renderTileSelectionSidebar();
+    });
+
+    this._syncSelectionFromCanvas(null, null, {
+      allowAutoExpand,
+      allowScrollToTile
+    });
+    this._queueSelectionSyncFromCanvas({
+      allowAutoExpand,
+      allowScrollToTile
+    });
+    const remainingDocs = this._getSelectedTileDocs();
+    if (remainingDocs.length) {
+      this._preserveTileSelectionContextForNexus(remainingDocs, `selection:${source}:remaining`);
+    } else {
+      this._clearTileSelectionContextForNexus(`selection:${source}:empty`);
+    }
+    return releasedDocs;
+  }
+
+  async _restoreSelectionAfterBulkTileUpdate(docIds = [], {
+    source = 'unknown',
+    allowAutoExpand = true,
+    allowScrollToTile = true
+  } = {}) {
+    const ids = Array.from(new Set((Array.isArray(docIds) ? docIds : [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)));
+    if (!ids.length) return [];
+    let preservedRestoreContext = false;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const docs = ids.map((id) => canvas?.scene?.tiles?.get?.(id) || null).filter(Boolean);
+      if (docs.length) {
+        if (!preservedRestoreContext) {
+          this._preserveTileSelectionContextForNexus(docs, `bulkRestore:${source}`);
+          preservedRestoreContext = true;
+        }
+        const selectedDocs = this._selectTileDocs(docs, {
+          retainSelection: false,
+          force: true,
+          source,
+          allowAutoExpand,
+          allowScrollToTile
+        });
+        if (selectedDocs.length) {
+          await waitForUiFrame(240);
+          const controlledIds = new Set((Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled : [])
+            .map((tile) => tile?.document?.id || tile?.id)
+            .filter(Boolean));
+          const missingIds = ids.filter((id) => !controlledIds.has(id));
+          if (!missingIds.length) return selectedDocs;
+          Logger.info('LayerManager.bulk.selectionRestore.retryAfterRefresh', {
+            sceneId: canvas?.scene?.id || null,
+            source,
+            missingCount: missingIds.length,
+            tileCount: ids.length
+          });
+          const retryDocs = ids.map((id) => canvas?.scene?.tiles?.get?.(id) || null).filter(Boolean);
+          const retrySelectedDocs = this._selectTileDocs(retryDocs, {
+            retainSelection: false,
+            force: true,
+            source: `${source}:delayed`,
+            allowAutoExpand,
+            allowScrollToTile
+          });
+          if (retrySelectedDocs.length) return retrySelectedDocs;
+        }
+      }
+      await waitForUiFrame(80);
+    }
+    Logger.warn('LayerManager.bulk.selectionRestoreIncomplete', {
+      sceneId: canvas?.scene?.id || null,
+      source,
+      tileIds: ids
+    });
+    return [];
+  }
+
+  async _toggleDocsVisibility(docs = [], {
+    source = 'unknown',
+    nextHidden = null,
+    referenceDoc = null
+  } = {}) {
+    const orderedDocs = this._orderTileDocuments(docs);
+    if (!orderedDocs.length) return [];
+    if (!canvas?.scene?.updateEmbeddedDocuments) throw new Error('No active scene available for layer visibility updates.');
+    const targets = requireMutableTileDocuments(orderedDocs, {
+      user: game?.user,
+      action: 'change visibility for'
+    });
+    if (!targets.length) return [];
+    const selectedIds = this._getSelectedTileDocIds();
+    if (selectedIds.length) {
+      this._preserveTileSelectionContextForNexus(
+        this._getOrderedDocsByIds(selectedIds),
+        `visibility:${source}:selected`
+      );
+    }
+    const referenceId = getTileDocumentId(referenceDoc);
+    const targetReference = referenceId
+      ? targets.find((target) => getTileDocumentId(target) === referenceId) || null
+      : null;
+    const resolvedNextHidden = typeof nextHidden === 'boolean'
+      ? nextHidden
+      : (targetReference ? !isLayerHidden(targetReference) : !targets.every((target) => isLayerHidden(target)));
+    const updates = targets
+      .filter((doc) => isLayerHidden(doc) !== resolvedNextHidden)
+      .map((doc) => buildLayerHiddenUpdate(doc, resolvedNextHidden))
+      .filter(Boolean);
+
+    if (updates.length) {
+      this._preserveListScrollTop(this._captureListScrollTop());
+      bulkLayerDocumentUpdateState.depth += 1;
+      try {
+        await canvas.scene.updateEmbeddedDocuments('Tile', updates);
+      } finally {
+        bulkLayerDocumentUpdateState.depth = Math.max(0, bulkLayerDocumentUpdateState.depth - 1);
+        if (bulkLayerDocumentUpdateState.renderPending) {
+          bulkLayerDocumentUpdateState.renderPending = false;
+          this._scheduleRender();
+        }
+      }
+    }
+    Logger.info('LayerManager.bulk.visibility.commit', {
+      sceneId: canvas?.scene?.id || null,
+      source,
+      tileCount: targets.length,
+      updateCount: updates.length,
+      hidden: resolvedNextHidden
+    });
+    await this._restoreSelectionAfterBulkTileUpdate(selectedIds, {
+      source: `visibility:${source}`,
+      allowAutoExpand: false,
+      allowScrollToTile: false
+    });
+    this._updateSelectionActions();
     this._updateFlattenFooter();
+    return targets;
+  }
+
+  async _toggleDocsLock(docs = [], { source = 'contextMenu' } = {}) {
+    const orderedDocs = this._orderTileDocuments(docs);
+    if (!orderedDocs.length) return [];
+    if (!canvas?.scene?.updateEmbeddedDocuments) throw new Error('No active scene available for layer lock updates.');
+    const targets = requireMutableTileDocuments(orderedDocs, {
+      user: game?.user,
+      action: 'lock'
+    });
+    if (!targets.length) return [];
+    const selectedIds = this._getSelectedTileDocIds();
+    if (selectedIds.length) {
+      this._preserveTileSelectionContextForNexus(
+        this._getOrderedDocsByIds(selectedIds),
+        `lock:${source}:selected`
+      );
+    }
+    const allLocked = targets.every((doc) => !!doc?.locked);
+    const nextLocked = !allLocked;
+    const updates = targets
+      .filter((doc) => !!doc?.locked !== nextLocked)
+      .map((doc) => buildLayerLockUpdate(doc, nextLocked))
+      .filter(Boolean);
+
+    if (updates.length) {
+      this._preserveListScrollTop(this._captureListScrollTop());
+      bulkLayerDocumentUpdateState.depth += 1;
+      try {
+        await canvas.scene.updateEmbeddedDocuments('Tile', updates);
+      } finally {
+        bulkLayerDocumentUpdateState.depth = Math.max(0, bulkLayerDocumentUpdateState.depth - 1);
+        if (bulkLayerDocumentUpdateState.renderPending) {
+          bulkLayerDocumentUpdateState.renderPending = false;
+          this._scheduleRender();
+        }
+      }
+    }
+    Logger.info('LayerManager.bulk.lock.commit', {
+      sceneId: canvas?.scene?.id || null,
+      source,
+      tileCount: targets.length,
+      updateCount: updates.length,
+      locked: nextLocked
+    });
+    await this._restoreSelectionAfterBulkTileUpdate(selectedIds, { source: `lock:${source}` });
+    this._updateSelectionActions();
+    this._updateFlattenFooter();
+    return targets;
+  }
+
+  async _flattenDocs(docs = []) {
+    await flattenContextMenuDocs({
+      docs,
+      orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids),
+      flattenManager: getTileFlattenManager(),
+      selectTileDocs: (orderedDocs) => this._selectTileDocs(orderedDocs),
+      updateFlattenFooter: () => this._updateFlattenFooter()
+    });
   }
 
   async _deconstructDoc(doc) {
-    if (!doc) return;
-    const manager = getTileFlattenManager();
-    if (manager?.isBusy?.()) {
-      throw new Error('Another flattening or deconstruction operation is already in progress.');
-    }
-    Logger.info('LayerManager.contextMenu.deconstruct.begin', {
-      sceneId: canvas?.scene?.id || null,
-      tileId: doc?.id || null
+    await deconstructContextMenuDoc({
+      doc,
+      flattenManager: getTileFlattenManager(),
+      updateFlattenFooter: () => this._updateFlattenFooter()
     });
-    try {
-      await manager.confirmAndDeconstructTile(doc);
-    } finally {
-      this._updateFlattenFooter();
-    }
   }
 
   _buildFlattenContextMenuItem(docs = []) {
-    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean));
-    const flattenManager = getTileFlattenManager();
-    const busy = !!flattenManager?.isBusy?.();
-    const singleDoc = orderedDocs.length === 1 ? orderedDocs[0] : null;
-    const singleFlattened = !!singleDoc && TileFlattenManager.isFlattenedTile(singleDoc);
-
-    if (singleFlattened) {
-      return {
-        label: 'Deconstruct',
-        iconClass: 'fa-solid fa-object-ungroup',
-        disabled: busy || !canvas?.ready,
-        action: () => this._deconstructDoc(singleDoc),
-        errorMessage: 'Failed to deconstruct the targeted layer.'
-      };
-    }
-
-    return {
-      label: 'Flatten',
-      iconClass: 'fa-solid fa-compress-arrows-alt',
-      disabled: !TileFlattenManager.canFlattenSelection(orderedDocs) || busy,
-      action: () => this._flattenDocs(orderedDocs),
-      errorMessage: 'Failed to flatten the targeted layers.'
-    };
+    return buildLayerManagerFlattenContextMenuItem({
+      docs,
+      orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids),
+      flattenManager: getTileFlattenManager(),
+      onFlatten: (orderedDocs) => this._flattenDocs(orderedDocs),
+      onDeconstruct: (doc) => this._deconstructDoc(doc)
+    });
   }
 
   async _openNexusTileEditor(doc) {
+    await openContextMenuNexusTileEditor(doc);
+  }
+
+  async _openTileMaskEditor(doc) {
     if (!doc) throw new Error('Tile document not available.');
-    Logger.info('LayerManager.contextMenu.nexusEdit.begin', {
+    Logger.info('LayerManager.contextMenu.maskEditor.begin', {
       sceneId: canvas?.scene?.id || null,
       tileId: doc?.id || null,
-      mode: getFaNexusTileEditMode(doc)
+      hasMask: hasTileMask(doc)
     });
-    await openFaNexusTileEditor(doc, { source: 'layer-manager-context-menu' });
+    await openFaNexusTileMaskEditor(doc, { source: 'layer-manager-context-menu' });
+  }
+
+  async _clearTileMasks(docs = []) {
+    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean))
+      .filter((doc) => doc && hasTileMask(doc));
+    if (!orderedDocs.length) return;
+    Logger.info('LayerManager.contextMenu.clearMask.begin', {
+      sceneId: canvas?.scene?.id || null,
+      tileCount: orderedDocs.length
+    });
+    for (const doc of orderedDocs) {
+      await clearStandardTileMask(doc, { reason: 'layer-manager-context-menu' });
+    }
+    ui?.notifications?.info?.(`Cleared tile mask${orderedDocs.length === 1 ? '' : 's'}.`);
+    this._syncSelectionFromCanvas();
   }
 
   async _promptDocsElevationChange(docs = [], anchor = null) {
-    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean));
-    if (!orderedDocs.length) return;
-    const blockedDocs = orderedDocs.filter((doc) => !doc?.canUserModify?.(game.user, 'update'));
-    if (blockedDocs.length) {
-      throw new Error('You do not have permission to move every targeted layer.');
-    }
-    const DialogV2 = foundry?.applications?.api?.DialogV2;
-    if (!DialogV2?.wait) {
-      throw new Error('DialogV2.wait is unavailable for layer elevation changes.');
-    }
-    const uniqueElevations = Array.from(new Set(orderedDocs.map((doc) => formatElevation(Number(doc?.elevation ?? 0)))));
-    const initialValue = uniqueElevations.length === 1 ? uniqueElevations[0] : '';
-    const inputId = `fa-nexus-layer-manager-elevation-${Date.now()}`;
-    const tileCount = orderedDocs.length;
-    const result = await DialogV2.wait({
-      window: {
-        title: tileCount === 1 ? 'Change Layer Elevation' : 'Change Layer Elevation'
-      },
-      position: {
-        width: 320,
-        height: 'auto'
-      },
-      modal: true,
-      content: `
-        <form class="standard-form">
-          <p>Move ${tileCount} layer${tileCount === 1 ? '' : 's'} to an exact elevation.</p>
-          <div class="form-group">
-            <label for="${inputId}">Elevation</label>
-            <div class="form-fields">
-              <input id="${inputId}" name="elevation" type="number" step="0.001" value="${initialValue}">
-            </div>
-          </div>
-        </form>
-      `,
-      buttons: [
-        {
-          action: 'apply',
-          label: 'Apply',
-          icon: 'fas fa-arrows-up-down',
-          default: true,
-          callback: (_event, _button, dialog) => {
-            const input = dialog?.element?.querySelector?.(`#${CSS.escape(inputId)}`);
-            return String(input?.value ?? '').trim();
-          }
-        },
-        {
-          action: 'cancel',
-          label: 'Cancel'
-        }
-      ],
-      close: () => null,
-      render: (_event, dialog) => {
-        const input = dialog?.element?.querySelector?.(`#${CSS.escape(inputId)}`);
-        requestAnimationFrame(() => {
-          this._positionApplicationNearCursor(dialog, anchor);
-          try {
-            input?.focus?.();
-            input?.select?.();
-          } catch (_) {}
-        });
-      }
+    await promptLayerManagerDocsElevationChange({
+      docs,
+      anchor,
+      orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids),
+      user: game?.user,
+      formatElevation,
+      parseElevationInput,
+      positionApplicationNearCursor: (dialog, dialogAnchor) => this._positionApplicationNearCursor(dialog, dialogAnchor),
+      applyDocsElevationChange: (orderedDocs, targetElevation) => this._applyDocsElevationChange(orderedDocs, targetElevation)
     });
-    if (result === null || result === undefined) return;
-    const targetElevation = parseElevationInput(result);
-    if (!Number.isFinite(targetElevation)) {
-      throw new Error('Elevation value must be a valid number.');
-    }
-    await this._applyDocsElevationChange(orderedDocs, targetElevation);
+  }
+
+  _resolveTileElevationMove(doc, requestedElevation) {
+    return resolveLayerManagerTileElevationMove({
+      doc,
+      requestedElevation,
+      quantizeElevation
+    });
+  }
+
+  async _restoreSelectionAfterElevationMove(docIds = [], { source = 'unknown' } = {}) {
+    return restoreLayerManagerSelectionAfterElevationMove({
+      docIds,
+      source,
+      scene: canvas?.scene,
+      waitForUiFrame,
+      selectTileDocs: (docs) => this._selectTileDocs(docs)
+    });
   }
 
   async _applyDocsElevationChange(docs = [], targetElevation) {
-    const orderedDocs = this._getOrderedDocsByIds(docs.map((doc) => doc?.id).filter(Boolean));
-    if (!orderedDocs.length || !canvas?.scene?.updateEmbeddedDocuments) return;
-    const blockedDocs = orderedDocs.filter((doc) => !doc?.canUserModify?.(game.user, 'update'));
-    if (blockedDocs.length) {
-      throw new Error('You do not have permission to move every targeted layer.');
-    }
-    const scene = canvas?.scene;
-    if (!scene) throw new Error('No active scene available for layer elevation change.');
-    const nextElevation = quantizeElevation(targetElevation);
-    const targetKey = elevationGroupKey(nextElevation);
-    const movedIds = new Set(orderedDocs.map((doc) => doc?.id).filter(Boolean));
-    const updates = [];
-    let nextSort = computeNextSortAtElevation(nextElevation);
-    if (!Number.isFinite(nextSort)) nextSort = 0;
-    nextSort += Math.max(0, orderedDocs.length - 1) * 2;
-    for (const doc of orderedDocs) {
-      const currentKey = elevationGroupKey(doc?.elevation ?? 0);
-      const currentSort = Number(doc?.sort ?? 0) || 0;
-      if (currentKey !== targetKey || currentSort !== nextSort) {
-        updates.push({
-          _id: doc.id,
-          elevation: nextElevation,
-          sort: nextSort
-        });
-      }
-      nextSort -= 2;
-    }
-    if (!updates.length) {
-      Logger.info('LayerManager.contextMenu.elevation.noop', {
-        sceneId: scene.id || null,
-        targetKey,
-        tileCount: orderedDocs.length
-      });
-      return;
-    }
-
-    await scene.updateEmbeddedDocuments('Tile', updates);
-
-    const metadata = getSceneElevationGroupMetadata(scene);
-    const completeMoves = [];
-    for (const [sourceKey, groupDocs] of this._viewState?.fullElevationGroups || []) {
-      if (!Array.isArray(groupDocs) || !groupDocs.length || sourceKey === targetKey) continue;
-      const groupIds = groupDocs.map((doc) => doc?.id).filter(Boolean);
-      if (!groupIds.length || !groupIds.every((id) => movedIds.has(id))) continue;
-      completeMoves.push({ sourceKey, targetKey });
-    }
-    if (completeMoves.length) {
-      await setSceneElevationGroupMetadata(scene, mergeElevationGroupMetadataOnBulkMove({
-        metadata,
-        moves: completeMoves
-      }));
-    }
-
-    Logger.info('LayerManager.contextMenu.elevation.commit', {
-      sceneId: scene.id || null,
-      targetKey,
-      tileCount: updates.length,
-      metadataMoves: completeMoves.length
+    await applyLayerManagerDocsElevationChange({
+      docs,
+      targetElevation,
+      orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids),
+      user: game?.user,
+      scene: canvas?.scene,
+      quantizeElevation,
+      elevationGroupKey,
+      computeNextSortAtElevation,
+      getSceneElevationGroupMetadata,
+      mergeElevationGroupMetadataOnBulkMove,
+      setSceneElevationGroupMetadata,
+      getFullElevationDocs: (key) => this._getFullElevationDocs(key),
+      resolveTileElevationMove: ({ doc, requestedElevation }) => this._resolveTileElevationMove(doc, requestedElevation),
+      restoreSelectionAfterElevationMove: (docIds, options) => this._restoreSelectionAfterElevationMove(docIds, options)
     });
   }
 
   _getSelectedTileDocs({ visibleOnly = false } = {}) {
-    const selected = Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled : [];
-    const docsById = new Map();
-    for (const tile of selected) {
-      const doc = tile?.document || null;
-      const id = doc?.id || tile?.id;
-      if (!doc || !id) continue;
-      docsById.set(id, doc);
-    }
-    if (!docsById.size) return [];
-    let allowedIds = null;
-    if (visibleOnly) {
-      const visibleIds = new Set();
-      const root = this.element;
-      for (const item of root?.querySelectorAll?.('[data-tile-id]') || []) {
-        const id = item?.dataset?.tileId;
-        if (id) visibleIds.add(id);
-      }
-      allowedIds = visibleIds;
-    }
-    const orderedIds = Array.isArray(this._viewState?.fullTileIdsInOrder) ? this._viewState.fullTileIdsInOrder : [...docsById.keys()];
-    const docs = [];
-    for (const id of orderedIds) {
-      if (allowedIds && !allowedIds.has(id)) continue;
-      const doc = docsById.get(id);
-      if (doc) docs.push(doc);
-    }
-    return docs;
+    return getLayerManagerSelectedTileDocs({
+      root: this.element,
+      viewState: this._viewState,
+      visibleOnly,
+      controlledTiles: canvas?.tiles?.controlled
+    });
   }
 
   _getSelectionActionState() {
-    const selectedDocs = this._getSelectedTileDocs();
-    const lockTargets = selectedDocs.filter((doc) => doc?.canUserModify?.(game.user, 'update'));
-    const deleteTargets = selectedDocs.filter((doc) => doc?.canUserModify?.(game.user, 'delete'));
-    const allLocked = lockTargets.length ? lockTargets.every((doc) => !!doc?.locked) : false;
-    const lockLabel = allLocked ? 'Unlock Selected' : 'Lock Selected';
-    return {
-      lockLabel,
-      lockTitle: `${lockLabel} layer${lockTargets.length === 1 ? '' : 's'}`,
-      lockDisabled: lockTargets.length === 0,
-      deleteDisabled: deleteTargets.length === 0
-    };
+    return buildLayerManagerSelectionActionState(this._getSelectedTileDocs(), { user: game?.user });
   }
 
   _updateSelectionActions() {
     const root = this.element;
     if (!root) return;
-    const lockButton = root.querySelector('button[data-action="toggle-selection-lock"]');
-    const deleteButton = root.querySelector('button[data-action="delete-selection"]');
-    const state = this._getSelectionActionState();
-    if (lockButton) {
-      lockButton.disabled = state.lockDisabled;
-      lockButton.classList.toggle('disabled', state.lockDisabled);
-      lockButton.setAttribute('aria-disabled', state.lockDisabled ? 'true' : 'false');
-      lockButton.title = state.lockTitle;
-      lockButton.setAttribute('aria-label', state.lockTitle);
-    }
-    if (deleteButton) {
-      deleteButton.disabled = state.deleteDisabled;
-      deleteButton.classList.toggle('disabled', state.deleteDisabled);
-      deleteButton.setAttribute('aria-disabled', state.deleteDisabled ? 'true' : 'false');
-    }
+    applyLayerManagerSelectionActionState(root, this._getSelectionActionState());
   }
 
   async _toggleSelectionLock() {
-    const targets = this._getSelectedTileDocs().filter((doc) => doc?.canUserModify?.(game.user, 'update'));
-    if (!targets.length) return;
-    const allLocked = targets.every((doc) => !!doc?.locked);
-    const nextLocked = !allLocked;
-    await Promise.allSettled(targets.map((doc) => Promise.resolve(doc.update({ locked: nextLocked }))));
-    this._updateSelectionActions();
+    try {
+      await this._toggleDocsLock(this._getSelectedTileDocs(), { source: 'selectionToolbar' });
+    } catch (error) {
+      this._notifyLayerManagerActionError('toggle selected layer lock', error);
+    }
   }
 
   async _deleteSelection() {
-    const targets = this._getSelectedTileDocs().filter((doc) => doc?.canUserModify?.(game.user, 'delete'));
-    const ids = targets.map((doc) => doc?.id).filter(Boolean);
-    if (!ids.length || !canvas?.scene?.deleteEmbeddedDocuments) return;
-    try {
-      await canvas.scene.deleteEmbeddedDocuments('Tile', ids);
-    } catch (error) {
-      Logger.warn('LayerManager.deleteSelection.failed', { error: String(error?.message || error) });
-      ui?.notifications?.error?.(`Failed to delete selected layers: ${error?.message || error}`);
-    } finally {
-      this._updateSelectionActions();
-    }
+    await deleteSelectedDocs({
+      docs: this._getSelectedTileDocs(),
+      user: game?.user,
+      deleteEmbeddedDocuments: canvas?.scene?.deleteEmbeddedDocuments?.bind(canvas.scene),
+      onSelectionActionsUpdated: () => this._updateSelectionActions()
+    });
   }
 
   _onSearchInput(event) {
@@ -3632,41 +4425,17 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _getMatchingElevationGroupKeys(viewState = this._viewState) {
-    const state = viewState || this._viewState;
-    if (!state) return [];
-    if (state?.nestedGrouping) {
-      const visibleKeys = state?.matchingGroupHierarchy?.visibleKeys;
-      if (visibleKeys instanceof Set) {
-        return Array.from(visibleKeys).filter((key) => String(key || '').trim().length);
-      }
-    }
-    const map = state?.matchingTileIdsByElevation;
-    if (map instanceof Map) {
-      return Array.from(map.keys()).filter((key) => String(key || '').trim().length);
-    }
-    return [];
+    return getLayerManagerMatchingElevationGroupKeys(viewState || this._viewState);
   }
 
   _setMatchingElevationGroupsCollapsed(collapsed) {
-    const matchingGroupKeys = this._getMatchingElevationGroupKeys();
-    if (!matchingGroupKeys.length) return;
-    const state = this._getSessionState();
-    if (!(state.collapsedElevations instanceof Set)) {
-      state.collapsedElevations = new Set();
-    }
-    let changed = false;
-    for (const key of matchingGroupKeys) {
-      if (collapsed) {
-        if (!state.collapsedElevations.has(key)) {
-          state.collapsedElevations.add(key);
-          changed = true;
-        }
-        continue;
-      }
-      if (state.collapsedElevations.delete(key)) changed = true;
-    }
+    const { changed, matchingGroupKeys } = setLayerManagerMatchingElevationGroupsCollapsed({
+      viewState: this._viewState,
+      sessionState: this._getSessionState(),
+      collapsed,
+      persistCollapsedState: queuePersistLayerManagerCollapsedState
+    });
     if (!changed) return;
-    queuePersistLayerManagerCollapsedState();
     Logger.info(collapsed ? 'LayerManager.elevationGroup.collapseAll' : 'LayerManager.elevationGroup.expandAll', {
       sceneId: canvas?.scene?.id || null,
       groupCount: matchingGroupKeys.length,
@@ -3683,90 +4452,80 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._setMatchingElevationGroupsCollapsed(false);
   }
 
+  _toggleAllElevationGroups(buttonEl = null) {
+    const action = String(buttonEl?.dataset?.groupToggleAllAction || '').trim();
+    if (action === 'expand') this._expandAllElevationGroups();
+    else this._collapseAllElevationGroups();
+  }
+
   _toggleElevationCollapse(buttonEl) {
     const separator = buttonEl?.closest?.('.fa-nexus-layer-manager__separator');
     const key = String(buttonEl?.dataset?.elevationKey || separator?.dataset?.elevationKey || '').trim();
     if (!key) return;
-    const state = this._getSessionState();
-    if (state.collapsedElevations.has(key)) state.collapsedElevations.delete(key);
-    else state.collapsedElevations.add(key);
-    queuePersistLayerManagerCollapsedState();
+    toggleLayerManagerElevationGroupCollapsed({
+      sessionState: this._getSessionState(),
+      elevationKey: key,
+      persistCollapsedState: queuePersistLayerManagerCollapsedState
+    });
     this._scheduleRender();
   }
 
   _expandElevationGroupsForDocs(docs = []) {
-    if (!Array.isArray(docs) || !docs.length) return false;
-    const state = this._getSessionState();
-    if (!(state?.collapsedElevations instanceof Set) || !state.collapsedElevations.size) return false;
-    const keysToExpand = new Set();
-
-    for (const doc of docs) {
-      if (!doc) continue;
-      const exactKey = elevationGroupKey(doc?.elevation ?? 0);
-      if (!exactKey) continue;
-      if (!this._usesNestedGrouping()) {
-        keysToExpand.add(exactKey);
-        continue;
-      }
-      let node = this._getFullGroupNode(exactKey);
-      if (!node) {
-        keysToExpand.add(exactKey);
-        continue;
-      }
-      while (node) {
-        keysToExpand.add(node.key);
-        node = node.parentKey ? this._getFullGroupNode(node.parentKey) : null;
-      }
-    }
-
-    let changed = false;
-    for (const key of keysToExpand) {
-      if (state.collapsedElevations.delete(key)) changed = true;
-    }
+    const { changed, keysToExpand } = expandLayerManagerElevationGroupsForDocs({
+      docs,
+      viewState: this._viewState,
+      sessionState: this._getSessionState(),
+      elevationGroupKey,
+      resolveDocumentGroupKey: (doc) => this._resolveDisplayElevationKeyForDoc(doc),
+      persistCollapsedState: queuePersistLayerManagerCollapsedState
+    });
     if (changed) {
-      queuePersistLayerManagerCollapsedState();
       Logger.info('LayerManager.selection.autoExpand', {
         sceneId: canvas?.scene?.id || null,
-        groupCount: keysToExpand.size,
-        elevationKeys: Array.from(keysToExpand)
+        groupCount: keysToExpand.length,
+        elevationKeys: keysToExpand
       });
     }
     return changed;
   }
 
   _getMatchingElevationDocs(elevationKey) {
-    const key = String(elevationKey || '').trim();
-    if (!key) return [];
-    const ids = this._viewState?.matchingTileIdsByElevation?.get?.(key) || [];
-    const docs = [];
-    for (const id of ids) {
-      const doc = this._viewState?.fullTileDocsById?.get?.(id) || canvas?.scene?.tiles?.get?.(id) || null;
-      if (doc) docs.push(doc);
-    }
-    return docs;
+    return getLayerManagerMatchingElevationDocs(this._viewState, elevationKey, {
+      resolveDocumentById: (id) => canvas?.scene?.tiles?.get?.(id) || null
+    });
   }
 
   _getFullElevationDocs(elevationKey) {
-    const key = String(elevationKey || '').trim();
-    if (!key) return [];
-    const docs = this._viewState?.fullGroupDocsByKey?.get?.(key) || [];
-    return Array.isArray(docs) ? docs.filter(Boolean) : [];
+    return getLayerManagerFullElevationDocs(this._viewState, elevationKey);
   }
 
   _getFullGroupNode(elevationKey) {
-    const key = String(elevationKey || '').trim();
-    if (!key) return null;
-    return this._viewState?.fullGroupHierarchy?.nodesByKey?.get?.(key) || null;
+    return getLayerManagerFullGroupNode(this._viewState, elevationKey);
   }
 
   _getMatchingGroupNode(elevationKey) {
-    const key = String(elevationKey || '').trim();
+    return getLayerManagerMatchingGroupNode(this._viewState, elevationKey);
+  }
+
+  _resolveDisplayElevationKeyForDoc(doc = null) {
+    const id = String(doc?.id || doc?._id || '').trim();
+    if (!id) return '';
+    return String(this._viewState?.fullTileGroupKeyById?.get?.(id) || '').trim();
+  }
+
+  _resolveGroupElevation(groupKey = '') {
+    const key = String(groupKey || '').trim();
     if (!key) return null;
-    return this._viewState?.matchingGroupHierarchy?.nodesByKey?.get?.(key) || null;
+    const fullNode = this._getFullGroupNode(key);
+    if (Number.isFinite(fullNode?.elevation)) return Number(fullNode.elevation);
+    const exactElevation = Number(this._viewState?.fullExactGroupElevationsByKey?.get?.(key));
+    if (Number.isFinite(exactElevation)) return exactElevation;
+    const parsed = parseElevationInput(key);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   _usesNestedGrouping() {
-    return !!this._viewState?.nestedGrouping;
+    return usesNestedLayerManagerGrouping(this._viewState);
   }
 
   _queueElevationGroupMetadataSync(metadata) {
@@ -3793,6 +4552,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     if (!(nodes instanceof Map) || !nodes.size) return [];
     const moves = [];
     for (const node of nodes.values()) {
+      if (node?.canEditElevation === false || isSyntheticDisplayGroupKey(node?.key)) continue;
       const fullIds = Array.isArray(node?.fullSubtreeDocs)
         ? node.fullSubtreeDocs.map((doc) => doc?.id).filter(Boolean)
         : [];
@@ -3806,118 +4566,201 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _resolveDraggedTileIds(originId) {
-    const visibleSelectedDocs = this._getSelectedTileDocs({ visibleOnly: true });
-    const visibleSelectedIds = new Set(visibleSelectedDocs.map((doc) => doc?.id).filter(Boolean));
-    if (originId && visibleSelectedIds.has(originId) && visibleSelectedIds.size > 1) {
-      return visibleSelectedDocs.map((doc) => doc?.id).filter(Boolean);
-    }
-    return originId ? [originId] : [];
+    return resolveLayerManagerDraggedTileIds({
+      originId,
+      visibleSelectedDocs: this._getSelectedTileDocs({ visibleOnly: true })
+    });
   }
 
   _getOrderedDocsByIds(tileIds = []) {
-    const wanted = new Set(tileIds.filter(Boolean));
-    if (!wanted.size) return [];
-    const docs = [];
-    const orderedIds = Array.isArray(this._viewState?.fullTileIdsInOrder) ? this._viewState.fullTileIdsInOrder : [];
-    for (const id of orderedIds) {
-      if (!wanted.has(id)) continue;
-      const doc = this._viewState?.fullTileDocsById?.get?.(id) || canvas?.scene?.tiles?.get?.(id) || null;
-      if (doc) docs.push(doc);
-    }
-    if (docs.length >= wanted.size) return docs;
-    for (const id of wanted) {
-      if (docs.some((doc) => doc?.id === id)) continue;
-      const doc = this._viewState?.fullTileDocsById?.get?.(id) || canvas?.scene?.tiles?.get?.(id) || null;
-      if (doc) docs.push(doc);
-    }
-    return docs;
+    return getLayerManagerOrderedDocsByIds({
+      tileIds,
+      viewState: this._viewState,
+      resolveDocumentById: (id) => canvas?.scene?.tiles?.get?.(id) || null
+    });
   }
 
-  _setDraggedRowState(tileIds = []) {
-    const root = this.element;
-    if (!root) return;
-    const wanted = new Set(tileIds.filter(Boolean));
-    for (const item of root.querySelectorAll('[data-tile-id]')) {
-      const id = item?.dataset?.tileId;
-      item.classList.toggle('is-dragging', !!id && wanted.has(id));
-    }
+  _getPreviewEntryById(previewId = '') {
+    const targetId = String(previewId || '').trim();
+    if (!targetId) return null;
+    return Array.isArray(this._viewState?.entries)
+      ? this._viewState.entries.find((entry) => entry?.preview === true && String(entry?.previewId || '').trim() === targetId) || null
+      : null;
+  }
+
+  _setDraggedRowState(tileIds = [], previewIds = []) {
+    setLayerManagerDraggedRowState({
+      root: this.element,
+      tileIds,
+      previewIds
+    });
   }
 
   _clearDraggedRowState() {
-    const root = this.element;
-    if (!root) return;
-    for (const item of root.querySelectorAll('.is-dragging')) {
-      item.classList.remove('is-dragging');
-    }
+    clearLayerManagerDraggedRowState({
+      root: this.element
+    });
   }
 
   _clearDropIndicator() {
-    const root = this.element;
-    if (!root) {
-      this._dropIndicator = null;
-      return;
-    }
-    for (const item of root.querySelectorAll('.is-drop-before, .is-drop-after, .is-drop-header')) {
-      item.classList.remove('is-drop-before', 'is-drop-after', 'is-drop-header');
-    }
-    this._dropIndicator = null;
+    this._dropIndicator = clearLayerManagerDropIndicator({
+      root: this.element
+    });
   }
 
   _applyDropIndicator(target) {
-    if (!target?.element) {
-      this._clearDropIndicator();
-      return;
-    }
-    const nextKey = JSON.stringify({
-      kind: target.kind,
-      rowId: target.rowId || null,
-      elevationKey: target.elevationKey || null,
-      placeBefore: target.placeBefore !== false
+    this._dropIndicator = applyLayerManagerDropIndicator({
+      root: this.element,
+      target,
+      currentDropIndicator: this._dropIndicator
     });
-    if (this._dropIndicator === nextKey) return;
-    this._clearDropIndicator();
-    if (target.kind === 'header') {
-      target.element.classList.add('is-drop-header');
-    } else if (target.placeBefore) {
-      target.element.classList.add('is-drop-before');
-    } else {
-      target.element.classList.add('is-drop-after');
-    }
-    this._dropIndicator = nextKey;
   }
 
   _resolveDropTarget(event) {
-    if (!this._dragState?.tileIds?.length) return null;
-    const header = event?.target?.closest?.('.fa-nexus-layer-manager__separator[data-elevation-key]:not(.fa-nexus-layer-manager__separator--foreground)');
-    if (header) {
-      const elevationKey = String(header?.dataset?.elevationKey || '').trim();
-      if (!elevationKey) return null;
-      return {
-        kind: 'header',
-        elevationKey,
-        element: header
-      };
-    }
-    const row = event?.target?.closest?.('[data-tile-id]');
-    if (!row) return null;
-    const rowId = String(row?.dataset?.tileId || '').trim();
-    if (!rowId) return null;
-    const draggedIds = new Set(this._dragState.tileIds);
-    if (draggedIds.has(rowId)) return null;
-    const rect = row.getBoundingClientRect();
-    const midpoint = rect.top + (rect.height / 2);
+    return resolveLayerManagerDropTarget({
+      event,
+      dragState: this._dragState
+    });
+  }
+
+  _serializeDropTarget(target = null) {
+    if (!target) return '';
+    return JSON.stringify({
+      kind: target.kind || null,
+      rowId: target.rowId || null,
+      previewId: target.previewId || null,
+      elevationKey: target.elevationKey || null,
+      placeBefore: target.placeBefore !== false
+    });
+  }
+
+  _buildPreviewSortContext(sort, overrides = {}) {
+    const resolvedSort = Number(sort);
+    const nextSort = Number.isFinite(resolvedSort) ? resolvedSort : 0;
+    const previewSort = Number.isFinite(Number(overrides?.previewSort))
+      ? Number(overrides.previewSort)
+      : nextSort;
     return {
-      kind: 'row',
-      rowId,
-      elevationKey: String(row?.dataset?.elevationKey || '').trim(),
-      placeBefore: Number(event?.clientY ?? 0) <= midpoint,
-      element: row
+      sort: nextSort,
+      placementSorts: [nextSort],
+      previewSort,
+      previewSorts: [previewSort],
+      strategy: overrides?.strategy || 'layer-manager-preview-drop',
+      anchorTileId: overrides?.anchorTileId || null,
+      anchorTileSort: Number.isFinite(Number(overrides?.anchorTileSort)) ? Number(overrides.anchorTileSort) : null,
+      siblingUpdates: []
     };
+  }
+
+  _resolvePreviewDropSortContext(target, targetElevation = null) {
+    if (target?.kind === 'row') {
+      const docs = Array.isArray(this._viewState?.fullElevationGroups?.get?.(target.elevationKey))
+        ? this._viewState.fullElevationGroups.get(target.elevationKey)
+        : [];
+      const targetId = String(target?.rowId || '').trim();
+      const targetDoc = docs.find((doc) => String(doc?.id || '') === targetId) || canvas?.scene?.tiles?.get?.(targetId) || null;
+      const targetSortResult = targetDoc
+        ? normalizeTileDocumentSortForPlacement(targetDoc, {
+          scene: canvas?.scene,
+          source: 'layer-manager-preview-drop'
+        })
+        : null;
+      const targetSort = Number(targetSortResult?.sort ?? targetDoc?.sort ?? NaN);
+      if (!targetDoc || !Number.isFinite(targetSort)) {
+        const fallbackSort = Number.isFinite(targetSort)
+          ? targetSort
+          : (Number.isFinite(targetElevation) ? computeNextSortAtElevation(targetElevation) : 0);
+        return this._buildPreviewSortContext(fallbackSort, {
+          strategy: 'layer-manager-preview-drop-missing-row',
+          anchorTileId: targetId,
+          anchorTileSort: targetSort
+        });
+      }
+      const resolved = resolvePlacementSortAtElevation(targetElevation, {
+        scene: canvas?.scene,
+        anchorTileId: targetId,
+        sortBefore: target.placeBefore !== true,
+        count: 1
+      });
+      const nextSort = Number(resolved?.sort);
+      if (Number.isFinite(nextSort) && nextSort !== targetSort) return resolved;
+      const fallbackSort = targetSort + (target.placeBefore ? TILE_SORT_STEP : -TILE_SORT_STEP);
+      return this._buildPreviewSortContext(fallbackSort, {
+        previewSort: fallbackSort,
+        strategy: 'layer-manager-preview-drop-adjacent-row',
+        anchorTileId: targetId,
+        anchorTileSort: targetSort
+      });
+    }
+    if (target?.kind === 'preview') {
+      const targetPreviewEntry = this._getPreviewEntryById(target?.previewId);
+      const targetSort = Number(targetPreviewEntry?.placementSort ?? targetPreviewEntry?.sort ?? NaN);
+      const targetPreviewSort = Number(targetPreviewEntry?.sort ?? targetPreviewEntry?.placementSort ?? NaN);
+      if (Number.isFinite(targetSort)) {
+        const offset = target.placeBefore ? TILE_SORT_STEP : -TILE_SORT_STEP;
+        return this._buildPreviewSortContext(targetSort + offset, {
+          previewSort: (Number.isFinite(targetPreviewSort) ? targetPreviewSort : targetSort) + offset,
+          strategy: 'layer-manager-preview-drop-preview'
+        });
+      }
+    }
+    const fallbackSort = Number.isFinite(targetElevation) ? computeNextSortAtElevation(targetElevation) : 0;
+    return this._buildPreviewSortContext(fallbackSort, {
+      strategy: 'layer-manager-preview-drop-top'
+    });
+  }
+
+  _captureListScrollTop() {
+    const list = this.element?.querySelector?.('.fa-nexus-layer-manager__list') || null;
+    const scrollTop = Number(list?.scrollTop);
+    return Number.isFinite(scrollTop) ? scrollTop : null;
+  }
+
+  _preserveListScrollTop(scrollTop = null) {
+    const numeric = Number(scrollTop);
+    if (!Number.isFinite(numeric)) return;
+    this._preservedListScrollTop = numeric;
+    this._suppressPreviewAutoScrollOnce = true;
+  }
+
+  _restorePreservedListScrollTop() {
+    const scrollTop = Number(this._preservedListScrollTop);
+    this._preservedListScrollTop = null;
+    if (!Number.isFinite(scrollTop)) return false;
+    const list = this.element?.querySelector?.('.fa-nexus-layer-manager__list') || null;
+    if (!list) return false;
+    try { list.scrollTop = scrollTop; } catch (_) { return false; }
+    return true;
   }
 
   _onListDragStart(event) {
     if (event?.target?.closest?.('.fa-nexus-layer-manager__rename-input')) {
       event.preventDefault();
+      return;
+    }
+    const previewRow = event?.target?.closest?.('[data-preview-id]');
+    const previewId = String(previewRow?.dataset?.previewId || '').trim();
+    if (previewId) {
+      const previewEntry = this._getPreviewEntryById(previewId);
+      const previewKind = String(previewEntry?.previewKind || previewRow?.dataset?.previewKind || '').trim();
+      if (!previewEntry?.preview || previewEntry?.canDragPreview === false || !previewKind) {
+        event.preventDefault();
+        return;
+      }
+      try {
+        if (event?.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', previewId);
+        }
+      } catch (_) {}
+      this._dragState = {
+        previewId,
+        previewKind
+      };
+      this._lastActivePreviewId = previewId;
+      this._lastDropTarget = null;
+      this._setDraggedRowState([], [previewId]);
+      this._clearDropIndicator();
       return;
     }
     const row = event?.target?.closest?.('[data-tile-id]');
@@ -3926,54 +4769,66 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       event.preventDefault();
       return;
     }
-    const orderedDocs = this._getOrderedDocsByIds(this._resolveDraggedTileIds(originId))
-      .filter((doc) => doc?.canUserModify?.(game.user, 'update'));
-    const tileIds = orderedDocs.map((doc) => doc?.id).filter(Boolean);
-    if (!tileIds.length) {
-      event.preventDefault();
-      return;
-    }
-    this._dragState = { tileIds, originId };
-    try {
-      if (event.dataTransfer) {
-        event.dataTransfer.effectAllowed = 'move';
-        event.dataTransfer.setData('text/plain', tileIds.join(','));
-      }
-    } catch (_) {}
-    this._setDraggedRowState(tileIds);
-    this._clearDropIndicator();
+    this._dragState = prepareLayerManagerListDragStart({
+      event,
+      originId,
+      orderedDocs: this._getOrderedDocsByIds(this._resolveDraggedTileIds(originId)),
+      user: game?.user,
+      setDraggedRowState: (tileIds) => this._setDraggedRowState(tileIds),
+      clearDropIndicator: () => this._clearDropIndicator()
+    });
+    this._lastDropTarget = null;
   }
 
   _onListDragOver(event) {
-    if (!this._dragState?.tileIds?.length) return;
-    const target = this._resolveDropTarget(event);
-    if (!target) {
-      this._clearDropIndicator();
-      return;
-    }
-    event.preventDefault();
-    try {
-      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-    } catch (_) {}
-    this._applyDropIndicator(target);
+    const target = handleLayerManagerListDragOver({
+      event,
+      dragState: this._dragState,
+      resolveDropTarget: (dragEvent) => this._resolveDropTarget(dragEvent),
+      applyDropIndicator: (target) => this._applyDropIndicator(target),
+      clearDropIndicator: () => this._clearDropIndicator(),
+      preserveIndicatorOnMiss: true
+    });
+    if (target) this._lastDropTarget = target;
   }
 
   _onListDragLeave(event) {
-    const currentTarget = event?.currentTarget;
-    const relatedTarget = event?.relatedTarget;
-    if (currentTarget && relatedTarget && currentTarget.contains(relatedTarget)) return;
+    if (shouldIgnoreListDragLeave({
+      currentTarget: event?.currentTarget,
+      relatedTarget: event?.relatedTarget
+    })) return;
+    this._lastDropTarget = null;
     this._clearDropIndicator();
   }
 
   async _onListDrop(event) {
-    if (!this._dragState?.tileIds?.length) return;
+    const hasTileDrag = !!this._dragState?.tileIds?.length;
+    const hasPreviewDrag = !!String(this._dragState?.previewId || '').trim();
+    if (!hasTileDrag && !hasPreviewDrag) return;
     event.preventDefault();
-    const target = this._resolveDropTarget(event);
+    const indicatedTarget = this._lastDropTarget || null;
+    const resolvedTarget = this._resolveDropTarget(event) || null;
+    if (
+      indicatedTarget
+      && resolvedTarget
+      && this._serializeDropTarget(indicatedTarget) !== this._serializeDropTarget(resolvedTarget)
+    ) {
+      Logger.warn('LayerManager.dropTarget.resolvedDifferentFromIndicator', {
+        indicated: this._serializeDropTarget(indicatedTarget),
+        resolved: this._serializeDropTarget(resolvedTarget),
+        dragKind: hasTileDrag ? 'tile' : 'preview'
+      });
+    }
+    const target = indicatedTarget || resolvedTarget;
     try {
-      if (target) await this._applyDropReorder(target);
+      if (target) {
+        if (hasTileDrag) await this._applyDropReorder(target);
+        else await this._applyPreviewDropReorder(target);
+      }
     } finally {
       this._clearDropIndicator();
       this._clearDraggedRowState();
+      this._lastDropTarget = null;
       this._dragState = null;
     }
   }
@@ -3981,52 +4836,400 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   _onListDragEnd() {
     this._clearDropIndicator();
     this._clearDraggedRowState();
+    this._lastDropTarget = null;
     this._dragState = null;
   }
 
   async _applyDropReorder(target) {
+    this._preserveListScrollTop(this._captureListScrollTop());
+    const previewAnchors = this._capturePreviewAnchorsForTileDrop(target);
+    await applyLayerManagerDropReorder({
+      target,
+      dragState: this._dragState,
+      viewState: this._viewState,
+      user: game?.user,
+      updateEmbeddedDocuments: canvas?.scene?.updateEmbeddedDocuments?.bind(canvas.scene),
+      elevationGroupKey,
+      resolveGroupElevation: (key) => this._resolveGroupElevation(key),
+      resolveDisplayElevationKey: (doc) => this._resolveDisplayElevationKeyForDoc(doc),
+      resolveDocumentById: (id) => canvas?.scene?.tiles?.get?.(id) || null
+    });
+    await this._applyPreviewAnchorsAfterTileDrop(previewAnchors);
+  }
+
+  _capturePreviewAnchorsForTileDrop(target) {
+    const movingIds = new Set((Array.isArray(this._dragState?.tileIds) ? this._dragState.tileIds : []).filter(Boolean));
+    const entries = Array.isArray(this._viewState?.entries) ? this._viewState.entries : [];
     const targetElevationKey = String(target?.elevationKey || '').trim();
-    if (!targetElevationKey || !canvas?.scene?.updateEmbeddedDocuments) return;
-    const movingDocs = this._getOrderedDocsByIds(this._dragState?.tileIds || [])
-      .filter((doc) => doc?.canUserModify?.(game.user, 'update'));
-    if (!movingDocs.length) return;
-    const movingIds = new Set(movingDocs.map((doc) => doc?.id).filter(Boolean));
-    const reorderedGroups = new Map();
-    for (const [key, docs] of this._viewState?.fullElevationGroups || []) {
-      reorderedGroups.set(key, (Array.isArray(docs) ? docs : []).filter((doc) => doc?.id && !movingIds.has(doc.id)));
+    if (!movingIds.size || !targetElevationKey || !entries.length) return [];
+
+    const affectedKeys = new Set([targetElevationKey]);
+    for (const id of movingIds) {
+      const sourceKey = String(this._viewState?.fullTileGroupKeyById?.get?.(id) || '').trim();
+      if (sourceKey) affectedKeys.add(sourceKey);
     }
-    if (!reorderedGroups.has(targetElevationKey)) reorderedGroups.set(targetElevationKey, []);
-    const targetGroup = reorderedGroups.get(targetElevationKey);
-    if (!Array.isArray(targetGroup)) return;
-    let insertIndex = 0;
-    if (target?.kind === 'row') {
-      const targetId = String(target?.rowId || '').trim();
-      const rowIndex = targetGroup.findIndex((doc) => String(doc?.id || '') === targetId);
-      if (rowIndex < 0) return;
-      insertIndex = rowIndex + (target.placeBefore ? 0 : 1);
-    }
-    targetGroup.splice(insertIndex, 0, ...movingDocs);
-    const affectedKeys = new Set([targetElevationKey, ...movingDocs.map((doc) => elevationGroupKey(doc?.elevation ?? 0))]);
-    const updates = [];
-    for (const key of affectedKeys) {
-      const docs = reorderedGroups.get(key) || [];
-      const nextElevation = Number(key);
-      const total = docs.length;
-      for (let index = 0; index < docs.length; index += 1) {
-        const doc = docs[index];
-        const nextSort = (total - index) * 2;
-        const currentElevationKey = elevationGroupKey(doc?.elevation ?? 0);
-        const currentSort = Number(doc?.sort ?? 0) || 0;
-        if (currentElevationKey === key && currentSort === nextSort) continue;
-        updates.push({
-          _id: doc.id,
-          elevation: nextElevation,
-          sort: nextSort
+
+    const anchors = [];
+    for (const elevationKey of affectedKeys) {
+      const groupEntries = entries.filter((entry) => String(entry?.elevationKey || '').trim() === elevationKey);
+      for (let index = 0; index < groupEntries.length; index += 1) {
+        const previewEntry = groupEntries[index];
+        if (previewEntry?.preview !== true) continue;
+        const previewId = String(previewEntry?.previewId || '').trim();
+        const previewKind = String(previewEntry?.previewKind || '').trim();
+        if (!previewId || !previewKind) continue;
+
+        let previousTile = null;
+        for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
+          const candidate = groupEntries[previousIndex];
+          const candidateId = String(candidate?.id || '').trim();
+          if (!candidateId || candidate?.preview || candidate?.separator || candidate?.marker) continue;
+          if (movingIds.has(candidateId)) continue;
+          previousTile = candidate;
+          break;
+        }
+
+        let nextTile = null;
+        for (let nextIndex = index + 1; nextIndex < groupEntries.length; nextIndex += 1) {
+          const candidate = groupEntries[nextIndex];
+          const candidateId = String(candidate?.id || '').trim();
+          if (!candidateId || candidate?.preview || candidate?.separator || candidate?.marker) continue;
+          if (movingIds.has(candidateId)) continue;
+          nextTile = candidate;
+          break;
+        }
+
+        const anchorTile = previousTile || nextTile;
+        const anchorTileId = String(anchorTile?.id || '').trim();
+        if (!anchorTileId) {
+          Logger.debug('LayerManager.tileDrop.previewAnchor.skip', {
+            previewId,
+            previewKind,
+            elevationKey,
+            reason: 'no-stable-neighbor',
+            movingIds: Array.from(movingIds)
+          });
+          continue;
+        }
+
+        anchors.push({
+          previewId,
+          previewKind,
+          previewKey: previewEntry.previewKey || null,
+          elevationKey,
+          elevation: Number(previewEntry?.documentElevation ?? previewEntry?.groupElevation ?? previewEntry?.elevation ?? NaN),
+          placementLevelId: previewEntry?.placementLevelId ?? resolveSyntheticTargetPlacementLevelId(elevationKey),
+          anchorTileId,
+          placeBefore: !previousTile
         });
       }
     }
-    if (!updates.length) return;
-    await canvas.scene.updateEmbeddedDocuments('Tile', updates);
+    return anchors;
+  }
+
+  async _applyPreviewAnchorsAfterTileDrop(anchors = []) {
+    if (!Array.isArray(anchors) || !anchors.length) return;
+    for (const anchor of anchors) {
+      const previewId = String(anchor?.previewId || '').trim();
+      const previewKind = String(anchor?.previewKind || '').trim();
+      const anchorTileId = String(anchor?.anchorTileId || '').trim();
+      const targetElevationKey = String(anchor?.elevationKey || '').trim();
+      if (!previewId || !previewKind || !anchorTileId || !targetElevationKey) continue;
+
+      const rawTargetElevation = this._resolveGroupElevation(targetElevationKey);
+      const targetElevation = rawTargetElevation == null ? NaN : Number(rawTargetElevation);
+      if (!Number.isFinite(targetElevation)) {
+        Logger.warn('LayerManager.tileDrop.previewAnchor.missingElevation', {
+          previewId,
+          previewKind,
+          targetElevationKey,
+          anchorTileId,
+          sceneId: canvas?.scene?.id || null
+        });
+        continue;
+      }
+
+      const controller = resolvePreviewSessionController(previewKind);
+      if (!controller || typeof controller.applyLayerManagerPreviewPlacement !== 'function') {
+        Logger.warn('LayerManager.tileDrop.previewAnchor.controllerUnavailable', {
+          previewId,
+          previewKind,
+          targetElevation,
+          targetElevationKey,
+          anchorTileId,
+          sceneId: canvas?.scene?.id || null
+        });
+        continue;
+      }
+
+      const sortBefore = anchor.placeBefore !== true;
+      const sortContext = resolvePlacementSortAtElevation(targetElevation, {
+        scene: canvas?.scene,
+        anchorTileId,
+        sortBefore,
+        count: 1
+      });
+      const nextSort = Number(sortContext?.sort);
+      const previewSort = Number(sortContext?.previewSort);
+      if (!Number.isFinite(nextSort)) {
+        Logger.warn('LayerManager.tileDrop.previewAnchor.invalidSort', {
+          previewId,
+          previewKind,
+          targetElevation,
+          targetElevationKey,
+          anchorTileId,
+          sortStrategy: sortContext?.strategy || null,
+          sceneId: canvas?.scene?.id || null
+        });
+        continue;
+      }
+
+      Logger.info('LayerManager.tileDrop.previewAnchor.apply', {
+        previewId,
+        previewKind,
+        targetElevationKey,
+        targetElevation,
+        anchorTileId,
+        placeBefore: anchor.placeBefore === true,
+        nextSort,
+        previewSort: Number.isFinite(previewSort) ? previewSort : null,
+        sortStrategy: sortContext?.strategy || null,
+        siblingUpdates: Array.isArray(sortContext?.siblingUpdates) ? sortContext.siblingUpdates.length : 0,
+        placementLevelId: anchor.placementLevelId ?? null
+      });
+
+      const applied = await Promise.resolve(controller.applyLayerManagerPreviewPlacement({
+        elevation: targetElevation,
+        sort: nextSort,
+        previewSort: Number.isFinite(previewSort) ? previewSort : nextSort,
+        previewKind,
+        previewId,
+        previewKey: anchor.previewKey || null,
+        placementLevelId: anchor.placementLevelId ?? undefined,
+        anchorTileId,
+        sortBefore,
+        announce: false,
+        immediate: true
+      }));
+
+      if (!applied) {
+        Logger.warn('LayerManager.tileDrop.previewAnchor.noop', {
+          previewId,
+          previewKind,
+          targetElevation,
+          targetElevationKey,
+          anchorTileId,
+          nextSort
+        });
+      } else {
+        this._lastActivePreviewId = previewId;
+      }
+    }
+    this._scheduleRender();
+  }
+
+  async _applyPreviewDropReorder(target) {
+    const previewId = String(this._dragState?.previewId || '').trim();
+    const previewKind = String(this._dragState?.previewKind || '').trim();
+    if (!previewId || !previewKind) return;
+
+    const previewEntry = this._getPreviewEntryById(previewId);
+    if (!previewEntry?.preview) {
+      Logger.debug('LayerManager.previewDrop.missingPreviewEntry', {
+        previewId,
+        previewKind,
+        sceneId: canvas?.scene?.id || null
+      });
+      return;
+    }
+
+    const targetElevationKey = String(target?.elevationKey || '').trim();
+    const rawTargetElevation = this._resolveGroupElevation(targetElevationKey);
+    const targetElevation = rawTargetElevation == null ? NaN : Number(rawTargetElevation);
+    if (!Number.isFinite(targetElevation)) {
+      Logger.warn('LayerManager.previewDrop.missingTargetElevation', {
+        previewId,
+        previewKind,
+        targetElevationKey,
+        sceneId: canvas?.scene?.id || null
+      });
+      return;
+    }
+
+    const controller = resolvePreviewSessionController(previewKind);
+    if (!controller || typeof controller.applyLayerManagerPreviewPlacement !== 'function') {
+      Logger.warn('LayerManager.previewDrop.controllerUnavailable', {
+        previewId,
+        previewKind,
+        targetElevation,
+        targetElevationKey,
+        sceneId: canvas?.scene?.id || null
+      });
+      return;
+    }
+
+    const sortContext = this._resolvePreviewDropSortContext(target, targetElevation);
+    const nextSort = Number(sortContext?.sort);
+    const previewSort = Number(sortContext?.previewSort);
+    const anchorTileId = target?.kind === 'row'
+      ? String(target?.rowId || '').trim() || null
+      : null;
+    const placementLevelId = resolveSyntheticTargetPlacementLevelId(targetElevationKey);
+    const listScrollTop = this._captureListScrollTop();
+    Logger.info('LayerManager.previewDrop.apply', {
+      previewId,
+      previewKind,
+      targetKind: target?.kind || null,
+      targetElevationKey,
+      targetElevation,
+      nextSort,
+      previewSort: Number.isFinite(previewSort) ? previewSort : null,
+      sortStrategy: sortContext?.strategy || null,
+      siblingUpdates: Array.isArray(sortContext?.siblingUpdates) ? sortContext.siblingUpdates.length : 0,
+      anchorTileId,
+      placementLevelId: placementLevelId ?? null
+    });
+
+    const applied = await Promise.resolve(controller.applyLayerManagerPreviewPlacement({
+      elevation: targetElevation,
+      sort: nextSort,
+      previewSort: Number.isFinite(previewSort) ? previewSort : nextSort,
+      previewKind,
+      previewId,
+      previewKey: previewEntry.previewKey || null,
+      targetPreviewId: target?.kind === 'preview' ? String(target?.previewId || '').trim() || null : null,
+      placementLevelId,
+      anchorTileId,
+      sortBefore: target?.kind === 'row' ? target.placeBefore !== true : undefined,
+      announce: false,
+      immediate: true
+    }));
+
+    if (!applied) {
+      Logger.warn('LayerManager.previewDrop.noop', {
+        previewId,
+        previewKind,
+        targetElevation,
+        targetElevationKey,
+        nextSort,
+        anchorTileId
+      });
+      return;
+    }
+
+    this._preserveListScrollTop(listScrollTop);
+    this._lastActivePreviewId = previewId;
+    this._scheduleRender();
+  }
+
+  _handlePreviewRowClick(previewRow) {
+    const previewId = String(previewRow?.dataset?.previewId || '').trim();
+    if (!previewId) return false;
+    const previewEntry = this._getPreviewEntryById(previewId);
+    if (!previewEntry?.preview) {
+      Logger.debug('LayerManager.previewClick.missingPreviewEntry', {
+        previewId,
+        sceneId: canvas?.scene?.id || null
+      });
+      return false;
+    }
+    const previewKind = String(previewEntry?.previewKind || previewRow?.dataset?.previewKind || '').trim();
+    const controller = resolvePreviewSessionController(previewKind);
+    if (!controller) {
+      Logger.warn('LayerManager.previewClick.controllerUnavailable', {
+        previewId,
+        previewKind,
+        sceneId: canvas?.scene?.id || null
+      });
+      return false;
+    }
+
+    const payload = {
+      previewId,
+      previewKey: previewEntry.previewKey || previewRow?.dataset?.previewKey || null,
+      previewKind,
+      elevation: Number(previewEntry?.documentElevation ?? previewEntry?.elevation ?? NaN),
+      sort: Number(previewEntry?.placementSort ?? NaN),
+      previewSort: Number(previewEntry?.sort ?? previewEntry?.placementSort ?? NaN),
+      placementLevelId: previewEntry?.placementLevelId ?? undefined,
+      announce: false,
+      immediate: true
+    };
+
+    let applied = false;
+    if (typeof controller.selectLayerManagerPreview === 'function') {
+      applied = !!controller.selectLayerManagerPreview(payload);
+    } else if (typeof controller.applyLayerManagerPreviewPlacement === 'function') {
+      applied = !!controller.applyLayerManagerPreviewPlacement(payload);
+    } else {
+      Logger.warn('LayerManager.previewClick.unsupportedController', {
+        previewId,
+        previewKind,
+        sceneId: canvas?.scene?.id || null
+      });
+      return false;
+    }
+    if (applied) this._scheduleRender();
+    return applied;
+  }
+
+  _resolveMarqueeLayerOperation(event = null) {
+    if (event?.altKey) return 'subtract';
+    if (event?.shiftKey) return 'add';
+    return 'replace';
+  }
+
+  _handleTextureMarqueeLayerClick(rowEl, event = null) {
+    if (!rowEl || !(event?.ctrlKey || event?.metaKey)) return false;
+    const texturePaintManager = resolveTexturePaintManager();
+    if (!texturePaintManager?.isActive) return false;
+    let marqueeModeActive = false;
+    try {
+      marqueeModeActive = typeof texturePaintManager.isMarqueeModeActive === 'function'
+        ? !!texturePaintManager.isMarqueeModeActive()
+        : false;
+    } catch (error) {
+      Logger.error('LayerManager.textureMarquee.modeCheck.failed', {
+        sceneId: canvas?.scene?.id || null,
+        error: String(error?.message || error)
+      });
+      ui?.notifications?.error?.(`Failed to check Texture Painter marquee mode: ${error?.message || error}`);
+      return false;
+    }
+    if (!marqueeModeActive) return false;
+
+    const tileId = String(rowEl?.dataset?.tileId || '').trim();
+    const tile = tileId ? this._getTilePlaceable(tileId) : null;
+    const doc = tile?.document || canvas?.scene?.tiles?.get?.(tileId) || this._viewState?.fullTileDocsById?.get?.(tileId) || null;
+    if (!tile && !doc) {
+      Logger.error('LayerManager.textureMarquee.missingLayer', {
+        sceneId: canvas?.scene?.id || null,
+        tileId: tileId || null
+      });
+      ui?.notifications?.error?.('Failed to apply layer pixels to the marquee: layer document is unavailable.');
+      return true;
+    }
+
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const operation = this._resolveMarqueeLayerOperation(event);
+    void Promise.resolve(texturePaintManager.applyLayerPixelsToMarquee(tile || doc, { operation }))
+      .then(() => {
+        Logger.info('LayerManager.textureMarquee.applyLayerPixels', {
+          sceneId: canvas?.scene?.id || null,
+          tileId: tileId || doc?.id || null,
+          operation
+        });
+      })
+      .catch((error) => {
+        Logger.error('LayerManager.textureMarquee.applyLayerPixels.failed', {
+          sceneId: canvas?.scene?.id || null,
+          tileId: tileId || doc?.id || null,
+          operation,
+          error: String(error?.message || error)
+        });
+      });
+    return true;
   }
 
   _ensureHooks() {
@@ -4039,7 +5242,11 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     const refresh = (reason = 'hook-refresh', { invalidateListCache = true, refreshSelection = true } = {}) => {
       if (invalidateListCache) invalidateSelectionListFilterCache(reason);
       if (this.active || this.isPopout) this._startWheelSession();
-      if (refreshSelection && selectionFilterState.active && selectionFilterState.skipFiltered) {
+      if (bulkLayerDocumentUpdateState.depth > 0 && reason === 'update-tile') {
+        bulkLayerDocumentUpdateState.renderPending = true;
+        return;
+      }
+      if (refreshSelection) {
         scheduleSelectionFilterRefresh({
           reason,
           source: 'layer-manager-hooks',
@@ -4048,7 +5255,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       }
       this._scheduleRender();
     };
-    const syncSelection = (tile, controlled) => this._syncSelectionFromCanvas(tile, controlled);
+    const syncSelection = () => this._queueSelectionSyncFromCanvas();
 
     hook('createTile', () => refresh('create-tile'));
     hook('updateTile', () => refresh('update-tile'));
@@ -4056,8 +5263,19 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     hook('canvasReady', () => refresh('canvas-ready'));
     hook('canvasTearDown', () => refresh('canvas-teardown'));
     hook('updateScene', () => refresh('update-scene'));
+    hook('createLevel', () => refresh('create-level'));
+    hook('updateLevel', () => refresh('update-level'));
+    hook('deleteLevel', () => refresh('delete-level'));
+    hook('drawPrimaryCanvasGroup', () => refresh('draw-primary-group'));
     hook('fa-nexus-preview-layers-changed', () => refresh('preview-layers-changed'));
+    hook('fa-nexus-tile-config-selection-sync', (options = {}) => {
+      this._queueSelectionSyncFromCanvas({
+        allowAutoExpand: options?.allowAutoExpand !== false,
+        allowScrollToTile: options?.allowScrollToTile !== false
+      });
+    });
     hook('controlTile', syncSelection);
+    hook('releaseTile', syncSelection);
     hook('updateSetting', (payload) => {
       if (payload?.namespace !== MODULE_ID) return;
       if (payload?.key === COLLAPSED_STATE_SETTING) {
@@ -4071,6 +5289,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _removeHooks() {
+    this._canvasSelectionSyncQueued = false;
     if (!globalThis.Hooks || !this._hookIds.length) return;
     for (const { name, fn } of this._hookIds) {
       try { Hooks.off(name, fn); } catch (_) {}
@@ -4080,6 +5299,10 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
 
   _scheduleRender() {
     if (!this.rendered || (!this.active && !this.isPopout)) return;
+    const explicitScrollQueued = !!this._scrollTargetId || !!this._scrollPreviewTargetId;
+    if (!explicitScrollQueued && this._preservedListScrollTop === null) {
+      this._preserveListScrollTop(this._captureListScrollTop());
+    }
     if (this._renderQueued) return;
     this._renderQueued = true;
     requestAnimationFrame(() => {
@@ -4089,109 +5312,115 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _handleSelectionListFilterStateChange(reason) {
-    invalidateSelectionListFilterCache(reason);
-    if (!selectionFilterState.active || !selectionFilterState.skipFiltered) return;
-    scheduleSelectionFilterRefresh({
+    handleLayerManagerSelectionListFilterStateChange({
       reason,
-      source: 'layer-manager-list-filters',
-      resyncSettings: false
+      selectionFilterState,
+      invalidateSelectionListFilterCache,
+      scheduleSelectionFilterRefresh
     });
   }
 
   _activateTilesLayer() {
-    try {
-      if (canvas?.tiles && canvas.activeLayer !== canvas.tiles) canvas.tiles.activate();
-    } catch (_) {}
+    activateLayerManagerTilesLayer();
   }
 
   _onRangeChange(isInput = false) {
-    const root = this.element;
-    if (!root) return;
-    const minInput = root.querySelector('input[data-range="min"]');
-    const maxInput = root.querySelector('input[data-range="max"]');
-    const minRaw = minInput?.value ?? '';
-    const maxRaw = maxInput?.value ?? '';
-    const minValue = minRaw.trim();
-    const maxValue = maxRaw.trim();
-    selectionFilterState.min = parseElevationInput(minValue);
-    selectionFilterState.max = parseElevationInput(maxValue);
-    if ((minValue || maxValue) && !selectionFilterState.ignoreForeground) {
-      selectionFilterState.ignoreForeground = true;
-      if (!isInput) writeSetting(IGNORE_FOREGROUND_SETTING, true);
-      refreshTileInteractionState();
-    }
-    if (!isInput) {
-      writeSetting(RANGE_MIN_SETTING, minValue);
-      writeSetting(RANGE_MAX_SETTING, maxValue);
-      refreshTileInteractionState();
-      pruneSelectionForFilter();
-    }
+    applyRangeFilterChange({
+      root: this.element,
+      isInput,
+      selectionFilterState,
+      parseElevationInput,
+      writeSetting,
+      refreshTileInteractionState,
+      pruneSelectionForFilter,
+      rangeMinSetting: RANGE_MIN_SETTING,
+      rangeMaxSetting: RANGE_MAX_SETTING,
+      ignoreForegroundSetting: IGNORE_FOREGROUND_SETTING
+    });
   }
 
   _onSkipLockedChange() {
-    const root = this.element;
-    if (!root) return;
-    const input = root.querySelector('input[data-action="skip-locked"]');
-    const value = !!input?.checked;
-    selectionFilterState.skipLocked = value;
-    writeSetting(SKIP_LOCKED_SETTING, value);
-    refreshTileInteractionState();
-    pruneSelectionForFilter();
+    applySelectionBooleanFilterChange({
+      root: this.element,
+      action: 'skip-locked',
+      selectionFilterState,
+      stateKey: 'skipLocked',
+      settingKey: SKIP_LOCKED_SETTING,
+      writeSetting,
+      refreshTileInteractionState,
+      pruneSelectionForFilter
+    });
   }
 
   _onSkipHiddenChange() {
-    const root = this.element;
-    if (!root) return;
-    const input = root.querySelector('input[data-action="skip-hidden"]');
-    const value = !!input?.checked;
-    selectionFilterState.skipHidden = value;
-    writeSetting(SKIP_HIDDEN_SETTING, value);
-    refreshTileInteractionState();
-    pruneSelectionForFilter();
+    applySelectionBooleanFilterChange({
+      root: this.element,
+      action: 'skip-hidden',
+      selectionFilterState,
+      stateKey: 'skipHidden',
+      settingKey: SKIP_HIDDEN_SETTING,
+      writeSetting,
+      refreshTileInteractionState,
+      pruneSelectionForFilter
+    });
   }
 
   _onSkipFilteredChange() {
-    const root = this.element;
-    if (!root) return;
-    const input = root.querySelector('input[data-action="skip-filtered"]');
-    const value = !!input?.checked;
-    selectionFilterState.skipFiltered = value;
-    invalidateSelectionListFilterCache('skip-filtered-toggle');
-    writeSetting(SKIP_FILTERED_SETTING, value);
-    scheduleSelectionFilterRefresh({
-      reason: 'skip-filtered-toggle',
-      source: 'layer-manager-selection-options',
-      resyncSettings: false
+    applySkipFilteredChange({
+      root: this.element,
+      selectionFilterState,
+      invalidateSelectionListFilterCache,
+      writeSetting,
+      scheduleSelectionFilterRefresh,
+      settingKey: SKIP_FILTERED_SETTING
     });
   }
 
   _setFilterActive(active) {
-    const next = !!active;
-    if (selectionFilterState.active === next) return;
-    selectionFilterState.active = next;
-    if (next) setAltKeyHeld(isAltModifierActive());
-    refreshTileInteractionState();
-    pruneSelectionForFilter();
+    const changed = setSelectionFilterActive({
+      active,
+      selectionFilterState,
+      setAltKeyHeld,
+      isAltModifierActive,
+      refreshTileInteractionState,
+      pruneSelectionForFilter
+    });
+    if (!active) restoreLayerManagerTileInteractivity({ source: 'layer-manager-deactivate' });
+    return changed;
   }
 
   _setActiveClass(active) {
-    const el = this.element;
-    if (!el) return;
-    el.classList.toggle('active', this.isPopout ? true : !!active);
-    if (!el.dataset.tab) el.dataset.tab = TAB_ID;
-    if (!el.dataset.group) el.dataset.group = 'primary';
+    setLayerManagerActiveClass({
+      element: this.element,
+      active,
+      isPopout: this.isPopout,
+      tabId: TAB_ID
+    });
   }
 
   _onListClick(event) {
     if (event.target?.closest?.('.fa-nexus-layer-manager__rename-input')) return;
     if (event.target?.closest?.('.fa-nexus-layer-manager__separator-group-name-input')) return;
     if (event.target?.closest?.('.fa-nexus-layer-manager__separator-group-elevation-input')) return;
-    this._clearPendingSeparatorSelection();
+    const sceneMarkerVisibilityToggle = event.target?.closest?.('[data-action="toggle-scene-marker-visibility"]');
+    if (sceneMarkerVisibilityToggle) {
+      event.preventDefault();
+      event.stopPropagation();
+      this._toggleSceneMarkerVisibility(sceneMarkerVisibilityToggle);
+      return;
+    }
     const sceneMarker = event.target?.closest?.('[data-scene-marker]');
     if (sceneMarker) {
       event.preventDefault();
       event.stopPropagation();
-      this._selectSceneMarker(sceneMarker, event);
+      return;
+    }
+
+    const levelBoundary = event.target?.closest?.('.fa-nexus-layer-manager__separator--level-boundary');
+    if (levelBoundary) {
+      event.preventDefault();
+      event.stopPropagation();
+      this._selectCurrentLevelBand(levelBoundary);
       return;
     }
 
@@ -4227,14 +5456,22 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       return;
     }
 
-    const separator = event.target?.closest?.('.fa-nexus-layer-manager__separator:not(.fa-nexus-layer-manager__separator--foreground)');
+    const previewRow = event.target?.closest?.('[data-preview-id]');
+    if (previewRow) {
+      event.preventDefault();
+      event.stopPropagation();
+      this._handlePreviewRowClick(previewRow);
+      return;
+    }
+
+    const separator = event.target?.closest?.('.fa-nexus-layer-manager__separator:not(.fa-nexus-layer-manager__separator--level-boundary)');
     if (separator) {
       event.preventDefault();
       event.stopPropagation();
       const renameTarget = event.target?.closest?.('.fa-nexus-layer-manager__separator-name, .fa-nexus-layer-manager__separator-elevation');
       if (renameTarget) {
         if ((Number(event?.detail) || 0) > 1) return;
-        this._queueSeparatorSelection(separator, {
+        this._selectElevation(separator, {
           ctrlKey: !!event?.ctrlKey,
           metaKey: !!event?.metaKey,
           shiftKey: !!event?.shiftKey
@@ -4252,38 +5489,87 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     const currentIndex = items.indexOf(target);
     const tileId = target.dataset.tileId;
     if (!tileId) return;
+    if (this._handleTextureMarqueeLayerClick(target, event)) return;
     this._lastClickedTileId = tileId;
 
     this._activateTilesLayer();
 
-    const tile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === tileId);
-    if (!tile) return;
-
     const isMeta = !!(event.ctrlKey || event.metaKey);
     const isShift = !!event.shiftKey;
-
-    if (!isMeta) this._clearSceneMarkerSelection();
+    const tile = this._getTilePlaceable(tileId);
+    if (!tile) {
+      const doc = canvas?.scene?.tiles?.get?.(tileId) || this._viewState?.fullTileDocsById?.get?.(tileId) || null;
+      if (doc) {
+        this._preserveTileSelectionContextForNexus(
+          [doc],
+          `list.${isShift ? 'shift' : (isMeta ? 'meta' : 'single')}:documentOnly`
+        );
+        Logger.info('LayerManager.selection.documentOnlyPreserved', {
+          sceneId: canvas?.scene?.id || null,
+          source: 'list',
+          tileId,
+          locked: !!doc?.locked,
+          hidden: isLayerHidden(doc)
+        });
+      } else {
+        Logger.debug('LayerManager.selection.missingDocumentAndPlaceable', {
+          sceneId: canvas?.scene?.id || null,
+          tileId
+        });
+      }
+      return;
+    }
 
     if (isShift && this._lastClickedIndex >= 0) {
       const start = Math.min(this._lastClickedIndex, currentIndex);
       const end = Math.max(this._lastClickedIndex, currentIndex);
-      if (!isMeta) {
-        try { canvas.tiles.releaseAll(); } catch (_) {}
-      }
+      const rangeDocs = [];
       for (let i = start; i <= end; i += 1) {
         const rangeId = items[i]?.dataset?.tileId;
         if (!rangeId) continue;
-        const rangeTile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === rangeId);
-        if (!rangeTile) continue;
-        try { rangeTile.control({ releaseOthers: false }); } catch (_) {}
+        const rangeTile = this._getTilePlaceable(rangeId);
+        const rangeDoc = rangeTile?.document || canvas?.scene?.tiles?.get?.(rangeId) || null;
+        if (rangeDoc) rangeDocs.push(rangeDoc);
+      }
+      try {
+        this._selectTileDocs(rangeDocs, {
+          retainSelection: isMeta,
+          force: true,
+          source: 'list.shift'
+        });
+      } catch (error) {
+        this._notifyLayerManagerActionError('select layer range', error);
       }
     } else if (isMeta) {
       try {
-        if (tile.controlled) tile.release();
-        else tile.control({ releaseOthers: false });
-      } catch (_) {}
+        if (tile.controlled) {
+          withBulkTileSelectionBatch(() => {
+            tile.release({ renderSidebar: false });
+            renderTileSelectionSidebar();
+          });
+          this._syncSelectionFromCanvas();
+        } else {
+          const doc = tile.document || canvas?.scene?.tiles?.get?.(tileId) || null;
+          this._selectTileDocs(doc ? [doc] : [], {
+            retainSelection: true,
+            force: true,
+            source: 'list.meta'
+          });
+        }
+      } catch (error) {
+        this._notifyLayerManagerActionError('toggle layer selection', error);
+      }
     } else {
-      try { tile.control({ releaseOthers: true }); } catch (_) {}
+      const doc = tile.document || canvas?.scene?.tiles?.get?.(tileId) || null;
+      try {
+        this._selectTileDocs(doc ? [doc] : [], {
+          retainSelection: false,
+          force: true,
+          source: 'list.single'
+        });
+      } catch (error) {
+        this._notifyLayerManagerActionError('select layer', error);
+      }
     }
 
     this._lastClickedIndex = currentIndex;
@@ -4291,17 +5577,19 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _onListDoubleClick(event) {
-    this._clearPendingSeparatorSelection();
     if (event.target?.closest?.('.fa-nexus-layer-manager__rename-input')) return;
     if (event.target?.closest?.('.fa-nexus-layer-manager__separator-group-name-input')) return;
     if (event.target?.closest?.('.fa-nexus-layer-manager__separator-group-elevation-input')) return;
+    if (event.target?.closest?.('[data-action="toggle-scene-marker-visibility"]')) return;
     if (event.target?.closest?.('[data-action="toggle-visibility"]')) return;
     if (event.target?.closest?.('[data-action="toggle-elevation-visibility"]')) return;
     if (event.target?.closest?.('[data-action="toggle-lock"]')) return;
     if (event.target?.closest?.('[data-action="toggle-elevation-collapse"]')) return;
     const groupName = event.target?.closest?.('.fa-nexus-layer-manager__separator-name');
     if (groupName) {
-      const separator = groupName.closest('.fa-nexus-layer-manager__separator:not(.fa-nexus-layer-manager__separator--foreground)');
+      const separator = groupName.closest('.fa-nexus-layer-manager__separator');
+      if (separator?.classList?.contains('fa-nexus-layer-manager__separator--level-boundary')) return;
+      if (String(separator?.dataset?.groupCanRename || '').trim() === 'false') return;
       const elevationKey = String(separator?.dataset?.elevationKey || '').trim();
       if (!elevationKey) return;
       event.preventDefault();
@@ -4317,7 +5605,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     if (!target) return;
     const tileId = target.dataset.tileId;
     if (!tileId) return;
-    const tile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === tileId);
+    const tile = this._getTilePlaceable(tileId);
     if (!tile) return;
     this._activateTilesLayer();
     try {
@@ -4327,15 +5615,22 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _onListContextMenu(event) {
-    this._clearPendingSeparatorSelection();
     if (event.target?.closest?.('.fa-nexus-layer-manager__rename-input')) return;
     if (event.target?.closest?.('.fa-nexus-layer-manager__separator-group-name-input')) return;
     if (event.target?.closest?.('.fa-nexus-layer-manager__separator-group-elevation-input')) return;
+    if (event.target?.closest?.('[data-action="toggle-scene-marker-visibility"]')) return;
     if (event.target?.closest?.('[data-action="toggle-visibility"]')) return;
     if (event.target?.closest?.('[data-action="toggle-elevation-visibility"]')) return;
     if (event.target?.closest?.('[data-action="toggle-lock"]')) return;
     if (event.target?.closest?.('[data-action="toggle-elevation-collapse"]')) return;
-    const separator = event.target?.closest?.('.fa-nexus-layer-manager__separator:not(.fa-nexus-layer-manager__separator--foreground)');
+    const levelBoundary = event.target?.closest?.('.fa-nexus-layer-manager__separator--level-boundary');
+    if (levelBoundary) {
+      event.preventDefault();
+      event.stopPropagation();
+      this._toggleCurrentLevelBandIsolation(levelBoundary);
+      return;
+    }
+    const separator = event.target?.closest?.('.fa-nexus-layer-manager__separator:not(.fa-nexus-layer-manager__separator--level-boundary)');
     if (separator) {
       const elevationKey = String(separator?.dataset?.elevationKey || '').trim();
       if (!elevationKey) return;
@@ -4343,7 +5638,11 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
       const canUpdateAll = docs.length > 0 && docs.every((doc) => doc?.canUserModify?.(game.user, 'update'));
       const allLocked = docs.length > 0 && docs.every((doc) => !!doc?.locked);
       const filtersApplied = !!this._viewState?.filtersApplied;
-      const canRenameGroup = !!canvas?.scene?.canUserModify?.(game.user, 'update');
+      const canRenameGroup = !!canvas?.scene?.canUserModify?.(game.user, 'update')
+        && String(separator?.dataset?.groupCanRename || '').trim() !== 'false';
+      const canEditElevationGroup = canUpdateAll
+        && !filtersApplied
+        && String(separator?.dataset?.groupCanEditElevation || '').trim() !== 'false';
       event.preventDefault();
       event.stopPropagation();
       this._showLayerContextMenu(event, [
@@ -4357,7 +5656,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
         {
           label: 'Change Elevation',
           iconClass: 'fa-solid fa-arrows-up-down',
-          disabled: !canUpdateAll || filtersApplied,
+          disabled: !canEditElevationGroup,
           title: filtersApplied ? 'Clear filters before changing a group elevation.' : '',
           action: () => {
             this._beginElevationGroupElevationEdit(elevationKey);
@@ -4382,7 +5681,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     if (!tileId) return;
     const clickedTile = this._getTilePlaceable(tileId);
     if (!clickedTile) {
-      Logger.error('LayerManager.contextMenu.tile.missing', { tileId });
+      Logger.debug('LayerManager.contextMenu.tile.missing', { tileId });
       return;
     }
     this._triggerTileContextHighlight(clickedTile, event);
@@ -4399,6 +5698,9 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     const canUpdateAll = docs.every((doc) => doc?.canUserModify?.(game.user, 'update'));
     const allLocked = docs.every((doc) => !!doc?.locked);
     const hasNexusEdit = docs.length === 1 && !!getFaNexusTileEditMode(clickedDoc);
+    const canMaskSingle = docs.length === 1 && canLaunchFaNexusTileMask(clickedDoc);
+    const clickedHasMask = hasTileMask(clickedDoc);
+    const hasAnyMask = docs.some((doc) => hasTileMask(doc));
     const menuAnchor = {
       clientX: Number(event?.clientX ?? 0),
       clientY: Number(event?.clientY ?? 0)
@@ -4435,11 +5737,25 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
         errorMessage: 'Failed to open FA Nexus editor.'
       },
       {
-        label: 'Edit',
-        iconClass: 'fa-solid fa-pen-to-square',
+        label: clickedHasMask ? 'Edit Mask' : 'Apply Mask',
+        iconClass: 'fa-solid fa-mask',
+        disabled: !canMaskSingle,
+        action: () => this._openTileMaskEditor(clickedDoc),
+        errorMessage: 'Failed to open FA Nexus mask editor.'
+      },
+      {
+        label: 'Clear Mask',
+        iconClass: 'fa-solid fa-eraser',
+        disabled: !hasAnyMask || !canUpdateAll,
+        action: () => this._clearTileMasks(docs),
+        errorMessage: 'Failed to clear tile mask.'
+      },
+      {
+        label: 'Configure',
+        iconClass: 'fa-solid fa-gear',
         disabled: docs.length !== 1 || !clickedTile,
         action: () => this._openTileSettings(clickedTile),
-        errorMessage: 'Failed to open layer settings.'
+        errorMessage: 'Failed to open layer configuration.'
       },
       this._buildFlattenContextMenuItem(docs)
     ]);
@@ -4451,7 +5767,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     const tileId = target.dataset.tileId;
     if (!tileId || tileId === this._hoveredTileId) return;
     this._clearHover();
-    const tile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === tileId);
+    const tile = this._getTilePlaceable(tileId);
     if (!tile) return;
     if (isTileBeingEdited(tile)) return;
     try { tile._onHoverIn(hoverEventStub, { hoverOutOthers: true }); } catch (_) {}
@@ -4477,47 +5793,28 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _resolveElevationStep({ shiftKey = false, ctrlKey = false, metaKey = false } = {}) {
-    if (shiftKey) return ELEVATION_STEP_COARSE;
-    if (ctrlKey || metaKey) return ELEVATION_STEP_FINE;
-    return ELEVATION_STEP_DEFAULT;
+    return resolveLayerManagerElevationStep({
+      shiftKey,
+      ctrlKey,
+      metaKey,
+      defaultStep: ELEVATION_STEP_DEFAULT,
+      fineStep: ELEVATION_STEP_FINE,
+      coarseStep: ELEVATION_STEP_COARSE
+    });
   }
 
   _getElevationShortcutDirection(event = null) {
-    const code = String(event?.code || '');
-    if (code === 'BracketRight' || code === 'ArrowUp') return 1;
-    if (code === 'BracketLeft' || code === 'ArrowDown') return -1;
-    return 0;
+    return getLayerManagerElevationShortcutDirection(event);
   }
 
   _getElevationAnnouncePoint(pointer = null) {
-    const coerce = (point) => {
-      if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
-      return { x: Number(point.x), y: Number(point.y) };
-    };
-    const direct = coerce(pointer?.world || pointer);
-    if (direct) return direct;
-    const selectedTile = Array.isArray(canvas?.tiles?.controlled)
-      ? canvas.tiles.controlled.find((tile) => !!tile && !tile.destroyed) || null
-      : null;
-    const selectedCenter = coerce(selectedTile?.center);
-    if (selectedCenter) return selectedCenter;
-    const doc = selectedTile?.document || this._getSelectedTileDocs()[0] || null;
-    const docX = Number(doc?.x);
-    const docY = Number(doc?.y);
-    const docW = Number(doc?.width);
-    const docH = Number(doc?.height);
-    if (Number.isFinite(docX) && Number.isFinite(docY) && Number.isFinite(docW) && Number.isFinite(docH)) {
-      return { x: docX + (docW / 2), y: docY + (docH / 2) };
-    }
-    const dimensions = canvas?.dimensions;
-    const sceneX = Number((dimensions?.sceneX ?? dimensions?.x ?? 0) || 0) || 0;
-    const sceneY = Number((dimensions?.sceneY ?? dimensions?.y ?? 0) || 0) || 0;
-    const sceneWidth = Number((dimensions?.sceneWidth ?? dimensions?.width ?? canvas?.scene?.width) || 0) || 0;
-    const sceneHeight = Number((dimensions?.sceneHeight ?? dimensions?.height ?? canvas?.scene?.height) || 0) || 0;
-    if (sceneWidth > 0 && sceneHeight > 0) {
-      return { x: sceneX + (sceneWidth / 2), y: sceneY + (sceneHeight / 2) };
-    }
-    return null;
+    return getLayerManagerElevationAnnouncePoint({
+      pointer,
+      controlledTiles: canvas?.tiles?.controlled,
+      selectedDocs: this._getSelectedTileDocs(),
+      dimensions: canvas?.dimensions,
+      scene: canvas?.scene
+    });
   }
 
   _onCanvasKeyDown(event, pointer = null) {
@@ -4561,159 +5858,28 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _adjustElevationSelection(direction, event = null, { pointer = null, source = 'unknown' } = {}) {
-    if (!Number.isFinite(direction) || direction === 0) return false;
-    const step = this._resolveElevationStep(event || {});
-    if (!canvas?.ready || !canvas?.scene) return false;
-    let markerAdjusted = false;
-    if (this._selectedSceneMarkers?.size) {
-      for (const markerKind of this._selectedSceneMarkers) {
-        if (this._adjustSceneMarkerElevation(markerKind, direction, step, pointer)) {
-          markerAdjusted = true;
-        }
-      }
-    }
-
-    if (!canvas?.tiles && !markerAdjusted) return false;
-    if (!canvas?.tiles) {
-      if (markerAdjusted && event) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-      }
-      return markerAdjusted;
-    }
-    const selection = Array.isArray(canvas.tiles.controlled) ? canvas.tiles.controlled : [];
-    if (!selection.length && !markerAdjusted) return false;
-    const orderedDocs = this._getOrderedDocsByIds(
-      selection
-        .map((tile) => tile?.document?.id || tile?.id)
-        .filter(Boolean)
-    );
-    const minElevation = -1000;
-    const maxElevation = 1000;
-    const groups = new Map();
-    const movedGroupsBySource = new Map();
-    const movedDocIds = new Set();
-    let announceElevation = null;
-    const elevationDelta = direction * step;
-
-    for (const doc of orderedDocs) {
-      if (!doc?.canUserModify?.(game.user, 'update')) continue;
-      if (doc?.locked) continue;
-      const current = Number(doc.elevation ?? 0) || 0;
-      const clamped = Math.min(maxElevation, Math.max(minElevation, current + elevationDelta));
-      const next = quantizeElevation(clamped);
-      if (next === current) continue;
-      const id = doc.id || doc._id;
-      if (!id) continue;
-      const sourceKey = elevationGroupKey(current);
-      const targetKey = elevationGroupKey(next);
-      if (announceElevation === null) announceElevation = next;
-      let group = groups.get(next);
-      if (!group) {
-        group = [];
-        groups.set(next, group);
-      }
-      group.push({ id, elevation: next });
-      let movedGroup = movedGroupsBySource.get(sourceKey);
-      if (!movedGroup) {
-        movedGroup = { ids: new Set(), targetKey };
-        movedGroupsBySource.set(sourceKey, movedGroup);
-      }
-      movedGroup.ids.add(id);
-      movedDocIds.add(id);
-    }
-
-    if (!groups.size && !markerAdjusted) return false;
-    if (!groups.size && markerAdjusted && event) {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation?.();
-      return true;
-    }
-    const updates = [];
-    for (const [elevation, items] of groups.entries()) {
-      let nextSort = computeNextSortAtElevation(elevation);
-      if (!Number.isFinite(nextSort)) nextSort = 0;
-      // Preserve the current top-to-bottom order of the selected rows.
-      nextSort += Math.max(0, items.length - 1) * 2;
-      for (const item of items) {
-        updates.push({ _id: item.id, elevation, sort: nextSort });
-        nextSort -= 2;
-      }
-    }
-    const completeElevationGroupMoves = this._usesNestedGrouping()
-      ? this._collectCompleteVisibleGroupMovesForDelta(movedDocIds, elevationDelta)
-      : (() => {
-        const moves = [];
-        for (const [sourceKey, moveState] of movedGroupsBySource.entries()) {
-          const fullDocs = this._getFullElevationDocs(sourceKey);
-          const fullIds = fullDocs.map((doc) => doc?.id).filter(Boolean);
-          if (!fullIds.length || fullIds.length !== moveState.ids.size) continue;
-          if (!fullIds.every((id) => moveState.ids.has(id))) continue;
-          if (moveState.targetKey === sourceKey) continue;
-          moves.push({ sourceKey, targetKey: moveState.targetKey });
-        }
-        return moves;
-      })();
-
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
-    if (updates.length) {
-      const scene = canvas?.scene;
-      try {
-        const updatePromise = Promise.resolve(scene?.updateEmbeddedDocuments?.('Tile', updates));
-        updatePromise
-          .then(() => {
-            if (!completeElevationGroupMoves.length || !scene) return;
-            const metadata = getSceneElevationGroupMetadata(scene);
-            const nextMetadata = mergeElevationGroupMetadataOnBulkMove({ metadata, moves: completeElevationGroupMoves });
-            return setSceneElevationGroupMetadata(scene, nextMetadata)
-              .then(() => {
-                Logger.info('LayerManager.elevationGroup.adjust.commit', {
-                  sceneId: scene.id || null,
-                  source,
-                  moveCount: completeElevationGroupMoves.length,
-                  moves: completeElevationGroupMoves
-                });
-              })
-              .catch((error) => {
-                Logger.error('LayerManager.elevationGroup.adjust.metadataFailed', {
-                  sceneId: scene.id || null,
-                  source,
-                  moveCount: completeElevationGroupMoves.length,
-                  moves: completeElevationGroupMoves,
-                  error: String(error?.message || error)
-                });
-                ui?.notifications?.error?.(`Layers moved but failed to update elevation group names: ${error?.message || error}`);
-              });
-          })
-          .catch((error) => {
-            Logger.error('LayerManager.elevationAdjust.failed', {
-              sceneId: scene?.id || null,
-              source,
-              updateCount: updates.length,
-              markerAdjusted,
-              error: String(error?.message || error)
-            });
-            ui?.notifications?.error?.(`Failed to change layer elevation: ${error?.message || error}`);
-          });
-      } catch (error) {
-        Logger.error('LayerManager.elevationAdjust.failed', {
-          sceneId: scene?.id || null,
-          source,
-          updateCount: updates.length,
-          markerAdjusted,
-          error: String(error?.message || error)
-        });
-        ui?.notifications?.error?.(`Failed to change layer elevation: ${error?.message || error}`);
-      }
-    }
-    if (Number.isFinite(announceElevation)) {
-      this._queueElevationAnnounce(this._getElevationAnnouncePoint(pointer), announceElevation);
-    }
-    return true;
+    return adjustLayerManagerElevationSelection({
+      direction,
+      event,
+      pointer,
+      source,
+      user: game?.user,
+      selectedSceneMarkers: this._selectedSceneMarkers,
+      adjustSceneMarkerElevation: (markerKind, markerDirection, step, markerPointer) => this._adjustSceneMarkerElevation(markerKind, markerDirection, step, markerPointer),
+      controlledTiles: canvas?.tiles?.controlled,
+      orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids),
+      resolveTileElevationMove: ({ doc, requestedElevation }) => this._resolveTileElevationMove(doc, requestedElevation),
+      elevationGroupKey,
+      computeNextSortAtElevation,
+      getFullElevationDocs: (key) => this._getFullElevationDocs(key),
+      getSceneElevationGroupMetadata,
+      mergeElevationGroupMetadataOnBulkMove,
+      setSceneElevationGroupMetadata,
+      restoreSelectionAfterElevationMove: (docIds, options) => this._restoreSelectionAfterElevationMove(docIds, options),
+      queueElevationAnnounce: (worldPoint, elevation) => this._queueElevationAnnounce(worldPoint, elevation),
+      getElevationAnnouncePoint: (markerPointer) => this._getElevationAnnouncePoint(markerPointer),
+      resolveElevationStep: (options) => this._resolveElevationStep(options)
+    });
   }
 
   _onListWheel(event) {
@@ -4777,7 +5943,7 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
 
   _clearHover() {
     if (!this._hoveredTileId) return;
-    const tile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === this._hoveredTileId);
+    const tile = this._getTilePlaceable(this._hoveredTileId);
     if (tile) {
       try { tile._onHoverOut(hoverEventStub); } catch (_) {}
     }
@@ -4785,145 +5951,146 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _shouldHandleRenameHotkey(event) {
-    if ((!this.active && !this.isPopout) || this._renameSubmitting) return false;
-    const key = String(event?.key || '');
-    const code = String(event?.code || '');
-    if (key !== 'F2' && code !== 'F2') return false;
-    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
-    if (this._isEditableElement(event.target) || this._isEditableElement(document?.activeElement)) return false;
-    return true;
+    return shouldHandleLayerManagerRenameHotkey({
+      event,
+      active: this.active,
+      isPopout: this.isPopout,
+      renameSubmitting: this._renameSubmitting
+    });
   }
 
   _isEditableElement(element) {
-    if (!(element instanceof HTMLElement)) return false;
-    if (element.closest('.fa-nexus-layer-manager__rename-input')) return true;
-    return !!element.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]');
+    return isEditableLayerManagerElement(element);
   }
 
   _beginRenameFromHotkey() {
-    const tileId = this._resolveRenameTargetId();
+    const tileId = resolveLayerManagerRenameTargetId({
+      root: this.element,
+      lastClickedTileId: this._lastClickedTileId
+    });
     if (!tileId) return;
     this._beginRename(tileId);
   }
 
-  _resolveRenameTargetId() {
-    const root = this.element;
-    const list = root?.querySelector?.('.fa-nexus-layer-manager__list');
-    if (!list) return null;
-    const resolveRowId = (selector) => {
-      const row = list.querySelector(selector);
-      return row?.dataset?.tileId || null;
-    };
-    if (this._lastClickedTileId) {
-      const match = resolveRowId(`[data-tile-id="${CSS.escape(this._lastClickedTileId)}"]`);
-      if (match) return match;
-    }
-    return resolveRowId('[data-tile-id].is-selected');
+  _applyRenameStatePatch(patch = {}) {
+    if (!patch || typeof patch !== 'object') return;
+    if (Object.prototype.hasOwnProperty.call(patch, 'renamingTileId')) this._renamingTileId = patch.renamingTileId;
+    if (Object.prototype.hasOwnProperty.call(patch, 'renameDraft')) this._renameDraft = patch.renameDraft;
+    if (Object.prototype.hasOwnProperty.call(patch, 'renameFocusPending')) this._renameFocusPending = patch.renameFocusPending;
   }
 
-  _findRenameDocument(tileId) {
-    if (!tileId) return null;
-    return canvas?.scene?.tiles?.get?.(tileId)
-      || canvas?.tiles?.placeables?.find?.((tile) => (tile?.document?.id || tile?.id) === tileId)?.document
-      || null;
+  _applyElevationGroupNameEditStatePatch(patch = {}) {
+    if (!patch || typeof patch !== 'object') return;
+    if (Object.prototype.hasOwnProperty.call(patch, 'editingElevationGroupNameKey')) this._editingElevationGroupNameKey = patch.editingElevationGroupNameKey;
+    if (Object.prototype.hasOwnProperty.call(patch, 'editingElevationGroupNameDraft')) this._editingElevationGroupNameDraft = patch.editingElevationGroupNameDraft;
+    if (Object.prototype.hasOwnProperty.call(patch, 'editingElevationGroupNameFocusPending')) this._editingElevationGroupNameFocusPending = patch.editingElevationGroupNameFocusPending;
+  }
+
+  _applyElevationGroupElevationEditStatePatch(patch = {}) {
+    if (!patch || typeof patch !== 'object') return;
+    if (Object.prototype.hasOwnProperty.call(patch, 'editingElevationGroupElevationKey')) this._editingElevationGroupElevationKey = patch.editingElevationGroupElevationKey;
+    if (Object.prototype.hasOwnProperty.call(patch, 'editingElevationGroupElevationDraft')) this._editingElevationGroupElevationDraft = patch.editingElevationGroupElevationDraft;
+    if (Object.prototype.hasOwnProperty.call(patch, 'editingElevationGroupElevationFocusPending')) this._editingElevationGroupElevationFocusPending = patch.editingElevationGroupElevationFocusPending;
+  }
+
+  _applyScrollStatePatch(patch = {}) {
+    if (!patch || typeof patch !== 'object') return;
+    if (Object.prototype.hasOwnProperty.call(patch, 'scrollTargetId')) this._scrollTargetId = patch.scrollTargetId;
+    if (Object.prototype.hasOwnProperty.call(patch, 'scrollQueued')) this._scrollQueued = patch.scrollQueued;
+  }
+
+  _applyPreviewScrollStatePatch(patch = {}) {
+    if (!patch || typeof patch !== 'object') return;
+    if (Object.prototype.hasOwnProperty.call(patch, 'scrollPreviewTargetId')) this._scrollPreviewTargetId = patch.scrollPreviewTargetId;
+    if (Object.prototype.hasOwnProperty.call(patch, 'scrollPreviewQueued')) this._scrollPreviewQueued = patch.scrollPreviewQueued;
+  }
+
+  _setPendingCanvasSelectionSyncOptions(options = null) {
+    if (!options || typeof options !== 'object') {
+      this._pendingCanvasSelectionSyncOptions = null;
+      return null;
+    }
+    const prior = this._pendingCanvasSelectionSyncOptions && typeof this._pendingCanvasSelectionSyncOptions === 'object'
+      ? this._pendingCanvasSelectionSyncOptions
+      : {};
+    const next = { ...prior };
+    if (Object.prototype.hasOwnProperty.call(options, 'allowAutoExpand')) {
+      next.allowAutoExpand = options.allowAutoExpand !== false;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'allowScrollToTile')) {
+      next.allowScrollToTile = options.allowScrollToTile !== false;
+    }
+    this._pendingCanvasSelectionSyncOptions = Object.keys(next).length ? next : null;
+    return this._pendingCanvasSelectionSyncOptions;
   }
 
   _beginRename(tileId) {
-    const doc = this._findRenameDocument(tileId);
-    if (!doc) return;
-    if (!doc?.canUserModify?.(game.user, 'update')) {
-      ui?.notifications?.warn?.('You do not have permission to rename this tile.');
-      return;
-    }
-    this._clearElevationGroupEditState();
-    const root = this.element;
-    const item = root?.querySelector?.(`[data-tile-id="${CSS.escape(tileId)}"]`);
-    const currentLabel = item?.querySelector?.('.fa-nexus-layer-manager__name')?.textContent?.trim()
-      || computeTileName({ document: doc }, 0);
-    this._renamingTileId = tileId;
-    this._renameDraft = currentLabel || '';
-    this._renameFocusPending = true;
-    this._scheduleRender();
+    return beginLayerManagerRename({
+      tileId,
+      resolveRenameDocument: (id) => resolveTileDocument(id),
+      user: game?.user,
+      clearElevationGroupEditState: () => this._clearElevationGroupEditState(),
+      root: this.element,
+      computeTileName,
+      setRenameState: (patch) => this._applyRenameStatePatch(patch),
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   _clearRenameState() {
-    this._renamingTileId = null;
-    this._renameDraft = '';
-    this._renameFocusPending = false;
+    this._applyRenameStatePatch({
+      renamingTileId: null,
+      renameDraft: '',
+      renameFocusPending: false
+    });
   }
 
   _cancelRename() {
-    if (!this._renamingTileId) return;
-    this._clearRenameState();
-    this._scheduleRender();
+    return cancelLayerManagerRename({
+      renamingTileId: this._renamingTileId,
+      setRenameState: (patch) => this._applyRenameStatePatch(patch),
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   async _commitRename(inputEl = null) {
-    const tileId = this._renamingTileId;
-    if (!tileId || this._renameSubmitting) return;
-    const doc = this._findRenameDocument(tileId);
-    if (!doc) {
-      this._clearRenameState();
-      this._scheduleRender();
-      return;
-    }
-
-    const nextValue = String(inputEl?.value ?? this._renameDraft ?? '').trim();
-    const currentValue = String(readFaFlag(doc, 'name') || '').trim();
-    this._renameDraft = nextValue;
-    this._renameSubmitting = true;
-
-    try {
-      if (!doc?.canUserModify?.(game.user, 'update')) {
-        ui?.notifications?.warn?.('You do not have permission to rename this tile.');
-        this._clearRenameState();
-        this._scheduleRender();
-        return;
-      }
-      if (!nextValue) {
-        if (currentValue) {
-          if (typeof doc.unsetFlag === 'function') await doc.unsetFlag(MODULE_ID, 'name');
-          else await doc.update({ [`flags.${MODULE_ID}.-=name`]: null });
-        }
-      } else if (nextValue !== currentValue) {
-        if (typeof doc.setFlag === 'function') await doc.setFlag(MODULE_ID, 'name', nextValue);
-        else await doc.update({ [`flags.${MODULE_ID}.name`]: nextValue });
-      }
-      this._clearRenameState();
-      this._scheduleRender();
-    } finally {
-      this._renameSubmitting = false;
-    }
+    return commitLayerManagerRename({
+      inputEl,
+      renamingTileId: this._renamingTileId,
+      renameSubmitting: this._renameSubmitting,
+      resolveRenameDocument: (id) => resolveTileDocument(id),
+      readFlag: readFaFlag,
+      renameDraft: this._renameDraft,
+      moduleId: MODULE_ID,
+      user: game?.user,
+      setRenameState: (patch) => this._applyRenameStatePatch(patch),
+      setRenameSubmitting: (value) => { this._renameSubmitting = !!value; },
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   _onRenameInputKeyDown(event) {
-    if (!event) return;
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      event.stopPropagation();
-      this._commitRename(event.currentTarget).catch((error) => {
-        Logger.warn('LayerManager.rename.failed', { error: String(error?.message || error) });
-        ui?.notifications?.error?.(`Failed to rename tile: ${error?.message || error}`);
-      });
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      this._cancelRename();
-    }
+    return handleLayerManagerRenameInputKeyDown({
+      event,
+      commitRename: (inputEl) => this._commitRename(inputEl),
+      cancelRename: () => this._cancelRename()
+    });
   }
 
   _clearElevationGroupNameEditState() {
-    this._editingElevationGroupNameKey = null;
-    this._editingElevationGroupNameDraft = '';
-    this._editingElevationGroupNameFocusPending = false;
+    this._applyElevationGroupNameEditStatePatch({
+      editingElevationGroupNameKey: null,
+      editingElevationGroupNameDraft: '',
+      editingElevationGroupNameFocusPending: false
+    });
   }
 
   _clearElevationGroupElevationEditState() {
-    this._editingElevationGroupElevationKey = null;
-    this._editingElevationGroupElevationDraft = '';
-    this._editingElevationGroupElevationFocusPending = false;
+    this._applyElevationGroupElevationEditStatePatch({
+      editingElevationGroupElevationKey: null,
+      editingElevationGroupElevationDraft: '',
+      editingElevationGroupElevationFocusPending: false
+    });
   }
 
   _clearElevationGroupEditState() {
@@ -4932,133 +6099,79 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _beginElevationGroupNameEdit(elevationKey) {
-    const key = String(elevationKey || '').trim();
-    if (!key) return;
-    const scene = canvas?.scene;
-    if (!scene?.canUserModify?.(game.user, 'update')) {
-      ui?.notifications?.warn?.('You do not have permission to rename elevation groups.');
-      return;
-    }
-    this._clearRenameState();
-    const metadata = getSceneElevationGroupMetadata(scene);
-    this._clearElevationGroupElevationEditState();
-    this._editingElevationGroupNameKey = key;
-    this._editingElevationGroupNameDraft = getElevationGroupName(metadata, key);
-    this._editingElevationGroupNameFocusPending = true;
-    Logger.info('LayerManager.elevationGroup.rename.begin', {
-      sceneId: scene.id || null,
-      elevationKey: key
+    const node = this._getFullGroupNode(elevationKey);
+    if (node?.canRename === false) return false;
+    return beginLayerManagerElevationGroupNameEdit({
+      elevationKey,
+      scene: canvas?.scene,
+      user: game?.user,
+      clearRenameState: () => this._clearRenameState(),
+      getSceneElevationGroupMetadata,
+      getElevationGroupName,
+      clearElevationGroupElevationEditState: () => this._clearElevationGroupElevationEditState(),
+      setElevationGroupNameEditState: (patch) => this._applyElevationGroupNameEditStatePatch(patch),
+      scheduleRender: () => this._scheduleRender()
     });
-    this._scheduleRender();
   }
 
   _cancelElevationGroupNameEdit() {
-    if (!this._editingElevationGroupNameKey) return;
-    this._clearElevationGroupNameEditState();
-    this._scheduleRender();
+    return cancelLayerManagerElevationGroupNameEdit({
+      editingElevationGroupNameKey: this._editingElevationGroupNameKey,
+      setElevationGroupNameEditState: (patch) => this._applyElevationGroupNameEditStatePatch(patch),
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   async _commitElevationGroupNameEdit(inputEl = null) {
-    const elevationKey = String(this._editingElevationGroupNameKey || '').trim();
-    if (!elevationKey || this._editingElevationGroupSubmitting) return;
-    const scene = canvas?.scene;
-    if (!scene) {
-      this._clearElevationGroupNameEditState();
-      this._scheduleRender();
-      return;
-    }
-    const nextValue = String(inputEl?.value ?? this._editingElevationGroupNameDraft ?? '').trim();
-    const metadata = getSceneElevationGroupMetadata(scene);
-    const currentValue = getElevationGroupName(metadata, elevationKey);
-    this._editingElevationGroupNameDraft = nextValue;
-    this._editingElevationGroupSubmitting = true;
-
-    try {
-      if (!scene?.canUserModify?.(game.user, 'update')) {
-        ui?.notifications?.warn?.('You do not have permission to rename elevation groups.');
-        this._clearElevationGroupNameEditState();
-        this._scheduleRender();
-        return;
-      }
-      if (nextValue === currentValue) {
-        this._clearElevationGroupNameEditState();
-        this._scheduleRender();
-        return;
-      }
-      const fullGroupNode = this._getFullGroupNode(elevationKey);
-      const nextMetadata = cloneElevationGroupMetadata(metadata);
-      if (!nextValue) delete nextMetadata[elevationKey];
-      else {
-        const nextEntry = {
-          ...(nextMetadata[elevationKey] || {}),
-          name: nextValue
-        };
-        if (fullGroupNode?.isSynthetic) nextEntry.synthetic = true;
-        else delete nextEntry.synthetic;
-        nextMetadata[elevationKey] = nextEntry;
-      }
-      await setSceneElevationGroupMetadata(scene, nextMetadata);
-      Logger.info('LayerManager.elevationGroup.rename.commit', {
-        sceneId: scene.id || null,
-        elevationKey,
-        name: nextValue || null
-      });
-      this._clearElevationGroupNameEditState();
-      this._scheduleRender();
-    } catch (error) {
-      this._editingElevationGroupNameFocusPending = true;
-      this._scheduleRender();
-      throw error;
-    } finally {
-      this._editingElevationGroupSubmitting = false;
-    }
+    return commitLayerManagerElevationGroupNameEdit({
+      inputEl,
+      editingElevationGroupNameKey: this._editingElevationGroupNameKey,
+      editingElevationGroupSubmitting: this._editingElevationGroupSubmitting,
+      scene: canvas?.scene,
+      user: game?.user,
+      editingElevationGroupNameDraft: this._editingElevationGroupNameDraft,
+      setElevationGroupNameEditState: (patch) => this._applyElevationGroupNameEditStatePatch(patch),
+      setElevationGroupSubmitting: (value) => { this._editingElevationGroupSubmitting = !!value; },
+      getSceneElevationGroupMetadata,
+      getElevationGroupName,
+      getFullGroupNode: (key) => this._getFullGroupNode(key),
+      cloneElevationGroupMetadata,
+      setSceneElevationGroupMetadata,
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   _onElevationGroupNameInputKeyDown(event) {
-    if (!event) return;
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      event.stopPropagation();
-      this._commitElevationGroupNameEdit(event.currentTarget).catch((error) => {
-        Logger.error('LayerManager.elevationGroup.rename.failed', {
-          elevationKey: this._editingElevationGroupNameKey || null,
-          error: String(error?.message || error)
-        });
-        ui?.notifications?.error?.(`Failed to rename elevation group: ${error?.message || error}`);
-      });
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      this._cancelElevationGroupNameEdit();
-    }
+    return handleLayerManagerElevationGroupNameInputKeyDown({
+      event,
+      commitElevationGroupNameEdit: (inputEl) => this._commitElevationGroupNameEdit(inputEl),
+      cancelElevationGroupNameEdit: () => this._cancelElevationGroupNameEdit(),
+      getEditingElevationGroupNameKey: () => this._editingElevationGroupNameKey
+    });
   }
 
   _beginElevationGroupElevationEdit(elevationKey) {
-    const key = String(elevationKey || '').trim();
-    if (!key) return;
-    const scene = canvas?.scene;
-    if (!scene?.canUserModify?.(game.user, 'update')) {
-      ui?.notifications?.warn?.('You do not have permission to move elevation groups.');
-      return;
-    }
-    this._clearRenameState();
-    this._clearElevationGroupNameEditState();
-    this._editingElevationGroupElevationKey = key;
-    this._editingElevationGroupElevationDraft = formatElevation(Number(key));
-    this._editingElevationGroupElevationFocusPending = true;
-    Logger.info('LayerManager.elevationGroup.move.begin', {
-      sceneId: scene.id || null,
-      elevationKey: key
+    const node = this._getFullGroupNode(elevationKey);
+    if (node?.canEditElevation === false || !isEditableElevationGroupKey(elevationKey)) return false;
+    return beginLayerManagerElevationGroupElevationEdit({
+      elevationKey,
+      scene: canvas?.scene,
+      user: game?.user,
+      clearRenameState: () => this._clearRenameState(),
+      clearElevationGroupNameEditState: () => this._clearElevationGroupNameEditState(),
+      setElevationGroupElevationEditState: (patch) => this._applyElevationGroupElevationEditStatePatch(patch),
+      initialElevation: Number.isFinite(node?.elevation) ? Number(node.elevation) : this._resolveGroupElevation(elevationKey),
+      formatElevation,
+      scheduleRender: () => this._scheduleRender()
     });
-    this._scheduleRender();
   }
 
   _cancelElevationGroupElevationEdit() {
-    if (!this._editingElevationGroupElevationKey) return;
-    this._clearElevationGroupElevationEditState();
-    this._scheduleRender();
+    return cancelLayerManagerElevationGroupElevationEdit({
+      editingElevationGroupElevationKey: this._editingElevationGroupElevationKey,
+      setElevationGroupElevationEditState: (patch) => this._applyElevationGroupElevationEditStatePatch(patch),
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   async _commitElevationGroupElevationEdit(inputEl = null) {
@@ -5076,112 +6189,34 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     this._editingElevationGroupSubmitting = true;
 
     try {
-      if (!scene?.canUserModify?.(game.user, 'update')) {
-        ui?.notifications?.warn?.('You do not have permission to move elevation groups.');
-        this._clearElevationGroupElevationEditState();
-        this._scheduleRender();
-        return;
-      }
       if (!Number.isFinite(nextElevation)) {
         throw new Error('Elevation group value must be a valid number.');
       }
-      const targetElevation = quantizeElevation(nextElevation);
-      const targetKey = elevationGroupKey(targetElevation);
-      if (targetKey === sourceKey) {
-        this._clearElevationGroupElevationEditState();
-        this._scheduleRender();
-        return;
-      }
-      if (this._usesNestedGrouping() && this._viewState?.filtersApplied) {
-        throw new Error('Clear layer filters before moving nested elevation groups.');
-      }
-
-      const sourceGroupNode = this._getFullGroupNode(sourceKey);
-      const movingDocs = this._getOrderedDocsByIds(
-        this._getFullElevationDocs(sourceKey).map((doc) => doc?.id).filter(Boolean)
-      );
-      if (!movingDocs.length) {
-        this._clearElevationGroupElevationEditState();
-        this._scheduleRender();
-        return;
-      }
-      const blockedDocs = movingDocs.filter((doc) => !doc?.canUserModify?.(game.user, 'update'));
-      if (blockedDocs.length) {
-        throw new Error('You do not have permission to move every layer in this elevation group.');
-      }
-
-      const movedDocIds = new Set(movingDocs.map((doc) => doc?.id).filter(Boolean));
-      const updates = [];
-      if (this._usesNestedGrouping()) {
-        const sourceElevation = Number(sourceGroupNode?.elevation ?? parseElevationInput(sourceKey));
-        if (!Number.isFinite(sourceElevation)) {
-          throw new Error(`Unable to resolve source elevation group ${sourceKey}.`);
-        }
-        const delta = quantizeElevation(targetElevation - sourceElevation);
-        const targetGroups = new Map();
-        for (const doc of movingDocs) {
-          const currentElevation = Number(doc?.elevation ?? 0) || 0;
-          const nextDocElevation = quantizeElevation(currentElevation + delta);
-          const nextDocKey = elevationGroupKey(nextDocElevation);
-          let bucket = targetGroups.get(nextDocKey);
-          if (!bucket) {
-            bucket = {
-              elevation: nextDocElevation,
-              items: []
-            };
-            targetGroups.set(nextDocKey, bucket);
-          }
-          bucket.items.push(doc);
-        }
-        for (const bucket of targetGroups.values()) {
-          let nextSort = computeNextSortAtElevation(bucket.elevation);
-          if (!Number.isFinite(nextSort)) nextSort = 0;
-          nextSort += Math.max(0, bucket.items.length - 1) * 2;
-          for (const doc of bucket.items) {
-            updates.push({
-              _id: doc.id,
-              elevation: bucket.elevation,
-              sort: nextSort
-            });
-            nextSort -= 2;
-          }
-        }
-      } else {
-        let nextSort = computeNextSortAtElevation(targetElevation);
-        if (!Number.isFinite(nextSort)) nextSort = 0;
-        nextSort += Math.max(0, movingDocs.length - 1) * 2;
-        for (const doc of movingDocs) {
-          updates.push({
-            _id: doc.id,
-            elevation: targetElevation,
-            sort: nextSort
-          });
-          nextSort -= 2;
-        }
-      }
-      await scene.updateEmbeddedDocuments('Tile', updates);
-      const metadata = getSceneElevationGroupMetadata(scene);
-      const nextMetadata = this._usesNestedGrouping()
-        ? mergeElevationGroupMetadataOnBulkMove({
-          metadata,
-          moves: this._collectCompleteVisibleGroupMovesForDelta(
-            movedDocIds,
-            targetElevation - Number(sourceGroupNode?.elevation ?? parseElevationInput(sourceKey) ?? 0)
-          )
-        })
-        : mergeElevationGroupMetadataOnMove({
-          metadata,
-          sourceKey,
-          targetKey
-        });
-      await setSceneElevationGroupMetadata(scene, nextMetadata);
-      Logger.info('LayerManager.elevationGroup.move.commit', {
-        sceneId: scene.id || null,
+      const result = await commitLayerManagerElevationGroupElevationEdit({
         sourceKey,
-        targetKey,
-        tileCount: updates.length,
-        nestedGrouping: this._usesNestedGrouping()
+        draft,
+        scene,
+        user: game?.user,
+        usesNestedGrouping: this._usesNestedGrouping(),
+        filtersApplied: !!this._viewState?.filtersApplied,
+        sourceGroupNode: this._getFullGroupNode(sourceKey),
+        orderDocsByIds: (ids) => this._getOrderedDocsByIds(ids),
+        getFullElevationDocs: (key) => this._getFullElevationDocs(key),
+        parseElevationInput,
+        quantizeElevation,
+        elevationGroupKey,
+        computeNextSortAtElevation,
+        getSceneElevationGroupMetadata,
+        mergeElevationGroupMetadataOnBulkMove,
+        setSceneElevationGroupMetadata,
+        resolveTileElevationMove: ({ doc, requestedElevation }) => this._resolveTileElevationMove(doc, requestedElevation),
+        restoreSelectionAfterElevationMove: (docIds, options) => this._restoreSelectionAfterElevationMove(docIds, options)
       });
+      if (!result?.updates?.length && !result?.movedDocIds?.length) {
+        this._clearElevationGroupElevationEditState();
+        this._scheduleRender();
+        return;
+      }
       this._clearElevationGroupElevationEditState();
       this._scheduleRender();
     } catch (error) {
@@ -5194,24 +6229,12 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
   }
 
   _onElevationGroupElevationInputKeyDown(event) {
-    if (!event) return;
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      event.stopPropagation();
-      this._commitElevationGroupElevationEdit(event.currentTarget).catch((error) => {
-        Logger.error('LayerManager.elevationGroup.move.failed', {
-          elevationKey: this._editingElevationGroupElevationKey || null,
-          error: String(error?.message || error)
-        });
-        ui?.notifications?.error?.(`Failed to move elevation group: ${error?.message || error}`);
-      });
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      this._cancelElevationGroupElevationEdit();
-    }
+    return handleLayerManagerElevationGroupElevationInputKeyDown({
+      event,
+      commitElevationGroupElevationEdit: (inputEl) => this._commitElevationGroupElevationEdit(inputEl),
+      cancelElevationGroupElevationEdit: () => this._cancelElevationGroupElevationEdit(),
+      getEditingElevationGroupElevationKey: () => this._editingElevationGroupElevationKey
+    });
   }
 
   _toggleVisibility(buttonEl) {
@@ -5219,30 +6242,92 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     if (!item) return;
     const tileId = item.dataset.tileId;
     if (!tileId) return;
-    const tile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === tileId) || null;
+    const tile = this._getTilePlaceable(tileId) || null;
     const doc = tile?.document || canvas?.scene?.tiles?.get?.(tileId) || null;
-    if (!doc?.canUserModify?.(game.user, 'update')) return;
-    const selectedDocs = this._getSelectedTileDocs().filter((selectedDoc) => selectedDoc?.canUserModify?.(game.user, 'update'));
-    const selectionHasDoc = selectedDocs.some((selectedDoc) => selectedDoc?.id === doc.id);
-    const targets = selectionHasDoc && selectedDocs.length > 1 ? selectedDocs : [doc];
-    const nextHidden = !isLayerHidden(doc);
-    for (const target of targets) {
-      setLayerHidden(target, nextHidden);
-    }
+    const selectedDocs = this._getSelectedTileDocs();
+    const selectedIds = new Set(selectedDocs.map((selectedDoc) => getTileDocumentId(selectedDoc)).filter(Boolean));
+    const targets = selectedIds.has(getTileDocumentId(doc)) && selectedDocs.length > 1 ? selectedDocs : [doc];
+    const rowSelected = item.classList?.contains('is-selected') || item.getAttribute?.('aria-selected') === 'true';
+    if (rowSelected) this._preserveTileSelectionContextForNexus(targets, 'visibility:rowButton:selectedRow');
+    void this._toggleDocsVisibility(targets, {
+      source: 'rowButton',
+      referenceDoc: doc,
+      nextHidden: !isLayerHidden(doc)
+    }).catch((error) => this._notifyLayerManagerActionError('toggle layer visibility', error));
   }
 
   _toggleElevationVisibility(buttonEl) {
     const separator = buttonEl?.closest?.('.fa-nexus-layer-manager__separator');
     const elevationKey = String(buttonEl?.dataset?.elevationKey || separator?.dataset?.elevationKey || '').trim();
     if (!elevationKey) return;
-    const targets = this._getMatchingElevationDocs(elevationKey);
-    const toggleTargets = targets.filter((target) => target?.canUserModify?.(game.user, 'update'));
-    if (!toggleTargets.length) return;
-    const allHidden = toggleTargets.every((target) => isLayerHidden(target));
-    const nextHidden = !allHidden;
-    for (const target of toggleTargets) {
-      setLayerHidden(target, nextHidden);
+    const docs = this._getMatchingElevationDocs(elevationKey);
+    const orderedDocs = this._orderTileDocuments(docs);
+    void this._toggleDocsVisibility(orderedDocs, {
+      source: 'elevationHeader',
+      nextHidden: !orderedDocs.every((target) => isLayerHidden(target))
+    }).catch((error) => this._notifyLayerManagerActionError('toggle elevation visibility', error));
+  }
+
+  _toggleSceneMarkerVisibility(buttonEl) {
+    const item = buttonEl?.closest?.('[data-scene-marker]');
+    const markerId = String(item?.dataset?.sceneMarker || '').trim();
+    if (!markerId) return;
+    const targetMarkerIds = new Set([markerId]);
+    const markerEntries = [];
+    const seenTargets = new Set();
+    for (const entry of Array.from(this._viewState?.entries || [])) {
+      if (!entry?.marker) continue;
+      if (!targetMarkerIds.has(String(entry.markerId || '').trim())) continue;
+      const markerLevelId = String(entry?.markerLevelId || '').trim();
+      const markerKind = String(entry?.markerKind || '').trim().toLowerCase();
+      const targetKey = `${markerLevelId}:${markerKind}`;
+      if (!markerLevelId || !markerKind || seenTargets.has(targetKey)) continue;
+      markerEntries.push(entry);
+      seenTargets.add(targetKey);
     }
+    const referenceEntry = markerEntries.find((entry) => String(entry?.markerId || '').trim() === markerId)
+      || markerEntries[0]
+      || null;
+    if (!referenceEntry) return;
+    const nextHidden = !referenceEntry.hidden;
+    const scene = canvas?.scene;
+    if (!scene?.updateEmbeddedDocuments) {
+      throw new Error('No active scene available for level image visibility updates.');
+    }
+    const updates = [];
+    for (const entry of markerEntries) {
+      const levelId = String(entry?.markerLevelId || '').trim();
+      const markerKind = String(entry?.markerKind || '').trim().toLowerCase();
+      const level = scene.levels.get(levelId) || null;
+      if (!level?.canUserModify?.(game.user, 'update')) continue;
+      const update = { _id: levelId };
+      foundry.utils.setProperty(update, `flags.${MODULE_ID}.${getLevelTextureHiddenFlagKey(markerKind)}`, nextHidden);
+      updates.push(update);
+    }
+    if (!updates.length) return;
+    this._preserveListScrollTop(this._captureListScrollTop());
+    const requiresCanvasRedraw = scene === canvas?.scene
+      && !!canvas?.ready
+      && markerEntries.some((entry) => {
+        const levelId = String(entry?.markerLevelId || '').trim();
+        const level = levelId ? scene.levels.get(levelId) || null : null;
+        return !!level?.isView || !!level?.isVisible;
+      });
+    void scene.updateEmbeddedDocuments('Level', updates)
+      .then(async () => {
+        if (requiresCanvasRedraw) {
+          await canvas.draw(scene);
+        }
+        Logger.info('LayerManager.sceneMarker.visibility.commit', {
+          sceneId: scene?.id || null,
+          markerCount: updates.length,
+          hidden: nextHidden,
+          redraw: requiresCanvasRedraw
+        });
+        this._scheduleRender();
+        this._updateFlattenFooter();
+      })
+      .catch((error) => this._notifyLayerManagerActionError('toggle level image visibility', error));
   }
 
   _toggleLock(buttonEl) {
@@ -5250,267 +6335,276 @@ export class LayerManagerTab extends HandlebarsApplicationMixin(AbstractSidebarT
     if (!item) return;
     const tileId = item.dataset.tileId;
     if (!tileId) return;
-    const tile = canvas?.tiles?.placeables?.find((t) => (t?.document?.id || t?.id) === tileId) || null;
+    const tile = this._getTilePlaceable(tileId) || null;
     const doc = tile?.document || canvas?.scene?.tiles?.get?.(tileId) || null;
-    if (!doc?.canUserModify?.(game.user, 'update')) return;
-    try { doc.update({ locked: !doc.locked }); } catch (_) {}
+    const selectedDocs = this._getSelectedTileDocs();
+    const selectedIds = new Set(selectedDocs.map((selectedDoc) => getTileDocumentId(selectedDoc)).filter(Boolean));
+    const targets = selectedIds.has(getTileDocumentId(doc)) && selectedDocs.length > 1 ? selectedDocs : [doc];
+    const rowSelected = item.classList?.contains('is-selected') || item.getAttribute?.('aria-selected') === 'true';
+    if (rowSelected) this._preserveTileSelectionContextForNexus(targets, 'lock:rowButton:selectedRow');
+    void this._toggleDocsLock(targets, { source: 'rowButton' })
+      .catch((error) => this._notifyLayerManagerActionError('toggle layer lock', error));
   }
 
   _toggleElevationLock(buttonEl) {
     const separator = buttonEl?.closest?.('.fa-nexus-layer-manager__separator');
-    const rawElevation = buttonEl?.dataset?.elevation || separator?.dataset?.elevation;
-    const elevation = Number(rawElevation);
-    if (!Number.isFinite(elevation)) return;
-    const docs = canvas?.scene?.tiles ? Array.from(canvas.scene.tiles) : [];
-    const targets = docs.filter((doc) => {
-      if (!doc) return false;
-      const docElevation = Number(doc?.elevation ?? 0);
-      return docElevation === elevation;
-    });
-    const toggleTargets = targets.filter((target) => target?.canUserModify?.(game.user, 'update'));
-    if (!toggleTargets.length) return;
-    const allLocked = toggleTargets.every((target) => !!target?.locked);
-    const nextLocked = !allLocked;
-    for (const target of toggleTargets) {
-      try { target.update({ locked: nextLocked }); } catch (_) {}
-    }
+    const elevationKey = String(buttonEl?.dataset?.elevationKey || separator?.dataset?.elevationKey || '').trim();
+    if (!elevationKey) return;
+    void this._toggleDocsLock(this._getMatchingElevationDocs(elevationKey), { source: 'elevationHeader' })
+      .catch((error) => this._notifyLayerManagerActionError('toggle elevation lock', error));
   }
 
   _clearSceneMarkerSelection() {
-    if (!this._selectedSceneMarkers?.size) return;
-    this._selectedSceneMarkers.clear();
-    this._scheduleRender();
+    clearLayerManagerSceneMarkerSelection({
+      selectedSceneMarkers: this._selectedSceneMarkers,
+      scheduleRender: () => this._scheduleRender()
+    });
   }
 
   _selectSceneMarker(markerEl, event = null) {
-    const kindRaw = markerEl?.dataset?.sceneMarker;
-    const kind = kindRaw === 'foreground' ? 'foreground' : (kindRaw === 'background' ? 'background' : null);
-    if (!kind) return;
-    const isMeta = !!(event?.ctrlKey || event?.metaKey);
-    const isShift = !!event?.shiftKey;
-    const allowMulti = isMeta || isShift;
-    if (!allowMulti) {
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      this._selectedSceneMarkers.clear();
-      this._selectedSceneMarkers.add(kind);
-    } else if (this._selectedSceneMarkers.has(kind)) {
-      this._selectedSceneMarkers.delete(kind);
-    } else {
-      this._selectedSceneMarkers.add(kind);
-    }
-    this._scheduleRender();
-    this._updateFlattenFooter();
+    const markerId = String(markerEl?.dataset?.sceneMarker || '').trim();
+    selectLayerManagerSceneMarker({
+      markerId,
+      event,
+      selectedSceneMarkers: this._selectedSceneMarkers,
+      releaseAllTiles: () => canvas?.tiles?.releaseAll?.(),
+      scheduleRender: () => this._scheduleRender(),
+      updateFlattenFooter: () => this._updateFlattenFooter()
+    });
   }
 
-  _adjustSceneMarkerElevation(kind, direction, step, pointer = null) {
-    const current = kind === 'foreground' ? getForegroundElevation() : getBackgroundElevation();
-    if (!Number.isFinite(current)) return false;
-    const minElevation = -1000;
-    const maxElevation = 1000;
-    const raw = current + (direction * step);
-    const clamped = Math.min(maxElevation, Math.max(minElevation, raw));
-    const next = quantizeElevation(clamped);
-    if (next === current) return false;
-
-    if (kind === 'foreground') {
-      try { canvas?.scene?.update?.({ foregroundElevation: next }); } catch (_) {}
-    } else {
-      try {
-        if (canvas?.scene && ('backgroundElevation' in canvas.scene)) {
-          canvas.scene.update?.({ backgroundElevation: next });
-        }
-      } catch (_) {}
-      setBackgroundRenderElevation(next);
-      try {
-        const enabled = isKeepTokensAboveTileElevationsEnabled();
-        Hooks?.callAll?.('fa-nexus-token-elevation-offset-changed', { enabled });
-      } catch (_) {}
-    }
-
-    const announceElevation = (kind === 'background')
-      ? getBackgroundDisplayElevation()
-      : next;
-    this._queueElevationAnnounce(pointer?.world || null, announceElevation, { immediate: true });
-    this._scheduleRender();
-    return true;
+  _adjustSceneMarkerElevation(markerId, direction, step, pointer = null) {
+    return adjustSceneMarkerElevationBlocked({
+      markerId,
+      viewEntries: this._viewState?.entries,
+      direction,
+      step,
+      sceneId: canvas?.scene?.id || null,
+      currentLevelId: getCurrentSceneLevel()?.id || null
+    });
   }
 
   _selectElevation(separatorEl, event) {
     const elevationKey = String(separatorEl?.dataset?.elevationKey || '').trim();
-    if (!elevationKey) return;
-    const docs = this._getMatchingElevationDocs(elevationKey);
-    const targets = docs
-      .map((doc) => doc?.object || canvas?.tiles?.placeables?.find?.((tile) => (tile?.document?.id || tile?.id) === doc?.id) || null)
-      .filter((tile) => !!tile && !tile.destroyed);
-    if (!targets.length) return;
-    this._activateTilesLayer();
-    const retain = !!(event?.ctrlKey || event?.metaKey);
-    if (!retain) this._clearSceneMarkerSelection();
-    if (!retain) {
-      try { canvas.tiles.releaseAll(); } catch (_) {}
+    const docs = elevationKey ? this._getMatchingElevationDocs(elevationKey) : [];
+    try {
+      const retainSelection = !!(event?.ctrlKey || event?.metaKey);
+      if (retainSelection && docs.length) {
+        const controlledIds = new Set((Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled : [])
+          .map((tile) => tile?.document?.id || tile?.id)
+          .filter(Boolean));
+        const allSelected = docs.every((doc) => controlledIds.has(getTileDocumentId(doc)));
+        if (allSelected) {
+          this._releaseTileDocs(docs, {
+            source: 'elevationHeader.meta',
+            allowAutoExpand: false,
+            allowScrollToTile: false
+          });
+          return;
+        }
+      }
+      this._selectTileDocs(docs, {
+        retainSelection,
+        force: true,
+        source: 'elevationHeader'
+      });
+    } catch (error) {
+      this._notifyLayerManagerActionError('select elevation group', error);
     }
-    for (const target of targets) {
-      try { target.control({ releaseOthers: false }); } catch (_) {}
+  }
+
+  _selectCurrentLevelBand(markerEl = null) {
+    const scene = canvas?.scene;
+    if (!scene) {
+      this._notifyLayerManagerActionError('select current level band', new Error('No active scene available.'));
+      return;
     }
-    this._syncSelectionFromCanvas();
+    const currentLevel = getCurrentSceneLevel(scene);
+    const currentLevelId = String(currentLevel?.id || '').trim();
+    const currentRange = getCurrentLevelElevationRange(scene);
+    if (!currentLevelId || !currentRange) {
+      this._notifyLayerManagerActionError('select current level band', new Error('No current level elevation band is available.'));
+      return;
+    }
+
+    const docs = collectTileDocuments({ scene })
+      .filter((doc) => isDocumentInCurrentLevelElevationBand(doc, { scene }));
+    if (!docs.length) {
+      Logger.info('LayerManager.levelBoundary.selection.noCurrentBandTiles', {
+        sceneId: scene?.id || null,
+        levelId: currentLevelId,
+        markerId: String(markerEl?.dataset?.levelBoundary || '').trim() || null
+      });
+      return;
+    }
+
+    try {
+      this._selectTileDocs(docs, {
+        retainSelection: false,
+        force: true,
+        source: 'levelBoundary.selectBand'
+      });
+    } catch (error) {
+      this._notifyLayerManagerActionError('select current level band', error);
+    }
+  }
+
+  _toggleCurrentLevelBandIsolation(markerEl = null) {
+    const scene = canvas?.scene;
+    if (!scene) {
+      this._notifyLayerManagerActionError('toggle current level visibility', new Error('No active scene available.'));
+      return;
+    }
+    const currentLevel = getCurrentSceneLevel(scene);
+    const currentLevelId = String(currentLevel?.id || '').trim();
+    const currentRange = getCurrentLevelElevationRange(scene);
+    if (!currentLevelId || !currentRange) {
+      this._notifyLayerManagerActionError('toggle current level visibility', new Error('No current level elevation band is available.'));
+      return;
+    }
+
+    const docs = collectTileDocuments()
+      .filter((doc) => !isDocumentInCurrentLevelElevationBand(doc, { scene }));
+    if (!docs.length) {
+      Logger.info('LayerManager.levelBoundary.visibility.noOutOfBandTiles', {
+        sceneId: scene?.id || null,
+        levelId: currentLevelId,
+        markerId: String(markerEl?.dataset?.levelBoundary || '').trim() || null
+      });
+      return;
+    }
+    const nextHidden = docs.some((doc) => !isLayerHidden(doc));
+    void this._toggleDocsVisibility(docs, {
+      source: 'levelBoundary',
+      nextHidden
+    }).catch((error) => this._notifyLayerManagerActionError('toggle current level visibility', error));
   }
 
   _isDoubleContextClick(tileId) {
-    const now = Date.now();
-    const last = this._lastContextClick || { id: null, time: 0 };
-    const isDouble = last.id === tileId && (now - last.time) < CONTEXT_DOUBLE_CLICK_MS;
-    this._lastContextClick = { id: tileId, time: now };
+    const { isDouble, nextState } = resolveLayerManagerDoubleContextClick({
+      tileId,
+      lastContextClick: this._lastContextClick,
+      thresholdMs: CONTEXT_DOUBLE_CLICK_MS
+    });
+    this._lastContextClick = nextState;
     return isDouble;
   }
 
   _openTileSettings(tile) {
-    const canView = tile.document?.testUserPermission?.(game.user, 'LIMITED');
-    if (!canView) return;
-    const stub = Object.assign({}, clickEventStub);
-    if (typeof tile._onClickRight2 === 'function') {
-      try { tile._onClickRight2(stub); } catch (_) {}
-      return;
-    }
-    try { tile.sheet?.render?.({ force: true }); } catch (_) {}
+    openLayerManagerTileSettings({
+      tile,
+      clickEventStub,
+      user: game?.user
+    });
   }
 
   _openSceneSettings() {
-    try { canvas?.scene?.sheet?.render?.({ force: true }); } catch (_) {}
+    openLayerManagerSceneSettings({
+      scene: canvas?.scene
+    });
   }
 
   _queueScrollToTile(tileId) {
-    if (!tileId || (!this.active && !this.isPopout)) return;
-    this._scrollTargetId = tileId;
-    if (this._scrollQueued) return;
-    this._scrollQueued = true;
-    requestAnimationFrame(() => {
-      this._scrollQueued = false;
-      const targetId = this._scrollTargetId;
-      this._scrollTargetId = null;
-      this._scrollToTile(targetId);
+    return queueLayerManagerScrollToTile({
+      tileId,
+      active: this.active,
+      isPopout: this.isPopout,
+      scrollQueued: this._scrollQueued,
+      setScrollState: (patch) => this._applyScrollStatePatch(patch),
+      getScrollTargetId: () => this._scrollTargetId,
+      clearScrollTargetId: () => this._applyScrollStatePatch({ scrollTargetId: null }),
+      requestFrame: requestAnimationFrame,
+      scrollToTile: (targetId) => this._scrollToTile(targetId)
     });
   }
 
   _queueScrollToPreview(previewId) {
-    if (!previewId || (!this.active && !this.isPopout)) return;
-    this._scrollPreviewTargetId = previewId;
-    if (this._scrollPreviewQueued) return;
-    this._scrollPreviewQueued = true;
-    requestAnimationFrame(() => {
-      this._scrollPreviewQueued = false;
-      const targetId = this._scrollPreviewTargetId;
-      this._scrollPreviewTargetId = null;
-      this._scrollToPreview(targetId);
+    return queueLayerManagerScrollToPreview({
+      previewId,
+      active: this.active,
+      isPopout: this.isPopout,
+      scrollPreviewQueued: this._scrollPreviewQueued,
+      setPreviewScrollState: (patch) => this._applyPreviewScrollStatePatch(patch),
+      getPreviewTargetId: () => this._scrollPreviewTargetId,
+      clearPreviewTargetId: () => this._applyPreviewScrollStatePatch({ scrollPreviewTargetId: null }),
+      requestFrame: requestAnimationFrame,
+      scrollToPreview: (targetId) => this._scrollToPreview(targetId)
     });
   }
 
   _scrollToTile(tileId) {
-    const root = this.element;
-    if (!root || !tileId) return;
-    const list = root.querySelector('.fa-nexus-layer-manager__list');
-    if (!list) return;
-    const item = list.querySelector(`[data-tile-id="${CSS.escape(tileId)}"]`);
-    if (!item) return;
-    const listRect = list.getBoundingClientRect();
-    const itemRect = item.getBoundingClientRect();
-    if (itemRect.top < listRect.top || itemRect.bottom > listRect.bottom) {
-      try { item.scrollIntoView({ block: 'nearest' }); } catch (_) {}
-    }
+    return scrollLayerManagerToTile({
+      root: this.element,
+      tileId
+    });
   }
 
   _scrollToPreview(previewId) {
-    const root = this.element;
-    if (!root || !previewId) return;
-    const list = root.querySelector('.fa-nexus-layer-manager__list');
-    if (!list) return;
-    const item = list.querySelector(`[data-preview-id="${CSS.escape(previewId)}"]`);
-    if (!item) return;
-    const listRect = list.getBoundingClientRect();
-    const itemRect = item.getBoundingClientRect();
-    if (itemRect.top < listRect.top || itemRect.bottom > listRect.bottom) {
-      try { item.scrollIntoView({ block: 'nearest' }); } catch (_) {}
-    }
+    return scrollLayerManagerToPreview({
+      root: this.element,
+      previewId
+    });
   }
 
   _syncPreviewScroll() {
-    const root = this.element;
-    if (!root) return;
-    const list = root.querySelector('.fa-nexus-layer-manager__list');
-    if (!list) return;
-    const activePreview = list.querySelector('.fa-nexus-layer-manager__item.is-preview.is-selected');
-    if (!activePreview) {
-      this._lastActivePreviewId = null;
-      return;
-    }
-    const previewId = activePreview.dataset?.previewId || null;
-    if (!previewId) return;
-    if (previewId !== this._lastActivePreviewId) {
-      this._lastActivePreviewId = previewId;
-      this._queueScrollToPreview(previewId);
-      return;
-    }
-    const listRect = list.getBoundingClientRect();
-    const itemRect = activePreview.getBoundingClientRect();
-    if (itemRect.top < listRect.top || itemRect.bottom > listRect.bottom) {
-      this._queueScrollToPreview(previewId);
-    }
+    return syncLayerManagerPreviewScroll({
+      root: this.element,
+      lastActivePreviewId: this._lastActivePreviewId,
+      setLastActivePreviewId: (value) => { this._lastActivePreviewId = value; },
+      queueScrollToPreview: (previewId) => this._queueScrollToPreview(previewId)
+    });
   }
 
-  _syncSelectionFromCanvas(tile = null, controlled = null) {
-    const root = this.element;
-    if (!root) return;
-    const list = root.querySelector('.fa-nexus-layer-manager__list');
-    if (!list) return;
-    const selectedDocs = tile
-      ? (() => {
-        const isSelected = controlled === null ? !!tile?.controlled : !!controlled;
-        return isSelected && tile?.document ? [tile.document] : [];
-      })()
-      : this._getSelectedTileDocs();
-    const expandedGroups = this._expandElevationGroupsForDocs(selectedDocs);
-    if (expandedGroups) {
-      const scrollTargetId = tile?.document?.id || selectedDocs[0]?.id || null;
-      if (scrollTargetId) this._queueScrollToTile(scrollTargetId);
-      this._scheduleRender();
-      this._updateSelectionActions();
-      this._updateFlattenFooter();
-      return;
+  _queueSelectionSyncFromCanvas(options = null) {
+    if (options && typeof options === 'object') {
+      this._setPendingCanvasSelectionSyncOptions(options);
     }
-    if (tile) {
-      const id = tile?.document?.id || tile?.id;
-      if (!id) return;
-      const item = list.querySelector(`[data-tile-id="${CSS.escape(id)}"]`);
-      if (item) {
-        const isSelected = controlled === null ? !!tile.controlled : !!controlled;
-        item.classList.toggle('is-selected', isSelected);
-        item.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-        if (isSelected) this._queueScrollToTile(id);
-      }
-      this._updateSelectionActions();
-      this._updateFlattenFooter();
-      return;
+    if (this._canvasSelectionSyncQueued) return true;
+    this._canvasSelectionSyncQueued = true;
+    const flush = () => {
+      this._canvasSelectionSyncQueued = false;
+      const nextOptions = this._pendingCanvasSelectionSyncOptions;
+      this._pendingCanvasSelectionSyncOptions = null;
+      this._syncSelectionFromCanvas(null, null, nextOptions);
+    };
+    try {
+      requestAnimationFrame(flush);
+    } catch (_) {
+      try { queueMicrotask(flush); } catch (_) { flush(); }
     }
+    return true;
+  }
 
-    const selectedIds = new Set((canvas?.tiles?.controlled || []).map((t) => t?.document?.id || t?.id));
-    for (const item of list.querySelectorAll('[data-tile-id]')) {
-      const id = item.dataset.tileId;
-      const isSelected = selectedIds.has(id);
-      item.classList.toggle('is-selected', isSelected);
-      item.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-    }
-    this._updateSelectionActions();
-    this._updateFlattenFooter();
+  _syncSelectionFromCanvas(tile = null, controlled = null, options = null) {
+    return syncLayerManagerSelectionFromCanvas({
+      root: this.element,
+      tile,
+      controlled,
+      getSelectedTileDocs: () => this._getSelectedTileDocs(),
+      expandElevationGroupsForDocs: (docs) => this._expandElevationGroupsForDocs(docs),
+      queueScrollToTile: (tileId) => this._queueScrollToTile(tileId),
+      scheduleRender: () => this._scheduleRender(),
+      updateSelectionActions: () => this._updateSelectionActions(),
+      updateFlattenFooter: () => this._updateFlattenFooter(),
+      controlledTiles: canvas?.tiles?.controlled,
+      allowAutoExpand: options?.allowAutoExpand !== false,
+      allowScrollToTile: options?.allowScrollToTile !== false
+    });
   }
 }
 
 try {
   Hooks.once('init', () => {
+    ensureSceneLevelTextureVisibilityPatch();
     registerLayerManagerTab();
   });
 } catch (_) {}
 
 try {
   Hooks.once('canvasReady', () => {
+    ensureTileReleaseAllPatch();
+    ensureTileReleasePatch();
+    ensureTileControlReleaseOthersPatch();
     ensureTileSelectionPatch();
     ensureTileSelectAllPatch();
     ensureTileForegroundSelectionPatch();

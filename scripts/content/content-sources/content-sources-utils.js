@@ -1,10 +1,21 @@
 import { NexusLogger as Logger } from '../../core/nexus-logger.js';
+import {
+  normalizeFolderPath as normalizeSharedFolderPath,
+  normalizePathLower
+} from '../../storage/path-utils.js';
+
+/**
+ * @typedef {import('../../core/fa-nexus-types.js').FaNexusFolderSelection} FaNexusFolderSelection
+ */
 
 const identityPath = (value) => {
   if (value == null) return '';
   const str = String(value);
   return str;
 };
+
+const canonicalizePath = (normalizePath, value) => normalizeSharedFolderPath(normalizePath(value));
+const toPathLower = (value) => normalizePathLower(value) || String(value || '').trim().toLowerCase();
 
 const defaultLogger = {
   debug: (...args) => {
@@ -13,6 +24,10 @@ const defaultLogger = {
   }
 };
 
+/**
+ * @param {FaNexusFolderSelection|null|undefined} selection
+ * @returns {FaNexusFolderSelection|null}
+ */
 export function cloneFolderSelection(selection) {
   if (!selection) return null;
   try {
@@ -31,6 +46,10 @@ export function cloneFolderSelection(selection) {
   return selection;
 }
 
+/**
+ * @param {FaNexusFolderSelection|null|undefined} selection
+ * @returns {FaNexusFolderSelection|null}
+ */
 export function summarizeFolderSelection(selection) {
   if (!selection) return null;
   const snapshot = (arr) => (Array.isArray(arr) ? arr.slice() : undefined);
@@ -48,9 +67,9 @@ export function summarizeFolderSelection(selection) {
 const normalizeExcludeFilters = (selection, { normalizePath = identityPath, availableLowers = null } = {}) => {
   const map = new Map();
   const addPath = (raw) => {
-    const path = normalizePath(raw);
+    const path = canonicalizePath(normalizePath, raw);
     if (!path) return;
-    const lower = path.toLowerCase();
+    const lower = toPathLower(path);
     if (!lower) return;
     if (availableLowers && availableLowers.size && !availableLowers.has(lower)) {
       let exists = false;
@@ -62,7 +81,7 @@ const normalizeExcludeFilters = (selection, { normalizePath = identityPath, avai
     if (!map.has(lower)) map.set(lower, path);
   };
   const addLower = (raw) => {
-    const lower = String(raw || '').toLowerCase();
+    const lower = toPathLower(raw);
     if (!lower) return;
     if (map.has(lower)) return;
     if (availableLowers && availableLowers.size && !availableLowers.has(lower)) {
@@ -72,8 +91,8 @@ const normalizeExcludeFilters = (selection, { normalizePath = identityPath, avai
       }
       if (!exists) return;
     }
-    const canonical = normalizePath(lower) || lower;
-    const canonicalLower = canonical.toLowerCase();
+    const canonical = canonicalizePath(normalizePath, lower) || lower;
+    const canonicalLower = toPathLower(canonical);
     if (!map.has(canonicalLower)) map.set(canonicalLower, canonical);
   };
 
@@ -98,7 +117,7 @@ const uniqueNormalizedPaths = (values, normalizePath) => {
   for (const raw of values) {
     const path = normalizePath(raw);
     if (!path) continue;
-    const lower = path.toLowerCase();
+    const lower = toPathLower(path);
     if (!lower || seen.has(lower)) continue;
     seen.add(lower);
     normalizedPaths.push(path);
@@ -107,18 +126,14 @@ const uniqueNormalizedPaths = (values, normalizePath) => {
   return { paths: normalizedPaths, lowers: normalizedLowers };
 };
 
+/**
+ * @param {FaNexusFolderSelection|null|undefined} selection
+ * @param {{ normalizePath?: (value: string|number|boolean|null|undefined) => string, supportsUnassigned?: boolean }} [options]
+ * @returns {FaNexusFolderSelection}
+ */
 export function normalizeFolderSelection(selection, { normalizePath = identityPath, supportsUnassigned = false } = {}) {
   const input = (selection && typeof selection === 'object') ? selection : {};
-  const normalize = (value) => {
-    const normalized = normalizePath(value);
-    if (!normalized) return '';
-    return normalized
-      .replace(/\\/g, '/')
-      .replace(/\/+/g, '/')
-      .replace(/^\/+/, '')
-      .replace(/\/+$/, '')
-      .trim();
-  };
+  const normalize = (value) => canonicalizePath(normalizePath, value);
 
   const type = String(input.type || '').toLowerCase();
   let normalized;
@@ -126,7 +141,7 @@ export function normalizeFolderSelection(selection, { normalizePath = identityPa
   if (type === 'folder') {
     const path = normalize(input.path || input.includePaths?.[0] || input.paths?.[0]);
     if (path) {
-      const lower = path.toLowerCase();
+      const lower = toPathLower(path);
       normalized = {
         type: 'folder',
         path,
@@ -143,7 +158,7 @@ export function normalizeFolderSelection(selection, { normalizePath = identityPa
     const { paths: nextPaths, lowers: nextLowers } = uniqueNormalizedPaths(incoming, normalize);
     if (!nextPaths.length && lowers.length) {
       const byLower = uniqueNormalizedPaths(lowers, (value) => {
-        const lower = String(value || '').toLowerCase();
+        const lower = toPathLower(value);
         return lower;
       });
       nextPaths.push(...byLower.paths);
@@ -151,7 +166,7 @@ export function normalizeFolderSelection(selection, { normalizePath = identityPa
     }
     if (nextPaths.length === 1) {
       const path = nextPaths[0];
-      const lower = path.toLowerCase();
+      const lower = toPathLower(path);
       normalized = {
         type: 'folder',
         path,
@@ -215,6 +230,11 @@ const cloneSelectionArrays = (selection) => {
   return clone;
 };
 
+/**
+ * @param {FaNexusFolderSelection|null|undefined} selection
+ * @param {{ availableLowers?: Set<string>|null, supportsUnassigned?: boolean, normalizePath?: (value: string|number|boolean|null|undefined) => string }} [options]
+ * @returns {FaNexusFolderSelection}
+ */
 export function enforceFolderSelectionAvailability(selection, {
   availableLowers = null,
   supportsUnassigned = false,
@@ -225,7 +245,7 @@ export function enforceFolderSelectionAvailability(selection, {
   if (!availableLowers || !availableLowers.size) return normalized;
 
   if (normalized.type === 'folder') {
-    const target = String(normalized.pathLower || normalized.path || '').toLowerCase();
+    const target = toPathLower(normalized.pathLower || normalized.path || '');
     if (!hasAvailableLower(target, availableLowers)) {
       return { type: 'all', includePaths: [], includePathLowers: [] };
     }
@@ -236,8 +256,8 @@ export function enforceFolderSelectionAvailability(selection, {
     const nextLowers = [];
     const count = Math.max(paths.length, lowers.length);
     for (let i = 0; i < count; i += 1) {
-      const path = normalizePath(paths[i]);
-      const lower = String(lowers[i] || path || '').toLowerCase();
+      const path = canonicalizePath(normalizePath, paths[i]);
+      const lower = toPathLower(lowers[i] || path || '');
       if (!lower || !hasAvailableLower(lower, availableLowers)) continue;
       if (nextLowers.includes(lower)) continue;
       const canonicalPath = path || lower;
@@ -249,7 +269,7 @@ export function enforceFolderSelectionAvailability(selection, {
     }
     if (nextPaths.length === 1) {
       const folderPath = nextPaths[0];
-      const lower = folderPath.toLowerCase();
+      const lower = toPathLower(folderPath);
       return {
         type: 'folder',
         path: folderPath,
@@ -289,18 +309,18 @@ export function mergeFolderSelectionExcludes({
     if (!source) return;
     if (Array.isArray(source.excludePaths)) {
       for (const value of source.excludePaths) {
-        const path = normalizePath(value);
+        const path = canonicalizePath(normalizePath, value);
         if (!path) continue;
-        const lower = path.toLowerCase();
+        const lower = toPathLower(path);
         if (!lower) continue;
         if (!map.has(lower)) map.set(lower, path);
       }
     }
     if (Array.isArray(source.excludePathLowers)) {
       for (const value of source.excludePathLowers) {
-        const lower = String(value || '').toLowerCase();
+        const lower = toPathLower(value);
         if (!lower || map.has(lower)) continue;
-        const canonical = normalizePath(lower) || lower;
+        const canonical = canonicalizePath(normalizePath, lower) || lower;
         map.set(lower, canonical);
       }
     }
@@ -329,18 +349,22 @@ export function mergeFolderSelectionExcludes({
   return cleaned;
 }
 
+/**
+ * @param {FaNexusFolderSelection|null|undefined} selection
+ * @returns {string}
+ */
 export function folderSelectionKey(selection) {
   if (!selection || typeof selection !== 'object') return 'all';
   const type = String(selection.type || 'all').toLowerCase();
   let base;
   if (type === 'folder') {
-    const lower = String(selection.pathLower || selection.path || '').toLowerCase();
+    const lower = toPathLower(selection.pathLower || selection.path || '');
     base = `folder:${lower}`;
   } else if (type === 'folders') {
     const lowers = Array.isArray(selection.pathLowers) ? selection.pathLowers
       : Array.isArray(selection.includePathLowers) ? selection.includePathLowers
-      : Array.isArray(selection.paths) ? selection.paths.map((p) => String(p || '').toLowerCase()) : [];
-    const unique = Array.from(new Set(lowers.map((p) => String(p || '').toLowerCase())));
+      : Array.isArray(selection.paths) ? selection.paths.map((p) => toPathLower(p)) : [];
+    const unique = Array.from(new Set(lowers.map((p) => toPathLower(p))));
     unique.sort();
     base = `folders:${unique.join('|')}`;
   } else if (type === 'unassigned') {
@@ -351,9 +375,9 @@ export function folderSelectionKey(selection) {
 
   const excludes = Array.isArray(selection.excludePathLowers) && selection.excludePathLowers.length
     ? selection.excludePathLowers
-    : Array.isArray(selection.excludePaths) ? selection.excludePaths.map((p) => String(p || '').toLowerCase()) : [];
+    : Array.isArray(selection.excludePaths) ? selection.excludePaths.map((p) => toPathLower(p)) : [];
   if (excludes && excludes.length) {
-    const normalized = Array.from(new Set(excludes.map((p) => String(p || '').toLowerCase())));
+    const normalized = Array.from(new Set(excludes.map((p) => toPathLower(p))));
     normalized.sort();
     if (normalized.length) base = `${base}|exclude:${normalized.join('|')}`;
   }

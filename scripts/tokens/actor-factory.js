@@ -4,6 +4,16 @@
  */
 
 import * as SystemDetection from './system-detection.js';
+import { getCurrentSceneLevel } from '../canvas/elevation-band-utils.js';
+
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorData} FaNexusActorData
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorDropCoordinates} FaNexusActorDropCoordinates
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenDragData} FaNexusTokenDragData
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusActorTokenOptions} FaNexusActorTokenOptions
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenPrototypeData} FaNexusTokenPrototypeData
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenSize} FaNexusTokenSize
+ */
 
 /**
  * Generate a clean actor name from filename
@@ -42,12 +52,47 @@ function generateActorName(filename) {
  * Actor Factory - Main entry point for creating actors from dropped tokens
  */
 export class ActorFactory {
+  static resolveTokenDepthFromGridDimensions(gridWidth, gridHeight, fallbackDepth = null) {
+    const fallback = Number(fallbackDepth);
+    if (Number.isFinite(fallback) && fallback > 0) return fallback;
+
+    const width = Number(gridWidth);
+    const height = Number(gridHeight);
+    const depth = Math.max(
+      Number.isFinite(width) && width > 0 ? width : 1,
+      Number.isFinite(height) && height > 0 ? height : 1
+    );
+    return Math.round(depth * 100) / 100;
+  }
+
+  static _resolveCurrentTokenPlacementContext(scene = canvas?.scene) {
+    const level = getCurrentSceneLevel(scene);
+    const levelId = String(level?.id || '').trim();
+    if (!levelId) {
+      throw new Error('Unable to resolve current canvas level for v14 token creation');
+    }
+
+    const bottomElevation = Number(level?.elevation?.bottom);
+    if (!Number.isFinite(bottomElevation)) {
+      throw new Error(`Unable to resolve bottom elevation for current canvas level "${levelId}" during v14 token creation`);
+    }
+
+    return {
+      levelId,
+      elevation: bottomElevation
+    };
+  }
+
+  static _resolveCurrentTokenLevelId(scene = canvas?.scene) {
+    return ActorFactory._resolveCurrentTokenPlacementContext(scene).levelId;
+  }
   
   /**
    * Create an actor from drag data with system-appropriate settings
-   * @param {Object} dragData - The drag data from the token drop
-   * @param {Object} dropCoordinates - Drop coordinates {screen: {x, y}, world: {x, y}}
-   * @returns {Promise<Object>} Created actor and token documents
+   * @param {FaNexusTokenDragData} dragData - The drag data from the token drop
+   * @param {FaNexusActorDropCoordinates} dropCoordinates - Drop coordinates {screen: {x, y}, world: {x, y}}
+   * @param {FaNexusActorFactoryOptions} [options] - Actor creation hooks and overrides
+   * @returns {Promise<{actor:Actor,token:TokenDocument}>} Created actor and token documents
    */
   static async createActorFromDragData(dragData, dropCoordinates, options = {}) {
     try {
@@ -66,6 +111,7 @@ export class ActorFactory {
         throw new Error('Failed to create actor with all fallback strategies');
       }
       
+      /** @type {FaNexusActorTokenOptions} */
       let tokenOptions = {};
       if (options && typeof options.beforeTokenCreate === 'function') {
         try {
@@ -92,8 +138,9 @@ export class ActorFactory {
   /**
    * Create actor with multi-tier fallback strategy
    * @param {string} actorName - Name for the actor
-   * @param {Object} dragData - Drag data containing token information
-   * @returns {Promise<Actor>} Created actor or null if all strategies fail
+   * @param {FaNexusTokenDragData} dragData - Drag data containing token information
+   * @param {FaNexusActorFactoryOptions} [options] - Creation overrides
+   * @returns {Promise<Actor|null>} Created actor or null if all strategies fail
    */
   static async _createActorWithFallback(actorName, dragData, options = {}) {
     const systemId = SystemDetection.getCurrentSystemId();
@@ -107,9 +154,16 @@ export class ActorFactory {
     const actorTypeOverride = requestedActorType && (!availableTypes.length || availableTypes.includes(requestedActorType))
       ? requestedActorType
       : '';
-    const orderedTypes = actorTypeOverride
-      ? [actorTypeOverride, ...fallbackTypes.filter((actorType) => actorType !== actorTypeOverride)]
-      : fallbackTypes;
+    if (systemId === 'daggerheart' && requestedActorType && !actorTypeOverride) {
+      const available = availableTypes.length ? availableTypes.join(', ') : 'none reported by system';
+      throw new Error(`Daggerheart actor type "${requestedActorType}" is not registered. Available types: ${available}`);
+    }
+
+    const orderedTypes = systemId === 'daggerheart'
+      ? this._getDaggerheartActorCreationTypes(actorTypeOverride, fallbackTypes)
+      : (actorTypeOverride
+        ? [actorTypeOverride, ...fallbackTypes.filter((actorType) => actorType !== actorTypeOverride)]
+        : fallbackTypes);
     const failures = [];
 
     console.info('fa-nexus | ActorFactory: Resolved actor creation fallback order', {
@@ -137,6 +191,17 @@ export class ActorFactory {
         const actor = await ActorFactory._createActorInTargetFolder(actorData);
         
         if (actor) {
+          try {
+            await this._finalizeCreatedActor(actor, actorType, dragData);
+          } catch (error) {
+            console.error(`fa-nexus | ActorFactory: Finalization failed for newly-created actor "${actor.name}", deleting actor`, error);
+            try {
+              await actor.delete();
+            } catch (deleteError) {
+              console.error(`fa-nexus | ActorFactory: Failed to delete actor "${actor.name}" after finalization error`, deleteError);
+            }
+            throw error;
+          }
           return actor;
         }
         
@@ -150,6 +215,11 @@ export class ActorFactory {
       }
     }
     
+    if (systemId === 'daggerheart') {
+      const attemptedType = orderedTypes[0] || actorTypeOverride || 'unknown';
+      throw new Error(`Daggerheart actor creation failed for type "${attemptedType}": ${failures.map((failure) => failure.error).join('; ') || 'no actor was created'}`);
+    }
+
     // If all typed attempts failed, try minimal data approach
     console.warn('fa-nexus | ActorFactory: All typed actor creation attempts failed, trying minimal data approach', {
       systemId,
@@ -202,13 +272,73 @@ export class ActorFactory {
     } catch (_) {}
     return await Actor.create(actorData);
   }
+
+  static _getDaggerheartActorCreationTypes(actorTypeOverride, fallbackTypes = []) {
+    const selectedType = actorTypeOverride
+      || fallbackTypes.find((actorType) => actorType === 'adversary')
+      || fallbackTypes[0]
+      || 'adversary';
+    return selectedType ? [selectedType] : [];
+  }
+
+  static async _finalizeCreatedActor(actor, actorType, dragData) {
+    if (SystemDetection.getCurrentSystemId() !== 'daggerheart') return;
+    await this._applyDaggerheartActorSize(actor, actorType, dragData);
+  }
+
+  static _getDaggerheartSizeFromGridDimensions(gridWidth, gridHeight) {
+    const width = Number(gridWidth);
+    const height = Number(gridHeight);
+    const maxDimension = Math.max(
+      Number.isFinite(width) && width > 0 ? width : 1,
+      Number.isFinite(height) && height > 0 ? height : 1
+    );
+
+    if (maxDimension >= 4) return 'gargantuan';
+    if (maxDimension >= 3) return 'huge';
+    if (maxDimension >= 2) return 'large';
+    if (maxDimension >= 1) return 'medium';
+    if (maxDimension >= 0.75) return 'small';
+    return 'tiny';
+  }
+
+  static async _applyDaggerheartActorSize(actor, actorType, dragData) {
+    if (!actor?.system?.metadata?.usesSize) return;
+
+    const tokenSize = dragData?.tokenSize || { gridWidth: 1, gridHeight: 1 };
+    const size = this._getDaggerheartSizeFromGridDimensions(tokenSize.gridWidth, tokenSize.gridHeight);
+    const choices = CONFIG?.DH?.ACTOR?.tokenSize || {};
+    if (choices && Object.keys(choices).length && !choices[size]) {
+      throw new Error(`Daggerheart token size "${size}" is not registered for actor type "${actorType}"`);
+    }
+    if (actor.system.size === size) {
+      console.info(`fa-nexus | Daggerheart: Actor "${actor.name}" already has size "${size}"`, {
+        actorType,
+        gridWidth: tokenSize.gridWidth,
+        gridHeight: tokenSize.gridHeight
+      });
+      return;
+    }
+
+    try {
+      await actor.update({ 'system.size': size });
+      console.info(`fa-nexus | Daggerheart: Set actor size to "${size}" for ${actor.name}`, {
+        actorType,
+        gridWidth: tokenSize.gridWidth,
+        gridHeight: tokenSize.gridHeight
+      });
+    } catch (error) {
+      console.error(`fa-nexus | Daggerheart: Failed to set actor size "${size}" for ${actor.name}`, error);
+      throw error;
+    }
+  }
   
   /**
    * Build actor data for a specific type and system
    * @param {string} actorName - Name for the actor
    * @param {string} actorType - Type of actor to create
-   * @param {Object} dragData - Drag data containing token information
-   * @returns {Object} Actor data object
+   * @param {FaNexusTokenDragData} dragData - Drag data containing token information
+   * @returns {FaNexusActorData} Actor data object
    */
   static _buildActorData(actorName, actorType, dragData) {
     // Get base actor data from system detection
@@ -238,8 +368,8 @@ export class ActorFactory {
   
   /**
    * Build token prototype data from drag information
-   * @param {Object} dragData - Drag data containing token size and URL
-   * @returns {Object} Token prototype data
+   * @param {FaNexusTokenDragData} dragData - Drag data containing token size and URL
+   * @returns {FaNexusTokenPrototypeData} Token prototype data
    */
   static _buildTokenData(dragData) {
     const { gridWidth, gridHeight, scale } = dragData.tokenSize;
@@ -254,6 +384,10 @@ export class ActorFactory {
     return {
       width: optimizedDimensions.gridWidth,
       height: optimizedDimensions.gridHeight,
+      depth: this.resolveTokenDepthFromGridDimensions(
+        optimizedDimensions.gridWidth,
+        optimizedDimensions.gridHeight
+      ),
       texture: {
         src: dragData.url,
         scaleX, // Negative scale indicates a mirrored axis in Foundry
@@ -272,7 +406,7 @@ export class ActorFactory {
    * @param {number} originalGridWidth - Original grid width
    * @param {number} originalGridHeight - Original grid height  
    * @param {number} originalScale - Original scale
-   * @returns {Object} Optimized dimensions {gridWidth, gridHeight, scale, fit}
+   * @returns {{gridWidth:number,gridHeight:number,scale:number,fit:'contain'|'width'|'height'}} Optimized dimensions
    */
   static _optimizeGargantuanDimensions(filename, originalGridWidth, originalGridHeight, originalScale) {
     const name = filename.toLowerCase();
@@ -352,10 +486,10 @@ export class ActorFactory {
 
   /**
    * Enhance actor data for D&D 5e system
-   * @param {Object} actorData - Base actor data
+   * @param {FaNexusActorData} actorData - Base actor data
    * @param {string} actorType - Actor type
-   * @param {Object} dragData - Drag data
-   * @returns {Object} Enhanced actor data
+   * @param {FaNexusTokenDragData} dragData - Drag data
+   * @returns {FaNexusActorData} Enhanced actor data
    */
   static _enhanceForDnd5e(actorData, actorType, dragData) {
     // Safely extract token size with fallbacks
@@ -398,10 +532,10 @@ export class ActorFactory {
   
   /**
    * Enhance actor data for Pathfinder 2e system
-   * @param {Object} actorData - Base actor data
+   * @param {FaNexusActorData} actorData - Base actor data
    * @param {string} actorType - Actor type
-   * @param {Object} dragData - Drag data
-   * @returns {Object} Enhanced actor data
+   * @param {FaNexusTokenDragData} dragData - Drag data
+   * @returns {FaNexusActorData} Enhanced actor data
    */
   static _enhanceForPf2e(actorData, actorType, dragData) {
     // Safely extract token size with fallbacks
@@ -440,10 +574,10 @@ export class ActorFactory {
   
   /**
    * Enhance actor data for Pathfinder 1e system
-   * @param {Object} actorData - Base actor data
+   * @param {FaNexusActorData} actorData - Base actor data
    * @param {string} actorType - Actor type
-   * @param {Object} dragData - Drag data
-   * @returns {Object} Enhanced actor data
+   * @param {FaNexusTokenDragData} dragData - Drag data
+   * @returns {FaNexusActorData} Enhanced actor data
    */
   static _enhanceForPf1(actorData, actorType, dragData) {
     // Safely extract token size with fallbacks
@@ -482,10 +616,10 @@ export class ActorFactory {
 
   /**
    * Enhance actor data for DSA5 system
-   * @param {Object} actorData - Base actor data
+   * @param {FaNexusActorData} actorData - Base actor data
    * @param {string} actorType - Actor type
-   * @param {Object} dragData - Drag data
-   * @returns {Object} Enhanced actor data
+   * @param {FaNexusTokenDragData} dragData - Drag data
+   * @returns {FaNexusActorData} Enhanced actor data
    */
   static _enhanceForDsa5(actorData, actorType, dragData) {
     // Safely extract token size with fallbacks
@@ -542,10 +676,10 @@ export class ActorFactory {
 
   /**
    * Enhance actor data for Black Flag system
-   * @param {Object} actorData - Base actor data
+   * @param {FaNexusActorData} actorData - Base actor data
    * @param {string} actorType - Actor type
-   * @param {Object} dragData - Drag data
-   * @returns {Object} Enhanced actor data
+   * @param {FaNexusTokenDragData} dragData - Drag data
+   * @returns {FaNexusActorData} Enhanced actor data
    */
   static _enhanceForBlackFlag(actorData, actorType, dragData) {
     // Safely extract token size with fallbacks
@@ -563,30 +697,32 @@ export class ActorFactory {
 
   /**
    * Enhance actor data for Daggerheart system
-   * @param {Object} actorData - Base actor data
+   * @param {FaNexusActorData} actorData - Base actor data
    * @param {string} actorType - Actor type
-   * @param {Object} dragData - Drag data
-   * @returns {Object} Enhanced actor data
+   * @param {FaNexusTokenDragData} dragData - Drag data
+   * @returns {FaNexusActorData} Enhanced actor data
    */
   static _enhanceForDaggerheart(actorData, actorType, dragData) {
     // Safely extract token size with fallbacks
     const tokenSize = dragData.tokenSize || { gridWidth: 1, gridHeight: 1, scale: 1 };
     const { gridWidth, gridHeight } = tokenSize;
-    const sizeCategory = this._getCreatureSizeFromGridDimensions(gridWidth, gridHeight);
-    
-    actorData.system = actorData.system || {};
-    actorData.system.bio = actorData.system.bio || {};
-    actorData.system.bio.size = sizeCategory;
-    
-    console.log(`fa-nexus | Daggerheart: Set creature size to "${sizeCategory}" for ${actorData.name} (${gridWidth}x${gridHeight} grid)`);
+    const sizeCategory = this._getDaggerheartSizeFromGridDimensions(gridWidth, gridHeight);
+
+    // Daggerheart's create workflow fails when partial system data causes its ActionField initial data
+    // to be cleaned as a partial update. Create with no system payload, then update system.size after create.
+    delete actorData.system;
+
+    console.info(`fa-nexus | Daggerheart: Queued actor size "${sizeCategory}" for ${actorData.name} (${gridWidth}x${gridHeight} grid)`, {
+      actorType
+    });
     return actorData;
   }
   
   /**
    * Create token on canvas from actor and drop data
    * @param {Actor} actor - The created actor
-   * @param {Object} dragData - Drag data containing token information
-   * @param {Object} dropCoordinates - Drop coordinates (already snapped)
+   * @param {FaNexusTokenDragData} dragData - Drag data containing token information
+   * @param {FaNexusActorDropCoordinates} dropCoordinates - Drop coordinates (already snapped)
    * @returns {Promise<TokenDocument>} Created token document
    */
   static async _createTokenOnCanvas(actor, dragData, dropCoordinates, tokenOptions = {}) {
@@ -597,6 +733,11 @@ export class ActorFactory {
     const prototypeToken = actor.prototypeToken;
     const gridWidth = prototypeToken.width;
     const gridHeight = prototypeToken.height;
+    const tokenDepth = ActorFactory.resolveTokenDepthFromGridDimensions(
+      gridWidth,
+      gridHeight,
+      prototypeToken.depth
+    );
     const prototypeScaleX = Number(prototypeToken.texture.scaleX ?? 1) || 1;
     const prototypeScaleY = Number(prototypeToken.texture.scaleY ?? 1) || 1;
     const baseScaleX = Math.abs(prototypeScaleX);
@@ -605,6 +746,10 @@ export class ActorFactory {
     const textureMirrorX = prototypeScaleX < 0;
     const textureMirrorY = prototypeScaleY < 0;
     const tokenRotation = Number.isFinite(dragData?.rotation) ? Number(dragData.rotation) : 0;
+    const {
+      levelId: tokenLevelId,
+      elevation: tokenElevation
+    } = ActorFactory._resolveCurrentTokenPlacementContext(canvas.scene);
 
     // Get grid size for calculating token dimensions
     const gridSize = canvas.grid.size;
@@ -633,8 +778,11 @@ export class ActorFactory {
       actorLink,
       x: tokenX,
       y: tokenY,
+      level: tokenLevelId,
+      elevation: tokenElevation,
       width: gridWidth,
       height: gridHeight,
+      depth: tokenDepth,
       texture: {
         src: dragData.url,
         scaleX: appliedScaleX,
@@ -741,8 +889,8 @@ export class ActorFactory {
   /**
    * Update an actor's prototype token with new token data
    * @param {Actor} actor - The actor to update
-   * @param {Object} dropData - The token drop data
-   * @param {Object} options - Update options
+   * @param {FaNexusTokenDragData} dropData - The token drop data
+   * @param {FaNexusActorUpdateOptions} options - Update options
    * @param {boolean} [options.preserveSize] - When true, do not update actor size or prototype token dimensions
    * @returns {Promise<void>}
    */
@@ -782,6 +930,10 @@ export class ActorFactory {
     if (!preserveSize) {
       prototypeTokenUpdate.width = tokenSize.gridWidth;
       prototypeTokenUpdate.height = tokenSize.gridHeight;
+      prototypeTokenUpdate.depth = ActorFactory.resolveTokenDepthFromGridDimensions(
+        tokenSize.gridWidth,
+        tokenSize.gridHeight
+      );
       prototypeTokenUpdate.scale = Math.abs(baseScale);
     }
 
@@ -842,6 +994,8 @@ export class ActorFactory {
         await actor.update({
           'system.status.size': { value: sizeCategory }
         });
+      } else if (systemId === 'daggerheart') {
+        await ActorFactory._applyDaggerheartActorSize(actor, actor?.type || 'unknown', dropData);
       }
     }
     

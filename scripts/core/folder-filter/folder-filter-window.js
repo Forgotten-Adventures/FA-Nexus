@@ -6,21 +6,16 @@ const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
  * the main FA Nexus shell while preserving the existing filter logic.
  */
 export class FolderFilterWindow extends HandlebarsApplicationMixin(ApplicationV2) {
-  // Clone parent defaults so FA-specific ids/width do not leak onto other ApplicationV2 windows.
-  static DEFAULT_OPTIONS = foundry.utils.mergeObject(
-    foundry.utils.deepClone(super.DEFAULT_OPTIONS ?? {}),
-    {
-      id: 'fa-nexus-folder-window',
-      tag: 'section',
-      position: { width: 265 },
-      window: {
-        resizable: false,
-        minimizable: false,
-        title: 'Folders Filter'
-      }
+  static DEFAULT_OPTIONS = {
+    id: 'fa-nexus-folder-window',
+    tag: 'section',
+    position: { width: 265 },
+    window: {
+      resizable: false,
+      minimizable: false,
+      title: 'Folders Filter'
     },
-    { inplace: false }
-  );
+  };
 
   static PARTS = {
     body: { template: 'modules/fa-nexus/templates/folder-filter.hbs' }
@@ -47,7 +42,6 @@ export class FolderFilterWindow extends HandlebarsApplicationMixin(ApplicationV2
   _onRender(initial, context) {
     super._onRender(initial, context);
     try { this.element?.classList?.add('fa-nexus-folder-window-root'); } catch (_) {}
-    /*try { this._disableWindowTransitions(); } catch (_) {}*/
     try { this._applyMaxHeightStyles(); } catch (_) {}
     try { this._parentApp?._onFilterWindowRendered?.(this); } catch (_) {}
     try { this.requestFitToContent(); } catch (_) {}
@@ -87,18 +81,6 @@ export class FolderFilterWindow extends HandlebarsApplicationMixin(ApplicationV2
     }
 
     this._applyMaxHeightStyles();
-  }
-
-  _disableWindowTransitions() {
-    const root = this.element;
-    if (!root) return;
-    root.style.transition = 'none';
-    root.style.animationDuration = '0s';
-    const content = this._getWindowContentElement(root);
-    if (content) {
-      content.style.transition = 'none';
-      content.style.animationDuration = '0s';
-    }
   }
 
   _getWindowHeaderElement(root) {

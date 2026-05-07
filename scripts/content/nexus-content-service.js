@@ -3,6 +3,21 @@ import { CloudDB } from './cloud-db.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 
 /**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryListResult} FaNexusInventoryListResult
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenInventoryRecord} FaNexusTokenInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').LoadAndMergeCloudRecordsOptions} LoadAndMergeCloudRecordsOptions
+ * @typedef {import('../core/fa-nexus-types.js').LocalInventoryConfig} LocalInventoryConfig
+ * @typedef {import('../core/fa-nexus-types.js').MergeLocalAndCloudRecordsOptions} MergeLocalAndCloudRecordsOptions
+ * @typedef {import('../core/fa-nexus-types.js').NexusContentServiceOptions} NexusContentServiceOptions
+ * @typedef {import('../core/fa-nexus-types.js').NexusSyncOptions} NexusSyncOptions
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusAuthContext} FaNexusAuthContext
+ * @typedef {import('../core/fa-nexus-types.js').ProgressEmitterLike} ProgressEmitterLike
+ * @typedef {import('../core/fa-nexus-types.js').RetryWithBackoffOptions} RetryWithBackoffOptions
+ * @typedef {import('../core/fa-nexus-types.js').UrlCacheLike} UrlCacheLike
+ */
+
+/**
  * Lightweight event emitter for progress tracking
  */
 export class ProgressEmitter {
@@ -44,15 +59,10 @@ export class ProgressEmitter {
 
 /**
  * Retry a function with exponential backoff
- * @param {Function} fn - Function to retry
- * @param {Object} options
- * @param {number} options.maxRetries - Maximum number of retries
- * @param {number} options.initialDelay - Initial delay in ms
- * @param {number} options.maxDelay - Maximum delay in ms
- * @param {Function} options.onRetry - Callback before each retry
- * @param {Function} options.shouldRetry - Predicate to skip retries for certain errors
- * @param {AbortSignal} options.signal - Abort signal
- * @returns {Promise}
+ * @template T
+ * @param {() => Promise<T>|T} fn - Function to retry
+ * @param {RetryWithBackoffOptions} [options]
+ * @returns {Promise<T>}
  */
 async function retryWithBackoff(fn, {
   maxRetries = 3,
@@ -139,7 +149,7 @@ export class NexusContentService {
   /**
    * Unified content service for both tokens and assets.
    * Handles manifest syncing, listing, and URL resolution (including signed URLs for premium).
-   * @param {{base?:string,dbTokens?:CloudDB,dbAssets?:CloudDB,urlCache?:UrlCache,progressEmitter?:ProgressEmitter}} [options]
+   * @param {NexusContentServiceOptions} [options]
    */
   constructor(options = {}) {
     this.settingsNamespace = options.settingsNamespace || 'fa-nexus';
@@ -185,7 +195,7 @@ export class NexusContentService {
    * Sync local IndexedDB with remote manifests.
    * Handles both full and delta modes and updates meta with latest hash.
    * @param {'tokens'|'assets'} kind
-   * @param {{onManifestProgress?:(info:{phase:string,count:number,total:number})=>void,progressBatch?:number,signal?:AbortSignal}} [options]
+   * @param {NexusSyncOptions} [options]
    * @returns {Promise<string>} latest hash
    */
   async sync(kind, options = {}) {
@@ -375,7 +385,7 @@ export class NexusContentService {
    * List items for a kind with optional simple filters
    * @param {'tokens'|'assets'} kind
    * @param {{text?:string,tier?:string,pathPrefix?:string,offset?:number,limit?:number}} [opts]
-   * @returns {Promise<{items:Array<object>, total:number}>}
+   * @returns {Promise<FaNexusInventoryListResult>}
    */
   async list(kind, opts = {}) { return this._dbFor(kind).query(kind, opts); }
 
@@ -499,7 +509,8 @@ export class NexusContentService {
           });
         } catch (_) {}
       }
-      Logger.error('ContentService.url:error', { kind, file_path: pRaw, error: errorMsg });
+      const logUrlError = errorMsg === 'AUTH' ? Logger.warn.bind(Logger) : Logger.error.bind(Logger);
+      logUrlError('ContentService.url:error', { kind, file_path: pRaw, error: errorMsg });
       this.progressEmitter.emit('url:error', { kind, file_path: pRaw, error: errorMsg });
       throw error instanceof Error ? error : new Error(errorMsg);
     }
@@ -507,7 +518,7 @@ export class NexusContentService {
 
   /**
    * Update the auth context used for automatic disconnect handling.
-   * @param {{app?:object|null,authService?:object|Function|null}} [context]
+   * @param {FaNexusAuthContext} [context]
    * @returns {this}
    */
   setAuthContext(context = {}) {
@@ -620,6 +631,94 @@ export class NexusContentService {
   }
 }
 
+export class FaNexusOperationalError extends Error {
+  constructor(message, {
+    code = 'FA_NEXUS_OPERATION_FAILED',
+    source = '',
+    operation = '',
+    settingKey = '',
+    folder = '',
+    kind = '',
+    userMessage = '',
+    cause = null,
+    details = null
+  } = {}) {
+    super(message);
+    this.name = 'FaNexusOperationalError';
+    this.code = String(code || 'FA_NEXUS_OPERATION_FAILED');
+    this.source = String(source || '');
+    this.operation = String(operation || '');
+    this.settingKey = String(settingKey || '');
+    this.folder = String(folder || '');
+    this.kind = String(kind || '');
+    this.userMessage = String(userMessage || message || '');
+    if (cause != null) this.cause = cause;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export function createOperationalError(message, options = {}) {
+  return new FaNexusOperationalError(message, options);
+}
+
+function looksOperational(error) {
+  if (!error || typeof error !== 'object') return false;
+  return error instanceof FaNexusOperationalError
+    || error.name === 'FaNexusOperationalError'
+    || typeof error.code === 'string'
+    || typeof error.userMessage === 'string'
+    || typeof error.source === 'string';
+}
+
+export function wrapOperationalError(error, options = {}) {
+  if (looksOperational(error)) return error;
+  const message = options.message || String(error?.message || error || 'FA Nexus operation failed.');
+  return new FaNexusOperationalError(message, {
+    ...options,
+    cause: options.cause ?? error ?? null
+  });
+}
+
+export function formatOperationalError(error, fallback = 'FA Nexus operation failed.') {
+  if (looksOperational(error)) {
+    const userMessage = String(error?.userMessage || '').trim();
+    if (userMessage) return userMessage;
+    const message = String(error?.message || '').trim();
+    return message || fallback;
+  }
+  const message = String(error?.message || error || '').trim();
+  return message || fallback;
+}
+
+export function requireFilePickerMethod(method, {
+  source = 'ContentService.requireFilePickerMethod',
+  operation = '',
+  settingKey = '',
+  folder = '',
+  kind = '',
+  userMessage = ''
+} = {}) {
+  const runtimeFoundry = globalThis.foundry;
+  const FilePickerBase = runtimeFoundry?.applications?.apps?.FilePicker ?? globalThis.FilePicker;
+  const FilePickerImpl = FilePickerBase?.implementation ?? FilePickerBase;
+  if (typeof FilePickerImpl?.[method] === 'function') return FilePickerImpl;
+  throw createOperationalError(`FA Nexus could not resolve FilePicker.${method}.`, {
+    code: 'FILEPICKER_UNAVAILABLE',
+    source,
+    operation: operation || method,
+    settingKey,
+    folder,
+    kind,
+    userMessage: userMessage || 'FA Nexus requires the Foundry FilePicker runtime for this operation.'
+  });
+}
+
+function folderSettingLabel(settingKey) {
+  if (settingKey === 'assetFolders') return 'Asset Sources';
+  if (settingKey === 'tokenFolders') return 'Token Sources';
+  return String(settingKey || 'folder settings');
+}
+
 /**
  * Parse enabled folder paths from the given fa-nexus setting key.
  * @param {string} settingKey
@@ -627,23 +726,68 @@ export class NexusContentService {
  */
 export function getEnabledFolders(settingKey) {
   if (!settingKey) return [];
-  try {
-    const raw = game.settings.get('fa-nexus', settingKey);
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) return [];
-    const folders = [];
-    for (const entry of parsed) {
-      if (!entry || !entry.enabled) continue;
-      const path = entry.path ?? entry.folder ?? entry.value;
-      if (!path) continue;
-      const str = String(path).trim();
-      if (!str) continue;
-      folders.push(str);
-    }
-    return folders;
-  } catch (_) {
-    return [];
+  const label = folderSettingLabel(settingKey);
+  const gameSettings = globalThis.game?.settings;
+  if (!gameSettings?.get) {
+    throw createOperationalError(`FA Nexus could not read the ${label} setting because game.settings.get is unavailable.`, {
+      code: 'SETTINGS_UNAVAILABLE',
+      source: 'ContentService.getEnabledFolders',
+      operation: 'read-enabled-folders',
+      settingKey,
+      userMessage: `FA Nexus could not read the ${label} setting because the Foundry settings runtime is unavailable.`
+    });
   }
+
+  let raw;
+  try {
+    raw = gameSettings.get('fa-nexus', settingKey);
+  } catch (error) {
+    throw wrapOperationalError(error, {
+      code: 'SETTINGS_READ_FAILED',
+      source: 'ContentService.getEnabledFolders',
+      operation: 'read-enabled-folders',
+      settingKey,
+      message: `FA Nexus could not read the ${label} setting.`,
+      userMessage: `FA Nexus could not read the ${label} setting.`
+    });
+  }
+
+  let parsed;
+  try {
+    parsed = raw ? JSON.parse(raw) : [];
+  } catch (error) {
+    throw createOperationalError(`FA Nexus found invalid JSON in the ${label} setting.`, {
+      code: 'SETTINGS_JSON_INVALID',
+      source: 'ContentService.getEnabledFolders',
+      operation: 'parse-enabled-folders',
+      settingKey,
+      userMessage: `FA Nexus found invalid JSON in the ${label} setting. Open the source dialog and resave that configuration.`,
+      cause: error,
+      details: { rawPreview: String(raw || '').slice(0, 160) }
+    });
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw createOperationalError(`FA Nexus found invalid data in the ${label} setting.`, {
+      code: 'SETTINGS_INVALID_SHAPE',
+      source: 'ContentService.getEnabledFolders',
+      operation: 'parse-enabled-folders',
+      settingKey,
+      userMessage: `FA Nexus found invalid data in the ${label} setting. Open the source dialog and resave that configuration.`,
+      details: { valueType: typeof parsed }
+    });
+  }
+
+  const folders = [];
+  for (const entry of parsed) {
+    if (!entry || !entry.enabled) continue;
+    const path = entry.path ?? entry.folder ?? entry.value;
+    if (!path) continue;
+    const str = String(path).trim();
+    if (!str) continue;
+    folders.push(str);
+  }
+  return folders;
 }
 
 const defaultKeySelector = (rec) => {
@@ -653,20 +797,12 @@ const defaultKeySelector = (rec) => {
 
 /**
  * Collect cached and freshly streamed local items for an inventory-style tab.
- * @param {object} config
+ * @param {LocalInventoryConfig} config
  * @param {string} [config.loggerTag] - label used for logging context
  * @param {string[]} [config.folders] - explicit folder list (defaults to settingsKey)
  * @param {string} [config.settingsKey] - fa-nexus setting key containing folder entries
- * @param {Function} config.loadCached - async (folder) => records[]
- * @param {Function} config.saveIndex - async (folder, records[]) => void
- * @param {Function} config.streamFolder - async (folder, onBatch, options) => void
- * @param {Function} [config.isCancelled] - () => boolean, checked between operations
- * @param {Function} [config.onCachedReady] - (cachedItems[]) when cached aggregation completed
- * @param {Function} [config.onStreamProgress] - (count, folder, batchCount) after each streamed batch
- * @param {Function} [config.onStreamFolderComplete] - (folder, records[]) after a folder finishes streaming
  * @param {{batchSize?:number,sleepMs?:number}} [config.streamOptions]
- * @param {Function} [config.keySelector] - builds dedupe key per record
- * @returns {Promise<{folders:string[],cachedItems:object[],localItems:object[],streamedCount:number,cancelled:boolean}>}
+ * @returns {Promise<{folders:string[],cachedItems:FaNexusInventoryRecord[],localItems:FaNexusInventoryRecord[],streamedCount:number,cancelled:boolean}>}
  */
 export async function collectLocalInventory(config) {
   const {
@@ -713,7 +849,7 @@ export async function collectLocalInventory(config) {
     try {
       part = await loadCached?.(folder);
     } catch (e) {
-      Logger.warn(`${loggerTag}.cache.error`, { folder, error: String(e?.message || e) });
+      Logger.error(`${loggerTag}.cache.error`, { folder, error: String(e?.message || e) });
     }
     if (Array.isArray(part) && part.length) {
       let added = 0;
@@ -768,7 +904,21 @@ export async function collectLocalInventory(config) {
         else await streamFolder(folder, handleBatch);
       }
     } catch (e) {
-      Logger.warn(`${loggerTag}.stream.error`, { folder, error: String(e?.message || e) });
+      const wrapped = wrapOperationalError(e, {
+        code: 'LOCAL_STREAM_FAILED',
+        source: `${loggerTag}.stream`,
+        operation: 'collect-local-inventory',
+        settingKey: settingsKey,
+        folder,
+        userMessage: `FA Nexus could not scan the configured folder "${folder}".`
+      });
+      Logger.error(`${loggerTag}.stream.error`, {
+        folder,
+        code: wrapped.code,
+        source: wrapped.source,
+        error: String(wrapped.message || wrapped)
+      });
+      throw wrapped;
     }
     try { await saveIndex?.(folder, perFolder); } catch (e) { Logger.warn(`${loggerTag}.save.error`, { folder, error: String(e?.message || e) }); }
     try { onStreamFolderComplete?.(folder, perFolder.slice()); } catch (_) {}
@@ -788,15 +938,8 @@ const defaultMergeLogger = (kind, detail) => {
 
 /**
  * Merge local and cloud records with deduplication and optional enhancement logic.
- * @param {object} options
- * @param {Array<object>} [options.local=[]]
- * @param {Array<object>} [options.cloud=[]]
- * @param {Function} [options.keySelector] - build dedupe key per record
- * @param {Function} [options.choosePreferred] - (localRecord, cloudRecord) => preferredRecord
- * @param {Function} [options.onEnhanceLocal] - ({ localRecord, cloudRecord }) => enhancedLocal
- * @param {Function} [options.onStats] - ({ kind, collisions, preferLocal, preferCloud, enhanced, localCount, cloudCount, mergedCount })
- * @param {string} [options.kind='items']
- * @returns {Array<object>}
+ * @param {MergeLocalAndCloudRecordsOptions} [options]
+ * @returns {FaNexusInventoryRecord[]}
  */
 export function mergeLocalAndCloudRecords({
   local = [],

@@ -1,17 +1,40 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { gatherBuildingLoops } from '../buildings/building-shape-helpers.js';
 import { BuildingWallMesher } from '../buildings/building-wall-mesher.js';
-import { getTileRenderElevation } from '../canvas/elevation-band-utils.js';
-import { cloneDisplayObjectForCustomTileProxy } from '../canvas/custom-tile-overhead.js';
+import { onCanvasReady } from '../canvas/canvas-readiness.js';
+import { getCurrentViewedLevelIds } from '../canvas/elevation-band-utils.js';
+import { getRawLevelIds } from '../canvas/tile-level-membership.js';
+import { resolveTileRenderOrder } from '../canvas/tile-band-utils.js';
+import {
+  getTileOcclusionMask,
+  getSurfaceTileOcclusionModes,
+  mapTileOcclusionElevation
+} from '../canvas/tile-occlusion.js';
+import { cloneDisplayObjectForProxy } from '../canvas/display-object-proxy.js';
 import { getOrCreatePixiTexture } from '../core/foundry-texture-loader-patch.js';
-import { applyStandardTileMaskToTile, getFlattenedChunkEntries } from '../textures/texture-render.js';
+import {
+  clearSharedTextureCache,
+  getFlattenedChunkEntries
+} from '../textures/texture-runtime-core.js';
+import {
+  applyStandardTileMaskToTile,
+  rehydrateAllMaskedTiles
+} from '../textures/texture-mask-runtime.js';
+import { getStandardMaskCustomBaseKey } from '../textures/standard-mask-custom-base.js';
 import { readShadowQualityConfig } from './shadow-quality.js';
+import {
+  clearAssetScatterCache,
+  rehydrateAllAssetScatterTiles
+} from './asset-scatter-geometry.js';
 import {
   computeSamplesFromPoints as computePathSamples,
   computeBoundsFromSamples as computePathBounds,
+  computePathShadowPoints,
   createMeshFromSamples as createPathMesh,
   loadPathTexture,
   createPathShader,
+  clearPathTextureCache,
+  rehydrateAllPathTiles,
   DEFAULT_SEGMENT_SAMPLES as PATH_DEFAULT_SEGMENT_SAMPLES,
   MIN_POINTS_TO_RENDER as PATH_MIN_POINTS
 } from '../paths/path-geometry.js';
@@ -33,6 +56,44 @@ const SCATTER_SHADOW_MAX_INSTANCES = 8000;
 // Scatter stamps use the active quality ceiling; this guard only prevents runaway sizes above the
 // current highest experimental tier and still respects the detected GPU cap.
 const SCATTER_SHADOW_MAX_DIMENSION = 8192;
+const SHADOW_BLANK_VALIDATION_MAX_PIXELS = 4_000_000;
+const SHADOW_BLANK_RECOVERY_COOLDOWN_MS = 10_000;
+const SHADOW_BLANK_VALIDATION_BUDGET = 12;
+const SHADOW_RENDERER_RECOVERY_DEBOUNCE_MS = 1_000;
+
+const SHADOW_OCCLUSION_FRAGMENT_SHADER = `
+varying vec2 vTextureCoord;
+
+uniform sampler2D uSampler;
+uniform sampler2D occlusionTexture;
+uniform vec2 screenDimensions;
+uniform float occlusionElevation;
+uniform float unoccludedAlpha;
+uniform float occludedAlpha;
+uniform float fadeOcclusion;
+uniform float radialOcclusion;
+uniform float visionOcclusion;
+uniform float surfaceOcclusion;
+
+void main() {
+  vec4 color = texture2D(uSampler, vTextureCoord);
+  vec2 maskCoord = gl_FragCoord.xy / max(screenDimensions, vec2(1.0));
+  vec4 occluded = 1.0 - step(vec4(occlusionElevation), texture2D(occlusionTexture, maskCoord));
+  float occlusion = max(
+    max(occluded.r * fadeOcclusion, occluded.g * radialOcclusion),
+    max(occluded.b * visionOcclusion, occluded.a * surfaceOcclusion)
+  );
+  gl_FragColor = color * mix(unoccludedAlpha, occludedAlpha, occlusion);
+}
+`;
+
+function logShadowLifecycleFailure(event, error, details = {}) {
+  Logger.warn('AssetShadow.lifecycle.failed', {
+    event,
+    error: String(error?.message || error),
+    ...details
+  });
+}
 
 function normalizeLayerOpacity(value, fallback = 1) {
   const numeric = Number(value);
@@ -42,10 +103,69 @@ function normalizeLayerOpacity(value, fallback = 1) {
   return 1;
 }
 
+function clampUnit(value, fallback = 0) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return Math.min(1, Math.max(0, numeric));
+  return Math.min(1, Math.max(0, Number(fallback) || 0));
+}
+
+function getTransparentTexture() {
+  try {
+    return PIXI.Texture.EMPTY;
+  } catch (_) {
+    return null;
+  }
+}
+
+function createAssetShadowOcclusionFilter(manager, layer) {
+  const FilterClass = globalThis.PIXI?.Filter;
+  if (!FilterClass) return null;
+  return new (class extends FilterClass {
+    constructor() {
+      super(undefined, SHADOW_OCCLUSION_FRAGMENT_SHADER, {
+        screenDimensions: [1, 1],
+        occlusionTexture: getTransparentTexture(),
+        occlusionElevation: 0,
+        unoccludedAlpha: 1,
+        occludedAlpha: 0,
+        fadeOcclusion: 0,
+        radialOcclusion: 0,
+        visionOcclusion: 0,
+        surfaceOcclusion: 0
+      });
+      this.manager = manager;
+      this.layer = layer;
+    }
+
+    apply(filterManager, input, output, clear, currentState) {
+      try {
+        this.manager?._prepareShadowOcclusionUniforms?.(this.layer, this.uniforms);
+      } catch (error) {
+        Logger.warn('AssetShadow.occlusionFilter.prepareFailed', {
+          layerKey: this.layer?.key || null,
+          error: String(error?.message || error)
+        });
+      }
+      super.apply(filterManager, input, output, clear, currentState);
+    }
+  })();
+}
+
+function getPrimaryShadowOcclusionMeshClasses() {
+  try {
+    const PrimarySpriteMesh = globalThis?.foundry?.canvas?.primary?.PrimarySpriteMesh;
+    const PrimaryBaseSamplerShader = globalThis?.foundry?.canvas?.rendering?.shaders?.PrimaryBaseSamplerShader;
+    if (typeof PrimarySpriteMesh !== 'function' || typeof PrimaryBaseSamplerShader !== 'function') return null;
+    return { PrimarySpriteMesh, PrimaryBaseSamplerShader };
+  } catch (_) {
+    return null;
+  }
+}
+
 /**
  * Manages aggregated drop-shadow render layers for FA Nexus asset tiles.
- * Proof-of-concept: collects tiles flagged with `flags.fa-nexus.shadow`, groups them
- * by elevation, and renders a shared blurred mask slightly below the tile layer.
+ * Collects shadow-capable tile flags by elevation and renders shared blurred masks
+ * slightly below the tile layer.
  */
 export class AssetShadowManager {
   /**
@@ -55,14 +175,14 @@ export class AssetShadowManager {
     if (_singleton) return _singleton;
     this.app = app;
     this._layers = new Map();
-    this._tileIndex = new Map(); // tile id -> elevation key
+    this._tileIndex = new Map(); // tile id -> shadow layer key
     this._textureCache = new Map();
     this._scatterShadowCache = new Map();
     this._standardMaskShadowCache = new Map();
     this._rebuildTimers = new Map();
     this._renderer = null;
     this._hooksBound = false;
-    this._suspendedTiles = new Map(); // tile id -> { doc, elevation }
+    this._suspendedTiles = new Map(); // tile id -> { doc, layerKey }
     this._sceneRect = { x: 0, y: 0, width: 0, height: 0 };
     this._options = {
       alpha: 0.65,
@@ -76,6 +196,18 @@ export class AssetShadowManager {
     this._pendingRebuilds = new Set();
     this._pendingRebuildImmediate = false;
     this._buildingShadowMaterial = null;
+    this._sceneId = null;
+    this._sceneGeneration = 0;
+    this._levelScopeWarnings = new Set();
+    this._rendererContextView = null;
+    this._rendererContextRunner = null;
+    this._pixiContextRecoveryTarget = null;
+    this._blankLayerRecoveryActive = false;
+    this._blankLayerRecoveryCooldownUntil = 0;
+    this._blankRenderValidationBudget = 0;
+    this._rendererRecoveryCooldownUntil = 0;
+    this._previewShadowOverrides = new Map();
+    this._previewElevationOverrides = new Map();
 
     this._bindHooks();
     this._updateRenderer();
@@ -96,9 +228,10 @@ export class AssetShadowManager {
 
   registerTile(tileDocument) {
     try {
-      if (!tileDocument || !this._isShadowTile(tileDocument)) return;
-      if (this._suspendedTiles.has(tileDocument.id)) this._suspendedTiles.delete(tileDocument.id);
-      this._addTile(tileDocument);
+      const doc = tileDocument?.document ?? tileDocument;
+      if (!doc || !this._isActiveSceneDocument(doc, { phase: 'registerTile' }) || !this._isShadowRenderableTile(doc, { phase: 'registerTile' })) return;
+      if (this._suspendedTiles.has(doc.id)) this._suspendedTiles.delete(doc.id);
+      this._addTile(doc);
     } catch (e) {
       Logger.warn('AssetShadow.registerTile.failed', String(e?.message || e));
     }
@@ -118,8 +251,9 @@ export class AssetShadowManager {
     if (this._hooksBound) return;
     this._hooksBound = true;
     this._boundCanvasReady = () => this._onCanvasReady();
+    this._boundCanvasTearDown = () => this._onCanvasTearDown();
     this._boundCreateTile = (doc) => this._onCreateTile(doc);
-    this._boundUpdateTile = (doc) => this._onUpdateTile(doc);
+    this._boundUpdateTile = (doc, changes) => this._onUpdateTile(doc, changes);
     this._boundDeleteTile = (doc) => this._onDeleteTile(doc);
     this._boundCanvasPan = () => this._onCanvasPan();
     this._boundElevationBandChanged = () => {
@@ -127,22 +261,27 @@ export class AssetShadowManager {
         for (const layer of this._layers.values()) this._syncLayerOrdering(layer);
         const parent = this._getCanvasParent();
         if (parent) parent.sortDirty = true;
-      } catch (_) {}
+      } catch (error) {
+        logShadowLifecycleFailure('elevation-band-sync', error);
+      }
     };
 
     const hooks = globalThis?.Hooks;
+    try { onCanvasReady(this._boundCanvasReady, { hooks }); }
+    catch (error) { logShadowLifecycleFailure('canvas-ready-registration', error); }
     if (hooks && typeof hooks.on === 'function') {
-      try { hooks.on('canvasReady', this._boundCanvasReady); } catch (_) {}
-      try { hooks.on('createTile', this._boundCreateTile); } catch (_) {}
-      try { hooks.on('updateTile', this._boundUpdateTile); } catch (_) {}
-      try { hooks.on('deleteTile', this._boundDeleteTile); } catch (_) {}
-      try { hooks.on('canvasPan', this._boundCanvasPan); } catch (_) {}
-      try { hooks.on('fa-nexus-token-elevation-offset-changed', this._boundElevationBandChanged); } catch (_) {}
-    }
-
-    if (canvas?.ready) {
-      // Defer to next microtask so canvas internals finish initialisation
-      queueMicrotask(() => this._onCanvasReady());
+      try { hooks.on('createTile', this._boundCreateTile); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'createTile' }); }
+      try { hooks.on('updateTile', this._boundUpdateTile); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'updateTile' }); }
+      try { hooks.on('deleteTile', this._boundDeleteTile); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'deleteTile' }); }
+      try { hooks.on('canvasTearDown', this._boundCanvasTearDown); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'canvasTearDown' }); }
+      try { hooks.on('canvasPan', this._boundCanvasPan); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'canvasPan' }); }
+      try { hooks.on('fa-nexus-token-elevation-offset-changed', this._boundElevationBandChanged); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'fa-nexus-token-elevation-offset-changed' }); }
     }
   }
 
@@ -152,10 +291,168 @@ export class AssetShadowManager {
     } catch (_) {
       this._renderer = null;
     }
+    this._bindRendererContextRecovery();
+  }
+
+  _bindRendererContextRecovery() {
+    try {
+      const renderer = this._renderer || canvas?.app?.renderer || null;
+      const view = canvas?.app?.view || renderer?.view || canvas?.app?.canvas || null;
+      if (view && this._rendererContextView !== view) {
+        this._unbindRendererViewContextRecovery();
+        this._boundWebglContextLost = this._boundWebglContextLost || ((event) => {
+          try { event?.preventDefault?.(); } catch (_) {}
+          Logger.warn('AssetShadow.webglContextLost', {
+            sceneId: this._sceneId || this._getActiveSceneId(),
+            generation: this._sceneGeneration
+          });
+        });
+        this._boundWebglContextRestored = this._boundWebglContextRestored || (() => {
+          this._recoverRendererResources('webglcontextrestored');
+        });
+        try { view.addEventListener?.('webglcontextlost', this._boundWebglContextLost, false); }
+        catch (error) { logShadowLifecycleFailure('webglcontextlost-registration', error); }
+        try { view.addEventListener?.('webglcontextrestored', this._boundWebglContextRestored, false); }
+        catch (error) { logShadowLifecycleFailure('webglcontextrestored-registration', error); }
+        this._rendererContextView = view;
+      }
+
+      const runner = renderer?.runners?.contextChange || null;
+      if (runner && this._rendererContextRunner !== runner) {
+        this._unbindPixiContextRecovery();
+        this._pixiContextRecoveryTarget = this._pixiContextRecoveryTarget || {
+          contextChange: () => this._recoverRendererResources('pixi-contextChange')
+        };
+        try {
+          runner.add?.(this._pixiContextRecoveryTarget);
+          this._rendererContextRunner = runner;
+        } catch (error) {
+          logShadowLifecycleFailure('pixi-contextChange-registration', error);
+        }
+      }
+    } catch (error) {
+      logShadowLifecycleFailure('renderer-context-registration', error);
+    }
+  }
+
+  _unbindRendererViewContextRecovery() {
+    const view = this._rendererContextView;
+    if (!view) return;
+    try {
+      if (this._boundWebglContextLost) view.removeEventListener?.('webglcontextlost', this._boundWebglContextLost, false);
+    } catch (_) {}
+    try {
+      if (this._boundWebglContextRestored) view.removeEventListener?.('webglcontextrestored', this._boundWebglContextRestored, false);
+    } catch (_) {}
+    this._rendererContextView = null;
+  }
+
+  _unbindPixiContextRecovery() {
+    try {
+      if (this._rendererContextRunner && this._pixiContextRecoveryTarget) {
+        this._rendererContextRunner.remove?.(this._pixiContextRecoveryTarget);
+      }
+    } catch (_) {}
+    this._rendererContextRunner = null;
+  }
+
+  _recoverRendererResources(reason = 'unknown') {
+    try {
+      const now = Date.now();
+      if (now < this._rendererRecoveryCooldownUntil) {
+        Logger.debug?.('AssetShadow.rendererResources.recoveryDebounced', {
+          reason,
+          sceneId: this._sceneId || this._getActiveSceneId(),
+          generation: this._sceneGeneration
+        });
+        return;
+      }
+      this._rendererRecoveryCooldownUntil = now + SHADOW_RENDERER_RECOVERY_DEBOUNCE_MS;
+      Logger.warn('AssetShadow.rendererResources.recovering', {
+        reason,
+        sceneId: this._sceneId || this._getActiveSceneId(),
+        generation: this._sceneGeneration
+      });
+      this._clearSourceTextureCache(reason, {
+        includeSharedRuntime: true,
+        resetPrograms: true
+      });
+      try { this._clearScatterShadowCache(); } catch (_) {}
+      try { this._clearStandardMaskShadowCache(); } catch (_) {}
+      try { rehydrateAllPathTiles?.(); }
+      catch (error) { logShadowLifecycleFailure('path-rehydrate-after-context-recovery', error, { reason }); }
+      try { rehydrateAllAssetScatterTiles?.(); }
+      catch (error) { logShadowLifecycleFailure('scatter-rehydrate-after-context-recovery', error, { reason }); }
+      try { rehydrateAllMaskedTiles?.({ reason: `asset-shadow-${reason}` }); }
+      catch (error) { logShadowLifecycleFailure('masked-rehydrate-after-context-recovery', error, { reason }); }
+      this._blankLayerRecoveryCooldownUntil = Math.max(this._blankLayerRecoveryCooldownUntil, now + SHADOW_BLANK_RECOVERY_COOLDOWN_MS);
+      this.refreshAll();
+    } catch (error) {
+      Logger.error('AssetShadow.rendererResources.recoveryFailed', {
+        reason,
+        error: String(error?.message || error)
+      });
+    }
+  }
+
+  _getActiveSceneId() {
+    try {
+      const id = canvas?.scene?.id ?? game?.scenes?.current?.id ?? null;
+      return id ? String(id) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _getDocumentSceneId(doc) {
+    try {
+      const id = doc?.parent?.id ?? doc?.scene?.id ?? null;
+      return id ? String(id) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _isCurrentSceneScope(generation = this._sceneGeneration, sceneId = this._sceneId || this._getActiveSceneId()) {
+    const activeSceneId = this._sceneId || this._getActiveSceneId();
+    return generation === this._sceneGeneration
+      && !!sceneId
+      && !!activeSceneId
+      && String(sceneId) === String(activeSceneId)
+      && !!canvas?.ready;
+  }
+
+  _isActiveSceneDocument(doc, { phase = 'unknown', log = true } = {}) {
+    if (!doc) return false;
+    const activeSceneId = this._sceneId || this._getActiveSceneId();
+    const docSceneId = this._getDocumentSceneId(doc);
+    if (!activeSceneId || !docSceneId) {
+      if (log) {
+        Logger.debug?.('AssetShadow.sceneOwnership.missing', {
+          phase,
+          tileId: doc?.id || null,
+          activeSceneId,
+          docSceneId
+        });
+      }
+      return false;
+    }
+    if (docSceneId === activeSceneId) return true;
+    if (log) {
+      Logger.debug?.('AssetShadow.foreignSceneDocument.ignored', {
+        phase,
+        tileId: doc?.id || null,
+        activeSceneId,
+        docSceneId
+      });
+    }
+    return false;
   }
 
   _onCanvasReady() {
     if (!canvas || !canvas.ready) return;
+    this._sceneGeneration += 1;
+    this._sceneId = this._getActiveSceneId();
     this._updateRenderer();
     this._clearAllLayers();
     this._sceneRect = this._getSceneRect();
@@ -163,7 +460,7 @@ export class AssetShadowManager {
     const placeables = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
     for (const placeable of placeables) {
       const doc = placeable?.document;
-      if (!doc || !this._isShadowTile(doc)) continue;
+      if (!doc || !this._isShadowRenderableTile(doc, { phase: 'canvasReady' })) continue;
       this._addTile(doc, { deferRebuild: true });
     }
 
@@ -172,43 +469,53 @@ export class AssetShadowManager {
     }
   }
 
+  _onCanvasTearDown() {
+    this._sceneGeneration += 1;
+    const previousSceneId = this._sceneId || this._getActiveSceneId();
+    this._sceneId = null;
+    this._clearAllLayers();
+    Logger.debug?.('AssetShadow.canvasTearDown.cleared', { sceneId: previousSceneId });
+  }
+
   _onCreateTile(doc) {
-    if (!doc || !this._isShadowTile(doc)) return;
+    if (!doc || !this._isActiveSceneDocument(doc, { phase: 'createTile' }) || !this._isShadowRenderableTile(doc, { phase: 'createTile' })) return;
     this._addTile(doc);
   }
 
-  _onUpdateTile(doc) {
+  _onUpdateTile(doc, changes = {}) {
     if (!doc) return;
-    const hasShadow = this._isShadowTile(doc);
+    if (!this._isActiveSceneDocument(doc, { phase: 'updateTile' })) return;
+    const hasShadow = this._isShadowRenderableTile(doc, { phase: 'updateTile', changes });
     const tileId = doc.id;
     const prevElevation = this._tileIndex.get(tileId);
     const suspendedEntry = tileId ? this._suspendedTiles.get(tileId) : null;
     this._clearStandardMaskShadowCache(tileId);
 
-    if (!hasShadow) {
-      if (suspendedEntry) {
-        this._suspendedTiles.delete(tileId);
-      } else if (prevElevation !== undefined) {
-        this._removeTile(doc);
+      if (!hasShadow) {
+        if (suspendedEntry) {
+          this._suspendedTiles.delete(tileId);
+        } else if (prevElevation !== undefined) {
+          this._removeTile(doc);
       }
       return;
     }
 
-    if (suspendedEntry) {
-      suspendedEntry.doc = doc;
-      suspendedEntry.elevation = this._getTileElevation(doc);
-      return;
-    }
+      if (suspendedEntry) {
+        suspendedEntry.doc = doc;
+        suspendedEntry.layerKey = this._getTileLayerState(doc).key;
+        return;
+      }
 
-    const elevation = this._getTileElevation(doc);
-    if (prevElevation !== undefined && prevElevation !== elevation) {
-      this._removeTile(doc);
-    }
-    this._addTile(doc);
+      const layerState = this._getTileLayerState(doc);
+      if (prevElevation !== undefined && prevElevation !== layerState.key) {
+        this._removeTile(doc);
+      }
+      this._addTile(doc);
   }
 
   _onDeleteTile(doc) {
     if (!doc) return;
+    if (!this._isActiveSceneDocument(doc, { phase: 'deleteTile' })) return;
     if (this._suspendedTiles.has(doc.id)) {
       this._suspendedTiles.delete(doc.id);
     }
@@ -219,67 +526,74 @@ export class AssetShadowManager {
   _onCanvasPan() {
     try {
       for (const layer of this._layers.values()) {
-        this._ensureBlurFilter(layer);
+        this._syncShadowLayerFilters(layer);
       }
     } catch (e) {
       Logger.warn('AssetShadow.onCanvasPan.failed', String(e?.message || e));
     }
   }
 
-  _addTile(doc, { deferRebuild = false } = {}) {
-    try {
-      if (!doc) return;
-      const elevation = this._getTileElevation(doc);
-      const layer = this._ensureLayer(elevation);
-      if (!layer) return;
-      layer.tiles.set(doc.id, doc);
-      this._tileIndex.set(doc.id, elevation);
-      if (!deferRebuild) this._scheduleRebuild(elevation);
-    } catch (e) {
-      Logger.warn('AssetShadow.addTile.failed', String(e?.message || e));
+    _addTile(doc, { deferRebuild = false } = {}) {
+      try {
+        if (!doc) return;
+        if (!this._isActiveSceneDocument(doc, { phase: 'addTile' })) return;
+        if (!this._isShadowRenderableTile(doc, { phase: 'addTile' })) return;
+        const layerState = this._getTileLayerState(doc);
+        const layer = this._ensureLayer(layerState);
+        if (!layer) return;
+        layer.tiles.set(doc.id, doc);
+        layer.renderOrder = layerState.renderOrder;
+        layer.shadowOcclusionKey = layerState.shadowOcclusionKey;
+        layer.shadowOcclusionProfile = layerState.shadowOcclusionProfile;
+        this._tileIndex.set(doc.id, layerState.key);
+        if (!deferRebuild) this._scheduleRebuild(layerState.key);
+      } catch (e) {
+        Logger.warn('AssetShadow.addTile.failed', String(e?.message || e));
+      }
     }
-  }
 
   _removeTile(doc) {
     try {
-      const tileId = doc?.id;
-      if (!tileId || !this._tileIndex.has(tileId)) return;
-      const elevation = this._tileIndex.get(tileId);
-      this._tileIndex.delete(tileId);
-      this._suspendedTiles.delete(tileId);
-      this._clearScatterShadowCache(tileId);
-      this._clearStandardMaskShadowCache(tileId);
-      const layer = this._layers.get(elevation);
-      if (!layer) return;
-      layer.tiles.delete(tileId);
-      if (!layer.tiles.size) {
-        this._destroyLayer(elevation);
-        return;
+        const tileId = doc?.id;
+        if (!this._isActiveSceneDocument(doc, { phase: 'removeTile' })) return;
+        if (!tileId || !this._tileIndex.has(tileId)) return;
+        const layerKey = this._tileIndex.get(tileId);
+        this._tileIndex.delete(tileId);
+        this._suspendedTiles.delete(tileId);
+        this._clearScatterShadowCache(tileId);
+        this._clearStandardMaskShadowCache(tileId);
+        const layer = this._layers.get(layerKey);
+        if (!layer) return;
+        layer.tiles.delete(tileId);
+        if (!layer.tiles.size) {
+          this._destroyLayer(layerKey);
+          return;
+        }
+        this._scheduleRebuild(layerKey);
+      } catch (e) {
+        Logger.warn('AssetShadow.removeTile.failed', String(e?.message || e));
       }
-      this._scheduleRebuild(elevation);
-    } catch (e) {
-      Logger.warn('AssetShadow.removeTile.failed', String(e?.message || e));
     }
-  }
 
   suspendTile(tileDocument) {
     try {
       const doc = tileDocument?.document ?? tileDocument;
       if (!doc) return false;
+      if (!this._isActiveSceneDocument(doc, { phase: 'suspendTile' })) return false;
       const tileId = doc.id;
-      if (!tileId) return false;
-      if (this._suspendedTiles.has(tileId)) return true;
-      const elevation = this._tileIndex.get(tileId);
-      if (elevation === undefined) return false;
-      const layer = this._layers.get(elevation);
-      if (!layer || !layer.tiles.has(tileId)) return false;
-      layer.tiles.delete(tileId);
-      this._tileIndex.delete(tileId);
-      this._suspendedTiles.set(tileId, { doc, elevation });
-      this._scheduleRebuild(elevation, true);
-      return true;
-    } catch (e) {
-      Logger.warn('AssetShadow.suspendTile.failed', String(e?.message || e));
+        if (!tileId) return false;
+        if (this._suspendedTiles.has(tileId)) return true;
+        const layerKey = this._tileIndex.get(tileId);
+        if (layerKey === undefined) return false;
+        const layer = this._layers.get(layerKey);
+        if (!layer || !layer.tiles.has(tileId)) return false;
+        layer.tiles.delete(tileId);
+        this._tileIndex.delete(tileId);
+        this._suspendedTiles.set(tileId, { doc, layerKey });
+        this._scheduleRebuild(layerKey, true);
+        return true;
+      } catch (e) {
+        Logger.warn('AssetShadow.suspendTile.failed', String(e?.message || e));
       return false;
     }
   }
@@ -288,12 +602,21 @@ export class AssetShadowManager {
     try {
       const doc = tileDocument?.document ?? tileDocument;
       if (!doc) return false;
+      if (!this._isActiveSceneDocument(doc, { phase: 'resumeTile' })) return false;
       const tileId = doc.id;
       if (!tileId) return false;
       const entry = this._suspendedTiles.get(tileId);
       if (!entry) return false;
+      const liveDoc = canvas?.scene?.tiles?.get?.(tileId) || entry.doc || doc;
+      const previousLayerKey = entry.layerKey || null;
+      const nextLayerKey = this._isActiveSceneDocument(liveDoc, { phase: 'resumeTile:live', log: false })
+        && this._isShadowRenderableTile(liveDoc, { phase: 'resumeTile:live', log: false })
+        ? this._getTileLayerState(liveDoc).key
+        : null;
       this._suspendedTiles.delete(tileId);
-      this._addTile(doc);
+      if (nextLayerKey) this._addTile(liveDoc, { deferRebuild: true });
+      const rebuildTargets = new Set([previousLayerKey, nextLayerKey].filter(Boolean));
+      for (const target of rebuildTargets) this._scheduleRebuild(target, true);
       return true;
     } catch (e) {
       Logger.warn('AssetShadow.resumeTile.failed', String(e?.message || e));
@@ -323,36 +646,55 @@ export class AssetShadowManager {
     return true;
   }
 
-  _scheduleRebuild(elevation, immediate = false) {
-    const layer = this._layers.get(elevation);
-    if (!layer || !canvas?.ready) return;
-    layer.dirty = true;
-    const handle = this._rebuildTimers.get(elevation);
-    if (handle) {
-      try { clearTimeout(handle); } catch (_) {}
-      this._rebuildTimers.delete(elevation);
+  _scheduleRebuild(target, immediate = false) {
+    const layerKeys = this._resolveLayerKeys(target);
+    if (!layerKeys.length) return;
+    for (const layerKey of layerKeys) {
+      const layer = this._layers.get(layerKey);
+      if (!layer || !canvas?.ready) continue;
+      layer.dirty = true;
+      const handle = this._rebuildTimers.get(layerKey);
+      if (handle) {
+        try { clearTimeout(handle); } catch (_) {}
+        this._rebuildTimers.delete(layerKey);
+      }
+      if (this._rebuildSuspendCount > 0) {
+        this._pendingRebuilds.add(layerKey);
+        if (immediate) this._pendingRebuildImmediate = true;
+        continue;
+      }
+      const generation = this._sceneGeneration;
+      const sceneId = this._sceneId || this._getActiveSceneId();
+      const run = () => {
+        this._rebuildTimers.delete(layerKey);
+        if (!this._isCurrentSceneScope(generation, sceneId)) {
+          Logger.debug?.('AssetShadow.rebuild.staleTimerDiscarded', { layerKey, sceneId, generation });
+          return;
+        }
+        this._rebuildLayer(layerKey, { generation, sceneId });
+      };
+      if (immediate) {
+        run();
+        continue;
+      }
+      const delay = Math.max(16, Number(this._options.debounce || 0));
+      const timer = setTimeout(run, delay);
+      this._rebuildTimers.set(layerKey, timer);
     }
-    if (this._rebuildSuspendCount > 0) {
-      this._pendingRebuilds.add(elevation);
-      if (immediate) this._pendingRebuildImmediate = true;
-      return;
-    }
-    const run = () => {
-      this._rebuildTimers.delete(elevation);
-      this._rebuildLayer(elevation);
-    };
-    if (immediate) {
-      run();
-      return;
-    }
-    const delay = Math.max(16, Number(this._options.debounce || 0));
-    const timer = setTimeout(run, delay);
-    this._rebuildTimers.set(elevation, timer);
   }
 
-  async _rebuildLayer(elevation) {
+  async _rebuildLayer(elevation, { generation = this._sceneGeneration, sceneId = this._sceneId || this._getActiveSceneId() } = {}) {
     const layer = this._layers.get(elevation);
     if (!layer || !canvas?.ready) return;
+    if (!this._isCurrentSceneScope(generation, sceneId)) return;
+    if (layer.sceneId && sceneId && layer.sceneId !== sceneId) {
+      Logger.debug?.('AssetShadow.rebuild.sceneMismatchDiscarded', {
+        elevation,
+        layerSceneId: layer.sceneId,
+        sceneId
+      });
+      return;
+    }
     if (!layer.dirty && !layer.rebuilding) return;
     if (layer.rebuilding) {
       layer.dirty = true;
@@ -361,47 +703,82 @@ export class AssetShadowManager {
     layer.rebuilding = true;
     layer.dirty = false;
 
+    let rebuildDrawContainer = null;
+    const rebuildTempDisplayObjects = [];
+    const rebuildTempTextures = [];
+    const staleRebuildAbort = new Error('stale shadow rebuild scope');
+    staleRebuildAbort.faNexusStaleRebuild = true;
+    const assertCurrentRebuild = () => {
+      if (!this._isCurrentSceneScope(generation, sceneId)) throw staleRebuildAbort;
+    };
+
     try {
       this._updateRenderer();
       const renderer = this._renderer;
       if (!renderer) return;
 
       const docs = [];
-      for (const doc of layer.tiles.values()) {
-        if (!doc || doc.isEmbedded && doc.parent !== canvas.scene) continue;
+      const staleTileIds = [];
+      for (const [tileId, doc] of layer.tiles.entries()) {
+        if (
+          !doc
+          || !this._isActiveSceneDocument(doc, { phase: 'rebuildLayer', log: false })
+          || !this._isShadowRenderableTile(doc, { phase: 'rebuildLayer', log: false })
+        ) {
+          staleTileIds.push(tileId);
+          continue;
+        }
         docs.push(doc);
+      }
+      if (staleTileIds.length) {
+        for (const tileId of staleTileIds) {
+          layer.tiles.delete(tileId);
+          if (this._tileIndex.get(tileId) === elevation) this._tileIndex.delete(tileId);
+          this._suspendedTiles.delete(tileId);
+          this._clearScatterShadowCache(tileId);
+          this._clearStandardMaskShadowCache(tileId);
+        }
+        Logger.debug?.('AssetShadow.rebuild.removedStaleTiles', {
+          elevation,
+          sceneId,
+          tileIds: staleTileIds
+        });
       }
       if (!docs.length) {
         this._destroyLayer(elevation);
         return;
       }
+      this._sortLayerShadowDocs(docs);
 
-      // Resolve shared layer settings and per-tile configuration
-      const firstDoc = docs[0];
-      const baseOptions = this._extractShadowBaseOptions(firstDoc);
+      // Resolve per-tile configuration. Alpha/blur are render-profile settings, so keep
+      // them with each entry; mixed building/window shadows at one elevation must not let
+      // the first tile in the layer decide the whole layer's blur.
       const tileConfigs = [];
-      const pathBoundsList = [];
-      let maxOffsetX = Math.abs(baseOptions.offsetX);
-      let maxOffsetY = Math.abs(baseOptions.offsetY);
-      let maxDilation = baseOptions.dilation;
+      let maxOffsetX = 0;
+      let maxOffsetY = 0;
+      let maxDilation = 0;
+      let maxAlpha = 0;
+      let maxBlur = 0;
 
       for (const doc of docs) {
-        const cfg = this._extractTileShadowConfig(doc, baseOptions);
+        const docBaseOptions = this._extractShadowBaseOptions(doc, { elevation: layer?.elevation });
+        const cfg = {
+          ...this._extractTileShadowConfig(doc, docBaseOptions),
+          alpha: docBaseOptions.alpha,
+          blur: docBaseOptions.blur
+        };
         const pathDescriptors = this._resolveShadowPathDescriptors(doc);
-        if (Array.isArray(pathDescriptors) && pathDescriptors.length) {
-          for (const descriptor of pathDescriptors) {
-            if (descriptor?.bounds) pathBoundsList.push(descriptor.bounds);
-          }
-        }
         tileConfigs.push({ doc, config: cfg, paths: pathDescriptors });
         if (Math.abs(cfg.offsetX) > maxOffsetX) maxOffsetX = Math.abs(cfg.offsetX);
         if (Math.abs(cfg.offsetY) > maxOffsetY) maxOffsetY = Math.abs(cfg.offsetY);
         if (cfg.dilation > maxDilation) maxDilation = cfg.dilation;
+        if (cfg.alpha > maxAlpha) maxAlpha = cfg.alpha;
+        if (cfg.blur > maxBlur) maxBlur = cfg.blur;
       }
 
       const layerOptions = {
-        alpha: baseOptions.alpha,
-        blur: baseOptions.blur,
+        alpha: maxAlpha,
+        blur: maxBlur,
         maxOffsetX,
         maxOffsetY,
         maxDilation
@@ -409,137 +786,276 @@ export class AssetShadowManager {
       layer.options = layerOptions;
 
       const baseRect = this._getSceneRect();
-      let sr = this._expandSceneRectForDocs(baseRect, docs);
-      if (pathBoundsList.length) {
-        sr = this._expandRectWithPathBounds(sr, pathBoundsList);
-      }
-      sr = this._applyShadowMargins(sr, {
-        offsetX: maxOffsetX,
-        offsetY: maxOffsetY,
-        dilation: maxDilation,
-        blur: layerOptions.blur
+      const renderChunks = this._buildLayerShadowRenderChunks(tileConfigs, {
+        fallbackRect: baseRect,
+        layerOptions
       });
-      this._sceneRect = sr;
-      const scale = this._computeTextureScale(sr);
-      const texWidth = Math.max(4, Math.round(sr.width * scale));
-      const texHeight = Math.max(4, Math.round(sr.height * scale));
+      const chunkStates = this._syncLayerRenderChunks(layer, renderChunks);
 
-      if (!Number.isFinite(texWidth) || !Number.isFinite(texHeight)) return;
+      for (const renderChunk of renderChunks) {
+        const chunkState = chunkStates.get(renderChunk.key);
+        if (!chunkState) continue;
 
-      const drawContainer = new PIXI.Container();
-      const tempDisplayObjects = [];
-      const dilationCache = new Map();
+        let sr = renderChunk.bounds || baseRect;
+        sr = this._applyShadowMargins(sr, {
+          offsetX: renderChunk.maxOffsetX,
+          offsetY: renderChunk.maxOffsetY,
+          dilation: renderChunk.maxDilation,
+          blur: Number(renderChunk.blur ?? layerOptions.blur ?? 0)
+        });
+        this._sceneRect = sr;
+        const scale = this._computeTextureScale(sr);
+        const texWidth = Math.max(4, Math.round(sr.width * scale));
+        const texHeight = Math.max(4, Math.round(sr.height * scale));
+        if (!Number.isFinite(texWidth) || !Number.isFinite(texHeight)) continue;
 
-      const getOffsetsForRadius = (radius) => {
-        const key = Number.isFinite(radius) ? radius.toFixed(3) : '0';
-        if (dilationCache.has(key)) return dilationCache.get(key);
-        const list = this._buildDilationOffsets(radius);
-        dilationCache.set(key, list);
-        return list;
-      };
-
-      for (const entry of tileConfigs) {
-        const { doc, config: cfg, paths } = entry;
-        const descriptors = Array.isArray(paths) ? paths.filter(Boolean) : [];
+        const chunkTempDisplayObjects = [];
+        const chunkTempTextures = [];
+        let chunkDrawContainer = null;
         try {
-          const dilationRadius = Math.max(0, Number(cfg.dilation || 0)) * scale;
-          const offsets = getOffsetsForRadius(dilationRadius);
-          const offsetXScaled = Number(cfg.offsetX ?? 0) * scale;
-          const offsetYScaled = Number(cfg.offsetY ?? 0) * scale;
-          const applyOffsetX = offsetXScaled;
-          const applyOffsetY = offsetYScaled;
+          chunkDrawContainer = await this._buildLayerShadowDrawContainer(renderChunk.entries, {
+            renderer,
+            scale,
+            sceneRect: sr,
+            assertCurrentRebuild,
+            tempDisplayObjects: chunkTempDisplayObjects,
+            tempTextures: chunkTempTextures
+          });
+          assertCurrentRebuild();
 
-          if (descriptors.length) {
-            for (const descriptor of descriptors) {
-              if (!descriptor) continue;
-              const isBuilding = descriptor.kind === 'building';
-              if (!isBuilding && (!Array.isArray(descriptor.samples) || descriptor.samples.length < PATH_MIN_POINTS)) continue;
-              for (const offset of offsets) {
-                let mesh = null;
-                if (isBuilding) {
-                  mesh = await this._createBuildingShadowMesh(descriptor, {
-                    scale,
-                    sceneRect: sr,
-                    dilationOffset: offset,
-                    offsetX: applyOffsetX,
-                    offsetY: applyOffsetY
-                  });
-                } else {
-                  mesh = await this._createPathShadowMesh(descriptor, {
-                    scale,
-                    sceneRect: sr,
-                    dilationOffset: offset,
-                    offsetX: applyOffsetX,
-                    offsetY: applyOffsetY
-                  });
-                }
-                if (!mesh) continue;
-                drawContainer.addChild(mesh);
-                tempDisplayObjects.push(mesh);
-              }
-            }
+          const childCount = Number(chunkDrawContainer?.children?.length || 0);
+          if (childCount <= 0) {
+            this._hideLayerRenderChunk(layer, chunkState);
             continue;
           }
 
-          const scatterStamp = await this._getScatterShadowStamp(doc, cfg, scale, renderer);
-          if (scatterStamp?.texture) {
-            const sprite = this._createDocShadowSprite(scatterStamp.texture, doc, scatterStamp.bounds, {
-              scale,
-              sceneRect: sr,
-              offsetX: applyOffsetX,
-              offsetY: applyOffsetY,
-              anchorMode: 'doc'
+          const renderTexture = this._renderLayerToTexture(layer, chunkDrawContainer, renderer, texWidth, texHeight, {
+            renderTarget: chunkState,
+            scale,
+            layerOptions: {
+              ...layerOptions,
+              alpha: Number(renderChunk.alpha ?? layerOptions.alpha ?? 0.35),
+              blur: Number(renderChunk.blur ?? layerOptions.blur ?? 0),
+              maxDilation: Number(renderChunk.maxDilation ?? layerOptions.maxDilation ?? 0)
+            }
+          });
+          if (!renderTexture) continue;
+          if (this._isLayerRenderTextureBlank(renderTexture, renderer, { elevation, sceneId, generation, childCount })) {
+            this._handleBlankLayerRender(elevation, {
+              sceneId,
+              generation,
+              childCount,
+              width: Number(renderTexture.width || 0),
+              height: Number(renderTexture.height || 0),
+              tileIds: renderChunk.entries.map((entry) => entry?.doc?.id).filter(Boolean)
             });
-            if (sprite) {
-              drawContainer.addChild(sprite);
-              tempDisplayObjects.push(sprite);
-            }
-            continue;
           }
+          chunkState.options = {
+            alpha: Number(renderChunk.alpha ?? layerOptions.alpha ?? 0.35),
+            blur: Number(renderChunk.blur ?? layerOptions.blur ?? 0),
+            maxDilation: Number(renderChunk.maxDilation ?? layerOptions.maxDilation ?? 0)
+          };
+          this._applyLayerChunkTexture(layer, chunkState, sr, renderTexture, scale);
+        } finally {
+          for (const displayObject of chunkTempDisplayObjects) {
+            try { displayObject.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+          }
+          for (const texture of chunkTempTextures) {
+            try { texture?.destroy?.(true); } catch (_) {}
+          }
+          try { chunkDrawContainer?.destroy?.({ children: false }); } catch (_) {}
+        }
+      }
 
-          const standardMaskFlags = this._readStandardTileMask(doc);
+      this._syncLayerOrdering(layer);
+    } catch (e) {
+      if (e?.faNexusStaleRebuild) {
+        Logger.debug?.('AssetShadow.rebuild.staleAbort', { elevation, sceneId, generation });
+      } else {
+        Logger.warn('AssetShadow.rebuild.failed', String(e?.message || e));
+      }
+    } finally {
+      for (const displayObject of rebuildTempDisplayObjects) {
+        try { displayObject.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      }
+      for (const texture of rebuildTempTextures) {
+        try { texture?.destroy?.(true); } catch (_) {}
+      }
+      try { rebuildDrawContainer?.destroy?.({ children: false }); } catch (_) {}
+      if (this._layers.get(elevation) !== layer || !this._isCurrentSceneScope(generation, sceneId)) {
+        Logger.debug?.('AssetShadow.rebuild.staleDiscarded', { elevation, sceneId, generation });
+        return;
+      }
+      layer.rebuilding = false;
+      if (layer.dirty) this._scheduleRebuild(elevation, true);
+    }
+  }
+
+  _sortLayerShadowDocs(docs = []) {
+    if (!Array.isArray(docs) || docs.length < 2) return docs;
+    const readOrder = (doc) => {
+      let renderOrder = null;
+      try { renderOrder = resolveTileRenderOrder(doc); } catch (_) { renderOrder = null; }
+      return {
+        sortLayer: Number(renderOrder?.sortLayer ?? 0) || 0,
+        elevation: Number(renderOrder?.elevation ?? doc?.elevation ?? 0) || 0,
+        sort: Number(renderOrder?.sort ?? doc?.sort ?? 0) || 0,
+        documentSort: Number(doc?.sort ?? 0) || 0,
+        id: String(doc?.id || doc?._id || '')
+      };
+    };
+    docs.sort((a, b) => {
+      const orderA = readOrder(a);
+      const orderB = readOrder(b);
+      const sortLayerDelta = orderA.sortLayer - orderB.sortLayer;
+      if (Math.abs(sortLayerDelta) > 1e-9) return sortLayerDelta;
+      const elevationDelta = orderA.elevation - orderB.elevation;
+      if (Math.abs(elevationDelta) > 1e-9) return elevationDelta;
+      const sortDelta = orderA.sort - orderB.sort;
+      if (Math.abs(sortDelta) > 1e-9) return sortDelta;
+      const documentSortDelta = orderA.documentSort - orderB.documentSort;
+      if (Math.abs(documentSortDelta) > 1e-9) return documentSortDelta;
+      return orderA.id.localeCompare(orderB.id);
+    });
+    return docs;
+  }
+
+  _getShadowQualityConfig() {
+    return readShadowQualityConfig();
+  }
+
+  async _buildLayerShadowDrawContainer(entries, context = {}) {
+    const drawContainer = new PIXI.Container();
+    const renderer = context.renderer || this._renderer;
+    const scale = Number(context.scale) || 1;
+    const sr = context.sceneRect || this._sceneRect || { x: 0, y: 0 };
+    const assertCurrentRebuild = typeof context.assertCurrentRebuild === 'function'
+      ? context.assertCurrentRebuild
+      : () => {};
+    const tempDisplayObjects = Array.isArray(context.tempDisplayObjects) ? context.tempDisplayObjects : [];
+    const tempTextures = Array.isArray(context.tempTextures) ? context.tempTextures : [];
+    const dilationCache = new Map();
+
+    const getOffsetsForRadius = (radius) => {
+      const key = Number.isFinite(radius) ? radius.toFixed(3) : '0';
+      if (dilationCache.has(key)) return dilationCache.get(key);
+      const list = this._buildDilationOffsets(radius);
+      dilationCache.set(key, list);
+      return list;
+    };
+
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      const { doc, config: cfg, paths } = entry || {};
+      if (!doc || !cfg) continue;
+      const descriptors = Array.isArray(paths) ? paths.filter(Boolean) : [];
+      try {
+        const dilationRadius = Math.max(0, Number(cfg.dilation || 0)) * scale;
+        const offsets = getOffsetsForRadius(dilationRadius);
+        const offsetXScaled = Number(cfg.offsetX ?? 0) * scale;
+        const offsetYScaled = Number(cfg.offsetY ?? 0) * scale;
+        const applyOffsetX = offsetXScaled;
+        const applyOffsetY = offsetYScaled;
+
+        const standardMaskFlags = this._readStandardTileMask(doc);
+        let standardMaskShadowStamp = null;
+        const getStandardMaskShadowStamp = async () => {
+          if (!standardMaskFlags) return null;
+          if (standardMaskShadowStamp) return standardMaskShadowStamp;
+          standardMaskShadowStamp = await this._getStandardMaskShadowStamp(doc, renderer);
+          assertCurrentRebuild();
+          if (!standardMaskShadowStamp?.texture) {
+            Logger.error('AssetShadow.standardTileMask.shadowStampFailed', {
+              tileId: doc?.id,
+              src: doc?.texture?.src || null
+            });
+            return null;
+          }
+          return standardMaskShadowStamp;
+        };
+
+        if (descriptors.length) {
+          const standardStamp = standardMaskFlags ? await this._getStandardMaskClipStamp(doc, renderer) : null;
           if (standardMaskFlags) {
-            const standardStamp = await this._getStandardMaskShadowStamp(doc, renderer);
-            if (!standardStamp?.texture) {
-              Logger.error('AssetShadow.standardTileMask.shadowStampFailed', {
-                tileId: doc?.id,
-                src: doc?.texture?.src || null
+            if (!standardStamp?.texture) continue;
+            const descriptorDilation = descriptors.reduce((max, descriptor) => Math.max(max, Number(descriptor?.shadowDilation || 0)), 0);
+            const pathMaskedSpread = descriptors.some((descriptor) => descriptor?.kind !== 'building')
+              ? Math.max(Number(cfg.dilation || 0), descriptorDilation)
+              : 0;
+            const maskedStamp = await this._createMaskedDescriptorShadowStamp(doc, descriptors, standardStamp, renderer, {
+              scale,
+              applyMask: true,
+              dilation: pathMaskedSpread
+            });
+            assertCurrentRebuild();
+            if (!maskedStamp?.texture) {
+              Logger.error('AssetShadow.standardTileMask.descriptorStampFailed', {
+                tileId: doc?.id
               });
+              try { standardStamp.texture.destroy(true); } catch (_) {}
               continue;
             }
-            for (const offset of offsets) {
-              const sprite = this._createDocShadowSprite(standardStamp.texture, doc, standardStamp.bounds, {
+            tempTextures.push(maskedStamp.texture);
+            const maskedOffsets = pathMaskedSpread > 0
+              ? [{ x: 0, y: 0 }]
+              : getOffsetsForRadius(Math.max(dilationRadius, descriptorDilation * scale));
+            for (const offset of maskedOffsets) {
+              const sprite = this._createWorldBoundsShadowSprite(maskedStamp.texture, maskedStamp.bounds, {
                 scale,
                 sceneRect: sr,
                 offsetX: offset.x + applyOffsetX,
-                offsetY: offset.y + applyOffsetY,
-                anchorMode: 'doc'
+                offsetY: offset.y + applyOffsetY
               });
               if (!sprite) continue;
               drawContainer.addChild(sprite);
               tempDisplayObjects.push(sprite);
             }
+            tempTextures.push(standardStamp.texture);
             continue;
           }
 
-          // Building tiles with path-shadow geometry enabled can legitimately have no drawable wall
-          // loops after 100% gaps (e.g. freestanding portals). In that case, don't fall back to a
-          // rectangle sprite shadow, as it will incorrectly shadow the portal itself.
-          if (this._usesBuildingShadowGeometry(doc)) continue;
+          for (const descriptor of descriptors) {
+            if (!descriptor) continue;
+            const isBuilding = descriptor.kind === 'building';
+            if (!isBuilding && (!Array.isArray(descriptor.samples) || descriptor.samples.length < PATH_MIN_POINTS)) continue;
+            for (const offset of offsets) {
+              let mesh = null;
+              if (isBuilding) {
+                mesh = await this._createBuildingShadowMesh(descriptor, {
+                  scale,
+                  sceneRect: sr,
+                  dilationOffset: offset,
+                  offsetX: applyOffsetX,
+                  offsetY: applyOffsetY
+                });
+              } else {
+                mesh = await this._createPathShadowMesh(descriptor, {
+                  scale,
+                  sceneRect: sr,
+                  dilationOffset: offset,
+                  offsetX: applyOffsetX,
+                  offsetY: applyOffsetY
+                });
+              }
+              try { assertCurrentRebuild(); }
+              catch (error) {
+                try { mesh?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+                throw error;
+              }
+              if (!mesh) continue;
+              drawContainer.addChild(mesh);
+              tempDisplayObjects.push(mesh);
+            }
+          }
+          continue;
+        }
 
-          const tex = await this._obtainTexture(doc?.texture?.src);
-          if (!tex) continue;
+        if (standardMaskFlags) {
+          const standardStamp = await getStandardMaskShadowStamp();
+          if (!standardStamp?.texture) continue;
           const texScaleX = Number(doc?.texture?.scaleX ?? 1) || 1;
           const texScaleY = Number(doc?.texture?.scaleY ?? 1) || 1;
-          const { width: docWidth, height: docHeight } = this._getDocDimensions(doc);
-
           for (const offset of offsets) {
-            const sprite = this._createDocShadowSprite(tex, doc, {
-              x: 0,
-              y: 0,
-              width: docWidth,
-              height: docHeight
-            }, {
+            const sprite = this._createDocShadowSprite(standardStamp.texture, doc, standardStamp.bounds, {
               scale,
               sceneRect: sr,
               offsetX: offset.x + applyOffsetX,
@@ -552,37 +1068,76 @@ export class AssetShadowManager {
             drawContainer.addChild(sprite);
             tempDisplayObjects.push(sprite);
           }
-        } catch (e) {
-          Logger.warn('AssetShadow.sprite.failed', String(e?.message || e));
+          continue;
         }
+
+        const scatterStamp = await this._getScatterShadowStamp(doc, cfg, scale, renderer);
+        assertCurrentRebuild();
+        if (scatterStamp?.texture) {
+          const sprite = this._createDocShadowSprite(scatterStamp.texture, doc, scatterStamp.bounds, {
+            scale,
+            sceneRect: sr,
+            offsetX: applyOffsetX,
+            offsetY: applyOffsetY,
+            anchorMode: 'doc'
+          });
+          if (sprite) {
+            drawContainer.addChild(sprite);
+            tempDisplayObjects.push(sprite);
+          }
+          continue;
+        }
+
+        // Building tiles with path-shadow geometry enabled can legitimately have no drawable wall
+        // loops after 100% gaps (e.g. freestanding portals). In that case, don't fall back to a
+        // rectangle sprite shadow, as it will incorrectly shadow the portal itself.
+        if (this._usesBuildingShadowGeometry(doc)) continue;
+
+        const tex = await this._obtainTexture(doc?.texture?.src);
+        assertCurrentRebuild();
+        if (!tex) continue;
+        const texScaleX = Number(doc?.texture?.scaleX ?? 1) || 1;
+        const texScaleY = Number(doc?.texture?.scaleY ?? 1) || 1;
+        const { width: docWidth, height: docHeight } = this._getDocDimensions(doc);
+
+        for (const offset of offsets) {
+          const sprite = this._createDocShadowSprite(tex, doc, {
+            x: 0,
+            y: 0,
+            width: docWidth,
+            height: docHeight
+          }, {
+            scale,
+            sceneRect: sr,
+            offsetX: offset.x + applyOffsetX,
+            offsetY: offset.y + applyOffsetY,
+            flipX: texScaleX,
+            flipY: texScaleY,
+            anchorMode: 'doc'
+          });
+          if (!sprite) continue;
+          drawContainer.addChild(sprite);
+          tempDisplayObjects.push(sprite);
+        }
+      } catch (e) {
+        if (e?.faNexusStaleRebuild) throw e;
+        Logger.warn('AssetShadow.sprite.failed', String(e?.message || e));
       }
-
-      const renderTexture = this._renderLayerToTexture(layer, drawContainer, renderer, texWidth, texHeight);
-      if (renderTexture) this._applyLayerTexture(layer, sr, renderTexture, scale);
-
-      for (const displayObject of tempDisplayObjects) {
-        try { displayObject.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
-      }
-      try { drawContainer.destroy({ children: false }); } catch (_) {}
-
-      this._syncLayerOrdering(layer);
-    } catch (e) {
-      Logger.warn('AssetShadow.rebuild.failed', String(e?.message || e));
-    } finally {
-      layer.rebuilding = false;
-      if (layer.dirty) this._scheduleRebuild(elevation, true);
     }
+
+    return drawContainer;
   }
 
-  _getShadowQualityConfig() {
-    return readShadowQualityConfig();
-  }
-
-  _renderLayerToTexture(layer, drawContainer, renderer, texWidth, texHeight) {
+  _renderLayerToTexture(layer, drawContainer, renderer, texWidth, texHeight, context = {}) {
     try {
       if (layer?.container) layer.container.filters = null;
+      const target = context?.renderTarget || layer;
+      const scale = Number(context?.scale) || 1;
+      const options = context?.layerOptions || layer?.options || {};
+      const blurAmount = Math.max(0, Number(options.blur || 0));
+      const blurPixels = blurAmount * scale;
 
-      let renderTexture = layer.renderTexture || null;
+      let renderTexture = target.renderTexture || null;
       if (!renderTexture || renderTexture.destroyed || renderTexture.width !== texWidth || renderTexture.height !== texHeight) {
         if (renderTexture && !renderTexture.destroyed) {
           try { renderTexture.destroy(true); } catch (_) {}
@@ -592,10 +1147,61 @@ export class AssetShadowManager {
           height: texHeight,
           scaleMode: PIXI.SCALE_MODES.LINEAR
         });
-        layer.renderTexture = renderTexture;
+        target.renderTexture = renderTexture;
       }
 
-      renderer.render(drawContainer, { renderTexture, clear: true });
+      if (blurPixels <= 0.01) {
+        if (target.rawRenderTexture && !target.rawRenderTexture.destroyed) {
+          try { target.rawRenderTexture.destroy(true); } catch (_) {}
+        }
+        target.rawRenderTexture = null;
+        renderer.render(drawContainer, { renderTexture, clear: true });
+        if (target === layer || context?.setLayerPrimary) layer.renderTexture = renderTexture;
+        return renderTexture;
+      }
+
+      let rawRenderTexture = target.rawRenderTexture || null;
+      if (!rawRenderTexture || rawRenderTexture.destroyed || rawRenderTexture.width !== texWidth || rawRenderTexture.height !== texHeight) {
+        if (rawRenderTexture && !rawRenderTexture.destroyed) {
+          try { rawRenderTexture.destroy(true); } catch (_) {}
+        }
+        rawRenderTexture = PIXI.RenderTexture.create({
+          width: texWidth,
+          height: texHeight,
+          scaleMode: PIXI.SCALE_MODES.LINEAR
+        });
+        target.rawRenderTexture = rawRenderTexture;
+      }
+
+      renderer.render(drawContainer, { renderTexture: rawRenderTexture, clear: true });
+
+      const blur = new PIXI.BlurFilter();
+      blur.blur = Math.min(64, Math.max(0.25, blurPixels));
+      blur.quality = this._computeBlurQuality(blur.blur);
+      blur.repeatEdgePixels = true;
+      try {
+        blur.padding = Math.ceil((blur.blur * 12) + Math.max(0, Number(options?.maxDilation || options?.dilation || 0)) + 4);
+      } catch (_) {}
+
+      const blurSprite = new PIXI.Sprite(rawRenderTexture);
+      blurSprite.anchor.set(0, 0);
+      blurSprite.position.set(0, 0);
+      blurSprite.width = texWidth;
+      blurSprite.height = texHeight;
+      blurSprite.eventMode = 'none';
+      blurSprite.filters = [blur];
+      try {
+        blurSprite.filterArea = new PIXI.Rectangle(0, 0, texWidth, texHeight);
+      } catch (_) {}
+
+      try {
+        renderer.render(blurSprite, { renderTexture, clear: true });
+      } finally {
+        try { blurSprite.filters = null; } catch (_) {}
+        try { blur.destroy(); } catch (_) {}
+        try { blurSprite.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      }
+      if (target === layer || context?.setLayerPrimary) layer.renderTexture = renderTexture;
       return renderTexture;
     } catch (error) {
       Logger.warn('AssetShadow.renderTexture.failed', String(error?.message || error));
@@ -603,10 +1209,85 @@ export class AssetShadowManager {
     }
   }
 
+  _isLayerRenderTextureBlank(renderTexture, renderer, context = {}) {
+    try {
+      const childCount = Number(context?.childCount || 0);
+      if (!renderTexture || renderTexture.destroyed || !renderer || childCount <= 0) return false;
+      if (this._blankRenderValidationBudget <= 0) return false;
+      this._blankRenderValidationBudget -= 1;
+
+      const width = Math.max(0, Math.round(Number(renderTexture.width || 0)));
+      const height = Math.max(0, Math.round(Number(renderTexture.height || 0)));
+      const pixelCount = width * height;
+      if (!width || !height || !Number.isFinite(pixelCount)) return false;
+      if (pixelCount > SHADOW_BLANK_VALIDATION_MAX_PIXELS) {
+        Logger.debug?.('AssetShadow.renderTexture.blankValidationSkipped', {
+          elevation: context?.elevation,
+          sceneId: context?.sceneId,
+          generation: context?.generation,
+          width,
+          height,
+          pixelCount,
+          maxPixels: SHADOW_BLANK_VALIDATION_MAX_PIXELS
+        });
+        return false;
+      }
+
+      const pixels = renderer.extract?.pixels?.(renderTexture);
+      if (!pixels) return false;
+      for (let i = 3; i < pixels.length; i += 4) {
+        if (pixels[i] > 0) return false;
+      }
+      return true;
+    } catch (error) {
+      Logger.warn('AssetShadow.renderTexture.blankValidationFailed', {
+        error: String(error?.message || error),
+        elevation: context?.elevation,
+        sceneId: context?.sceneId,
+        generation: context?.generation
+      });
+      return false;
+    }
+  }
+
+  _handleBlankLayerRender(elevation, details = {}) {
+    try {
+      const now = Date.now();
+      const payload = {
+        elevation,
+        sceneId: details.sceneId || this._sceneId || this._getActiveSceneId(),
+        generation: details.generation ?? this._sceneGeneration,
+        childCount: Number(details.childCount || 0),
+        width: Number(details.width || 0),
+        height: Number(details.height || 0),
+        tileIds: Array.isArray(details.tileIds) ? details.tileIds : []
+      };
+      if (this._blankLayerRecoveryActive || now < this._blankLayerRecoveryCooldownUntil) {
+        Logger.error('AssetShadow.renderTexture.blankAfterRecovery', payload);
+        return;
+      }
+      this._blankLayerRecoveryActive = true;
+      this._blankLayerRecoveryCooldownUntil = now + SHADOW_BLANK_RECOVERY_COOLDOWN_MS;
+      Logger.warn('AssetShadow.renderTexture.blankDetected', payload);
+      setTimeout(() => {
+        this._blankLayerRecoveryActive = false;
+        this._recoverRendererResources('blank-render-texture');
+      }, 0);
+    } catch (error) {
+      Logger.error('AssetShadow.renderTexture.blankRecoveryFailed', {
+        elevation,
+        error: String(error?.message || error)
+      });
+    }
+  }
+
   _applyLayerTexture(layer, sceneRect, renderTexture, scale) {
     try {
+      if (!layer || !sceneRect || !renderTexture || renderTexture.destroyed) return;
+      if (layer.container?.destroyed) return;
       const sprite = layer.sprite;
       if (!sprite) return;
+      if (sprite.destroyed || !sprite.position || !sprite.scale) return;
       sprite.texture = renderTexture;
       sprite.position.set(sceneRect.x, sceneRect.y);
       const invScale = scale ? 1 / scale : 1;
@@ -615,40 +1296,302 @@ export class AssetShadowManager {
       sprite.alpha = Number(layer.options.alpha || 0.35);
       sprite.visible = true;
 
-      this._ensureBlurFilter(layer);
       if (layer.container) layer.container.filters = null;
-      sprite.filters = layer.blurFilter ? [layer.blurFilter] : null;
+      this._syncShadowLayerFilters(layer);
     } catch (e) {
       Logger.warn('AssetShadow.applyTexture.failed', String(e?.message || e));
     }
   }
 
-  _extractShadowBaseOptions(doc) {
+  _applyLayerChunkTexture(layer, chunk, sceneRect, renderTexture, scale) {
+    try {
+      if (!layer || !chunk || !sceneRect || !renderTexture || renderTexture.destroyed) return;
+      if (layer.container?.destroyed) return;
+      const sprite = chunk.sprite;
+      if (!sprite || sprite.destroyed || !sprite.position || !sprite.scale) return;
+      sprite.texture = renderTexture;
+      sprite.position.set(sceneRect.x, sceneRect.y);
+      const invScale = scale ? 1 / scale : 1;
+      sprite.scale.set(invScale, invScale);
+      sprite.tint = 0x000000;
+      sprite.alpha = Number(chunk.options?.alpha ?? layer.options.alpha ?? 0.35);
+      sprite.visible = true;
+      chunk.sceneRect = sceneRect;
+      chunk.scale = scale;
+      if (!layer.renderTexture || layer.renderTexture.destroyed) layer.renderTexture = renderTexture;
+
+      if (layer.container) layer.container.filters = null;
+      this._syncShadowLayerFilters(layer);
+    } catch (e) {
+      Logger.warn('AssetShadow.applyChunkTexture.failed', String(e?.message || e));
+    }
+  }
+
+  _buildLayerShadowRenderChunks(tileConfigs, { fallbackRect = null, layerOptions = {} } = {}) {
+    try {
+      const entries = Array.isArray(tileConfigs) ? tileConfigs.filter((entry) => entry?.doc) : [];
+      if (!entries.length) return [];
+      const items = [];
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        const bounds = this._computeShadowEntryBounds(entry);
+        const rectBounds = bounds || this._normalizeWorldBounds(fallbackRect);
+        if (!rectBounds) continue;
+        const config = entry.config || {};
+        const alpha = Math.min(1, Math.max(0, Number(config.alpha ?? layerOptions.alpha ?? this._options.alpha ?? 0.65)));
+        const blur = Math.max(0, Number(config.blur ?? layerOptions.blur ?? this._options.blur ?? 0));
+        const profileKey = this._shadowRenderProfileKey({ alpha, blur });
+        const expanded = this._inflateWorldBounds(rectBounds, {
+          offsetX: Math.max(Math.abs(Number(config.offsetX || 0)), Math.abs(Number(layerOptions.maxOffsetX || 0))),
+          offsetY: Math.max(Math.abs(Number(config.offsetY || 0)), Math.abs(Number(layerOptions.maxOffsetY || 0))),
+          dilation: Math.max(Number(config.dilation || 0), Number(layerOptions.maxDilation || 0)),
+          blur
+        });
+        items.push({
+          index,
+          entry,
+          alpha,
+          blur,
+          profileKey,
+          bounds: rectBounds,
+          expanded
+        });
+      }
+      if (!items.length && fallbackRect) {
+        return [{
+          key: 'fallback',
+          entries,
+          bounds: fallbackRect,
+          alpha: Math.min(1, Math.max(0, Number(layerOptions.alpha ?? this._options.alpha ?? 0.65))),
+          blur: Math.max(0, Number(layerOptions.blur ?? this._options.blur ?? 0)),
+          profileKey: this._shadowRenderProfileKey(layerOptions),
+          maxOffsetX: Math.abs(Number(layerOptions.maxOffsetX || 0)),
+          maxOffsetY: Math.abs(Number(layerOptions.maxOffsetY || 0)),
+          maxDilation: Math.max(0, Number(layerOptions.maxDilation || 0))
+        }];
+      }
+
+      const parent = items.map((_, index) => index);
+      const find = (index) => {
+        let current = index;
+        while (parent[current] !== current) current = parent[current];
+        while (parent[index] !== index) {
+          const next = parent[index];
+          parent[index] = current;
+          index = next;
+        }
+        return current;
+      };
+      const union = (a, b) => {
+        const rootA = find(a);
+        const rootB = find(b);
+        if (rootA !== rootB) parent[rootB] = rootA;
+      };
+
+      for (let i = 0; i < items.length; i += 1) {
+        for (let j = i + 1; j < items.length; j += 1) {
+          if (items[i].profileKey !== items[j].profileKey) continue;
+          if (this._worldBoundsIntersect(items[i].expanded, items[j].expanded)) union(i, j);
+        }
+      }
+
+      const groups = new Map();
+      for (let i = 0; i < items.length; i += 1) {
+        const root = find(i);
+        let group = groups.get(root);
+        const item = items[i];
+        if (!group) {
+          group = {
+            entries: [],
+            bounds: null,
+            alpha: item.alpha,
+            blur: item.blur,
+            profileKey: item.profileKey,
+            maxOffsetX: 0,
+            maxOffsetY: 0,
+            maxDilation: 0
+          };
+          groups.set(root, group);
+        }
+        group.entries.push(item.entry);
+        group.bounds = this._mergeWorldBounds(group.bounds, item.bounds);
+        const config = item.entry?.config || {};
+        group.maxOffsetX = Math.max(group.maxOffsetX, Math.abs(Number(config.offsetX || 0)), Math.abs(Number(layerOptions.maxOffsetX || 0)));
+        group.maxOffsetY = Math.max(group.maxOffsetY, Math.abs(Number(config.offsetY || 0)), Math.abs(Number(layerOptions.maxOffsetY || 0)));
+        group.maxDilation = Math.max(group.maxDilation, Number(config.dilation || 0), Number(layerOptions.maxDilation || 0));
+        group.alpha = Math.max(group.alpha, item.alpha);
+        group.blur = Math.max(group.blur, item.blur);
+      }
+
+      return Array.from(groups.values())
+        .map((group, index) => {
+          const ids = group.entries
+            .map((entry) => String(entry?.doc?.id || entry?.doc?._id || 'tile').trim())
+            .filter(Boolean)
+            .sort();
+          const padded = this._rectFromWorldBounds(group.bounds, 8) || fallbackRect;
+          return {
+            key: `${group.profileKey}:${ids.length ? ids.join('|') : `chunk:${index}`}`,
+            entries: group.entries,
+            bounds: padded,
+            alpha: group.alpha,
+            blur: group.blur,
+            maxOffsetX: group.maxOffsetX,
+            maxOffsetY: group.maxOffsetY,
+            maxDilation: group.maxDilation
+          };
+        })
+        .filter((chunk) => chunk.bounds && chunk.entries.length)
+        .sort((a, b) => {
+          const ay = Number(a.bounds?.y || 0);
+          const by = Number(b.bounds?.y || 0);
+          if (ay !== by) return ay - by;
+          const ax = Number(a.bounds?.x || 0);
+          const bx = Number(b.bounds?.x || 0);
+          if (ax !== bx) return ax - bx;
+          return String(a.key).localeCompare(String(b.key));
+        });
+    } catch (error) {
+      Logger.warn('AssetShadow.renderChunks.failed', String(error?.message || error));
+      const rect = fallbackRect || this._getSceneRect();
+      return [{
+        key: 'fallback',
+        entries: Array.isArray(tileConfigs) ? tileConfigs.filter((entry) => entry?.doc) : [],
+        bounds: rect,
+        alpha: Math.min(1, Math.max(0, Number(layerOptions.alpha ?? this._options.alpha ?? 0.65))),
+        blur: Math.max(0, Number(layerOptions.blur ?? this._options.blur ?? 0)),
+        maxOffsetX: Math.abs(Number(layerOptions.maxOffsetX || 0)),
+        maxOffsetY: Math.abs(Number(layerOptions.maxOffsetY || 0)),
+        maxDilation: Math.max(0, Number(layerOptions.maxDilation || 0))
+      }];
+    }
+  }
+
+  _shadowRenderProfileKey(options = {}) {
+    const alpha = Math.min(1, Math.max(0, Number(options.alpha ?? this._options.alpha ?? 0.65)));
+    const blur = Math.max(0, Number(options.blur ?? this._options.blur ?? 0));
+    return `a${alpha.toFixed(3)}:b${blur.toFixed(3)}`;
+  }
+
+  _computeShadowEntryBounds(entry) {
+    try {
+      if (!entry?.doc) return null;
+      let bounds = this._computeTileBounds(entry.doc);
+      const descriptors = Array.isArray(entry.paths) ? entry.paths : [];
+      for (const descriptor of descriptors) {
+        const descriptorBounds = this._normalizeWorldBounds(descriptor?.bounds);
+        if (descriptorBounds) bounds = this._mergeWorldBounds(bounds, descriptorBounds);
+      }
+      return bounds;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _normalizeWorldBounds(bounds) {
+    try {
+      if (!bounds) return null;
+      const minX = Number.isFinite(Number(bounds.minX)) ? Number(bounds.minX) : Number(bounds.x);
+      const minY = Number.isFinite(Number(bounds.minY)) ? Number(bounds.minY) : Number(bounds.y);
+      const maxX = Number.isFinite(Number(bounds.maxX))
+        ? Number(bounds.maxX)
+        : (Number.isFinite(Number(bounds.width)) ? minX + Number(bounds.width) : NaN);
+      const maxY = Number.isFinite(Number(bounds.maxY))
+        ? Number(bounds.maxY)
+        : (Number.isFinite(Number(bounds.height)) ? minY + Number(bounds.height) : NaN);
+      if (![minX, minY, maxX, maxY].every(Number.isFinite)) return null;
+      return {
+        minX: Math.min(minX, maxX),
+        minY: Math.min(minY, maxY),
+        maxX: Math.max(minX, maxX),
+        maxY: Math.max(minY, maxY)
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _mergeWorldBounds(a, b) {
+    const left = this._normalizeWorldBounds(a);
+    const right = this._normalizeWorldBounds(b);
+    if (!left) return right;
+    if (!right) return left;
+    return {
+      minX: Math.min(left.minX, right.minX),
+      minY: Math.min(left.minY, right.minY),
+      maxX: Math.max(left.maxX, right.maxX),
+      maxY: Math.max(left.maxY, right.maxY)
+    };
+  }
+
+  _inflateWorldBounds(bounds, options = {}) {
+    const normalized = this._normalizeWorldBounds(bounds);
+    if (!normalized) return null;
+    const offsetX = Math.abs(Number(options.offsetX || 0)) || 0;
+    const offsetY = Math.abs(Number(options.offsetY || 0)) || 0;
+    const dilation = Math.max(0, Number(options.dilation || 0)) || 0;
+    const blur = Math.max(0, Number(options.blur || 0)) || 0;
+    const marginX = offsetX + dilation + (blur * 12) + 8;
+    const marginY = offsetY + dilation + (blur * 12) + 8;
+    return {
+      minX: normalized.minX - marginX,
+      minY: normalized.minY - marginY,
+      maxX: normalized.maxX + marginX,
+      maxY: normalized.maxY + marginY
+    };
+  }
+
+  _worldBoundsIntersect(a, b) {
+    const left = this._normalizeWorldBounds(a);
+    const right = this._normalizeWorldBounds(b);
+    if (!left || !right) return false;
+    return left.minX <= right.maxX
+      && left.maxX >= right.minX
+      && left.minY <= right.maxY
+      && left.maxY >= right.minY;
+  }
+
+  _rectFromWorldBounds(bounds, pad = 0) {
+    const normalized = this._normalizeWorldBounds(bounds);
+    if (!normalized) return null;
+    const padding = Math.max(0, Number(pad || 0));
+    const minX = normalized.minX - padding;
+    const minY = normalized.minY - padding;
+    const maxX = normalized.maxX + padding;
+    const maxY = normalized.maxY + padding;
+    return {
+      x: Math.floor(minX),
+      y: Math.floor(minY),
+      width: Math.max(1, Math.ceil(maxX - minX)),
+      height: Math.max(1, Math.ceil(maxY - minY))
+    };
+  }
+
+  _extractShadowBaseOptions(doc, { elevation = null } = {}) {
+    const targetElevation = Number(elevation ?? doc?.elevation ?? 0);
+    const previewOverride = this._getElevationPreviewShadowOverride(targetElevation);
     const defaults = {
-      alpha: Math.min(1, Math.max(0, Number(this._options.alpha ?? 0.65))),
-      blur: Math.max(0, Number(this._options.blur ?? 0)),
+      alpha: Math.min(1, Math.max(0, Number(previewOverride?.alpha ?? this._options.alpha ?? 0.65))),
+      blur: Math.max(0, Number(previewOverride?.blur ?? this._options.blur ?? 0)),
       dilation: Math.max(0, Number(this._options.dilation ?? 0)),
       offsetDistance: Math.min(MAX_OFFSET_DISTANCE, Math.max(0, Number(this._options.offsetDistance ?? 0))),
       offsetAngle: this._normalizeAngle(this._options.offsetAngle ?? 135)
     };
 
-    const read = (key) => {
-      try {
-        const value = doc?.getFlag?.('fa-nexus', key);
-        if (value === undefined || value === null) return undefined;
-        const numeric = Number(value);
-        return Number.isFinite(numeric) ? numeric : undefined;
-      } catch (_) {
-        return undefined;
-      }
-    };
+    const read = (key) => this._readTileShadowNumber(doc, key);
 
     const alpha = (() => {
+      if (previewOverride && Number.isFinite(Number(previewOverride.alpha))) {
+        return Math.min(1, Math.max(0, Number(previewOverride.alpha)));
+      }
       const value = read('shadowAlpha');
       return value !== undefined ? Math.min(1, Math.max(0, value)) : defaults.alpha;
     })();
 
     const blur = (() => {
+      if (previewOverride && Number.isFinite(Number(previewOverride.blur))) {
+        return Math.max(0, Number(previewOverride.blur));
+      }
       const value = read('shadowBlur');
       return value !== undefined ? Math.max(0, value) : defaults.blur;
     })();
@@ -658,14 +1601,14 @@ export class AssetShadowManager {
       return value !== undefined ? Math.max(0, value) : defaults.dilation;
     })();
 
-    const offsetDistance = (() => {
+    let offsetDistance = (() => {
       const value = read('shadowOffsetDistance');
       return value !== undefined
         ? Math.min(MAX_OFFSET_DISTANCE, Math.max(-MAX_OFFSET_DISTANCE, value))
         : defaults.offsetDistance;
     })();
 
-    const offsetAngle = (() => {
+    let offsetAngle = (() => {
       const value = read('shadowOffsetAngle');
       return value !== undefined ? this._normalizeAngle(value) : defaults.offsetAngle;
     })();
@@ -677,6 +1620,8 @@ export class AssetShadowManager {
       offsetX = vec.x;
       offsetY = vec.y;
     } else {
+      offsetDistance = Math.min(MAX_OFFSET_DISTANCE, Math.hypot(offsetX, offsetY));
+      offsetAngle = this._normalizeAngle(Math.atan2(offsetY, offsetX) * (180 / Math.PI));
       offsetX = Math.max(-MAX_OFFSET_DISTANCE, Math.min(MAX_OFFSET_DISTANCE, offsetX));
       offsetY = Math.max(-MAX_OFFSET_DISTANCE, Math.min(MAX_OFFSET_DISTANCE, offsetY));
     }
@@ -694,16 +1639,7 @@ export class AssetShadowManager {
 
   _extractTileShadowConfig(doc, defaults) {
     const base = defaults || this._extractShadowBaseOptions(null);
-    const read = (key) => {
-      try {
-        const value = doc?.getFlag?.('fa-nexus', key);
-        if (value === undefined || value === null) return undefined;
-        const numeric = Number(value);
-        return Number.isFinite(numeric) ? numeric : undefined;
-      } catch (_) {
-        return undefined;
-      }
-    };
+    const read = (key) => this._readTileShadowNumber(doc, key);
 
     let dilation = (() => {
       const value = read('shadowDilation');
@@ -712,14 +1648,14 @@ export class AssetShadowManager {
     const usesGeometryDilation = this._usesBuildingShadowGeometry(doc);
     if (usesGeometryDilation) dilation = 0;
 
-    const offsetDistance = (() => {
+    let offsetDistance = (() => {
       const value = read('shadowOffsetDistance');
       return value !== undefined
         ? Math.min(MAX_OFFSET_DISTANCE, Math.max(-MAX_OFFSET_DISTANCE, value))
         : Math.min(MAX_OFFSET_DISTANCE, Math.max(-MAX_OFFSET_DISTANCE, base.offsetDistance));
     })();
 
-    const offsetAngle = (() => {
+    let offsetAngle = (() => {
       const value = read('shadowOffsetAngle');
       return value !== undefined ? this._normalizeAngle(value) : this._normalizeAngle(base.offsetAngle);
     })();
@@ -730,6 +1666,9 @@ export class AssetShadowManager {
       const vec = this._computeOffsetVector(offsetDistance, offsetAngle);
       offsetX = vec.x;
       offsetY = vec.y;
+    } else {
+      offsetDistance = Math.min(MAX_OFFSET_DISTANCE, Math.hypot(offsetX, offsetY));
+      offsetAngle = this._normalizeAngle(Math.atan2(offsetY, offsetX) * (180 / Math.PI));
     }
     offsetX = Math.max(-MAX_OFFSET_DISTANCE, Math.min(MAX_OFFSET_DISTANCE, Number(offsetX || 0)));
     offsetY = Math.max(-MAX_OFFSET_DISTANCE, Math.min(MAX_OFFSET_DISTANCE, Number(offsetY || 0)));
@@ -952,6 +1891,44 @@ export class AssetShadowManager {
     };
   }
 
+  _clearSourceTextureCache(reason = 'unknown', options = {}) {
+    const includeSharedRuntime = !!options?.includeSharedRuntime;
+    const resetPrograms = !!options?.resetPrograms;
+    const result = {
+      managerTextureCount: 0,
+      pathTextureCount: null,
+      sharedTextureCount: null
+    };
+    try {
+      result.managerTextureCount = Number(this._textureCache?.size || 0);
+      this._textureCache?.clear?.();
+    } catch (error) {
+      logShadowLifecycleFailure('source-texture-cache-clear', error, { reason });
+    }
+
+    if (includeSharedRuntime) {
+      try { result.pathTextureCount = clearPathTextureCache?.({ resetProgram: resetPrograms }); }
+      catch (error) { logShadowLifecycleFailure('path-texture-cache-clear', error, { reason }); }
+      try { clearAssetScatterCache?.(); }
+      catch (error) { logShadowLifecycleFailure('scatter-texture-cache-clear', error, { reason }); }
+      try { result.sharedTextureCount = clearSharedTextureCache?.(); }
+      catch (error) { logShadowLifecycleFailure('shared-texture-cache-clear', error, { reason }); }
+    }
+
+    if (resetPrograms && this._buildingShadowMaterial) {
+      try { this._buildingShadowMaterial.destroy?.(); } catch (_) {}
+      this._buildingShadowMaterial = null;
+    }
+
+    Logger.debug?.('AssetShadow.sourceTextureCache.cleared', {
+      reason,
+      includeSharedRuntime,
+      resetPrograms,
+      ...result
+    });
+    return result;
+  }
+
   _clearScatterShadowCache(tileId = null) {
     try {
       if (!tileId) {
@@ -974,6 +1951,7 @@ export class AssetShadowManager {
 
   _clearStandardMaskShadowCache(tileId = null) {
     try {
+      if (!this._standardMaskShadowCache) this._standardMaskShadowCache = new Map();
       if (!tileId) {
         for (const entry of this._standardMaskShadowCache.values()) {
           if (entry?.texture && !entry.texture.destroyed) {
@@ -984,8 +1962,7 @@ export class AssetShadowManager {
         return;
       }
       const entry = this._standardMaskShadowCache.get(tileId);
-      if (!entry) return;
-      if (entry.texture && !entry.texture.destroyed) {
+      if (entry?.texture && !entry.texture.destroyed) {
         try { entry.texture.destroy(true); } catch (_) {}
       }
       this._standardMaskShadowCache.delete(tileId);
@@ -1011,6 +1988,7 @@ export class AssetShadowManager {
       })();
       const payload = {
         src: String(doc?.texture?.src || ''),
+        customBase: getStandardMaskCustomBaseKey(doc) || null,
         mask: String(flags?.maskShapeKey || flags?.maskSrc || ''),
         maskVersion: Number(flags?.maskVersion || 1),
         maskCrop: flags?.maskCrop || null,
@@ -1027,6 +2005,114 @@ export class AssetShadowManager {
       return JSON.stringify(payload);
     } catch (_) {
       return '';
+    }
+  }
+
+  _resolveStandardMaskOverlay(tile) {
+    const sourceContainer = tile?.mesh?.faNexusStandardMaskContainer
+      || tile?.faNexusStandardMaskContainer
+      || null;
+    const sourceBase = sourceContainer?.faNexusBaseDisplayObject
+      || sourceContainer?.faNexusBaseSprite
+      || null;
+    const sourceMask = sourceContainer?.faNexusMaskSprite || null;
+    return { sourceContainer, sourceBase, sourceMask };
+  }
+
+  async _waitForStandardMaskOverlay(tile, { tileId = null, attempts = 6, interval = 120 } = {}) {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    let overlay = this._resolveStandardMaskOverlay(tile);
+    for (let attempt = 0; attempt <= attempts; attempt += 1) {
+      if (
+        overlay.sourceContainer
+        && !overlay.sourceContainer.destroyed
+        && overlay.sourceBase
+        && !overlay.sourceBase.destroyed
+        && overlay.sourceMask
+        && !overlay.sourceMask.destroyed
+      ) return overlay;
+      if (attempt >= attempts) break;
+      await wait(interval);
+      if (attempt === Math.floor(attempts / 2)) {
+        try { await applyStandardTileMaskToTile(tile); }
+        catch (error) {
+          Logger.warn('AssetShadow.standardTileMask.overlayRetryFailed', {
+            tileId,
+            attempt,
+            error: String(error?.message || error)
+          });
+        }
+      }
+      overlay = this._resolveStandardMaskOverlay(tile);
+    }
+    return overlay;
+  }
+
+  async _getStandardMaskClipStamp(doc, renderer) {
+    try {
+      const tileId = doc?.id;
+      if (!tileId || !renderer) return null;
+      const flags = this._readStandardTileMask(doc);
+      if (!flags) return null;
+      const tile = canvas?.tiles?.placeables?.find?.((entry) => entry?.document?.id === tileId) || null;
+      if (!tile) {
+        Logger.error('AssetShadow.standardTileMask.clipTileMissing', { tileId });
+        return null;
+      }
+
+      await applyStandardTileMaskToTile(tile);
+      const { sourceMask } = await this._waitForStandardMaskOverlay(tile, { tileId });
+      if (!sourceMask || sourceMask.destroyed) {
+        Logger.error('AssetShadow.standardTileMask.clipMaskMissing', { tileId });
+        return null;
+      }
+
+      const proxyMask = cloneDisplayObjectForProxy(sourceMask);
+      if (!proxyMask || proxyMask.destroyed) {
+        Logger.error('AssetShadow.standardTileMask.clipProxyFailed', { tileId });
+        return null;
+      }
+      try { proxyMask.visible = true; } catch (_) {}
+      try { proxyMask.renderable = true; } catch (_) {}
+      try { proxyMask.alpha = 1; } catch (_) {}
+
+      const { width: docWidth, height: docHeight } = this._getDocDimensions(doc);
+      const maxTex = this._getMaxTextureSize();
+      const renderScale = Math.min(1, maxTex / Math.max(docWidth, docHeight));
+      const pixelWidth = Math.max(4, Math.ceil(docWidth * renderScale));
+      const pixelHeight = Math.max(4, Math.ceil(docHeight * renderScale));
+      if (!Number.isFinite(pixelWidth) || !Number.isFinite(pixelHeight)) {
+        try { proxyMask.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+        return null;
+      }
+
+      const renderTexture = PIXI.RenderTexture.create({
+        width: pixelWidth,
+        height: pixelHeight,
+        scaleMode: PIXI.SCALE_MODES.LINEAR
+      });
+      const stage = new PIXI.Container();
+      stage.eventMode = 'none';
+      stage.sortableChildren = false;
+      stage.interactiveChildren = false;
+      stage.scale.set(renderScale, renderScale);
+      stage.addChild(proxyMask);
+      renderer.render(stage, { renderTexture, clear: true });
+
+      try { proxyMask.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      try { stage.destroy({ children: false }); } catch (_) {}
+
+      return {
+        texture: renderTexture,
+        bounds: { x: 0, y: 0, width: docWidth, height: docHeight },
+        scale: renderScale
+      };
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.clipStamp.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      return null;
     }
   }
 
@@ -1054,20 +2140,14 @@ export class AssetShadowManager {
       }
 
       await applyStandardTileMaskToTile(tile);
-      const sourceContainer = tile?.mesh?.faNexusStandardMaskContainer
-        || tile?.faNexusStandardMaskContainer
-        || null;
-      const sourceBase = sourceContainer?.faNexusBaseDisplayObject
-        || sourceContainer?.faNexusBaseSprite
-        || null;
-      const sourceMask = sourceContainer?.faNexusMaskSprite || null;
+      const { sourceContainer, sourceBase, sourceMask } = await this._waitForStandardMaskOverlay(tile, { tileId });
       if (!sourceContainer || sourceContainer.destroyed || !sourceBase || sourceBase.destroyed || !sourceMask || sourceMask.destroyed) {
         Logger.error('AssetShadow.standardTileMask.overlayMissing', { tileId });
         return null;
       }
 
-      const proxyBase = cloneDisplayObjectForCustomTileProxy(sourceBase);
-      const proxyMask = cloneDisplayObjectForCustomTileProxy(sourceMask);
+      const proxyBase = cloneDisplayObjectForProxy(sourceBase);
+      const proxyMask = cloneDisplayObjectForProxy(sourceMask);
       if (!proxyBase || proxyBase.destroyed || !proxyMask || proxyMask.destroyed) {
         try { proxyBase?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
         try { proxyMask?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
@@ -1123,6 +2203,645 @@ export class AssetShadowManager {
         error: String(error?.message || error)
       });
       return null;
+    }
+  }
+
+  _getDescriptorShadowBounds(descriptors = []) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const descriptor of Array.isArray(descriptors) ? descriptors : []) {
+      const bounds = descriptor?.bounds || null;
+      if (!bounds) continue;
+      if (Number.isFinite(bounds.minX)) minX = Math.min(minX, bounds.minX);
+      else if (Number.isFinite(bounds.x)) minX = Math.min(minX, bounds.x);
+      if (Number.isFinite(bounds.minY)) minY = Math.min(minY, bounds.minY);
+      else if (Number.isFinite(bounds.y)) minY = Math.min(minY, bounds.y);
+      if (Number.isFinite(bounds.maxX)) maxX = Math.max(maxX, bounds.maxX);
+      else if (Number.isFinite(bounds.x + bounds.width)) maxX = Math.max(maxX, bounds.x + bounds.width);
+      if (Number.isFinite(bounds.maxY)) maxY = Math.max(maxY, bounds.maxY);
+      else if (Number.isFinite(bounds.y + bounds.height)) maxY = Math.max(maxY, bounds.y + bounds.height);
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    return { minX, minY, maxX, maxY, x: minX, y: minY, width, height };
+  }
+
+  _computeDescriptorStampScale(baseScale, bounds) {
+    const safeScale = Number(baseScale) || 1;
+    const width = Math.max(1, Number(bounds?.width || 0));
+    const height = Math.max(1, Number(bounds?.height || 0));
+    const maxDim = Math.max(width * safeScale, height * safeScale);
+    const maxTextureSize = this._getMaxTextureSize();
+    if (maxDim <= maxTextureSize) return safeScale;
+    return Math.max(0.01, safeScale * (maxTextureSize / maxDim));
+  }
+
+  _computeAveragePointDelta(targetPoints = [], sourcePoints = []) {
+    try {
+      const count = Math.min(
+        Array.isArray(targetPoints) ? targetPoints.length : 0,
+        Array.isArray(sourcePoints) ? sourcePoints.length : 0
+      );
+      if (!count) return null;
+      let sumX = 0;
+      let sumY = 0;
+      let used = 0;
+      for (let i = 0; i < count; i += 1) {
+        const target = targetPoints[i];
+        const source = sourcePoints[i];
+        const tx = Number(target?.x);
+        const ty = Number(target?.y);
+        const sx = Number(source?.x);
+        const sy = Number(source?.y);
+        if (![tx, ty, sx, sy].every(Number.isFinite)) continue;
+        sumX += tx - sx;
+        sumY += ty - sy;
+        used += 1;
+      }
+      if (!used) return null;
+      return { x: sumX / used, y: sumY / used };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _computePointDeltaOffsets(targetPoints = [], sourcePoints = [], { maxOffsets = 9 } = {}) {
+    const offsets = [];
+    const seen = new Set();
+    try {
+      const count = Math.min(
+        Array.isArray(targetPoints) ? targetPoints.length : 0,
+        Array.isArray(sourcePoints) ? sourcePoints.length : 0
+      );
+      if (!count) return offsets;
+      const add = (index) => {
+        const target = targetPoints[index];
+        const source = sourcePoints[index];
+        const tx = Number(target?.x);
+        const ty = Number(target?.y);
+        const sx = Number(source?.x);
+        const sy = Number(source?.y);
+        if (![tx, ty, sx, sy].every(Number.isFinite)) return;
+        const x = tx - sx;
+        const y = ty - sy;
+        if (Math.hypot(x, y) < 0.5) return;
+        const key = `${Math.round(x * 10) / 10}:${Math.round(y * 10) / 10}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        offsets.push({ x, y });
+      };
+      const slots = Math.max(1, Math.min(Math.floor(Number(maxOffsets) || 1), count));
+      for (let i = 0; i < slots; i += 1) {
+        add(Math.round((count - 1) * (slots === 1 ? 0 : (i / (slots - 1)))));
+      }
+    } catch (_) {}
+    return offsets;
+  }
+
+  _resolveDescriptorClipOffsets(descriptors = []) {
+    const offsets = [];
+    const seen = new Set();
+    const add = (xRaw, yRaw) => {
+      const x = Number(xRaw);
+      const y = Number(yRaw);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (Math.hypot(x, y) < 0.5) return;
+      const key = `${Math.round(x * 100) / 100}:${Math.round(y * 100) / 100}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      offsets.push({ x, y });
+    };
+    try {
+      for (const descriptor of Array.isArray(descriptors) ? descriptors : []) {
+        add(descriptor?.clipOffsetX, descriptor?.clipOffsetY);
+      }
+    } catch (_) {}
+    return offsets;
+  }
+
+  _getStandardMaskPathProgram() {
+    try {
+      if (this._standardMaskPathProgram) return this._standardMaskPathProgram;
+      const vertexSrc = `
+        precision highp float;
+        attribute vec2 aVertexPosition;
+        attribute vec2 aTextureCoord;
+        attribute float aAlpha;
+        attribute vec2 aMaskCoord;
+        uniform mat3 translationMatrix;
+        uniform mat3 projectionMatrix;
+        varying vec2 vTextureCoord;
+        varying float vAlpha;
+        varying vec2 vMaskCoord;
+        void main(void){
+          vAlpha = aAlpha;
+          vTextureCoord = aTextureCoord;
+          vMaskCoord = aMaskCoord;
+          vec3 position = projectionMatrix * translationMatrix * vec3(aVertexPosition, 1.0);
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `;
+      const fragmentSrc = `
+        precision mediump float;
+        varying vec2 vTextureCoord;
+        varying float vAlpha;
+        varying vec2 vMaskCoord;
+        uniform sampler2D uSampler;
+        uniform sampler2D uMaskSampler;
+        uniform vec4 uColor;
+        void main(void){
+          vec4 color = texture2D(uSampler, vTextureCoord) * uColor;
+          float inside = step(0.0, vMaskCoord.x) * step(0.0, vMaskCoord.y) * step(vMaskCoord.x, 1.0) * step(vMaskCoord.y, 1.0);
+          float maskAlpha = texture2D(uMaskSampler, vMaskCoord).a * inside;
+          color.rgb *= vAlpha;
+          color.a *= vAlpha * maskAlpha;
+          if (color.a <= 0.001) discard;
+          gl_FragColor = color;
+        }
+      `;
+      this._standardMaskPathProgram = PIXI.Program.from(vertexSrc, fragmentSrc);
+      return this._standardMaskPathProgram;
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.pathProgramFailed', {
+        error: String(error?.message || error)
+      });
+      return null;
+    }
+  }
+
+  _transformWorldPointToDocLocal(doc, point, options = {}) {
+    try {
+      if (!point) return null;
+      const worldX = Number(point.x);
+      const worldY = Number(point.y);
+      if (!Number.isFinite(worldX) || !Number.isFinite(worldY)) return null;
+      const pivotLocal = this._getDocPivotLocal(doc, options);
+      const pivotWorld = this._getDocPivotWorld(doc, options);
+      const rotation = (Number(doc?.rotation || 0) * Math.PI) / 180;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      const dx = worldX - pivotWorld.x;
+      const dy = worldY - pivotWorld.y;
+      return {
+        x: pivotLocal.x + (dx * cos) + (dy * sin),
+        y: pivotLocal.y - (dx * sin) + (dy * cos)
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _getGeometryAttributeBuffer(mesh, name) {
+    try {
+      const geometry = mesh?.geometry;
+      if (!geometry) return null;
+      const attr = geometry.getAttribute?.(name) || geometry.attributes?.[name] || null;
+      const buffer = geometry.getBuffer?.(name) || attr?.buffer || null;
+      const data = buffer?.data || attr?.data || null;
+      if (!data || typeof data.length !== 'number') return null;
+      return { attr, buffer, data };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _createStandardMaskPathShader(pathTexture, maskTexture) {
+    try {
+      const program = this._getStandardMaskPathProgram();
+      if (!program || !pathTexture || !maskTexture) return null;
+      return new PIXI.Shader(program, {
+        uSampler: pathTexture,
+        uMaskSampler: maskTexture,
+        uColor: new Float32Array([0, 0, 0, 1])
+      });
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.pathShaderFailed', {
+        error: String(error?.message || error)
+      });
+      return null;
+    }
+  }
+
+  _applyStandardMaskShaderToPathMesh(mesh, descriptor, doc, pathTexture, maskTexture) {
+    try {
+      if (!mesh || mesh.destroyed || !descriptor || !doc || !pathTexture || !maskTexture) return false;
+      const sourceSamples = Array.isArray(descriptor.sourceSamples) ? descriptor.sourceSamples : [];
+      if (sourceSamples.length < PATH_MIN_POINTS) return false;
+      const positionBuffer = this._getGeometryAttributeBuffer(mesh, 'aVertexPosition');
+      const vertexCount = Math.floor(Number(positionBuffer?.data?.length || 0) / 2);
+      if (vertexCount !== sourceSamples.length * 2) {
+        Logger.error('AssetShadow.standardTileMask.pathMaskCoordVertexMismatch', {
+          tileId: doc?.id || null,
+          sampleCount: sourceSamples.length,
+          vertexCount
+        });
+        return false;
+      }
+
+      const maskCoords = new Float32Array(vertexCount * 2);
+      const baseWidth = Math.max(1, Number(descriptor.maskWidth || descriptor.sourceWidth || descriptor.width || 1));
+      const halfWidthBase = baseWidth / 2;
+      for (let i = 0; i < sourceSamples.length; i += 1) {
+        const sample = sourceSamples[i];
+        if (!sample) continue;
+        let tangent = sample.tangent || null;
+        if (!tangent) {
+          const prev = sourceSamples[Math.max(0, i - 1)] || sample;
+          const next = sourceSamples[Math.min(sourceSamples.length - 1, i + 1)] || sample;
+          tangent = { x: Number(next.x || 0) - Number(prev.x || 0), y: Number(next.y || 0) - Number(prev.y || 0) };
+        }
+        const tangentLength = Math.hypot(Number(tangent.x || 0), Number(tangent.y || 0)) || 1;
+        const normal = { x: -(Number(tangent.y || 0) / tangentLength), y: Number(tangent.x || 0) / tangentLength };
+        const halfWidth = halfWidthBase * Math.max(0.01, Number(sample.widthMultiplier || 1) || 1);
+        const center = { x: Number(sample.x || 0), y: Number(sample.y || 0) };
+        const left = { x: center.x + (normal.x * halfWidth), y: center.y + (normal.y * halfWidth) };
+        const right = { x: center.x - (normal.x * halfWidth), y: center.y - (normal.y * halfWidth) };
+        const leftLocal = this._transformWorldPointToDocLocal(doc, left, { anchorMode: 'center' });
+        const rightLocal = this._transformWorldPointToDocLocal(doc, right, { anchorMode: 'center' });
+        const width = Math.max(1, Number(doc?.width || 0) || 1);
+        const height = Math.max(1, Number(doc?.height || 0) || 1);
+        const leftOffset = i * 4;
+        const rightOffset = leftOffset + 2;
+        maskCoords[leftOffset] = Number(leftLocal?.x ?? -1) / width;
+        maskCoords[leftOffset + 1] = Number(leftLocal?.y ?? -1) / height;
+        maskCoords[rightOffset] = Number(rightLocal?.x ?? -1) / width;
+        maskCoords[rightOffset + 1] = Number(rightLocal?.y ?? -1) / height;
+      }
+      try { mesh.geometry.addAttribute('aMaskCoord', maskCoords, 2); } catch (error) {
+        Logger.error('AssetShadow.standardTileMask.pathMaskCoordAttributeFailed', {
+          tileId: doc?.id || null,
+          error: String(error?.message || error)
+        });
+        return false;
+      }
+      const shader = this._createStandardMaskPathShader(pathTexture, maskTexture);
+      if (!shader) return false;
+      try { mesh.shader = shader; } catch (_) {}
+      try { mesh.material = shader; } catch (_) {}
+      mesh.faNexusStandardMaskApplied = true;
+      return true;
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.pathShaderApplyFailed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  _createStandardMaskInverseTexture(standardStamp, renderer) {
+    let renderTexture = null;
+    const tempObjects = [];
+    try {
+      if (!standardStamp?.texture || !renderer) return null;
+      const width = Math.max(4, Math.ceil(Number(standardStamp.texture.width || 0)));
+      const height = Math.max(4, Math.ceil(Number(standardStamp.texture.height || 0)));
+      if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+      renderTexture = PIXI.RenderTexture.create({
+        width,
+        height,
+        scaleMode: PIXI.SCALE_MODES.LINEAR
+      });
+      const stage = new PIXI.Container();
+      const fill = new PIXI.Graphics();
+      const maskSprite = new PIXI.Sprite(standardStamp.texture);
+      tempObjects.push(stage, fill, maskSprite);
+      stage.eventMode = 'none';
+      stage.sortableChildren = false;
+      stage.interactiveChildren = false;
+      fill.beginFill(0xFFFFFF, 1);
+      fill.drawRect(0, 0, width, height);
+      fill.endFill();
+      maskSprite.position.set(0, 0);
+      maskSprite.width = width;
+      maskSprite.height = height;
+      maskSprite.blendMode = PIXI.BLEND_MODES.ERASE;
+      stage.addChild(fill);
+      stage.addChild(maskSprite);
+      renderer.render(stage, { renderTexture, clear: true });
+      return renderTexture;
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.inverseTexture.failed', {
+        error: String(error?.message || error)
+      });
+      try { renderTexture?.destroy?.(true); } catch (_) {}
+      return null;
+    } finally {
+      for (const object of tempObjects) {
+        try { object?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      }
+    }
+  }
+
+  _addStandardMaskInverseEraseSprites(drawContainer, doc, standardStamp, renderer, context = {}) {
+    const tempObjects = Array.isArray(context?.tempObjects) ? context.tempObjects : null;
+    const tempTextures = Array.isArray(context?.tempTextures) ? context.tempTextures : null;
+    try {
+      if (!drawContainer || !doc || !standardStamp?.texture || !renderer) return false;
+      const scale = Number(context.scale) || 1;
+      const sceneRect = context.sceneRect || { x: 0, y: 0 };
+      const baseOffsetX = Number(context.baseOffsetX || 0) || 0;
+      const baseOffsetY = Number(context.baseOffsetY || 0) || 0;
+      const texScaleX = Number(doc?.texture?.scaleX ?? 1) || 1;
+      const texScaleY = Number(doc?.texture?.scaleY ?? 1) || 1;
+      const projectedOffsets = Array.isArray(context.projectedOffsets) && context.projectedOffsets.length
+        ? context.projectedOffsets
+        : [{ x: 0, y: 0 }];
+      const expansionRadius = Math.max(0, Number(context.expansionRadius || 0) || 0);
+      const expansionOffsets = this._buildDilationOffsets(expansionRadius * scale);
+      const inverseMaskTexture = this._createStandardMaskInverseTexture(standardStamp, renderer);
+      if (!inverseMaskTexture) {
+        Logger.error('AssetShadow.standardTileMask.inverseEraseTextureMissing', {
+          tileId: doc?.id || null
+        });
+        return false;
+      }
+      tempTextures?.push(inverseMaskTexture);
+
+      let added = 0;
+      for (const projectedOffset of projectedOffsets) {
+        const projectedX = (Number(projectedOffset?.x || 0) || 0) * scale;
+        const projectedY = (Number(projectedOffset?.y || 0) || 0) * scale;
+        for (const expansionOffset of expansionOffsets) {
+          const sprite = this._createDocShadowSprite(inverseMaskTexture, doc, standardStamp.bounds, {
+            scale,
+            sceneRect,
+            offsetX: baseOffsetX + projectedX + (Number(expansionOffset?.x || 0) || 0),
+            offsetY: baseOffsetY + projectedY + (Number(expansionOffset?.y || 0) || 0),
+            flipX: texScaleX,
+            flipY: texScaleY,
+            anchorMode: 'doc'
+          });
+          if (!sprite) continue;
+          sprite.blendMode = PIXI.BLEND_MODES.ERASE;
+          try { sprite.visible = true; sprite.renderable = true; sprite.alpha = 1; } catch (_) {}
+          drawContainer.addChild(sprite);
+          tempObjects?.push(sprite);
+          added += 1;
+        }
+      }
+      return added > 0;
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.inverseEraseSprites.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  _createDescriptorClipMaskTexture(doc, standardStamp, renderer, { bounds = null, sourceScale = 1, descriptors = [] } = {}) {
+    let renderTexture = null;
+    const tempObjects = [];
+    let inverseMaskTexture = null;
+    try {
+      if (!doc || !standardStamp?.texture || !renderer || !bounds) return null;
+      const scale = Number(sourceScale) || 1;
+      const width = Math.max(1, Number(bounds.width || 0));
+      const height = Math.max(1, Number(bounds.height || 0));
+      const pixelWidth = Math.max(4, Math.ceil(width * scale));
+      const pixelHeight = Math.max(4, Math.ceil(height * scale));
+      if (!Number.isFinite(pixelWidth) || !Number.isFinite(pixelHeight)) return null;
+
+      renderTexture = PIXI.RenderTexture.create({
+        width: pixelWidth,
+        height: pixelHeight,
+        scaleMode: PIXI.SCALE_MODES.LINEAR
+      });
+      const stage = new PIXI.Container();
+      const outsideOpaque = new PIXI.Graphics();
+      tempObjects.push(stage, outsideOpaque);
+      stage.eventMode = 'none';
+      stage.sortableChildren = false;
+      stage.interactiveChildren = false;
+      outsideOpaque.beginFill(0xFFFFFF, 1);
+      outsideOpaque.drawRect(0, 0, pixelWidth, pixelHeight);
+      outsideOpaque.endFill();
+      stage.addChild(outsideOpaque);
+
+      const texScaleX = Number(doc?.texture?.scaleX ?? 1) || 1;
+      const texScaleY = Number(doc?.texture?.scaleY ?? 1) || 1;
+      const clearDocSprite = this._createDocShadowSprite(PIXI.Texture.WHITE, doc, standardStamp.bounds, {
+        scale,
+        sceneRect: bounds,
+        offsetX: 0,
+        offsetY: 0,
+        flipX: texScaleX,
+        flipY: texScaleY,
+        anchorMode: 'doc'
+      });
+      const docMaskSprite = this._createDocShadowSprite(standardStamp.texture, doc, standardStamp.bounds, {
+        scale,
+        sceneRect: bounds,
+        offsetX: 0,
+        offsetY: 0,
+        flipX: texScaleX,
+        flipY: texScaleY,
+        anchorMode: 'doc'
+      });
+      if (!clearDocSprite || !docMaskSprite) {
+        Logger.error('AssetShadow.standardTileMask.descriptorClipMaskSpriteFailed', {
+          tileId: doc?.id || null
+        });
+        try { renderTexture.destroy(true); } catch (_) {}
+        return null;
+      }
+      tempObjects.push(clearDocSprite, docMaskSprite);
+      clearDocSprite.blendMode = PIXI.BLEND_MODES.ERASE;
+      docMaskSprite.blendMode = PIXI.BLEND_MODES.NORMAL;
+      try { clearDocSprite.visible = true; clearDocSprite.renderable = true; clearDocSprite.alpha = 1; } catch (_) {}
+      try { docMaskSprite.visible = true; docMaskSprite.renderable = true; docMaskSprite.alpha = 1; } catch (_) {}
+      stage.addChild(clearDocSprite);
+      stage.addChild(docMaskSprite);
+
+      const projectedOffsets = this._resolveDescriptorClipOffsets(descriptors);
+      if (projectedOffsets.length) {
+        inverseMaskTexture = this._createStandardMaskInverseTexture(standardStamp, renderer);
+        if (inverseMaskTexture) {
+          for (const projectedOffset of projectedOffsets) {
+            const inverseSprite = this._createDocShadowSprite(inverseMaskTexture, doc, standardStamp.bounds, {
+              scale,
+              sceneRect: bounds,
+              offsetX: (Number(projectedOffset.x || 0) || 0) * scale,
+              offsetY: (Number(projectedOffset.y || 0) || 0) * scale,
+              flipX: texScaleX,
+              flipY: texScaleY,
+              anchorMode: 'doc'
+            });
+            if (!inverseSprite) continue;
+            inverseSprite.blendMode = PIXI.BLEND_MODES.ERASE;
+            try { inverseSprite.visible = true; inverseSprite.renderable = true; inverseSprite.alpha = 1; } catch (_) {}
+            tempObjects.push(inverseSprite);
+            stage.addChild(inverseSprite);
+          }
+        }
+      }
+
+      renderer.render(stage, { renderTexture, clear: true });
+      return renderTexture;
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.descriptorClipMask.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      try { renderTexture?.destroy?.(true); } catch (_) {}
+      return null;
+    } finally {
+      for (const obj of tempObjects) {
+        try {
+          if (obj && !obj.destroyed) obj.destroy({ children: true, texture: false, baseTexture: false });
+        } catch (_) {}
+      }
+      try { inverseMaskTexture?.destroy?.(true); } catch (_) {}
+    }
+  }
+
+  async _createMaskedDescriptorShadowStamp(doc, descriptors, standardStamp, renderer, context = {}) {
+    let bounds = this._getDescriptorShadowBounds(descriptors);
+    if (!bounds || !standardStamp?.texture || !renderer) return null;
+    const pathDilation = Math.max(0, Number(context?.dilation || 0) || 0);
+    const hasPathDescriptor = (Array.isArray(descriptors) ? descriptors : [])
+      .some((descriptor) => descriptor && descriptor.kind !== 'building');
+    if (hasPathDescriptor && pathDilation > 0) {
+      bounds = {
+        minX: bounds.minX - pathDilation,
+        minY: bounds.minY - pathDilation,
+        maxX: bounds.maxX + pathDilation,
+        maxY: bounds.maxY + pathDilation,
+        x: bounds.x - pathDilation,
+        y: bounds.y - pathDilation,
+        width: Math.max(1, bounds.width + (pathDilation * 2)),
+        height: Math.max(1, bounds.height + (pathDilation * 2))
+      };
+    }
+    const sourceScale = this._computeDescriptorStampScale(Number(context?.scale) || 1, bounds);
+    const applyMask = context?.applyMask !== false;
+    const pixelWidth = Math.max(4, Math.ceil(bounds.width * sourceScale));
+    const pixelHeight = Math.max(4, Math.ceil(bounds.height * sourceScale));
+    if (!Number.isFinite(pixelWidth) || !Number.isFinite(pixelHeight)) return null;
+
+    const renderTexture = PIXI.RenderTexture.create({
+      width: pixelWidth,
+      height: pixelHeight,
+      scaleMode: PIXI.SCALE_MODES.LINEAR
+    });
+    const stage = new PIXI.Container();
+    const body = new PIXI.Container();
+    const tempObjects = [stage, body];
+    const expandPathDescriptor = (descriptor) => {
+      if (!(pathDilation > 0)) return descriptor;
+      const baseWidth = Math.max(1, Number(descriptor?.width) || 1);
+      const multiplierDelta = (pathDilation * 2) / baseWidth;
+      const expandSamples = (samples) => Array.isArray(samples)
+        ? samples.map((sample) => {
+          if (!sample) return sample;
+          const widthMultiplier = Math.max(0.01, Number(sample.widthMultiplier || 1) || 1);
+          return { ...sample, widthMultiplier: widthMultiplier + multiplierDelta };
+        })
+        : samples;
+      return {
+        ...descriptor,
+        samples: expandSamples(descriptor.samples),
+        sourceSamples: expandSamples(descriptor.sourceSamples),
+        width: baseWidth,
+        maskWidth: baseWidth
+      };
+    };
+    try {
+      stage.eventMode = 'none';
+      stage.sortableChildren = false;
+      stage.interactiveChildren = false;
+      body.eventMode = 'none';
+      body.sortableChildren = false;
+      body.interactiveChildren = false;
+
+      for (const descriptor of Array.isArray(descriptors) ? descriptors : []) {
+        if (!descriptor) continue;
+        const isBuilding = descriptor.kind === 'building';
+        let mesh = null;
+        if (isBuilding) {
+          const sourceDescriptor = descriptor.sourceWidth
+            ? { ...descriptor, width: descriptor.sourceWidth }
+            : descriptor;
+          mesh = await this._createBuildingShadowMesh(sourceDescriptor, {
+            scale: sourceScale,
+            sceneRect: bounds,
+            dilationOffset: { x: 0, y: 0 },
+            offsetX: 0,
+            offsetY: 0
+          });
+        } else if (Array.isArray(descriptor.samples) && descriptor.samples.length >= PATH_MIN_POINTS) {
+          const renderDescriptor = expandPathDescriptor(descriptor);
+          mesh = await this._createPathShadowMesh(renderDescriptor, {
+            scale: sourceScale,
+            sceneRect: bounds,
+            dilationOffset: { x: 0, y: 0 },
+            offsetX: 0,
+            offsetY: 0,
+            standardMaskDoc: doc,
+            standardMaskTexture: applyMask ? standardStamp.texture : null
+          });
+        }
+        if (!mesh) continue;
+        body.addChild(mesh);
+      }
+      if (!body.children?.length) {
+        try { renderTexture.destroy(true); } catch (_) {}
+        return null;
+      }
+
+      if (!applyMask) {
+        stage.addChild(body);
+        renderer.render(stage, { renderTexture, clear: true });
+        return { texture: renderTexture, bounds, scale: sourceScale };
+      }
+
+      const needsClipMask = Array.from(body.children || []).some((child) => !child?.faNexusStandardMaskApplied);
+      if (!needsClipMask) {
+        stage.addChild(body);
+        renderer.render(stage, { renderTexture, clear: true });
+        return { texture: renderTexture, bounds, scale: sourceScale };
+      }
+
+      const clipMaskTexture = this._createDescriptorClipMaskTexture(doc, standardStamp, renderer, { bounds, sourceScale, descriptors });
+      const maskSprite = clipMaskTexture ? new PIXI.Sprite(clipMaskTexture) : null;
+      if (!maskSprite) {
+        Logger.error('AssetShadow.standardTileMask.descriptorSourceMaskFailed', {
+          tileId: doc?.id || null
+        });
+        try { renderTexture.destroy(true); } catch (_) {}
+        return null;
+      }
+      tempObjects.push(maskSprite);
+      try { maskSprite.visible = true; } catch (_) {}
+      try { maskSprite.renderable = false; } catch (_) {}
+      try {
+        for (const child of Array.isArray(body.children) ? body.children : []) {
+          if (child && !child.destroyed) child.mask = maskSprite;
+        }
+      } catch (_) {}
+      stage.addChild(body);
+      stage.addChild(maskSprite);
+      renderer.render(stage, { renderTexture, clear: true });
+      try { clipMaskTexture.destroy(true); } catch (_) {}
+      return { texture: renderTexture, bounds, scale: sourceScale };
+    } catch (error) {
+      Logger.error('AssetShadow.standardTileMask.descriptorSourceStamp.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      try { renderTexture.destroy(true); } catch (_) {}
+      return null;
+    } finally {
+      try { stage.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+      for (const obj of tempObjects) {
+        try {
+          if (obj && !obj.destroyed) obj.destroy({ children: true, texture: false, baseTexture: false });
+        } catch (_) {}
+      }
     }
   }
 
@@ -1279,10 +2998,43 @@ export class AssetShadowManager {
   _resolvePathShadowDescriptorFromFlags(pathFlags, doc) {
     try {
       const shadow = pathFlags?.shadow;
-      if (!shadow || !shadow.enabled) return null;
-      const pointsRaw = Array.isArray(shadow.points) ? shadow.points : [];
+      const previewOverride = this._getTilePreviewShadowOverride(doc);
+      const previewForcesEnabled = previewOverride && Object.prototype.hasOwnProperty.call(previewOverride, 'enabled') && !!previewOverride.enabled;
+      if ((!shadow || !shadow.enabled) && !previewForcesEnabled) return null;
+      const previewOffsetPx = Number(previewOverride?.pathShadowOffsetPx);
+      const shadowState = shadow || {};
+      const useAutoShadowGeometry = Number.isFinite(previewOffsetPx) || previewForcesEnabled || (!shadowState?.manual && !shadowState?.editMode);
+      const pointsRaw = useAutoShadowGeometry
+        ? computePathShadowPoints(
+            pathFlags?.controlPoints || [],
+            Number.isFinite(previewOffsetPx) ? previewOffsetPx : (Number(shadowState?.offset) || 0),
+            {
+              closed: !!pathFlags?.closed,
+              feather: pathFlags?.feather || null
+            }
+          )
+        : (Array.isArray(shadowState.points) ? shadowState.points : []);
+      const sourcePointsRaw = useAutoShadowGeometry
+        ? computePathShadowPoints(
+            pathFlags?.controlPoints || [],
+            0,
+            {
+              closed: !!pathFlags?.closed,
+              feather: pathFlags?.feather || null
+            }
+          )
+        : [];
+      if (!useAutoShadowGeometry && pointsRaw.length < PATH_MIN_POINTS) {
+        Logger.error('AssetShadow.pathDescriptor.manualPointsMissing', {
+          tileId: doc?.id || null,
+          pathKind: pathFlags?._faNexusPathKind || null,
+          manual: !!shadowState?.manual,
+          editMode: !!shadowState?.editMode
+        });
+      }
       if (pointsRaw.length < PATH_MIN_POINTS) return null;
       const points = [];
+      const sourcePoints = [];
       for (const raw of pointsRaw) {
         if (!raw) continue;
         const worldPoint = this._transformDocLocalPoint(doc, {
@@ -1297,13 +3049,33 @@ export class AssetShadowManager {
           widthRight: Number.isFinite(raw.widthRight) ? Number(raw.widthRight) : 1
         });
       }
+      for (const raw of sourcePointsRaw) {
+        if (!raw) continue;
+        const worldPoint = this._transformDocLocalPoint(doc, {
+          x: Number(raw.x) || 0,
+          y: Number(raw.y) || 0
+        }, { anchorMode: 'center' });
+        if (!worldPoint) continue;
+        sourcePoints.push({
+          x: worldPoint.x,
+          y: worldPoint.y,
+          widthLeft: Number.isFinite(raw.widthLeft) ? Number(raw.widthLeft) : 1,
+          widthRight: Number.isFinite(raw.widthRight) ? Number(raw.widthRight) : 1
+        });
+      }
       if (points.length < PATH_MIN_POINTS) return null;
       const sampleCount = Math.max(2, Math.floor(pathFlags?.samplesPerSegment || PATH_DEFAULT_SEGMENT_SAMPLES));
       const tension = Number(pathFlags?.tension ?? 0) || 0;
       const closed = !!pathFlags?.closed && points.length >= PATH_MIN_POINTS;
       const samples = computePathSamples(points, sampleCount, tension, { closed });
       if (!Array.isArray(samples) || !samples.length) return null;
-      const shadowScale = Math.max(0.05, Number(pathFlags?.shadow?.scale) || 1);
+      const sourceSamples = sourcePoints.length >= PATH_MIN_POINTS
+        ? computePathSamples(sourcePoints, sampleCount, tension, { closed })
+        : [];
+      const clipOffset = this._computeAveragePointDelta(samples, sourceSamples);
+      const clipOffsets = this._computePointDeltaOffsets(samples, sourceSamples);
+      const previewScale = Number(previewOverride?.pathShadowScale);
+      const shadowScale = Math.max(0.05, Number.isFinite(previewScale) ? previewScale : (Number(shadowState?.scale) || 1));
       const baseWidth = Math.max(1, Number(pathFlags?.width) || Number(doc?.width) || 1);
       const pathWidth = baseWidth * shadowScale;
       const repeatBase = Math.max(1e-3, Number(pathFlags?.repeatSpacing) || baseWidth);
@@ -1325,12 +3097,17 @@ export class AssetShadowManager {
       const textureSrc = pathFlags?.baseSrc || doc?.texture?.src || null;
       return {
         samples,
+        sourceSamples,
         width: pathWidth,
+        sourceWidth: baseWidth,
         repeatSpacing,
         meshOptions,
         bounds,
         textureSrc,
-        useVisibleRows
+        useVisibleRows,
+        clipOffsetX: Number(clipOffset?.x || 0) || 0,
+        clipOffsetY: Number(clipOffset?.y || 0) || 0,
+        clipOffsets
       };
     } catch (error) {
       Logger.warn('AssetShadow.pathDescriptor.failed', String(error?.message || error));
@@ -1341,12 +3118,51 @@ export class AssetShadowManager {
   _resolveBuildingShadowDescriptors(doc) {
     try {
       const data = doc?.getFlag?.('fa-nexus', 'building');
-      const shadowState = data?.wall?.pathShadow;
+      const previewOverride = this._getTilePreviewShadowOverride(doc);
+      const previewForcesEnabled = previewOverride && Object.prototype.hasOwnProperty.call(previewOverride, 'enabled') && !!previewOverride.enabled;
+      const applyPreviewOverride = (source = {}) => {
+        const base = source && typeof source === 'object' ? source : {};
+        if (!previewOverride) {
+          return {
+            ...base,
+            scale: Math.max(0.05, Number(base?.scale) || 1)
+          };
+        }
+        const previewPathOffsetPx = Number(previewOverride?.pathShadowOffsetPx);
+        const previewScale = Number(previewOverride?.pathShadowScale);
+        return {
+          ...base,
+          alpha: Number.isFinite(Number(previewOverride?.shadowAlpha)) ? Number(previewOverride.shadowAlpha) : base.alpha,
+          blur: Number.isFinite(Number(previewOverride?.shadowBlur)) ? Number(previewOverride.shadowBlur) : base.blur,
+          dilation: Number.isFinite(Number(previewOverride?.shadowDilation)) ? Number(previewOverride.shadowDilation) : base.dilation,
+          offset: Number.isFinite(previewPathOffsetPx)
+            ? previewPathOffsetPx
+            : (Number.isFinite(Number(previewOverride?.shadowOffsetY)) ? Number(previewOverride.shadowOffsetY) : base.offset),
+          scale: Math.max(0.05, Number.isFinite(previewScale) ? previewScale : (Number(base?.scale) || 1))
+        };
+      };
+      let shadowState = data?.wall?.pathShadow;
+      if ((!shadowState || !shadowState.enabled) && previewForcesEnabled) {
+        shadowState = applyPreviewOverride({
+          ...(shadowState || {}),
+          enabled: true,
+          alpha: Number(shadowState?.alpha ?? 0.65),
+          blur: Number(shadowState?.blur ?? 0),
+          dilation: Number(shadowState?.dilation ?? 0),
+          offset: Number(shadowState?.offset ?? 0)
+        });
+      }
+      if (shadowState && previewOverride) {
+        shadowState = applyPreviewOverride(shadowState);
+      }
       if (!data || !shadowState || !shadowState.enabled) return [];
       const descriptors = [];
       const renderSegments = Array.isArray(data?.wall?.renderSegments) ? data.wall.renderSegments : [];
       for (const segment of renderSegments) {
-        const shadow = segment?.pathShadow || shadowState;
+        const segmentShadow = segment?.pathShadow;
+        const shadow = applyPreviewOverride(previewForcesEnabled && (!segmentShadow || !segmentShadow.enabled)
+          ? { ...shadowState, ...(segmentShadow || {}), enabled: true }
+          : (segmentShadow || shadowState));
         if (!shadow?.enabled) continue;
         const closed = segment?.closed !== false;
         const minPoints = closed ? 3 : 2;
@@ -1399,6 +3215,14 @@ export class AssetShadowManager {
           textureOffset: geometryTextureOffset,
           textureFlip
         });
+        const sourceCenterline = BuildingWallMesher.buildCenterline(localLoop, {
+          width: scaledWidth,
+          closed,
+          centerOffset: textureOffset.y,
+          textureRepeatDistance: repeatSpacing,
+          textureOffset: geometryTextureOffset,
+          textureFlip
+        });
         const samples = Array.isArray(centerline?.samples) ? centerline.samples : [];
         const worldSamples = samples
           .map((sample) => {
@@ -1411,6 +3235,19 @@ export class AssetShadowManager {
             };
           })
           .filter(Boolean);
+        const sourceWorldSamples = (Array.isArray(sourceCenterline?.samples) ? sourceCenterline.samples : [])
+          .map((sample) => {
+            const worldPoint = this._transformDocLocalPoint(doc, sample, { anchorMode: 'center' });
+            if (!worldPoint) return null;
+            return {
+              ...sample,
+              x: worldPoint.x,
+              y: worldPoint.y
+            };
+          })
+          .filter(Boolean);
+        const clipOffset = this._computeAveragePointDelta(worldSamples, sourceWorldSamples);
+        const clipOffsets = this._computePointDeltaOffsets(worldSamples, sourceWorldSamples);
         const bounds = worldSamples.length
           ? computePathBounds(worldSamples, effectiveWidth)
           : this._computeLoopBounds(worldLoop, effectiveWidth);
@@ -1419,6 +3256,8 @@ export class AssetShadowManager {
           loop: worldLoop,
           closed,
           width: effectiveWidth,
+          sourceWidth: scaledWidth,
+          shadowDilation: dilation,
           centerOffset,
           textureOffset: { ...geometryTextureOffset },
           textureFlip: { ...textureFlip },
@@ -1428,7 +3267,10 @@ export class AssetShadowManager {
           textureKey: segment?.pathKey || data?.wall?.pathKey || null,
           alphaMultiplier,
           startJoinDir: this._rotateDirection(segment?.startJoinDir, doc),
-          endJoinDir: this._rotateDirection(segment?.endJoinDir, doc)
+          endJoinDir: this._rotateDirection(segment?.endJoinDir, doc),
+          clipOffsetX: Number(clipOffset?.x || 0) || 0,
+          clipOffsetY: Number(clipOffset?.y || 0) || 0,
+          clipOffsets
         });
       }
       if (renderSegments.length) return descriptors;
@@ -1478,6 +3320,14 @@ export class AssetShadowManager {
           textureOffset: geometryTextureOffset,
           textureFlip
         });
+        const sourceCenterline = BuildingWallMesher.buildCenterline(loop, {
+          width: scaledWidth,
+          closed,
+          centerOffset: textureOffset.y,
+          textureRepeatDistance: repeatSpacing,
+          textureOffset: geometryTextureOffset,
+          textureFlip
+        });
         const samples = Array.isArray(centerline?.samples) ? centerline.samples : [];
         const worldSamples = samples
           .map((sample) => {
@@ -1490,6 +3340,19 @@ export class AssetShadowManager {
             };
           })
           .filter(Boolean);
+        const sourceWorldSamples = (Array.isArray(sourceCenterline?.samples) ? sourceCenterline.samples : [])
+          .map((sample) => {
+            const worldPoint = this._transformDocLocalPoint(doc, sample, { anchorMode: 'center' });
+            if (!worldPoint) return null;
+            return {
+              ...sample,
+              x: worldPoint.x,
+              y: worldPoint.y
+            };
+          })
+          .filter(Boolean);
+        const clipOffset = this._computeAveragePointDelta(worldSamples, sourceWorldSamples);
+        const clipOffsets = this._computePointDeltaOffsets(worldSamples, sourceWorldSamples);
         const bounds = worldSamples.length
           ? computePathBounds(worldSamples, effectiveWidth)
           : this._computeLoopBounds(worldLoop, effectiveWidth);
@@ -1498,6 +3361,8 @@ export class AssetShadowManager {
           loop: worldLoop,
           closed,
           width: effectiveWidth,
+          sourceWidth: scaledWidth,
+          shadowDilation: dilation,
           centerOffset,
           textureOffset: { ...geometryTextureOffset },
           textureFlip: { ...textureFlip },
@@ -1505,7 +3370,10 @@ export class AssetShadowManager {
           bounds,
           textureSrc,
           textureKey,
-          alphaMultiplier
+          alphaMultiplier,
+          clipOffsetX: Number(clipOffset?.x || 0) || 0,
+          clipOffsetY: Number(clipOffset?.y || 0) || 0,
+          clipOffsets
         });
       }
       return descriptors;
@@ -1657,12 +3525,24 @@ export class AssetShadowManager {
     };
   }
 
-  _getDocPivotWorld(doc, options = {}) {
-    const pivotLocal = this._getDocPivotLocal(doc, options);
-    return {
-      x: (Number(doc?.x) || 0) + pivotLocal.x,
-      y: (Number(doc?.y) || 0) + pivotLocal.y
+  _getDocAnchorWorld(doc, { anchorMode = 'doc' } = {}) {
+    const { width, height } = this._getDocDimensions(doc);
+    const actualAnchor = this._getDocAnchor(doc, { anchorMode: 'doc' });
+    const actualAnchorWorld = {
+      x: Number(doc?.x) || 0,
+      y: Number(doc?.y) || 0
     };
+    if (anchorMode === 'center') {
+      return {
+        x: actualAnchorWorld.x + (width * (0.5 - actualAnchor.x)),
+        y: actualAnchorWorld.y + (height * (0.5 - actualAnchor.y))
+      };
+    }
+    return actualAnchorWorld;
+  }
+
+  _getDocPivotWorld(doc, options = {}) {
+    return this._getDocAnchorWorld(doc, options);
   }
 
   _transformDocLocalPoint(doc, point, options = {}) {
@@ -1733,6 +3613,33 @@ export class AssetShadowManager {
         ((pivotWorld.y - sceneRect.y) * scale) + offsetY
       );
       sprite.rotation = (Number(doc?.rotation || 0) * Math.PI) / 180;
+      sprite.alpha = 1;
+      sprite.eventMode = 'none';
+      return sprite;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _createWorldBoundsShadowSprite(texture, bounds, context = {}) {
+    try {
+      if (!texture || !bounds) return null;
+      const width = Math.max(1, Number(bounds.width || 0));
+      const height = Math.max(1, Number(bounds.height || 0));
+      const scale = Number(context.scale) || 1;
+      const sceneRect = context.sceneRect || { x: 0, y: 0 };
+      const offsetX = Number(context.offsetX || 0);
+      const offsetY = Number(context.offsetY || 0);
+      const x = Number.isFinite(bounds.minX) ? Number(bounds.minX) : Number(bounds.x || 0);
+      const y = Number.isFinite(bounds.minY) ? Number(bounds.minY) : Number(bounds.y || 0);
+      const sprite = new PIXI.Sprite(texture);
+      sprite.anchor.set(0, 0);
+      sprite.width = width * scale;
+      sprite.height = height * scale;
+      sprite.position.set(
+        ((x - Number(sceneRect.x || 0)) * scale) + offsetX,
+        ((y - Number(sceneRect.y || 0)) * scale) + offsetY
+      );
       sprite.alpha = 1;
       sprite.eventMode = 'none';
       return sprite;
@@ -1818,6 +3725,9 @@ export class AssetShadowManager {
       );
       if (!mesh) return null;
       mesh.eventMode = 'none';
+      if (context.standardMaskTexture && context.standardMaskDoc) {
+        this._applyStandardMaskShaderToPathMesh(mesh, descriptor, context.standardMaskDoc, texture, context.standardMaskTexture);
+      }
       const uniforms = mesh.shader?.uniforms;
       if (uniforms?.uColor instanceof Float32Array) {
         uniforms.uColor[0] = 0;
@@ -1986,27 +3896,469 @@ export class AssetShadowManager {
       blur.repeatEdgePixels = true;
       layer.blurFilter = blur;
     }
+    const zoom = this._getCanvasZoomScale();
+    const targetBlur = Math.min(64, Math.max(0.25, blurAmount * Math.max(0.05, zoom)));
+    layer.blurFilter.blur = targetBlur;
+    layer.blurFilter.quality = this._computeBlurQuality(targetBlur);
+    try {
+      layer.blurFilter.padding = Math.ceil((targetBlur * 12) + Math.max(0, Number(layer.options?.maxDilation || layer.options?.dilation || 0)) + 4);
+    } catch (_) {}
+  }
+
+  _getTileShadowOcclusionMask(doc) {
+    try {
+      return getTileOcclusionMask(doc?.occlusion, { sourceOcclusion: doc?._source?.occlusion });
+    } catch (error) {
+      Logger.warn('AssetShadow.occlusionMask.readFailed', {
+        tileId: doc?.id || doc?._id || null,
+        error: String(error?.message || error)
+      });
+      return 0;
+    }
+  }
+
+  _getSurfaceShadowOcclusionMask() {
+    return getSurfaceTileOcclusionModes()
+      .map((mode) => Number(mode))
+      .filter((mode) => Number.isInteger(mode) && mode > 0)
+      .reduce((resolvedMask, mode) => resolvedMask | mode, 0);
+  }
+
+  _isSurfaceOnlyShadowOcclusionMask(mask) {
+    const numericMask = Number(mask) || 0;
+    const surfaceMask = this._getSurfaceShadowOcclusionMask();
+    return !!surfaceMask && numericMask === surfaceMask;
+  }
+
+  _getTileShadowOccludedAlpha(doc) {
+    const alpha = Number(doc?.occlusion?.alpha ?? doc?._source?.occlusion?.alpha);
+    return clampUnit(alpha, 0);
+  }
+
+  _getTileShadowOcclusionProfile(doc) {
+    const mask = this._getTileShadowOcclusionMask(doc);
+    if (!mask) return {
+      key: 'none',
+      mask: 0,
+      shareable: false,
+      type: 'none'
+    };
+
+    if (this._isSurfaceOnlyShadowOcclusionMask(mask)) {
+      const alphaKey = this._getTileShadowOccludedAlpha(doc).toFixed(3);
+      return {
+        key: `occlusion:surface:${mask}:a${alphaKey}`,
+        mask,
+        shareable: true,
+        type: 'surface',
+        alphaKey
+      };
+    }
+
+    const tileId = String(doc?.id || doc?._id || '').trim();
+    if (!tileId) {
+      Logger.error('AssetShadow.occlusionKey.missingTileId', { mask });
+      return {
+        key: `occlusion:missing:${mask}`,
+        mask,
+        shareable: false,
+        type: 'tile'
+      };
+    }
+    return {
+      key: `occlusion:${tileId}:${mask}`,
+      mask,
+      shareable: false,
+      type: 'tile'
+    };
+  }
+
+  _shouldLayerUseShadowOcclusion(layer) {
+    return !!layer && String(layer.shadowOcclusionKey || 'none') !== 'none';
+  }
+
+  _ensureShadowOcclusionFilter(layer, holder = layer) {
+    if (!this._shouldLayerUseShadowOcclusion(layer)) {
+      if (holder?.occlusionFilter && !holder.occlusionFilter.destroyed) {
+        try { holder.occlusionFilter.destroy(); } catch (_) {}
+      }
+      if (holder) holder.occlusionFilter = null;
+      return null;
+    }
+    if (!globalThis.PIXI?.Filter) {
+      this._logShadowOcclusionIssue(layer, 'AssetShadow.occlusionFilter.pixMissing');
+      return null;
+    }
+    if (!holder.occlusionFilter || holder.occlusionFilter.destroyed) {
+      holder.occlusionFilter = createAssetShadowOcclusionFilter(this, layer);
+    }
+    return holder.occlusionFilter;
+  }
+
+  _syncShadowLayerFilters(layer) {
+    if (!layer) return;
+    if (layer.blurFilter && !layer.blurFilter.destroyed) {
+      try { layer.blurFilter.destroy(); } catch (_) {}
+    }
+    layer.blurFilter = null;
+
+    const chunks = Array.from(layer.renderChunks?.values?.() || []);
+    const targets = chunks.length ? chunks : [{ sprite: layer.sprite, occlusionFilter: layer.occlusionFilter }];
+    for (const target of targets) {
+      if (!target?.sprite || target.sprite.destroyed) continue;
+      if (target.usesOcclusionMesh) {
+        try { target.sprite.filters = null; } catch (_) {}
+        this._syncShadowOcclusionMeshRuntime(layer, target.sprite);
+        continue;
+      }
+      const filters = [];
+      const occlusionFilter = this._ensureShadowOcclusionFilter(layer, target);
+      if (occlusionFilter && !occlusionFilter.destroyed) filters.push(occlusionFilter);
+      try { target.sprite.filters = filters.length ? filters : null; }
+      catch (error) {
+        Logger.warn('AssetShadow.filters.syncFailed', {
+          layerKey: layer?.key || null,
+          error: String(error?.message || error)
+        });
+      }
+    }
+    if (!chunks.length && targets[0]) layer.occlusionFilter = targets[0].occlusionFilter || null;
+  }
+
+  _getLayerOcclusionDoc(layer) {
+    if (!this._shouldLayerUseShadowOcclusion(layer)) return null;
+    const docs = Array.from(layer?.tiles?.values?.() || []);
+    const doc = docs[0] || null;
+    if (!doc) {
+      this._logShadowOcclusionIssue(layer, 'AssetShadow.occlusionFilter.missingDoc');
+      return null;
+    }
+    if (docs.length > 1) {
+      const profile = layer?.shadowOcclusionProfile || null;
+      const incompatibleDocs = profile?.shareable
+        ? docs.filter((entry) => this._getTileShadowOcclusionProfile(entry).key !== layer.shadowOcclusionKey)
+        : docs;
+      if (profile?.shareable && !incompatibleDocs.length) return doc;
+
+      const tileIds = docs
+        .map((entry) => entry?.id || entry?._id || null)
+        .filter(Boolean);
+      this._logShadowOcclusionIssue(layer, 'AssetShadow.occlusionFilter.sharedLayer', {
+        tileIds,
+        shareable: !!profile?.shareable,
+        incompatibleTileIds: incompatibleDocs
+          .map((entry) => entry?.id || entry?._id || null)
+          .filter(Boolean)
+      });
+      return null;
+    }
+    return doc;
+  }
+
+  _syncShadowOcclusionMeshRuntime(layer, displayObject) {
+    if (!displayObject || displayObject.destroyed) return false;
+    try {
+      const doc = this._getLayerOcclusionDoc(layer);
+      const tile = doc ? this._getTilePlaceableForDocument(doc) : null;
+      const sourceMesh = tile?.mesh || null;
+      const sourceState = sourceMesh?._occlusionState || null;
+      const targetState = displayObject._occlusionState || null;
+      if (!doc || !tile || !sourceMesh || !sourceState || !targetState) {
+        if (targetState) {
+          targetState.fade = 0;
+          targetState.radial = 0;
+          targetState.vision = 0;
+          targetState.surface = 0;
+        }
+        displayObject.occlusionMode = 0;
+        displayObject.occluded = false;
+        displayObject.unoccludedAlpha = 1;
+        displayObject.occludedAlpha = 0;
+        this._logShadowOcclusionIssue(layer, 'AssetShadow.occlusionMesh.missingMeshState', {
+          tileId: doc?.id || doc?._id || null,
+          hasTile: !!tile,
+          hasMesh: !!sourceMesh,
+          hasState: !!sourceState
+        });
+        return false;
+      }
+
+      displayObject.elevation = sourceMesh.elevation ?? doc.elevation ?? layer?.elevation ?? 0;
+      displayObject._occludedBySameElevationSurfaces = sourceMesh._occludedBySameElevationSurfaces !== false;
+      displayObject.occlusionMode = Number(sourceMesh.occlusionMode ?? this._getTileShadowOcclusionMask(doc) ?? 0) || 0;
+      displayObject.occluded = !!sourceMesh.occluded;
+      displayObject.unoccludedAlpha = 1;
+      displayObject.occludedAlpha = clampUnit(sourceMesh.occludedAlpha ?? doc?.occlusion?.alpha, 0);
+      targetState.fade = clampUnit(sourceState.fade, 0);
+      targetState.radial = clampUnit(sourceState.radial, 0);
+      targetState.vision = clampUnit(sourceState.vision, 0);
+      targetState.surface = clampUnit(sourceState.surface, 0);
+      if (typeof displayObject._updateBatchData === 'function') displayObject._updateBatchData();
+      this._clearShadowOcclusionIssue(layer);
+      return true;
+    } catch (error) {
+      Logger.warn('AssetShadow.occlusionMesh.syncFailed', {
+        layerKey: layer?.key || null,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  _getTilePlaceableForDocument(doc) {
+    try {
+      const tileId = String(doc?.id || doc?._id || '').trim();
+      if (!tileId) return null;
+      const direct = canvas?.tiles?.get?.(tileId);
+      if (direct) return direct;
+      const placeables = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
+      return placeables.find((tile) => tile?.document === doc || String(tile?.document?.id || tile?.document?._id || '') === tileId) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _prepareShadowOcclusionUniforms(layer, uniforms) {
+    if (!uniforms) return;
+    const doc = this._getLayerOcclusionDoc(layer);
+    const tile = doc ? this._getTilePlaceableForDocument(doc) : null;
+    const mesh = tile?.mesh || null;
+    const state = mesh?._occlusionState || null;
+    const occlusionMask = canvas?.masks?.occlusion || null;
+
+    uniforms.screenDimensions = canvas?.screenDimensions || [1, 1];
+    uniforms.occlusionTexture = occlusionMask?.renderTexture || getTransparentTexture();
+    uniforms.occlusionElevation = mapTileOcclusionElevation(tile || doc, {
+      mesh,
+      document: doc,
+      occlusionMask,
+      fallback: layer?.elevation ?? 0
+    }) ?? occlusionMask?.mapElevation?.(mesh?.elevation ?? doc?.elevation ?? layer?.elevation ?? 0) ?? 0;
+    uniforms.unoccludedAlpha = 1;
+    uniforms.occludedAlpha = clampUnit(mesh?.occludedAlpha ?? doc?.occlusion?.alpha, 0);
+
+    if (!doc || !tile || !mesh || !state) {
+      uniforms.fadeOcclusion = 0;
+      uniforms.radialOcclusion = 0;
+      uniforms.visionOcclusion = 0;
+      uniforms.surfaceOcclusion = 0;
+      this._logShadowOcclusionIssue(layer, 'AssetShadow.occlusionFilter.missingMeshState', {
+        tileId: doc?.id || doc?._id || null,
+        hasTile: !!tile,
+        hasMesh: !!mesh,
+        hasState: !!state
+      });
+      return;
+    }
+
+    uniforms.fadeOcclusion = clampUnit(state.fade, 0);
+    uniforms.radialOcclusion = clampUnit(state.radial, 0);
+    uniforms.visionOcclusion = clampUnit(state.vision, 0);
+    uniforms.surfaceOcclusion = clampUnit(state.surface, 0);
+    this._clearShadowOcclusionIssue(layer);
+  }
+
+  _logShadowOcclusionIssue(layer, code, details = {}) {
+    try {
+      const key = `${code}:${JSON.stringify(details)}`;
+      if (layer && layer.occlusionIssueKey === key) return;
+      if (layer) layer.occlusionIssueKey = key;
+      Logger.error(code, {
+        layerKey: layer?.key || null,
+        shadowOcclusionKey: layer?.shadowOcclusionKey || null,
+        ...details
+      });
+    } catch (_) {}
+  }
+
+  _clearShadowOcclusionIssue(layer) {
+    try { if (layer) layer.occlusionIssueKey = null; } catch (_) {}
+  }
+
+  _getCanvasZoomScale() {
     const zoomX = Number(canvas?.stage?.scale?.x);
     const zoomY = Number(canvas?.stage?.scale?.y);
     const zoomCandidates = [];
     if (Number.isFinite(zoomX)) zoomCandidates.push(Math.abs(zoomX));
     if (Number.isFinite(zoomY)) zoomCandidates.push(Math.abs(zoomY));
-    const zoom = zoomCandidates.length ? Math.max(...zoomCandidates) : 1;
-    const targetBlur = Math.min(64, Math.max(0.25, blurAmount * Math.max(0.05, zoom)));
-    layer.blurFilter.blur = targetBlur;
-    layer.blurFilter.quality = this._computeBlurQuality(targetBlur);
+    return zoomCandidates.length ? Math.max(...zoomCandidates) : 1;
   }
 
-  _ensureLayer(elevation) {
-    if (this._layers.has(elevation)) return this._layers.get(elevation);
+  _syncLayerRenderChunks(layer, renderChunks) {
+    const chunkList = Array.isArray(renderChunks) ? renderChunks : [];
+    if (!layer.renderChunks) layer.renderChunks = new Map();
+    const activeKeys = new Set(chunkList.map((chunk) => String(chunk?.key || '')).filter(Boolean));
+
+    for (const [key, chunk] of Array.from(layer.renderChunks.entries())) {
+      if (activeKeys.has(key)) continue;
+      this._destroyLayerRenderChunk(layer, chunk);
+      layer.renderChunks.delete(key);
+    }
+
+    for (const chunkInfo of chunkList) {
+      const key = String(chunkInfo?.key || '').trim();
+      if (!key) continue;
+      if (!layer.renderChunks.has(key)) {
+        layer.renderChunks.set(key, this._createLayerRenderChunk(layer, key));
+      }
+    }
+
+    const ordered = new Map();
+    for (const chunkInfo of chunkList) {
+      const key = String(chunkInfo?.key || '').trim();
+      const chunk = layer.renderChunks.get(key);
+      if (!key || !chunk) continue;
+      ordered.set(key, chunk);
+      try { layer.container?.addChild?.(chunk.sprite); } catch (_) {}
+    }
+    layer.renderChunks = ordered;
+
+    const first = ordered.values().next().value || null;
+    layer.renderTexture = first?.renderTexture || null;
+    return ordered;
+  }
+
+  _createLayerRenderChunk(layer, key) {
+    const occlusionMesh = this._shouldLayerUseShadowOcclusion(layer)
+      ? this._createShadowOcclusionChunkMesh(layer, key)
+      : null;
+    const sprite = occlusionMesh || new PIXI.Sprite(PIXI.Texture.EMPTY);
+    sprite.anchor.set(0, 0);
+    sprite.visible = false;
+    sprite.eventMode = 'none';
+    sprite.name = `fa-nexus-shadow-chunk:${key}`;
+    try { layer.container?.addChild?.(sprite); } catch (_) {}
+    return {
+      key,
+      sprite,
+      renderTexture: null,
+      rawRenderTexture: null,
+      occlusionFilter: null,
+      blurFilter: null,
+      usesOcclusionMesh: !!occlusionMesh,
+      sceneRect: null,
+      scale: 1
+    };
+  }
+
+  _createShadowOcclusionChunkMesh(layer, key) {
+    try {
+      const classes = getPrimaryShadowOcclusionMeshClasses();
+      if (!classes) {
+        if (!this._shadowOcclusionMeshUnavailableLogged) {
+          this._shadowOcclusionMeshUnavailableLogged = true;
+          Logger.error('AssetShadow.occlusionMesh.unavailable', {
+            layerKey: layer?.key || null
+          });
+        }
+        return null;
+      }
+      const rendererPlugins = canvas?.app?.renderer?.plugins || null;
+      if (!rendererPlugins?.batchOcclusion) {
+        if (!this._shadowOcclusionBatchUnavailableLogged) {
+          this._shadowOcclusionBatchUnavailableLogged = true;
+          Logger.error('AssetShadow.occlusionMesh.batchPluginUnavailable', {
+            layerKey: layer?.key || null
+          });
+        }
+        return null;
+      }
+
+      const { PrimarySpriteMesh, PrimaryBaseSamplerShader } = classes;
+      const mesh = new PrimarySpriteMesh(PIXI.Texture.EMPTY, PrimaryBaseSamplerShader);
+      mesh.name = `fa-nexus-shadow-occlusion-chunk:${key}`;
+      mesh.eventMode = 'none';
+      mesh.pluginName = 'batchOcclusion';
+      mesh.unoccludedAlpha = 1;
+      mesh.occludedAlpha = 0;
+      mesh.occlusionMode = 0;
+      mesh.occluded = false;
+      this._syncShadowOcclusionMeshRuntime(layer, mesh);
+
+      const manager = this;
+      const originalUpdateTransform = mesh.updateTransform;
+      mesh.updateTransform = function faNexusShadowOcclusionUpdateTransform(...args) {
+        const result = originalUpdateTransform.apply(this, args);
+        manager._syncShadowOcclusionMeshRuntime(layer, this);
+        return result;
+      };
+      return mesh;
+    } catch (error) {
+      Logger.error('AssetShadow.occlusionMesh.createFailed', {
+        layerKey: layer?.key || null,
+        error: String(error?.message || error)
+      });
+      return null;
+    }
+  }
+
+  _hideLayerRenderChunk(layer, chunk) {
+    try {
+      if (!chunk?.sprite || chunk.sprite.destroyed) return;
+      const previousTexture = chunk.renderTexture || null;
+      chunk.sprite.visible = false;
+      chunk.sprite.filters = null;
+      if (chunk.occlusionFilter && !chunk.occlusionFilter.destroyed) {
+        try { chunk.occlusionFilter.destroy(); } catch (_) {}
+      }
+      chunk.occlusionFilter = null;
+      if (chunk.renderTexture && !chunk.renderTexture.destroyed) {
+        try { chunk.renderTexture.destroy(true); } catch (_) {}
+      }
+      if (chunk.rawRenderTexture && !chunk.rawRenderTexture.destroyed) {
+        try { chunk.rawRenderTexture.destroy(true); } catch (_) {}
+      }
+      chunk.renderTexture = null;
+      chunk.rawRenderTexture = null;
+      if (layer?.renderTexture === previousTexture) layer.renderTexture = null;
+    } catch (_) {}
+  }
+
+  _destroyLayerRenderChunk(layer, chunk) {
+    if (!chunk) return;
+    const previousTexture = chunk.renderTexture || null;
+    try { chunk.sprite && (chunk.sprite.filters = null); } catch (_) {}
+    if (chunk.renderTexture && !chunk.renderTexture.destroyed) {
+      try { chunk.renderTexture.destroy(true); } catch (_) {}
+    }
+    if (chunk.rawRenderTexture && !chunk.rawRenderTexture.destroyed) {
+      try { chunk.rawRenderTexture.destroy(true); } catch (_) {}
+    }
+    if (chunk.blurFilter && !chunk.blurFilter.destroyed) {
+      try { chunk.blurFilter.destroy(); } catch (_) {}
+    }
+    if (chunk.occlusionFilter && !chunk.occlusionFilter.destroyed) {
+      try { chunk.occlusionFilter.destroy(); } catch (_) {}
+    }
+    try { chunk.sprite?.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+    chunk.renderTexture = null;
+    chunk.rawRenderTexture = null;
+    if (layer?.renderTexture === previousTexture) layer.renderTexture = null;
+  }
+
+  _ensureLayer(layerState) {
+    const layerKey = layerState?.key;
+    if (!layerKey) return null;
+    if (this._layers.has(layerKey)) return this._layers.get(layerKey);
     if (!canvas || !canvas.ready) return null;
 
     const layer = {
-      elevation,
+      key: layerKey,
+      elevation: Number(layerState?.elevation ?? 0) || 0,
+      kind: String(layerState?.kind || 'normal').trim() || 'normal',
+      placementLevelId: String(layerState?.placementLevelId || '').trim() || null,
+      renderOrder: layerState?.renderOrder || null,
+      shadowOcclusionKey: String(layerState?.shadowOcclusionKey || 'none'),
+      shadowOcclusionProfile: layerState?.shadowOcclusionProfile || null,
+      sceneId: this._sceneId || this._getActiveSceneId(),
+      generation: this._sceneGeneration,
       container: null,
       sprite: null,
       renderTexture: null,
+      renderChunks: new Map(),
       blurFilter: null,
+      occlusionFilter: null,
+      occlusionIssueKey: null,
       tiles: new Map(),
       options: { ...this._options },
       rebuilding: false,
@@ -2017,7 +4369,7 @@ export class AssetShadowManager {
     container.eventMode = 'none';
     container.sortableChildren = false;
     container.visible = true;
-    container.name = `fa-nexus-shadow:${elevation}`;
+    container.name = `fa-nexus-shadow:${layerKey}`;
 
     const sprite = new PIXI.Sprite(PIXI.Texture.EMPTY);
     sprite.anchor.set(0, 0);
@@ -2032,7 +4384,7 @@ export class AssetShadowManager {
     layer.container = container;
     layer.sprite = sprite;
 
-    this._layers.set(elevation, layer);
+    this._layers.set(layerKey, layer);
     this._syncLayerOrdering(layer);
     return layer;
   }
@@ -2050,32 +4402,52 @@ export class AssetShadowManager {
     try {
       const container = layer.container;
       const docElevation = Number(layer.elevation || 0);
-      const renderElevation = getTileRenderElevation(docElevation);
-      const sort = this._computeSortBelow(layer.elevation) - 0.0001;
+      const sort = this._computeSortBelow(layer);
+      const renderOrder = layer.renderOrder || resolveTileRenderOrder({ elevation: docElevation, sort: 0 }, {
+        elevation: docElevation,
+        placementLevelId: layer.placementLevelId || null
+      });
       if (Number.isFinite(sort)) {
         try { container.sort = sort; } catch (_) {}
         try { container.faNexusSort = sort; } catch (_) {}
         try { container.zIndex = sort; } catch (_) {}
       }
       try { container.faNexusElevationDoc = docElevation; } catch (_) {}
-      try { container.faNexusElevation = renderElevation; } catch (_) {}
-      try { container.elevation = renderElevation; } catch (_) {}
-      const tilesLayer = canvas?.tiles;
-      const sortLayer = tilesLayer?.constructor?.SORT_LAYERS?.TILES ?? tilesLayer?.sortLayer ?? 0;
-      try { container.sortLayer = sortLayer; } catch (_) {}
+      try { container.faNexusElevation = renderOrder.elevation; } catch (_) {}
+      try { container.faNexusPlacementLevelId = layer.placementLevelId || null; } catch (_) {}
+      try { container.faNexusBandKind = layer.kind || 'normal'; } catch (_) {}
+      try { container.elevation = renderOrder.elevation; } catch (_) {}
+      try { container.sortLayer = renderOrder.sortLayer; } catch (_) {}
+      const parent = container.parent;
+      if (parent && 'sortDirty' in parent) {
+        try { parent.sortDirty = true; } catch (_) {}
+      }
+      try { parent?.sortChildren?.(); } catch (_) {}
     } catch (e) {
       Logger.warn('AssetShadow.syncOrdering.failed', String(e?.message || e));
     }
   }
 
   _clearAllLayers() {
+    for (const timer of this._rebuildTimers.values()) {
+      try { clearTimeout(timer); } catch (_) {}
+    }
+    this._rebuildTimers.clear();
+    this._pendingRebuilds.clear();
+    this._pendingRebuildImmediate = false;
+    this._rebuildSuspendCount = 0;
     for (const elevation of Array.from(this._layers.keys())) {
       this._destroyLayer(elevation);
     }
     this._layers.clear();
     this._tileIndex.clear();
+    this._clearSourceTextureCache('clear-all-layers');
     this._clearScatterShadowCache();
     this._clearStandardMaskShadowCache();
+    this._levelScopeWarnings.clear();
+    this._blankRenderValidationBudget = SHADOW_BLANK_VALIDATION_BUDGET;
+    this._previewElevationOverrides.clear();
+    this._previewShadowOverrides.clear();
   }
 
   _destroyLayer(elevation) {
@@ -2092,12 +4464,27 @@ export class AssetShadowManager {
     if (layer.container) {
       try { layer.container.filters = null; } catch (_) {}
     }
+    if (layer.renderChunks?.size) {
+      for (const chunk of layer.renderChunks.values()) {
+        this._destroyLayerRenderChunk(layer, chunk);
+      }
+      layer.renderChunks.clear();
+    }
     if (layer.renderTexture && !layer.renderTexture.destroyed) {
       try { layer.renderTexture.destroy(true); } catch (_) {}
     }
+    if (layer.rawRenderTexture && !layer.rawRenderTexture.destroyed) {
+      try { layer.rawRenderTexture.destroy(true); } catch (_) {}
+    }
+    layer.renderTexture = null;
+    layer.rawRenderTexture = null;
     if (layer.blurFilter && !layer.blurFilter.destroyed) {
       try { layer.blurFilter.destroy(); } catch (_) {}
       layer.blurFilter = null;
+    }
+    if (layer.occlusionFilter && !layer.occlusionFilter.destroyed) {
+      try { layer.occlusionFilter.destroy(); } catch (_) {}
+      layer.occlusionFilter = null;
     }
     if (layer.container) {
       try {
@@ -2105,6 +4492,10 @@ export class AssetShadowManager {
         if (parent) parent.removeChild(layer.container);
       } catch (_) {}
       try { layer.container.destroy({ children: true }); } catch (_) {}
+    }
+    for (const tileId of layer.tiles?.keys?.() || []) {
+      if (this._tileIndex.get(tileId) === elevation) this._tileIndex.delete(tileId);
+      this._suspendedTiles.delete(tileId);
     }
     this._layers.delete(elevation);
   }
@@ -2116,7 +4507,7 @@ export class AssetShadowManager {
       const alpha = Number(doc?.alpha ?? 1);
       if (Number.isFinite(alpha) && alpha <= 0) return false;
       if (doc?.getFlag?.(MODULE_ID, LAYER_HIDDEN_FLAG)) return false;
-      return !!doc?.getFlag?.(MODULE_ID, 'shadow');
+      return this._resolveShadowEnabled(doc);
     } catch (_) {
       const hidden = doc?._source?.hidden;
       if (hidden && !game?.user?.isGM) return false;
@@ -2125,8 +4516,256 @@ export class AssetShadowManager {
       if (flags[LAYER_HIDDEN_FLAG]) return false;
       const alpha = Number(doc?.alpha ?? 1);
       if (Number.isFinite(alpha) && alpha <= 0) return false;
-      return !!flags.shadow;
+      return this._resolveShadowEnabled(doc);
     }
+  }
+
+  _getTilePreviewShadowOverride(doc) {
+    const tileId = String(doc?.id || doc?._id || '').trim();
+    if (!tileId) return null;
+    return this._previewShadowOverrides.get(tileId) || null;
+  }
+
+  _readTileShadowNumber(doc, key) {
+    const override = this._getTilePreviewShadowOverride(doc);
+    if (override && Object.prototype.hasOwnProperty.call(override, key)) {
+      const numeric = Number(override[key]);
+      if (Number.isFinite(numeric)) return numeric;
+    }
+    try {
+      const value = doc?.getFlag?.(MODULE_ID, key);
+      if (value !== undefined && value !== null) {
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) return numeric;
+      }
+    } catch (_) {}
+    try {
+      const flags = doc?.flags?.[MODULE_ID] || doc?._source?.flags?.[MODULE_ID];
+      if (!flags || !Object.prototype.hasOwnProperty.call(flags, key)) return undefined;
+      const numeric = Number(flags[key]);
+      return Number.isFinite(numeric) ? numeric : undefined;
+    } catch (_) {
+      return undefined;
+    }
+  }
+
+  _resolveShadowEnabled(doc) {
+    const override = this._getTilePreviewShadowOverride(doc);
+    if (override && Object.prototype.hasOwnProperty.call(override, 'enabled')) {
+      return !!override.enabled;
+    }
+    try {
+      const value = doc?.getFlag?.(MODULE_ID, 'shadow');
+      if (value !== undefined && value !== null) return !!value;
+    } catch (_) {}
+    const flags = doc?.flags?.[MODULE_ID] || doc?._source?.flags?.[MODULE_ID];
+    return !!flags?.shadow;
+  }
+
+  _normalizePreviewShadowOverride(override = {}) {
+    if (!override || typeof override !== 'object') return null;
+    const normalized = {};
+    if (Object.prototype.hasOwnProperty.call(override, 'enabled')) {
+      normalized.enabled = !!override.enabled;
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowAlpha') || Object.prototype.hasOwnProperty.call(override, 'alpha')) {
+      normalized.shadowAlpha = Math.min(1, Math.max(0, Number(override.shadowAlpha ?? override.alpha ?? this._options.alpha ?? 0.65)));
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowDilation') || Object.prototype.hasOwnProperty.call(override, 'dilation')) {
+      normalized.shadowDilation = Math.max(0, Number(override.shadowDilation ?? override.dilation ?? this._options.dilation ?? 0));
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowBlur') || Object.prototype.hasOwnProperty.call(override, 'blur')) {
+      normalized.shadowBlur = Math.max(0, Number(override.shadowBlur ?? override.blur ?? this._options.blur ?? 0));
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowOffsetDistance') || Object.prototype.hasOwnProperty.call(override, 'offsetDistance')) {
+      normalized.shadowOffsetDistance = Math.min(
+        MAX_OFFSET_DISTANCE,
+        Math.max(0, Number(override.shadowOffsetDistance ?? override.offsetDistance ?? this._options.offsetDistance ?? 0))
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowOffsetAngle') || Object.prototype.hasOwnProperty.call(override, 'offsetAngle')) {
+      normalized.shadowOffsetAngle = this._normalizeAngle(override.shadowOffsetAngle ?? override.offsetAngle ?? this._options.offsetAngle ?? 135);
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowOffsetX') || Object.prototype.hasOwnProperty.call(override, 'offsetX')) {
+      normalized.shadowOffsetX = Math.max(
+        -MAX_OFFSET_DISTANCE,
+        Math.min(MAX_OFFSET_DISTANCE, Number(override.shadowOffsetX ?? override.offsetX ?? 0))
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowOffsetY') || Object.prototype.hasOwnProperty.call(override, 'offsetY')) {
+      normalized.shadowOffsetY = Math.max(
+        -MAX_OFFSET_DISTANCE,
+        Math.min(MAX_OFFSET_DISTANCE, Number(override.shadowOffsetY ?? override.offsetY ?? 0))
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'pathShadowOffsetPx')) {
+      normalized.pathShadowOffsetPx = Math.max(
+        -MAX_OFFSET_DISTANCE,
+        Math.min(MAX_OFFSET_DISTANCE, Number(override.pathShadowOffsetPx ?? 0))
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'pathShadowScale') || Object.prototype.hasOwnProperty.call(override, 'shadowScale') || Object.prototype.hasOwnProperty.call(override, 'scale')) {
+      const rawScale = Number(override.pathShadowScale ?? override.shadowScale ?? override.scale);
+      if (Number.isFinite(rawScale)) normalized.pathShadowScale = Math.max(0.05, rawScale);
+    }
+    return Object.keys(normalized).length ? normalized : null;
+  }
+
+  _getElevationPreviewShadowOverride(elevation) {
+    const numericElevation = Number(elevation);
+    if (!Number.isFinite(numericElevation)) return null;
+    return this._previewElevationOverrides.get(numericElevation) || null;
+  }
+
+  _normalizeElevationPreviewShadowOverride(override = {}) {
+    if (!override || typeof override !== 'object') return null;
+    const normalized = {};
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowAlpha') || Object.prototype.hasOwnProperty.call(override, 'alpha')) {
+      normalized.alpha = Math.min(1, Math.max(0, Number(override.shadowAlpha ?? override.alpha ?? this._options.alpha ?? 0.65)));
+    }
+    if (Object.prototype.hasOwnProperty.call(override, 'shadowBlur') || Object.prototype.hasOwnProperty.call(override, 'blur')) {
+      normalized.blur = Math.max(0, Number(override.shadowBlur ?? override.blur ?? this._options.blur ?? 0));
+    }
+    return Object.keys(normalized).length ? normalized : null;
+  }
+
+  setElevationPreviewShadowOverride(elevation, override = null, { immediate = true } = {}) {
+    try {
+      const numericElevation = Number(elevation);
+      if (!Number.isFinite(numericElevation)) return false;
+      const normalizedOverride = this._normalizeElevationPreviewShadowOverride(override);
+      if (normalizedOverride) this._previewElevationOverrides.set(numericElevation, normalizedOverride);
+      else this._previewElevationOverrides.delete(numericElevation);
+      this._scheduleRebuild(numericElevation, immediate);
+      return true;
+    } catch (error) {
+      Logger.warn('AssetShadow.previewElevationOverride.failed', {
+        elevation,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  clearElevationPreviewShadowOverride(elevation, options = {}) {
+    return this.setElevationPreviewShadowOverride(elevation, null, options);
+  }
+
+  setTilePreviewShadowOverride(tileDocument, override = null, { immediate = true } = {}) {
+    try {
+      const doc = tileDocument?.document ?? tileDocument;
+      const tileId = String(doc?.id || doc?._id || '').trim();
+      if (!doc || !tileId) return false;
+      if (!this._isActiveSceneDocument(doc, { phase: 'previewShadowOverride' })) return false;
+
+      const previousRenderable = this._isShadowRenderableTile(doc, { phase: 'previewShadowOverride:before', log: false });
+      const previousLayerKey = this._tileIndex.get(tileId) || null;
+      const normalizedOverride = this._normalizePreviewShadowOverride(override);
+      if (normalizedOverride) this._previewShadowOverrides.set(tileId, normalizedOverride);
+      else this._previewShadowOverrides.delete(tileId);
+
+      const nextRenderable = this._isShadowRenderableTile(doc, { phase: 'previewShadowOverride:after', log: false });
+      const nextLayerKey = nextRenderable ? (this._getTileLayerState(doc)?.key || null) : null;
+
+      if (previousRenderable && (!nextRenderable || (previousLayerKey && nextLayerKey && previousLayerKey !== nextLayerKey))) {
+        this._removeTile(doc);
+      }
+      if (nextRenderable) {
+        this._addTile(doc, { deferRebuild: true });
+      }
+
+      const rebuildTargets = new Set([previousLayerKey, nextLayerKey].filter(Boolean));
+      for (const target of rebuildTargets) {
+        this._scheduleRebuild(target, immediate);
+      }
+      return true;
+    } catch (error) {
+      Logger.warn('AssetShadow.previewOverride.failed', {
+        tileId: tileDocument?.id || tileDocument?._id || tileDocument?.document?.id || null,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+  }
+
+  clearTilePreviewShadowOverride(tileDocument, options = {}) {
+    return this.setTilePreviewShadowOverride(tileDocument, null, options);
+  }
+
+  _isShadowRenderableTile(doc, { phase = 'unknown', log = true, changes = null } = {}) {
+    if (!this._isShadowTile(doc)) return false;
+    return this._isTileInCurrentLevelScope(doc, { phase, log, changes });
+  }
+
+  _isTileInCurrentLevelScope(doc, { phase = 'unknown', log = true, changes = null } = {}) {
+    let tileLevelIds = [];
+    try {
+      tileLevelIds = getRawLevelIds(doc);
+    } catch (error) {
+      Logger.warn('AssetShadow.levelScope.readFailed', {
+        phase,
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+
+    if (!tileLevelIds.length) return true;
+
+    let currentLevelIds = [];
+    try {
+      currentLevelIds = getCurrentViewedLevelIds(doc?.parent || canvas?.scene);
+    } catch (error) {
+      Logger.warn('AssetShadow.levelScope.currentLevelReadFailed', {
+        phase,
+        tileId: doc?.id || null,
+        tileLevelIds,
+        error: String(error?.message || error)
+      });
+      return false;
+    }
+
+    const currentSet = new Set((Array.isArray(currentLevelIds) ? currentLevelIds : [])
+      .map((levelId) => String(levelId || '').trim())
+      .filter(Boolean));
+    const usesNativeLevelScope = typeof doc?.includedInLevel === 'function' && currentSet.size > 0;
+    if (usesNativeLevelScope) {
+      try {
+        if (Array.from(currentSet).some((levelId) => doc.includedInLevel(levelId))) return true;
+      } catch (error) {
+        Logger.warn('AssetShadow.levelScope.nativeCheckFailed', {
+          phase,
+          tileId: doc?.id || null,
+          tileLevelIds,
+          currentLevelIds: Array.from(currentSet),
+          error: String(error?.message || error)
+        });
+        return false;
+      }
+    } else if (tileLevelIds.some((levelId) => currentSet.has(String(levelId || '').trim()))) {
+      return true;
+    }
+
+    if (log) {
+      const sceneId = this._getDocumentSceneId(doc) || this._sceneId || this._getActiveSceneId() || 'unknown-scene';
+      const warningKey = `${sceneId}:${doc?.id || 'unknown-tile'}:${tileLevelIds.join(',')}:${Array.from(currentSet).join(',')}`;
+      const payload = {
+        phase,
+        tileId: doc?.id || null,
+        sceneId,
+        tileLevelIds,
+        currentLevelIds: Array.from(currentSet),
+        nativeLevelScope: usesNativeLevelScope,
+        levelChanged: Object.prototype.hasOwnProperty.call(changes || {}, 'levels')
+      };
+      if (!currentSet.size && !this._levelScopeWarnings.has(warningKey)) {
+        this._levelScopeWarnings.add(warningKey);
+        Logger.warn('AssetShadow.levelScope.currentLevelMissing', payload);
+      } else {
+        Logger.debug?.('AssetShadow.levelScope.excluded', payload);
+      }
+    }
+    return false;
   }
 
   _getTileElevation(doc) {
@@ -2134,19 +4773,54 @@ export class AssetShadowManager {
     catch (_) { return 0; }
   }
 
-  _computeSortBelow(elevation) {
+  _getTileLayerState(doc) {
+    const elevation = this._getTileElevation(doc);
+    const renderOrder = resolveTileRenderOrder(doc);
+    const placementLevelId = String(renderOrder?.placementLevelId || '').trim() || null;
+    const kind = String(renderOrder?.kind || 'normal').trim() || 'normal';
+    const renderElevation = Number(renderOrder?.elevation ?? elevation) || elevation;
+    const sortLayer = Number(renderOrder?.sortLayer ?? 0) || 0;
+    const shadowOcclusionProfile = this._getTileShadowOcclusionProfile(doc);
+    const shadowOcclusionKey = shadowOcclusionProfile.key;
+    return {
+      key: `${kind}:${elevation}:${placementLevelId || 'none'}:${sortLayer}:${renderElevation}:${shadowOcclusionKey}`,
+      elevation,
+      renderOrder,
+      placementLevelId,
+      kind,
+      shadowOcclusionKey,
+      shadowOcclusionProfile
+    };
+  }
+
+  _resolveLayerKeys(target) {
+    if (target == null) return [];
+    if (this._layers.has(target)) return [target];
+    const numericTarget = Number(target);
+    if (!Number.isFinite(numericTarget)) return [];
+    const matching = [];
+    for (const [layerKey, layer] of this._layers.entries()) {
+      if (Number(layer?.elevation ?? 0) !== numericTarget) continue;
+      matching.push(layerKey);
+    }
+    return matching;
+  }
+
+  _computeSortBelow(layer) {
     try {
-      const list = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
-      let minSort = Number.POSITIVE_INFINITY;
-      for (const tile of list) {
-        const doc = tile?.document;
-        if (!doc) continue;
-        if (Number(doc.elevation || 0) !== Number(elevation || 0)) continue;
-        const sort = Number(doc.sort ?? 0) || 0;
-        if (sort < minSort) minSort = sort;
-      }
-      if (!Number.isFinite(minSort)) return 0;
-      return minSort - 0.0001;
+      const docs = Array.from(layer?.tiles?.values?.() || []);
+      const baseDoc = docs[0] || null;
+      const minSort = docs.reduce((lowest, doc) => {
+        const numericSort = Number(doc?.sort ?? 0) || 0;
+        return Math.min(lowest, numericSort);
+      }, Number.POSITIVE_INFINITY);
+      const renderOrder = resolveTileRenderOrder(baseDoc || { elevation: layer?.elevation ?? 0, sort: 0 }, {
+        elevation: layer?.elevation ?? 0,
+        sort: Number.isFinite(minSort) ? minSort : 0,
+        placementLevelId: layer?.placementLevelId || null
+      });
+      if (!Number.isFinite(Number(renderOrder?.sort))) return -5;
+      return Number(renderOrder.sort) - 0.0001;
     } catch (_) { return -5; }
   }
 
@@ -2168,16 +4842,21 @@ export class AssetShadowManager {
   getElevationSettings(elevation) {
     try {
       const target = Number(elevation ?? 0) || 0;
-      const layer = this._layers.get(target) || null;
-      const docs = layer ? Array.from(layer.tiles.values()) : this._collectShadowTilesAtElevation(target);
+      const docs = this._collectShadowTilesAtElevation(target);
       const tileCount = Array.isArray(docs) ? docs.length : 0;
       const baseOptions = { ...this._options };
+      const layerKeys = this._resolveLayerKeys(target);
+      const layers = layerKeys
+        .map((layerKey) => this._layers.get(layerKey) || null)
+        .filter(Boolean);
+      const firstLayer = layers[0] || null;
+      const previewOverride = this._getElevationPreviewShadowOverride(target);
       if (!tileCount) {
         const offset = this._computeOffsetVector(baseOptions.offsetDistance, baseOptions.offsetAngle);
         return {
-          alpha: Number(baseOptions.alpha ?? 0.65),
+          alpha: Number(previewOverride?.alpha ?? baseOptions.alpha ?? 0.65),
           dilation: Number(baseOptions.dilation ?? 0),
-          blur: Number(baseOptions.blur ?? 0),
+          blur: Number(previewOverride?.blur ?? baseOptions.blur ?? 0),
           offsetDistance: Number(baseOptions.offsetDistance ?? 0),
           offsetAngle: Number(baseOptions.offsetAngle ?? 135),
           offsetX: Number(offset.x || 0),
@@ -2189,17 +4868,6 @@ export class AssetShadowManager {
 
       const doc = docs[0];
       const approx = (a, b) => Math.abs(Number(a || 0) - Number(b || 0)) < 0.0005;
-      const readDocFlag = (key, fallback) => {
-        try {
-          const value = doc.getFlag('fa-nexus', key);
-          if (value === undefined || value === null) return fallback;
-          const numeric = Number(value);
-          return Number.isFinite(numeric) ? numeric : fallback;
-        } catch (_) {
-          return fallback;
-        }
-      };
-
       const firstConfig = this._extractTileShadowConfig(doc, baseOptions);
       let dilationMixed = false;
       let offsetMixed = false;
@@ -2215,9 +4883,9 @@ export class AssetShadowManager {
       }
 
       return {
-        alpha: Math.min(1, Math.max(0, readDocFlag('shadowAlpha', layer?.options?.alpha ?? this._options.alpha ?? 0.65))),
+        alpha: Math.min(1, Math.max(0, Number(previewOverride?.alpha ?? firstLayer?.options?.alpha ?? this._readTileShadowNumber(doc, 'shadowAlpha') ?? this._options.alpha ?? 0.65))),
         dilation: Math.max(0, firstConfig.dilation),
-        blur: Math.max(0, readDocFlag('shadowBlur', layer?.options?.blur ?? this._options.blur ?? 0)),
+        blur: Math.max(0, Number(previewOverride?.blur ?? firstLayer?.options?.blur ?? this._readTileShadowNumber(doc, 'shadowBlur') ?? this._options.blur ?? 0)),
         offsetDistance: Math.min(MAX_OFFSET_DISTANCE, Math.max(0, firstConfig.offsetDistance)),
         offsetAngle: this._normalizeAngle(firstConfig.offsetAngle),
         offsetX: firstConfig.offsetX,
@@ -2317,11 +4985,13 @@ export class AssetShadowManager {
         if (changed) updates.push(update);
       }
 
-      const layer = this._layers.get(Number(elevation ?? 0) || 0) || null;
-      if (layer) {
-        if (hasAlpha && alpha !== null) layer.options.alpha = Math.min(1, Math.max(0, Number(alpha)));
-        if (hasBlur && blur !== null) layer.options.blur = Math.max(0, Number(blur));
-      }
+        const matchingLayerKeys = this._resolveLayerKeys(Number(elevation ?? 0) || 0);
+        for (const layerKey of matchingLayerKeys) {
+          const layer = this._layers.get(layerKey) || null;
+          if (!layer) continue;
+          if (hasAlpha && alpha !== null) layer.options.alpha = Math.min(1, Math.max(0, Number(alpha)));
+          if (hasBlur && blur !== null) layer.options.blur = Math.max(0, Number(blur));
+        }
 
       if (!updates.length) return false;
       await canvas.scene.updateEmbeddedDocuments('Tile', updates, { diff: false });
@@ -2556,7 +5226,9 @@ try {
       if (game.settings.get('fa-nexus', 'assetDropShadow')) {
         AssetShadowManager.getInstance();
       }
-    } catch (_) {}
+    } catch (error) {
+      logShadowLifecycleFailure('ready', error);
+    }
   });
 
   Hooks.on('updateSetting', (setting) => {
@@ -2577,9 +5249,16 @@ try {
         const mgr = AssetShadowManager.peek() ?? AssetShadowManager.getInstance();
         mgr?.refreshAll?.();
       }
-    } catch (_) {}
+    } catch (error) {
+      logShadowLifecycleFailure('update-setting', error, {
+        namespace: setting?.namespace || '',
+        key: setting?.key || ''
+      });
+    }
   });
-} catch (_) {}
+} catch (error) {
+  logShadowLifecycleFailure('hook-setup', error);
+}
 
 export function getAssetShadowManager(app) {
   return AssetShadowManager.getInstance(app);

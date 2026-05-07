@@ -7,16 +7,29 @@
   <section class="fa-nexus-dialog-body">
     {{#if isExport}}
     <div class="form-group">
-      <label>Scene Action</label>
+      <label>Action</label>
       <label class="fa-nexus-checkbox-label" for="flatten-export-action-flatten">
         <input id="flatten-export-action-flatten" type="radio" name="flatten-export-action" value="flatten" {{#if exportActionIsFlatten}}checked{{/if}} />
-        <span>Flatten scene into tiles</span>
+        <span>Flatten into tiles</span>
       </label>
       <label class="fa-nexus-checkbox-label" for="flatten-export-action-export">
         <input id="flatten-export-action-export" type="radio" name="flatten-export-action" value="export" {{#if exportActionIsExport}}checked{{/if}} />
-        <span>Export scene images</span>
+        <span>Export images</span>
       </label>
       <p class="hint" data-export-action-hint>{{exportActionHint}}</p>
+    </div>
+
+    <div class="form-group">
+      <label>Scope</label>
+      <label class="fa-nexus-checkbox-label" for="flatten-export-scope-level">
+        <input id="flatten-export-scope-level" type="radio" name="flatten-export-scope" value="level" {{#if exportScopeIsLevel}}checked{{/if}} />
+        <span>Current level</span>
+      </label>
+      <label class="fa-nexus-checkbox-label" for="flatten-export-scope-scene">
+        <input id="flatten-export-scope-scene" type="radio" name="flatten-export-scope" value="scene" {{#if exportScopeIsScene}}checked{{/if}} />
+        <span>All scene levels</span>
+      </label>
+      <p class="hint" data-export-scope-hint>{{exportScopeHint}}</p>
     </div>
     {{/if}}
 
@@ -75,9 +88,19 @@
     <div class="form-group">
       <label class="fa-nexus-checkbox-label" for="flatten-export-split">
         <input id="flatten-export-split" type="checkbox" {{#if defaultExportSplitLayers}}checked{{/if}} />
-        <span>Split by scene foreground elevation</span>
+        <span>Split background / middle / foreground</span>
       </label>
       <p class="hint" data-export-split-hint>{{exportSplitHint}}</p>
+    </div>
+
+    <div class="form-group" data-export-middle-placement-group {{#unless defaultExportSplitLayers}}hidden{{/unless}}>
+      <label for="flatten-export-middle-placement">Middle Elevations</label>
+      <select id="flatten-export-middle-placement" {{#unless defaultExportSplitLayers}}disabled{{/unless}}>
+        <option value="separate" {{#if middlePlacementSeparate}}selected{{/if}}>Separate middle layer</option>
+        <option value="background" {{#if middlePlacementBackground}}selected{{/if}}>Merge into background</option>
+        <option value="foreground" {{#if middlePlacementForeground}}selected{{/if}}>Merge into foreground</option>
+      </select>
+      <p class="hint">Tiles between the background and foreground bands can be separate or merged into one band output.</p>
     </div>
 
     <div class="form-group">

@@ -1,19 +1,25 @@
 import { NexusLogger as Logger } from '../nexus-logger.js';
 
 /**
+ * @typedef {import('../fa-nexus-types.js').FaNexusSelectionItem} FaNexusSelectionItem
+ * @typedef {import('../fa-nexus-types.js').FaNexusSelectionContext} FaNexusSelectionContext
+ * @typedef {import('../fa-nexus-types.js').GridSelectionHelperOptions<FaNexusSelectionItem>} GridSelectionHelperOptions
+ */
+
+/**
  * Shared helper for grid-based multi-selection flows (assets, tokens, etc.).
  * Handles basic selection state, range toggles, and card UI updates.
  */
 export class GridSelectionHelper {
   /**
-   * @param {object} options
+   * @param {GridSelectionHelperOptions} options
    * @param {() => HTMLElement|null} [options.getGridContainer] Returns the grid container element.
-   * @param {() => any[]} [options.getGridItems] Returns the current grid items (fallback when no visibleItems cache).
-   * @param {(item:any) => string} [options.computeItemKey] Produces a stable selection key for an item.
+   * @param {() => FaNexusSelectionItem[]} [options.getGridItems] Returns the current grid items (fallback when no visibleItems cache).
+   * @param {(item:FaNexusSelectionItem) => string} [options.computeItemKey] Produces a stable selection key for an item.
    * @param {(card:HTMLElement) => string} [options.keyFromCard] Extracts selection key from a rendered card element.
    * @param {(card:HTMLElement, selected:boolean) => void} [options.setCardSelectionUI] Applies visual selection UI to a card.
-   * @param {(item:any, card:HTMLElement|null, context:object) => boolean} [options.isItemLocked] Returns true if item cannot be selected.
-   * @param {() => object} [options.getSelectionContext] Provides additional context (auth, etc.) for selection checks.
+   * @param {(item:FaNexusSelectionItem, card:HTMLElement|null, context:FaNexusSelectionContext) => boolean} [options.isItemLocked] Returns true if item cannot be selected.
+   * @param {() => FaNexusSelectionContext} [options.getSelectionContext] Provides additional context (auth, etc.) for selection checks.
    * @param {string} [options.cardSelector] Query selector for cards (defaults to '.fa-nexus-card').
    * @param {import('../nexus-logger.js').NexusLogger} [options.logger] Optional logger instance.
    * @param {string} [options.loggerTag] Logger namespace suffix.

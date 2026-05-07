@@ -1,5 +1,6 @@
 import { getCanvasInteractionController } from './canvas-interaction-controller.js';
 import { resolvePointerEvent } from './canvas-pointer-utils.js';
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
 
 const DEFAULT_EVENTS = new Set([
   'pointerdown',
@@ -43,7 +44,10 @@ export function createCanvasGestureSession(handlerMap = {}, options = {}) {
           controller
         });
       } catch (err) {
-        console.error('fa-nexus | canvas gesture handler failed', err);
+        Logger.error('CanvasGestureSession.handler.failed', {
+          eventName: lower,
+          error: err
+        });
       }
     };
   }
@@ -59,8 +63,11 @@ export function createCanvasGestureSession(handlerMap = {}, options = {}) {
     stop(reason = 'manual') {
       try {
         session.stop(reason);
-      } catch (_) {
-        // no-op
+      } catch (error) {
+        Logger.error('CanvasGestureSession.stop.failed', {
+          reason,
+          error
+        });
       }
     }
   };

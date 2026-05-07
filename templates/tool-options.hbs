@@ -51,6 +51,17 @@
             {{/if}}
           </div>
         {{/if}}
+        {{#if control.controls.shadowOnly.available}}
+          <div class="fa-nexus-path-shadow__edit-row" data-fa-nexus-drop-shadow-only-row>
+            <label class="fa-nexus-tool-options__toggle" title="{{control.controls.shadowOnly.tooltip}}">
+              <input type="checkbox"
+                     data-fa-nexus-drop-shadow-only
+                     {{#if control.controls.shadowOnly.enabled}}checked{{/if}}
+                     {{#if control.controls.shadowOnly.disabled}}disabled{{/if}}>
+              <span>{{control.controls.shadowOnly.label}}</span>
+            </label>
+          </div>
+        {{/if}}
         <div class="fa-nexus-drop-shadow__context-block">
           <div class="fa-nexus-drop-shadow__presets" data-fa-nexus-drop-shadow-presets>
             {{#each control.controls.presets as |preset|}}
@@ -632,6 +643,22 @@
                 </div>
               {{/if}}
 
+              {{#if (eq control.type "select")}}
+                <div class="fa-nexus-tool-options__control fa-nexus-declarative-select" data-fa-nexus-select-control="{{control.id}}" title="{{control.tooltip}}">
+                  <label class="fa-nexus-declarative-select__label">
+                    <span class="fa-nexus-tool-options__label" data-fa-nexus-select-label>{{control.label}}</span>
+                    <select class="fa-nexus-declarative-select__input"
+                            data-fa-nexus-select-input="{{control.id}}"
+                            {{#if control.disabled}}disabled{{/if}}>
+                      {{#each control.options as |option|}}
+                        <option value="{{option.value}}" {{#if option.selected}}selected{{/if}} {{#if option.disabled}}disabled{{/if}}>{{option.label}}</option>
+                      {{/each}}
+                    </select>
+                  </label>
+                  <p class="fa-nexus-tool-options__hint" data-fa-nexus-select-hint {{#unless control.hint}}hidden{{/unless}}>{{control.hint}}</p>
+                </div>
+              {{/if}}
+
               {{#if (eq control.type "action-row")}}
                 <div class="fa-nexus-tool-options__control fa-nexus-editor-actions" data-fa-nexus-editor-actions-root="{{control.id}}">
                   <div class="fa-nexus-texture-tools__actions fa-nexus-editor-actions__buttons">
@@ -757,6 +784,22 @@
                              {{#if control.disabled}}disabled{{/if}}>
                       <span data-fa-nexus-toggle-label>{{control.label}}</span>
                     </label>
+                  </div>
+                {{/if}}
+
+                {{#if (eq control.type "select")}}
+                  <div class="fa-nexus-tool-options__control fa-nexus-declarative-select" data-fa-nexus-select-control="{{control.id}}" title="{{control.tooltip}}">
+                    <label class="fa-nexus-declarative-select__label">
+                      <span class="fa-nexus-tool-options__label" data-fa-nexus-select-label>{{control.label}}</span>
+                      <select class="fa-nexus-declarative-select__input"
+                              data-fa-nexus-select-input="{{control.id}}"
+                              {{#if control.disabled}}disabled{{/if}}>
+                        {{#each control.options as |option|}}
+                          <option value="{{option.value}}" {{#if option.selected}}selected{{/if}} {{#if option.disabled}}disabled{{/if}}>{{option.label}}</option>
+                        {{/each}}
+                      </select>
+                    </label>
+                    <p class="fa-nexus-tool-options__hint" data-fa-nexus-select-hint {{#unless control.hint}}hidden{{/unless}}>{{control.hint}}</p>
                   </div>
                 {{/if}}
 
@@ -2194,6 +2237,22 @@
                           </button>
                         {{/each}}
                       </div>
+                    </div>
+                  {{/if}}
+
+                  {{#if (eq control.type "select")}}
+                    <div class="fa-nexus-tool-options__control fa-nexus-declarative-select" data-fa-nexus-select-control="{{control.id}}" title="{{control.tooltip}}">
+                      <label class="fa-nexus-declarative-select__label">
+                        <span class="fa-nexus-tool-options__label" data-fa-nexus-select-label>{{control.label}}</span>
+                        <select class="fa-nexus-declarative-select__input"
+                                data-fa-nexus-select-input="{{control.id}}"
+                                {{#if control.disabled}}disabled{{/if}}>
+                          {{#each control.options as |option|}}
+                            <option value="{{option.value}}" {{#if option.selected}}selected{{/if}} {{#if option.disabled}}disabled{{/if}}>{{option.label}}</option>
+                          {{/each}}
+                        </select>
+                      </label>
+                      <p class="fa-nexus-tool-options__hint" data-fa-nexus-select-hint {{#unless control.hint}}hidden{{/unless}}>{{control.hint}}</p>
                     </div>
                   {{/if}}
 

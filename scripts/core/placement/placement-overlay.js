@@ -1,4 +1,9 @@
 /**
+ * @typedef {import('../fa-nexus-types.js').PlacementOverlayOptions} PlacementOverlayOptions
+ * @typedef {import('../fa-nexus-types.js').PlacementSpinnerOptions} PlacementSpinnerOptions
+ */
+
+/**
  * PlacementOverlay
  * Shared cursor-following overlay for placement workflows.
  *
@@ -11,16 +16,7 @@
  */
 export class PlacementOverlay {
   /**
-   * @param {Object} [options]
-   * @param {{x:number,y:number}} [options.pointer] - Initial cursor position
-   * @param {number} [options.worldWidth] - Width in world units (pre-zoom)
-   * @param {number} [options.worldHeight] - Height in world units (pre-zoom)
-   * @param {number} [options.screenWidth] - Width in rendered pixels (post-zoom)
-   * @param {number} [options.screenHeight] - Height in rendered pixels (post-zoom)
-   * @param {string} [options.className] - Additional class names for the root element
-   * @param {number} [options.zIndex] - Custom z-index (defaults to 99999)
-   * @param {boolean} [options.trackZoom=true] - Whether to watch canvas zoom when world size used
-   * @param {(width:number, height:number)=>void} [options.onSizeChange] - Notified when rendered size changes
+   * @param {PlacementOverlayOptions} [options]
    */
   constructor(options = {}) {
     const {
@@ -82,10 +78,6 @@ export class PlacementOverlay {
     this.updatePointer(targetPointer.x, targetPointer.y);
   }
 
-  /**
-   * Root element accessor so existing code can manipulate legacy references.
-   * @returns {HTMLElement|null}
-   */
   get element() {
     return this._element;
   }
@@ -121,7 +113,7 @@ export class PlacementOverlay {
    * Update overlay world dimensions (pre-zoom). Automatically tracks zoom unless disabled.
    * @param {number} width
    * @param {number} height
-   * @param {Object} [options]
+   * @param {{trackZoom?:boolean}} [options]
    * @param {boolean} [options.trackZoom=true]
    */
   setWorldSize(width, height, options = {}) {
@@ -239,9 +231,7 @@ export class PlacementOverlay {
 
 /**
  * Factory helper for a consistent spinner + label cluster.
- * @param {Object} [options]
- * @param {string} [options.label='Downloading...']
- * @param {string} [options.iconClass='fas fa-spinner fa-spin']
+ * @param {PlacementSpinnerOptions} [options]
  * @returns {HTMLElement}
  */
 export function createPlacementSpinner(options = {}) {

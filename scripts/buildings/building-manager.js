@@ -1,7 +1,37 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { premiumFeatureBroker } from '../premium/premium-feature-broker.js';
-import { premiumEntitlementsService } from '../premium/premium-entitlements-service.js';
-import { ensurePremiumFeaturesRegistered } from '../premium/premium-feature-registry.js';
+import {
+  resolveTileId,
+  resolveTilePlaceable
+} from '../premium/session-host/editing-targets.js';
+import { resolvePremiumFeatureDelegate } from '../premium/session-host/delegate-bootstrap.js';
+import {
+  buildHostedSessionContextDetails,
+  canRecoverHostedSessionFromCanvasTeardown,
+  isApplicationHostReady
+} from '../premium/session-host/host-context.js';
+import {
+  cancelToolWindowMonitor,
+  startHostedToolWindowMonitor
+} from '../premium/session-host/tool-window-monitor.js';
+import {
+  beginEditingTileTracking,
+  endEditingTileWithRefresh
+} from '../premium/session-host/editing-session-state.js';
+import {
+  canCommitHostedSession,
+  handleSessionLaunchFailure as handleHostedSessionLaunchFailure,
+  hasHostedSessionChanges,
+  runHostedSessionLaunch,
+  stopSessionWithFinalize,
+  stopOrphanedSession as stopHostedOrphanedSession
+} from '../premium/session-host/session-lifecycle.js';
+import {
+  handleEntitlementRevalidationFailure,
+  scheduleEntitlementRevalidation
+} from '../premium/session-host/entitlement-revalidation.js';
+import {
+  syncHostedToolOptions
+} from '../premium/session-host/tool-options-sync.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
 import { applyBuildingTile, applyDoorFrameTile } from './building-tiles.js';
 import { TOOL_OPTIONS_RENDERER_MODE, createNormalizedToolOptionsDescriptor } from '../core/tool-options-descriptor.js';
@@ -12,6 +42,19 @@ import {
   resolveEffectivePolarity
 } from '../core/editor-shortcuts.js';
 import { buildHsbcToolOptionsControls } from '../core/hsbc.js';
+import {
+  getCurrentLevelBottomElevation,
+  getCurrentSceneLevel,
+  getGroundBandRenderSort,
+  getHighestControlledTileElevation,
+  getTileRenderElevation,
+  resolvePlacementAnchorTile
+} from '../canvas/elevation-band-utils.js';
+import {
+  getDefaultTilePlacementLevelId,
+  resolveTileRenderOrder
+} from '../canvas/tile-band-utils.js';
+import { resolvePlacementSortAtElevation } from '../canvas/canvas-interaction-controller.js';
 import { requestSelectionFilterRefresh } from '../canvas/selection-filter-refresh.js';
 
 const MODULE_ID = 'fa-nexus';
@@ -26,41 +69,22 @@ const EDITING_TILE_SET_KEY = '__faNexusBuildingEditingTileIds';
 
 const FEATURE_ID = 'building.edit';
 const TOOL_LABEL = 'Building Editor';
+const CANVAS_REBIND_TIMEOUT_MS = 15000;
+const HOST_CONTEXT_GRACE_MS = 5000;
+const PREVIEW_LAYER_HOOK = 'fa-nexus-preview-layers-changed';
 
-function getEditingTileSet() {
-  try {
-    const root = globalThis;
-    if (!root) return null;
-    let set = root[EDITING_TILE_SET_KEY];
-    if (!(set instanceof Set)) {
-      set = new Set();
-      root[EDITING_TILE_SET_KEY] = set;
-    }
-    return set;
-  } catch (_) {
-    return null;
-  }
+function stringifyError(error) {
+  return String(error?.message || error);
 }
 
-function resolveTileId(targetTile) {
-  try {
-    return targetTile?.document?.id || targetTile?.id || targetTile?.document?._id || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function resolvePlaceableTile(targetTile, tileId) {
-  try {
-    if (targetTile?.document && targetTile?.mesh) return targetTile;
-    const doc = targetTile?.document || targetTile;
-    if (doc?.object) return doc.object;
-    const id = tileId || doc?.id || doc?._id;
-    if (!id) return null;
-    return canvas?.tiles?.placeables?.find((tile) => tile?.document?.id === id) || null;
-  } catch (_) {
-    return null;
-  }
+function getDocumentLevelIds(target) {
+  const direct = target?.levels;
+  const source = direct instanceof Set || Array.isArray(direct)
+    ? Array.from(direct)
+    : (target?._source?.levels || []);
+  return Array.from(new Set(source
+    .map((levelId) => String(levelId || '').trim())
+    .filter(Boolean)));
 }
 
 export class BuildingManager {
@@ -70,6 +94,7 @@ export class BuildingManager {
     this._loading = null;
     this._entitlementProbe = null;
     this._toolMonitor = null;
+    this._canvasRebindState = null;
     this._portalMode = false;
     this._onToolOptionsChange = null;
     this._lastPersistedSubtool = null;
@@ -77,6 +102,8 @@ export class BuildingManager {
     this._editingTileId = null;
     this._forcingMeasurementsEnabled = false;
     this._hsbcTarget = 'wall';
+    this._lastPreviewLayerSignature = null;
+    this._pendingLaunchPlacementAnchorTileId = undefined;
   }
 
   /**
@@ -85,7 +112,13 @@ export class BuildingManager {
    * @param {Function|null} callback - Callback function receiving (state, handlers)
    */
   setToolOptionsChangeCallback(callback) {
-    this._onToolOptionsChange = typeof callback === 'function' ? callback : null;
+    const nextCallback = typeof callback === 'function' ? callback : null;
+    this._onToolOptionsChange = nextCallback;
+    return () => {
+      if (!nextCallback || this._onToolOptionsChange === nextCallback) {
+        this._onToolOptionsChange = null;
+      }
+    };
   }
 
   get isActive() {
@@ -93,28 +126,13 @@ export class BuildingManager {
   }
 
   hasSessionChanges() {
-    const delegate = this._delegate;
-    if (!delegate?.isActive) return false;
-    try {
-      if (typeof delegate?.hasSessionChanges === 'function') {
-        return !!delegate.hasSessionChanges();
-      }
-    } catch (_) {}
-    return true;
+    return hasHostedSessionChanges(this._delegate);
   }
 
   canCommitSession() {
-    const delegate = this._delegate;
-    if (!delegate?.isActive) return false;
-    try {
-      if (typeof delegate?.canCommitSession === 'function') {
-        return !!delegate.canCommitSession();
-      }
-      if (typeof delegate?._canCommitSession === 'function') {
-        return !!delegate._canCommitSession();
-      }
-    } catch (_) {}
-    return this.hasSessionChanges();
+    return canCommitHostedSession(this._delegate, {
+      fallback: () => this.hasSessionChanges()
+    });
   }
 
   get version() {
@@ -122,260 +140,261 @@ export class BuildingManager {
   }
 
   async start(session = {}) {
-    if (Object.prototype.hasOwnProperty.call(session || {}, 'portalMode')) {
-      this._portalMode = !!session.portalMode;
+    const startSession = { ...(session || {}) };
+    const sceneId = String(canvas?.scene?.id || '').trim();
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'sceneId') && sceneId) {
+      startSession.sceneId = sceneId;
+    }
+    if (Object.prototype.hasOwnProperty.call(startSession, 'portalMode')) {
+      this._portalMode = !!startSession.portalMode;
+    }
+    const controlledTiles = Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled : [];
+    const anchorTile = resolvePlacementAnchorTile(controlledTiles);
+    const anchorDoc = anchorTile?.document || anchorTile || null;
+    const selectedElevation = getHighestControlledTileElevation(controlledTiles);
+    const fallbackElevation = getCurrentLevelBottomElevation(canvas?.scene);
+    const selectedDoc = anchorDoc;
+    let placementLevels = getDocumentLevelIds(startSession);
+    let placementLevelId = String(startSession.placementLevelId || '').trim();
+    if (!placementLevels.length && placementLevelId) placementLevels = [placementLevelId];
+    if (!placementLevels.length && selectedDoc) {
+      placementLevels = getDocumentLevelIds(selectedDoc);
+    }
+    if (!placementLevelId && selectedDoc) {
+      const selectedLevelIds = getDocumentLevelIds(selectedDoc);
+      if (selectedLevelIds.length === 1) placementLevelId = selectedLevelIds[0];
+    }
+    if (!placementLevelId) {
+      placementLevelId = String(getCurrentSceneLevel(canvas?.scene)?.id || '').trim();
+    }
+    if (!placementLevels.length && placementLevelId) placementLevels = [placementLevelId];
+    const fillAnchorElevation = Number.isFinite(selectedElevation) ? selectedElevation : fallbackElevation;
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'selectedElevation') && Number.isFinite(fillAnchorElevation)) {
+      startSession.selectedElevation = fillAnchorElevation;
+    }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'fillElevation') && Number.isFinite(fillAnchorElevation)) {
+      startSession.fillElevation = fillAnchorElevation;
+    }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'selectedSort')) {
+      startSession.selectedSort = Number.isFinite(Number(anchorDoc?.sort)) ? Number(anchorDoc.sort) : null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'placementAnchorElevation') && Number.isFinite(fillAnchorElevation)) {
+      startSession.placementAnchorElevation = fillAnchorElevation;
+    }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'placementAnchorTileId')) {
+      startSession.placementAnchorTileId = anchorDoc?.id || null;
+    }
+    this._pendingLaunchPlacementAnchorTileId = startSession.placementAnchorTileId || null;
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'placementLevels') && placementLevels.length) {
+      startSession.placementLevels = placementLevels;
+    }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'placementLevelId') && placementLevelId) {
+      startSession.placementLevelId = placementLevelId;
     }
     const delegate = await this._ensureDelegate();
-    let result;
-    try {
-      this._clearEditingTile();
-      if (typeof delegate?.setPortalMode === 'function') {
-        delegate.setPortalMode(this._portalMode);
-      }
-      result = delegate.start?.(session);
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      // Sync tool options state BEFORE activating the tool to ensure the cached
-      // state reflects the new session mode (e.g., 'inner' vs 'outer'). Otherwise,
-      // activateTool would use stale cached state from the previous session.
-      this._syncToolOptionsState({
-        suppressRender: true,
-        suppressSubtoolPersistence: true,
-        suppressToolDefaultsPersistence: true
-      });
-      toolOptionsController.activateTool(FEATURE_ID, { label: TOOL_LABEL });
-      this._beginToolWindowMonitor(delegate);
-      this._restoreSubtoolPreference();
-      result = this._wrapSessionLaunchPromise(result, { phase: 'start' });
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, { phase: 'start' });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._clearEditingTile();
+        if (typeof delegate?.setPortalMode === 'function') {
+          delegate.setPortalMode(this._portalMode);
+        }
+      },
+      launchSession: () => delegate.start?.(startSession),
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._applyPendingLaunchPlacementAnchorTileId();
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        // Sync tool options state BEFORE activating the tool to ensure the cached
+        // state reflects the new session mode (e.g., 'inner' vs 'outer'). Otherwise,
+        // activateTool would use stale cached state from the previous session.
+        this._syncToolOptionsState({
+          suppressRender: true,
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+        toolOptionsController.activateTool(FEATURE_ID, { label: TOOL_LABEL });
+        this._beginToolWindowMonitor(delegate);
+        this._restoreSubtoolPreference();
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, { phase: 'start' }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
+    });
   }
 
   async editTile(tileDocument, options = {}) {
     if (Object.prototype.hasOwnProperty.call(options || {}, 'portalMode')) {
       this._portalMode = !!options.portalMode;
     }
+    const editOptions = { ...(options || {}) };
+    const sceneId = String(canvas?.scene?.id || '').trim();
+    if (!Object.prototype.hasOwnProperty.call(editOptions, 'sceneId') && sceneId) {
+      editOptions.sceneId = sceneId;
+    }
+    const doc = tileDocument?.document || tileDocument || null;
+    const documentLevelIds = getDocumentLevelIds(doc);
+    if (!Object.prototype.hasOwnProperty.call(editOptions, 'placementLevels') && documentLevelIds.length) {
+      editOptions.placementLevels = documentLevelIds;
+    }
+    if (!Object.prototype.hasOwnProperty.call(editOptions, 'placementLevelId') && documentLevelIds.length === 1) {
+      editOptions.placementLevelId = documentLevelIds[0];
+    }
     const delegate = await this._ensureDelegate();
     if (!delegate || typeof delegate.editTile !== 'function') {
       throw new Error('Installed building editor bundle does not support editing existing tiles.');
     }
-    let result;
-    try {
-      this._markEditingTile(tileDocument);
-      if (typeof delegate?.setPortalMode === 'function') {
-        delegate.setPortalMode(this._portalMode);
-      }
-      result = delegate.editTile(tileDocument, options);
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      // Sync tool options state BEFORE activating the tool to ensure the cached
-      // state reflects the new session mode. Otherwise, activateTool would use
-      // stale cached state from the previous session.
-      this._syncToolOptionsState({
-        suppressRender: true,
-        suppressSubtoolPersistence: true,
-        suppressToolDefaultsPersistence: true
-      });
-      toolOptionsController.activateTool(FEATURE_ID, { label: TOOL_LABEL });
-      this._beginToolWindowMonitor(delegate);
-      result = this._wrapSessionLaunchPromise(result, {
+    const tileId = resolveTileId(tileDocument);
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._markEditingTile(tileDocument);
+        if (typeof delegate?.setPortalMode === 'function') {
+          delegate.setPortalMode(this._portalMode);
+        }
+      },
+      launchSession: () => delegate.editTile(tileDocument, editOptions),
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        // Sync tool options state BEFORE activating the tool to ensure the cached
+        // state reflects the new session mode. Otherwise, activateTool would use
+        // stale cached state from the previous session.
+        this._syncToolOptionsState({
+          suppressRender: true,
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+        toolOptionsController.activateTool(FEATURE_ID, { label: TOOL_LABEL });
+        this._beginToolWindowMonitor(delegate);
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, {
         phase: 'edit',
-        tileId: resolveTileId(tileDocument)
-      });
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, {
-        phase: 'edit',
-        tileId: resolveTileId(tileDocument)
-      });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
-  }
-
-  _wrapSessionLaunchPromise(result, { phase = 'start', tileId = null } = {}) {
-    if (!result || typeof result.then !== 'function') return result;
-    return Promise.resolve(result).catch(async (error) => {
-      await this._handleSessionLaunchFailure(error, { phase, tileId });
-      throw error;
+        tileId
+      }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
     });
   }
 
   async _handleSessionLaunchFailure(error, { phase = 'start', tileId = null } = {}) {
-    Logger.error?.('BuildingManager.session.launchFailed', {
+    return handleHostedSessionLaunchFailure({
+      error,
       phase,
-      error: String(error?.message || error),
-      tileId: tileId || this._editingTileId || null,
-      delegateActive: !!this._delegate?.isActive,
-      canvasReady: !!canvas?.ready,
-      hasCanvasStage: !!canvas?.stage
+      loggerPrefix: 'BuildingManager',
+      details: buildHostedSessionContextDetails({
+        app: this._app,
+        delegate: this._delegate,
+        tileId: tileId || this._editingTileId || null
+      }),
+      cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
+      stopSession: ({ reason }) => this.stop({ reason }),
+      onFallbackCleanup: () => {
+        this._clearEditingTile();
+        try { toolOptionsController.deactivateTool(FEATURE_ID); } catch (_) {}
+      }
     });
-    this._cancelToolWindowMonitor();
-    try {
-      await Promise.resolve(this.stop({ reason: `${phase}-failed` }));
-    } catch (stopError) {
-      Logger.error?.('BuildingManager.session.launchFailed.stopFailed', {
-        phase,
-        error: String(stopError?.message || stopError)
-      });
-      this._clearEditingTile();
-      try { toolOptionsController.deactivateTool(FEATURE_ID); } catch (_) {}
-    }
   }
 
   _isEditorHostReady() {
-    try {
-      if (!canvas?.ready || !canvas?.stage) return false;
-      if (!this._app) return false;
-      if (this._app.rendered === false) return false;
-      if (!this._app.element) return false;
-      return true;
-    } catch (_) {
-      return false;
-    }
+    return isApplicationHostReady(this._app);
   }
 
   _stopOrphanedSession({ reason = 'host-context-unavailable' } = {}) {
-    Logger.error?.('BuildingManager.session.orphaned', {
+    return stopHostedOrphanedSession({
       reason,
-      tileId: this._editingTileId || null,
-      delegateActive: !!this._delegate?.isActive,
-      canvasReady: !!canvas?.ready,
-      hasCanvasStage: !!canvas?.stage,
-      appRendered: !!this._app?.rendered,
-      hasAppElement: !!this._app?.element
-    });
-    this._cancelToolWindowMonitor();
-    try {
-      const result = this.stop({ reason });
-      if (result && typeof result.catch === 'function') {
-        result.catch((stopError) => {
-          Logger.error?.('BuildingManager.session.orphaned.stopFailed', {
-            reason,
-            error: String(stopError?.message || stopError)
-          });
-        });
+      loggerPrefix: 'BuildingManager',
+      details: buildHostedSessionContextDetails({
+        app: this._app,
+        delegate: this._delegate,
+        includeAppState: true,
+        tileId: this._editingTileId || null
+      }),
+      cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
+      stopSession: ({ reason: stopReason }) => this.stop({ reason: stopReason }),
+      onFallbackCleanup: () => {
+        this._clearEditingTile();
+        try { toolOptionsController.deactivateTool(FEATURE_ID); } catch (_) {}
       }
-    } catch (stopError) {
-      Logger.error?.('BuildingManager.session.orphaned.stopFailed', {
-        reason,
-        error: String(stopError?.message || stopError)
-      });
-      this._clearEditingTile();
-      try { toolOptionsController.deactivateTool(FEATURE_ID); } catch (_) {}
-    }
+    });
   }
 
   async updateWallPath(options = {}) {
-    const delegate = await this._ensureDelegate();
-    if (!delegate) {
-      Logger.warn?.('BuildingManager.updateWallPath.delegateMissing', { options });
-      return null;
-    }
-    if (typeof delegate.updateWallPath !== 'function') {
-      Logger.warn?.('BuildingManager.updateWallPath.methodMissing', { options });
-      return null;
-    }
-    try {
-      return await delegate.updateWallPath(options);
-    } catch (error) {
-      Logger.warn?.('BuildingManager.updateWallPath.failed', { error: String(error?.message || error), options });
-      throw error;
-    }
+    return this._callRequiredDelegateMethod('updateWallPath', 'updateWallPath', {
+      args: [options],
+      context: { options },
+      missingReturn: null,
+      rethrow: true
+    });
   }
 
   async updateFillTexture(options = {}) {
-    const delegate = await this._ensureDelegate();
-    if (!delegate) {
-      Logger.warn?.('BuildingManager.updateFillTexture.delegateMissing', { options });
-      return null;
-    }
-    if (typeof delegate.updateFillTexture !== 'function') {
-      Logger.warn?.('BuildingManager.updateFillTexture.methodMissing', { options });
-      return null;
-    }
-    try {
-      return await delegate.updateFillTexture(options);
-    } catch (error) {
-      Logger.warn?.('BuildingManager.updateFillTexture.failed', { error: String(error?.message || error), options });
-      throw error;
-    }
+    return this._callRequiredDelegateMethod('updateFillTexture', 'updateFillTexture', {
+      args: [options],
+      context: { options },
+      missingReturn: null,
+      rethrow: true
+    });
   }
 
   switchActiveMode(mode) {
     if (!this._delegate?.isActive) return;
-    try {
-      const result = this._delegate.switchActiveMode?.(mode);
-      // If the delegate returns a promise (async switch), wait before refreshing UI.
-      Promise.resolve(result).finally(() => {
-        this._syncToolOptionsState({ suppressRender: false });
-      });
-      return result;
-    } catch (error) {
-      Logger.warn?.('BuildingManager.switchActiveMode.failed', { mode, error: String(error?.message || error) });
-      return null;
-    }
+    const call = this._callOptionalDelegateMethod('switchActiveMode', 'switchActiveMode', {
+      args: [mode],
+      context: { mode },
+      failureReturn: null
+    });
+    if (!call.ok) return call.result;
+    // If the delegate returns a promise (async switch), wait before refreshing UI.
+    Promise.resolve(call.result).finally(() => {
+      this._syncToolOptionsState({ suppressRender: false });
+    });
+    return call.result;
   }
 
   setActiveTool(toolId) {
     if (!this._delegate?.isActive) return;
-    try {
-      this._delegate.setActiveTool?.(toolId);
-      this._syncToolOptionsState({ suppressRender: false });
-    } catch (error) {
-      Logger.warn?.('BuildingManager.setActiveTool.failed', { toolId, error: String(error?.message || error) });
-    }
+    const call = this._callOptionalDelegateMethod('setActiveTool', 'setActiveTool', {
+      args: [toolId],
+      context: { toolId }
+    });
+    if (call.ok) this._syncToolOptionsState({ suppressRender: false });
   }
 
   setPortalMode(enabled = false) {
     this._portalMode = !!enabled;
-    if (typeof this._delegate?.setPortalMode === 'function') {
-      try {
-        this._delegate.setPortalMode(this._portalMode);
-      } catch (error) {
-        Logger.warn?.('BuildingManager.setPortalMode.failed', { enabled, error: String(error?.message || error) });
-      }
-    }
+    this._callOptionalDelegateMethod('setPortalMode', 'setPortalMode', {
+      args: [this._portalMode],
+      context: { enabled }
+    });
     this._syncToolOptionsState({ suppressRender: false });
     return this._portalMode;
   }
 
   forceExitPortalEditing() {
-    try { this._delegate?.exitPortalEditingAllSessions?.(); }
-    catch (error) { Logger.warn?.('BuildingManager.forceExitPortalEditing.failed', { error: String(error?.message || error) }); }
+    this._callOptionalDelegateMethod('forceExitPortalEditing', 'exitPortalEditingAllSessions');
     this._portalMode = false;
     this._syncToolOptionsState({ suppressRender: false });
   }
 
   stop(...args) {
-    this._cancelToolWindowMonitor();
-    toolOptionsController.deactivateTool(FEATURE_ID);
-    const finalizeEditingTile = () => {
-      try { this._clearEditingTile(); } catch (_) {}
-    };
-    if (!this._delegate) {
-      finalizeEditingTile();
-      return;
-    }
-    try {
-      if (this._delegate?.isActive) this._persistDelegateToolDefaults();
-      const result = this._delegate.stop?.(...args);
-      if (result && typeof result.then === 'function') {
-        return Promise.resolve(result).finally(() => {
-          finalizeEditingTile();
-        });
+    return stopSessionWithFinalize({
+      delegate: this._delegate,
+      beforeStop: () => {
+        this._cancelToolWindowMonitor();
+        this._clearCanvasRebindState();
+        toolOptionsController.deactivateTool(FEATURE_ID);
+      },
+      persistToolDefaults: () => this._persistDelegateToolDefaults(),
+      stopSession: (delegate) => {
+        const stopFn = delegate?.__faNexusOriginalStop || delegate?.stop;
+        return stopFn?.(...args);
+      },
+      finalize: () => {
+        try { this._clearEditingTile(); } catch (_) {}
+      },
+      onStopError: (error) => {
+        Logger.warn?.('BuildingManager.stop.failed', { error: String(error?.message || error) });
       }
-      finalizeEditingTile();
-      return result;
-    } catch (error) {
-      finalizeEditingTile();
-      Logger.warn?.('BuildingManager.stop.failed', { error: String(error?.message || error) });
-      throw error;
-    }
+    });
   }
 
   async commitBuilding(options = {}) {
@@ -426,31 +445,42 @@ export class BuildingManager {
   }
 
   async _ensureDelegate() {
-    if (this._delegate) return this._delegate;
-    ensurePremiumFeaturesRegistered();
+    if (this._delegate) {
+      this._installDelegatePreviewOrderingGuard(this._delegate);
+      return this._delegate;
+    }
     if (this._loading) return this._loading;
-    this._loading = (async () => {
-      const helper = await premiumFeatureBroker.resolve(FEATURE_ID);
-      let instance = null;
-      if (helper?.create) instance = helper.create(this._app);
-      else if (typeof helper === 'function') instance = new helper(this._app);
-      if (!instance) throw new Error('Premium building editor bundle missing BuildingManager implementation');
-      this._delegate = instance;
-      try { instance.attachHost?.(this); }
-      catch (_) {}
-      try {
-        if (typeof instance.setPortalMode === 'function') {
-          instance.setPortalMode(this._portalMode);
+    this._loading = resolvePremiumFeatureDelegate({
+      featureId: FEATURE_ID,
+      app: this._app,
+      host: this,
+      assignDelegate: (instance) => {
+        this._delegate = instance;
+      },
+      missingMessage: 'Premium building editor bundle missing BuildingManager implementation',
+      loadedLogName: 'BuildingEditor.bundle.loaded',
+      loadedHookName: 'fa-nexus-building-editor-loaded',
+      fallbackVersion: '0.0.14',
+      afterAttach: (instance) => {
+        try { this._installCanvasRebindGuard(instance); }
+        catch (error) {
+          Logger.error?.('BuildingManager.canvasRebindGuard.installFailed', {
+            error: String(error?.message || error)
+          });
         }
-      } catch (_) {}
-      try {
-        Logger.info?.('BuildingEditor.bundle.loaded', { version: instance?.version || '0.0.14' });
-        Hooks?.callAll?.('fa-nexus-building-editor-loaded', { version: instance?.version || '0.0.14' });
-      } catch (logError) {
-        Logger.warn?.('BuildingEditor.bundle.loaded.logFailed', String(logError?.message || logError));
+        try { this._installDelegatePreviewOrderingGuard(instance); }
+        catch (error) {
+          Logger.error?.('BuildingManager.previewOrderingGuard.installFailed', {
+            error: String(error?.message || error)
+          });
+        }
+        try {
+          if (typeof instance.setPortalMode === 'function') {
+            instance.setPortalMode(this._portalMode);
+          }
+        } catch (_) {}
       }
-      return instance;
-    })();
+    });
     try {
       return await this._loading;
     } finally {
@@ -458,134 +488,295 @@ export class BuildingManager {
     }
   }
 
-  _scheduleEntitlementProbe() {
-    ensurePremiumFeaturesRegistered();
-    if (this._entitlementProbe) return this._entitlementProbe;
-    const probe = (async () => {
-      try {
-        await premiumFeatureBroker.require(FEATURE_ID, { revalidate: true, reason: 'building-edit:revalidate' });
-      } catch (error) {
-        this._handleEntitlementFailure(error);
-      } finally {
-        if (this._entitlementProbe === probe) this._entitlementProbe = null;
-      }
-    })();
-    this._entitlementProbe = probe;
-    probe.catch(() => {});
-    return probe;
-  }
-
-  _handleEntitlementFailure(error) {
-    try { this.stop?.(); }
-    catch (_) {}
-    this._delegate = null;
-    if (!this._hasPremiumAuth()) {
-      Logger.info?.('BuildingManager.entitlement.skipDisconnect', {
-        code: error?.code || error?.name,
-        message: String(error?.message || error)
-      });
-      return;
+  async _callRequiredDelegateMethod(action, methodName, {
+    args = [],
+    context = {},
+    missingReturn = null,
+    rethrow = false
+  } = {}) {
+    const delegate = await this._ensureDelegate();
+    const details = context && typeof context === 'object' ? context : {};
+    if (!delegate) {
+      Logger.warn?.(`BuildingManager.${action}.delegateMissing`, details);
+      return missingReturn;
     }
-    const message = '🔐 Authentication expired - premium building editing has been disabled. Please reconnect Patreon.';
-    if (this._isAuthFailure(error)) {
-      try { premiumEntitlementsService?.clear?.({ reason: 'building-revalidate-failed' }); }
-      catch (_) {}
-      try { game?.settings?.set?.('fa-nexus', 'patreon_auth_data', null); }
-      catch (_) {}
-      ui?.notifications?.warn?.(message);
-    } else {
-      ui?.notifications?.error?.(`Unable to confirm premium access: ${error?.message || error}`);
+    const method = delegate?.[methodName];
+    if (typeof method !== 'function') {
+      Logger.warn?.(`BuildingManager.${action}.methodMissing`, details);
+      return missingReturn;
     }
-    try { Hooks?.callAll?.('fa-nexus-premium-auth-lost', { featureId: FEATURE_ID, error }); }
-    catch (_) {}
-  }
-
-  _isAuthFailure(error) {
-    if (!error) return false;
-    const code = String(error?.code || error?.name || '').toUpperCase();
-    if (code && (/AUTH/.test(code) || ['STATE_MISSING', 'ENTITLEMENT_REQUIRED', 'HTTP_401', 'HTTP_403', 'SESSION_EXPIRED', 'STATE_INVALID'].includes(code))) {
-      return true;
-    }
-    const message = String(error?.message || '').toLowerCase();
-    return message.includes('auth') || message.includes('state');
-  }
-
-  _hasPremiumAuth() {
     try {
-      const auth = game?.settings?.get?.('fa-nexus', 'patreon_auth_data');
-      return !!(auth && auth.authenticated && auth.state);
-    } catch (_) {
-      return false;
+      return await method.call(delegate, ...(Array.isArray(args) ? args : []));
+    } catch (error) {
+      Logger.warn?.(`BuildingManager.${action}.failed`, {
+        error: stringifyError(error),
+        ...details
+      });
+      if (rethrow) throw error;
+      return missingReturn;
     }
+  }
+
+  _callOptionalDelegateMethod(action, methodName, {
+    args = [],
+    context = {},
+    failureReturn = undefined
+  } = {}) {
+    const delegate = this._delegate;
+    const method = delegate?.[methodName];
+    if (typeof method !== 'function') return { ok: true, result: undefined };
+    try {
+      return {
+        ok: true,
+        result: method.call(delegate, ...(Array.isArray(args) ? args : []))
+      };
+    } catch (error) {
+      Logger.warn?.(`BuildingManager.${action}.failed`, {
+        error: stringifyError(error),
+        ...(context && typeof context === 'object' ? context : {})
+      });
+      return { ok: false, result: failureReturn, error };
+    }
+  }
+
+  _scheduleEntitlementProbe() {
+    return scheduleEntitlementRevalidation(this, {
+      featureId: FEATURE_ID,
+      revalidateReason: 'building-edit:revalidate',
+      onFailure: (error) => this._handleEntitlementFailure(error)
+    });
+  }
+
+  async _handleEntitlementFailure(error) {
+    return handleEntitlementRevalidationFailure({
+      error,
+      featureId: FEATURE_ID,
+      loggerPrefix: 'BuildingManager',
+      clearReason: 'building-revalidate-failed',
+      warningMessage: 'Authentication expired - premium building editing has been disabled. Please reconnect Patreon.',
+      stopSession: () => this.stop?.(),
+      resetState: () => {
+        this._delegate = null;
+      }
+    });
+  }
+
+  _installCanvasRebindGuard(delegate) {
+    if (!delegate || delegate.__faNexusCanvasRebindGuardInstalled) return;
+    const originalStop = typeof delegate.stop === 'function' ? delegate.stop.bind(delegate) : null;
+    if (!originalStop) return;
+    Object.defineProperty(delegate, '__faNexusOriginalStop', {
+      configurable: true,
+      enumerable: false,
+      writable: false,
+      value: originalStop
+    });
+    delegate.stop = (...args) => {
+      if (this._shouldRecoverFromCanvasTeardown(delegate, args)) {
+        return this._handleCanvasTeardownRecovery(delegate);
+      }
+      this._clearCanvasRebindState({ delegate });
+      return originalStop(...args);
+    };
+    Object.defineProperty(delegate, '__faNexusCanvasRebindGuardInstalled', {
+      configurable: true,
+      enumerable: false,
+      writable: false,
+      value: true
+    });
+  }
+
+  _shouldRecoverFromCanvasTeardown(delegate, args = []) {
+    if (!delegate?.isActive) return false;
+    if (Array.isArray(args) && args.length) return false;
+    const existing = this._canvasRebindState;
+    if (existing?.delegate === delegate) return true;
+    return canRecoverHostedSessionFromCanvasTeardown(this._app);
+  }
+
+  _clearCanvasRebindState({ delegate = null } = {}) {
+    const state = this._canvasRebindState;
+    if (!state) return;
+    if (delegate && state.delegate && state.delegate !== delegate) return;
+    this._canvasRebindState = null;
+    if (state.timeoutId != null) {
+      try { clearTimeout(state.timeoutId); } catch (_) {}
+    }
+    if (state.readyHook && Hooks?.off) {
+      try { Hooks.off('canvasReady', state.readyHook); } catch (_) {}
+    }
+  }
+
+  _handleCanvasTeardownRecovery(delegate) {
+    const existing = this._canvasRebindState;
+    if (existing?.delegate === delegate) return existing.promise;
+    this._clearCanvasRebindState({ delegate });
+    this._cancelToolWindowMonitor();
+    const expectedSceneId = String(delegate?._session?.sceneId || canvas?.scene?.id || '').trim();
+    Logger.warn?.('BuildingManager.session.canvasTeardownIntercepted', buildHostedSessionContextDetails({
+      app: this._app,
+      delegate,
+      includeAppState: true,
+      extra: {
+        expectedSceneId: expectedSceneId || null
+      }
+    }));
+    try { delegate._removeInteractionHandlers?.(); } catch (_) {}
+    try { delegate._clearDebugPreview?.(); } catch (_) {}
+    try { delegate._destroyOverlayLayer?.(); } catch (_) {}
+
+    let resolvePromise;
+    const promise = new Promise((resolve) => {
+      resolvePromise = resolve;
+    });
+
+    const finish = (value) => {
+      this._clearCanvasRebindState({ delegate });
+      resolvePromise?.(value);
+      return value;
+    };
+
+    const stopDelegate = async (reason, error = null) => {
+      if (error) {
+        Logger.error?.('BuildingManager.session.canvasTeardownRecoveryFailed', {
+          reason,
+          expectedSceneId: expectedSceneId || null,
+          error: String(error?.message || error)
+        });
+      } else {
+        Logger.warn?.('BuildingManager.session.canvasTeardownRecoveryAborted', {
+          reason,
+          expectedSceneId: expectedSceneId || null
+        });
+      }
+      const stopFn = delegate?.__faNexusOriginalStop || delegate?.stop;
+      try {
+        await Promise.resolve(stopFn?.({ reason }));
+      } catch (stopError) {
+        Logger.error?.('BuildingManager.session.canvasTeardownRecoveryStopFailed', {
+          reason,
+          expectedSceneId: expectedSceneId || null,
+          error: String(stopError?.message || stopError)
+        });
+      }
+      return finish(false);
+    };
+
+    const resume = async () => {
+      if (!delegate?.isActive) {
+        return finish(false);
+      }
+      const resumedSceneId = String(canvas?.scene?.id || '').trim();
+      if (expectedSceneId && resumedSceneId && expectedSceneId !== resumedSceneId) {
+        return stopDelegate('scene-changed-during-canvas-rebind');
+      }
+      if (!this._isEditorHostReady()) {
+        return stopDelegate('canvas-rebind-host-not-ready');
+      }
+      try {
+        delegate._installInteractionHandlers?.();
+        delegate._ensureOverlayLayer?.();
+        delegate._updateWallTexturePreview?.();
+        delegate._updateFillTexturePreview?.();
+        delegate._updateShadowPreview?.();
+        delegate._updateDoorFramePreview?.();
+        delegate._updateWindowPreview?.();
+        if (delegate._shapeEditMode) delegate._refreshShapeEditState?.({ immediate: true });
+        if (delegate._gapEditMode) delegate._refreshGapOverlay?.();
+        if (delegate._pointEditMode) {
+          delegate._refreshPointHandles?.();
+          delegate._updateEditOverlayVisibility?.();
+        }
+        this._syncToolOptionsState({
+          suppressRender: false,
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+        this._beginToolWindowMonitor(delegate);
+        Logger.warn?.('BuildingManager.session.canvasTeardownRecovered', buildHostedSessionContextDetails({
+          app: this._app,
+          delegate,
+          extra: {
+            expectedSceneId: expectedSceneId || null,
+            resumedSceneId: resumedSceneId || null
+          }
+        }));
+        return finish(true);
+      } catch (error) {
+        return stopDelegate('canvas-rebind-resume-failed', error);
+      }
+    };
+
+    const readyHook = () => {
+      Promise.resolve(resume()).catch((error) => {
+        stopDelegate('canvas-rebind-ready-hook-threw', error).catch?.(() => {});
+      });
+    };
+
+    const timeoutId = setTimeout(() => {
+      Promise.resolve(stopDelegate('canvas-rebind-timeout')).catch(() => {});
+    }, CANVAS_REBIND_TIMEOUT_MS);
+
+    this._canvasRebindState = {
+      delegate,
+      expectedSceneId,
+      promise,
+      readyHook,
+      timeoutId
+    };
+    try { Hooks?.on?.('canvasReady', readyHook); } catch (_) {}
+    return promise;
   }
 
   _beginToolWindowMonitor(delegate) {
     this._cancelToolWindowMonitor();
     if (!delegate) return;
-    const token = { cancelled: false, handle: null, usingTimeout: false, lastOptionsSync: 0 };
-    const schedule = (callback) => {
-      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
-        token.usingTimeout = false;
-        token.handle = window.requestAnimationFrame(callback);
-      } else {
-        token.usingTimeout = true;
-        token.handle = setTimeout(callback, 200);
-      }
-    };
-    const maybeSyncToolOptions = () => {
-      const now = Date.now();
-      if (token.lastOptionsSync && now - token.lastOptionsSync < 200) return;
-      token.lastOptionsSync = now;
-      this._syncToolOptionsState({
-        suppressRender: true,
-        suppressSubtoolPersistence: true,
-        suppressToolDefaultsPersistence: true
-      });
-    };
-    const loop = () => {
-      if (token.cancelled) return;
-      if (!delegate?.isActive) {
-        this._clearEditingTile();
-        this._cancelToolWindowMonitor();
-        toolOptionsController.deactivateTool(FEATURE_ID);
-        return;
-      }
-      if (!this._isEditorHostReady()) {
-        if (!token.hostFailureHandled) {
-          token.hostFailureHandled = true;
-          this._stopOrphanedSession({ reason: 'host-context-unavailable' });
-        }
-        return;
-      }
-      maybeSyncToolOptions();
-      schedule(loop);
-    };
-    schedule(loop);
-    this._toolMonitor = token;
+    this._toolMonitor = startHostedToolWindowMonitor({
+      delegate,
+      toolId: FEATURE_ID,
+      isHostReady: () => this._isEditorHostReady(),
+      clearEditingTile: () => this._clearEditingTile(),
+      cancelMonitor: () => this._cancelToolWindowMonitor(),
+      deactivateBeforeCancel: false,
+      stopOrphanedSession: (details) => this._stopOrphanedSession(details),
+      hostFailureGraceMs: HOST_CONTEXT_GRACE_MS,
+      onHostFirstUnavailable: ({ durationMs }) => {
+        Logger.warn?.('BuildingManager.session.hostTransientlyUnavailable', buildHostedSessionContextDetails({
+          app: this._app,
+          delegate,
+          includeAppState: true,
+          tileId: this._editingTileId || null,
+          extra: {
+            durationMs
+          }
+        }));
+      },
+      assignMonitorToken: (nextToken) => {
+        this._toolMonitor = nextToken;
+      },
+      syncToolOptions: () => {
+        this._syncToolOptionsState({
+          suppressRender: true,
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+      },
+      monitorSyncLoggerPrefix: 'BuildingManager'
+    });
   }
 
   _cancelToolWindowMonitor() {
-    const token = this._toolMonitor;
-    this._toolMonitor = null;
-    if (!token) return;
-    token.cancelled = true;
-    if (token.handle != null) {
-      if (token.usingTimeout) clearTimeout(token.handle);
-      else cancelAnimationFrame(token.handle);
-    }
+    this._toolMonitor = cancelToolWindowMonitor(this._toolMonitor);
   }
 
   _markEditingTile(targetTile) {
     try {
-      const tileId = resolveTileId(targetTile);
+      const { tileId, tile } = beginEditingTileTracking(this, {
+        target: targetTile,
+        sharedSetKey: EDITING_TILE_SET_KEY,
+        onReplace: () => this._clearEditingTile()
+      });
       if (!tileId) return;
-      if (this._editingTileId && this._editingTileId !== tileId) {
-        this._clearEditingTile();
-      }
-      this._editingTileId = tileId;
-      const set = getEditingTileSet();
-      if (set) set.add(tileId);
-      const tile = resolvePlaceableTile(targetTile, tileId);
       if (tile) {
         applyBuildingTile(tile);
         applyDoorFrameTile(tile);
@@ -594,30 +785,25 @@ export class BuildingManager {
   }
 
   _clearEditingTile() {
-    let clearedTileId = null;
     const refreshJobs = [];
-    try {
-      const tileId = this._editingTileId;
-      if (!tileId) return null;
-      clearedTileId = tileId;
-      this._editingTileId = null;
-      const set = getEditingTileSet();
-      if (set) set.delete(tileId);
-      const tile = resolvePlaceableTile(null, tileId);
-      if (tile) {
+    const { tileId, refreshPromise } = endEditingTileWithRefresh(this, {
+      sharedSetKey: EDITING_TILE_SET_KEY,
+      loggerPrefix: 'BuildingManager',
+      collectRefreshJobs: ({ tile }) => {
         refreshJobs.push(Promise.resolve(applyBuildingTile(tile)));
         refreshJobs.push(Promise.resolve(applyDoorFrameTile(tile)));
+        return refreshJobs;
       }
-    } catch (_) {}
-    this._refreshExitedEditTile(clearedTileId, refreshJobs.length ? Promise.allSettled(refreshJobs) : null);
-    return clearedTileId;
+    });
+    this._refreshExitedEditTile(tileId, refreshPromise || (refreshJobs.length ? Promise.allSettled(refreshJobs) : null));
+    return tileId;
   }
 
   _refreshExitedEditTile(tileId = null, waitFor = null) {
     if (!tileId) return;
     const refresh = () => {
       try {
-        const tile = resolvePlaceableTile(null, tileId);
+        const tile = resolveTilePlaceable(null, tileId);
         if (!tile || tile.destroyed) return;
         try {
           if (tile.frame) {
@@ -665,7 +851,9 @@ export class BuildingManager {
         if (descriptor.state && typeof descriptor.state === 'object') delegateState = descriptor.state;
         if (descriptor.handlers && typeof descriptor.handlers === 'object') handlers = descriptor.handlers;
       }
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn?.('BuildingManager.toolOptionsState.delegateFailed', { error: stringifyError(error) });
+    }
     const mergedHints = [...baseHints];
     if (Array.isArray(delegateState?.hints)) {
       for (const hint of delegateState.hints) {
@@ -710,6 +898,469 @@ export class BuildingManager {
       }
     };
     return { state, handlers };
+  }
+
+  _notifyPreviewLayerChangeIfNeeded(descriptor = null, { force = false, source = 'building-preview' } = {}) {
+    const customToggles = Array.isArray(descriptor?.legacyState?.customToggles)
+      ? descriptor.legacyState.customToggles
+        .filter((toggle) => String(toggle?.group || '') === 'placement')
+        .map((toggle) => ({ id: String(toggle?.id || ''), enabled: !!toggle?.enabled }))
+      : [];
+    const fillElevation = Number(descriptor?.legacyState?.fillElevation?.value ?? NaN);
+    const previewState = {
+      active: !!this._delegate?.isActive,
+      elevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : null,
+      fillElevation: Number.isFinite(fillElevation) ? fillElevation : null,
+      sort: Number.isFinite(this._delegate?._previewSort) ? Number(this._delegate._previewSort) : null,
+      portalMode: !!this._portalMode,
+      placementToggles: customToggles
+    };
+    const signature = JSON.stringify(previewState);
+    if (!force && signature === this._lastPreviewLayerSignature) return;
+    this._lastPreviewLayerSignature = signature;
+    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source, previewState }); } catch (_) {}
+  }
+
+  _getLayerManagerPreviewPlacementStore() {
+    const delegate = this._delegate;
+    if (!delegate) return null;
+    if (!delegate.__faNexusLayerManagerPreviewPlacement || typeof delegate.__faNexusLayerManagerPreviewPlacement !== 'object') {
+      try {
+        Object.defineProperty(delegate, '__faNexusLayerManagerPreviewPlacement', {
+          configurable: true,
+          enumerable: false,
+          writable: true,
+          value: {}
+        });
+      } catch (_) {
+        delegate.__faNexusLayerManagerPreviewPlacement = {};
+      }
+    }
+    return delegate.__faNexusLayerManagerPreviewPlacement;
+  }
+
+  _rememberLayerManagerPreviewPlacement({
+    previewKind = 'building-preview',
+    elevation = undefined,
+    sort = undefined,
+    previewSort = undefined,
+    placementLevelId = undefined,
+    anchorTileId = undefined,
+    sortBefore = undefined
+  } = {}) {
+    const delegate = this._delegate;
+    const store = this._getLayerManagerPreviewPlacementStore();
+    if (!delegate || !store) return null;
+    const targetIsFill = previewKind === 'building-fill-preview';
+    const key = targetIsFill ? 'fill' : 'wall';
+    const currentElevation = targetIsFill
+      ? Number(delegate._fillElevation ?? NaN)
+      : Number(delegate._previewElevation ?? NaN);
+    const currentSort = targetIsFill
+      ? Number(delegate._fillPreviewSort ?? NaN)
+      : Number(delegate._previewSort ?? NaN);
+    const currentPreviewSort = targetIsFill
+      ? Number(delegate._fillPreviewRenderSort ?? NaN)
+      : Number(delegate._previewRenderSort ?? NaN);
+    const nextElevation = Number.isFinite(Number(elevation))
+      ? Number(elevation)
+      : currentElevation;
+    const nextSort = Number.isFinite(Number(sort))
+      ? Number(sort)
+      : currentSort;
+    const nextPreviewSort = Number.isFinite(Number(previewSort))
+      ? Number(previewSort)
+      : (Number.isFinite(currentPreviewSort) ? currentPreviewSort : nextSort);
+    if (!Number.isFinite(nextElevation) || !Number.isFinite(nextSort)) return null;
+    store[key] = {
+      previewKind: targetIsFill ? 'building-fill-preview' : 'building-preview',
+      elevation: nextElevation,
+      sort: nextSort,
+      previewSort: Number.isFinite(nextPreviewSort) ? nextPreviewSort : nextSort,
+      placementLevelId: placementLevelId !== undefined
+        ? (String(placementLevelId || '').trim() || null)
+        : (String(delegate?._session?.placementLevelId || '').trim() || null),
+      anchorTileId: anchorTileId !== undefined
+        ? (String(anchorTileId || '').trim() || null)
+        : (String(delegate?._placementSortAnchorTileId || '').trim() || null),
+      sortBefore: sortBefore !== undefined
+        ? sortBefore === true
+        : delegate?._placementSortBeforeAnchor === true
+    };
+    return store[key];
+  }
+
+  _reassertLayerManagerPreviewPlacement(previewKind = 'building-preview', { source = 'building-preview-ordering-guard' } = {}) {
+    const delegate = this._delegate;
+    const store = delegate?.__faNexusLayerManagerPreviewPlacement || null;
+    if (!delegate || !store) return false;
+    const targetIsFill = previewKind === 'building-fill-preview';
+    const key = targetIsFill ? 'fill' : 'wall';
+    const placement = store[key] || null;
+    if (!placement) return false;
+    const currentElevation = targetIsFill
+      ? Number(delegate._fillElevation ?? NaN)
+      : Number(delegate._previewElevation ?? NaN);
+    const storedElevation = Number(placement.elevation);
+    if (!Number.isFinite(currentElevation) || !Number.isFinite(storedElevation) || Math.abs(currentElevation - storedElevation) > 0.0005) {
+      delete store[key];
+      Logger.debug?.('BuildingManager.previewOrderingGuard.cleared', {
+        previewKind: placement.previewKind || previewKind,
+        source,
+        currentElevation: Number.isFinite(currentElevation) ? currentElevation : null,
+        storedElevation: Number.isFinite(storedElevation) ? storedElevation : null
+      });
+      return false;
+    }
+    const nextSort = Number(placement.sort);
+    const nextPreviewSort = Number(placement.previewSort);
+    if (!Number.isFinite(nextSort)) return false;
+    try {
+      if (targetIsFill) {
+        delegate._fillPreviewSort = nextSort;
+        delegate._fillPreviewRenderSort = Number.isFinite(nextPreviewSort) ? nextPreviewSort : nextSort;
+      } else {
+        delegate._previewSort = nextSort;
+        delegate._previewRenderSort = Number.isFinite(nextPreviewSort) ? nextPreviewSort : nextSort;
+      }
+    } catch (_) {}
+    this._applyCurrentPreviewLayerOrdering({
+      fillElevation: targetIsFill ? storedElevation : null,
+      fillSort: targetIsFill ? nextSort : null,
+      ensurePreviewLayer: false,
+      ensureFillLayer: false
+    });
+    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source });
+    return true;
+  }
+
+  _installDelegatePreviewOrderingGuard(delegate) {
+    if (!delegate || delegate.__faNexusPreviewOrderingGuardInstalled) return;
+    const originalPreviewOrdering = typeof delegate._syncPreviewOrdering === 'function'
+      ? delegate._syncPreviewOrdering
+      : null;
+    const originalFillOrdering = typeof delegate._syncFillPreviewLayerOrdering === 'function'
+      ? delegate._syncFillPreviewLayerOrdering
+      : null;
+    if (!originalPreviewOrdering && !originalFillOrdering) return;
+
+    if (originalPreviewOrdering) {
+      const manager = this;
+      delegate._syncPreviewOrdering = function faNexusGuardedSyncPreviewOrdering(...args) {
+        const result = originalPreviewOrdering.apply(this, args);
+        manager._reassertLayerManagerPreviewPlacement('building-preview', {
+          source: 'building-preview-ordering-guard'
+        });
+        return result;
+      };
+    }
+
+    if (originalFillOrdering) {
+      const manager = this;
+      delegate._syncFillPreviewLayerOrdering = function faNexusGuardedSyncFillPreviewLayerOrdering(...args) {
+        const result = originalFillOrdering.apply(this, args);
+        manager._reassertLayerManagerPreviewPlacement('building-fill-preview', {
+          source: 'building-fill-preview-ordering-guard'
+        });
+        return result;
+      };
+    }
+
+    try {
+      Object.defineProperty(delegate, '__faNexusPreviewOrderingGuardInstalled', {
+        configurable: true,
+        enumerable: false,
+        writable: false,
+        value: true
+      });
+    } catch (_) {
+      delegate.__faNexusPreviewOrderingGuardInstalled = true;
+    }
+  }
+
+  _applyPendingLaunchPlacementAnchorTileId() {
+    if (this._pendingLaunchPlacementAnchorTileId === undefined) return null;
+    const anchorTileId = this._pendingLaunchPlacementAnchorTileId || null;
+    this._pendingLaunchPlacementAnchorTileId = undefined;
+    if (!this._delegate) return anchorTileId;
+    try { this._delegate._placementSortAnchorTileId = anchorTileId; } catch (_) {}
+    try { this._delegate._placementSortBeforeAnchor = false; } catch (_) {}
+    const session = this._delegate._session && typeof this._delegate._session === 'object'
+      ? this._delegate._session
+      : (this._delegate._session = {});
+    session.placementAnchorTileId = anchorTileId;
+    Logger.debug?.('BuildingManager.sortAnchor.launchApply', { anchorTileId });
+    return anchorTileId;
+  }
+
+  _syncDelegatePreviewRenderSort() {
+    const delegate = this._delegate;
+    if (!delegate) return null;
+    const currentPlacementSort = Number(delegate?._previewSort ?? 0);
+    if (this._editingTileId) {
+      const resolvedSort = Number.isFinite(currentPlacementSort) ? currentPlacementSort : 0;
+      try { delegate._previewRenderSort = resolvedSort; } catch (_) {}
+      return resolvedSort;
+    }
+    const elevation = Number(delegate?._previewElevation ?? delegate?._fillElevation ?? 0);
+    const resolved = resolvePlacementSortAtElevation(Number.isFinite(elevation) ? elevation : 0, {
+      anchorTileId: delegate?._placementSortAnchorTileId,
+      sortBefore: delegate?._placementSortBeforeAnchor === true,
+      scene: canvas?.scene,
+      count: 1
+    });
+    const placementSort = Number(resolved?.sort ?? currentPlacementSort);
+    if (Number.isFinite(placementSort) && Number.isFinite(currentPlacementSort) && Math.abs(placementSort - currentPlacementSort) > 0.000001) {
+      Logger.debug?.('BuildingManager.previewSort.launchResolved', {
+        previousSort: currentPlacementSort,
+        resolvedSort: placementSort,
+        elevation: Number.isFinite(elevation) ? elevation : 0,
+        anchorTileId: delegate?._placementSortAnchorTileId || null
+      });
+      try { delegate._previewSort = placementSort; } catch (_) {}
+    }
+    const renderSort = Number(resolved?.previewSort ?? placementSort);
+    const nextRenderSort = Number.isFinite(renderSort)
+      ? renderSort
+      : (Number.isFinite(placementSort) ? placementSort : 0);
+    try { delegate._previewRenderSort = nextRenderSort; } catch (_) {}
+    this._rememberLayerManagerPreviewPlacement({
+      previewKind: 'building-preview',
+      elevation,
+      sort: placementSort,
+      previewSort: nextRenderSort,
+      placementLevelId: delegate?._session?.placementLevelId,
+      anchorTileId: delegate?._placementSortAnchorTileId,
+      sortBefore: delegate?._placementSortBeforeAnchor === true
+    });
+    if (Number.isFinite(Number(delegate?._fillPreviewSort)) && !Number.isFinite(Number(delegate?._fillPreviewRenderSort))) {
+      try { delegate._fillPreviewRenderSort = Number(delegate._fillPreviewSort); } catch (_) {}
+    }
+    return nextRenderSort;
+  }
+
+  _applyCurrentPreviewLayerOrdering({
+    fillElevation = null,
+    fillSort = null,
+    ensurePreviewLayer = true,
+    ensureFillLayer = true
+  } = {}) {
+    const delegate = this._delegate;
+    if (!delegate) return;
+    const applyLayerOrdering = (layer, elevation, sort, renderSortOverride = undefined) => {
+      if (!layer || layer.destroyed) return;
+      const resolvedSort = Number.isFinite(Number(sort)) ? Number(sort) : 0;
+      const resolvedRenderSort = Number.isFinite(Number(renderSortOverride)) ? Number(renderSortOverride) : resolvedSort;
+      const resolvedElevation = Number.isFinite(Number(elevation)) ? Number(elevation) : 0;
+      const placementLevelId = String(delegate?._session?.placementLevelId || getDefaultTilePlacementLevelId() || '').trim() || null;
+      const renderOrder = resolveTileRenderOrder({ elevation: resolvedElevation, sort: resolvedRenderSort }, {
+        elevation: resolvedElevation,
+        sort: resolvedRenderSort,
+        placementLevelId,
+        allowCurrentLevelFallback: true
+      });
+      const renderSort = Number.isFinite(Number(renderOrder?.sort)) ? Number(renderOrder.sort) : resolvedRenderSort;
+      const renderElevation = Number.isFinite(Number(renderOrder?.elevation)) ? Number(renderOrder.elevation) : getTileRenderElevation(resolvedElevation);
+      const zIndex = Number.isFinite(Number(renderOrder?.zIndex)) ? Number(renderOrder.zIndex) : (getGroundBandRenderSort(resolvedElevation, resolvedRenderSort) !== null ? resolvedRenderSort : resolvedRenderSort);
+      const sortLayer = Number.isFinite(Number(renderOrder?.sortLayer)) ? Number(renderOrder.sortLayer) : layer.sortLayer;
+      try { delegate?._applyTileSortLayer?.(layer); } catch (_) {}
+      try { layer.faNexusElevationDoc = resolvedElevation; } catch (_) {}
+      try { layer.faNexusElevation = renderElevation; } catch (_) {}
+      try { layer.faNexusPlacementLevelId = renderOrder?.placementLevelId || placementLevelId || null; } catch (_) {}
+      try { layer.faNexusBandKind = renderOrder?.kind || 'normal'; } catch (_) {}
+      try { layer.elevation = renderElevation; } catch (_) {}
+      try { layer.faNexusSort = renderSort; } catch (_) {}
+      try { layer.faNexusPlacementSort = resolvedSort; } catch (_) {}
+      try { layer.faNexusPreviewSort = resolvedRenderSort; } catch (_) {}
+      try { layer.sort = renderSort; } catch (_) {}
+      try { layer.sortLayer = sortLayer; } catch (_) {}
+      try { layer.zIndex = zIndex; } catch (_) {}
+      const parent = layer.parent;
+      if (!parent) return;
+      try {
+        if ('sortDirty' in parent) parent.sortDirty = true;
+        parent.sortChildren?.();
+      } catch (_) {}
+    };
+
+    const previewRenderSort = Number.isFinite(Number(delegate._previewRenderSort))
+      ? Number(delegate._previewRenderSort)
+      : this._syncDelegatePreviewRenderSort();
+    if ((!delegate._previewLayer || delegate._previewLayer.destroyed) && ensurePreviewLayer) {
+      try { delegate._ensurePreviewLayer?.(delegate._previewElevation); } catch (_) {}
+    }
+    if (delegate._previewLayer && !delegate._previewLayer.destroyed) {
+      applyLayerOrdering(delegate._previewLayer, delegate._previewElevation, delegate._previewSort, previewRenderSort);
+    }
+    const storedFillSort = delegate._fillPreviewSort === null || delegate._fillPreviewSort === undefined
+      ? NaN
+      : Number(delegate._fillPreviewSort);
+    const resolvedFillElevation = Number.isFinite(Number(fillElevation))
+      ? Number(fillElevation)
+      : Number(delegate._fillElevation ?? NaN);
+    const resolvedFillSort = Number.isFinite(Number(fillSort))
+      ? Number(fillSort)
+      : (Number.isFinite(storedFillSort)
+        ? storedFillSort
+        : Number(delegate._previewSort ?? NaN));
+    const resolvedFillRenderSort = Number.isFinite(Number(delegate._fillPreviewRenderSort))
+      ? Number(delegate._fillPreviewRenderSort)
+      : resolvedFillSort;
+    if ((!delegate._fillPreviewLayer || delegate._fillPreviewLayer.destroyed) && ensureFillLayer) {
+      try { delegate._ensureFillPreviewLayer?.(resolvedFillElevation); } catch (_) {}
+    }
+    if (delegate._fillPreviewLayer && !delegate._fillPreviewLayer.destroyed) {
+      applyLayerOrdering(delegate._fillPreviewLayer, resolvedFillElevation, resolvedFillSort, resolvedFillRenderSort);
+    }
+  }
+
+  applyLayerManagerPreviewPlacement({
+    elevation = null,
+    sort = undefined,
+    previewSort = undefined,
+    previewKind = 'building-preview',
+    placementLevelId = undefined,
+    anchorTileId = undefined,
+    sortBefore = undefined
+  } = {}) {
+    if (!this._delegate?.isActive) return false;
+    const { state, handlers } = this._buildToolOptionsState();
+    let changed = false;
+    const targetIsFill = previewKind === 'building-fill-preview';
+
+    if (placementLevelId !== undefined) {
+      const nextPlacementLevelId = String(placementLevelId || '').trim() || null;
+      const session = this._delegate._session && typeof this._delegate._session === 'object'
+        ? this._delegate._session
+        : (this._delegate._session = {});
+      const currentPlacementLevelId = String(session.placementLevelId || '').trim() || null;
+      if (currentPlacementLevelId !== nextPlacementLevelId) {
+        session.placementLevelId = nextPlacementLevelId;
+        session.placementLevels = nextPlacementLevelId ? [nextPlacementLevelId] : [];
+        changed = true;
+      }
+      for (const layer of [this._delegate._previewLayer, this._delegate._fillPreviewLayer]) {
+        if (!layer || layer.destroyed) continue;
+        try { layer.faNexusPlacementLevelId = nextPlacementLevelId; } catch (_) {}
+      }
+    }
+
+    if (anchorTileId !== undefined) {
+      const nextAnchorTileId = String(anchorTileId || '').trim() || null;
+      if (String(this._delegate._placementSortAnchorTileId || '').trim() !== String(nextAnchorTileId || '').trim()) {
+        this._delegate._placementSortAnchorTileId = nextAnchorTileId;
+        const session = this._delegate._session && typeof this._delegate._session === 'object'
+          ? this._delegate._session
+          : (this._delegate._session = {});
+        session.placementAnchorTileId = nextAnchorTileId;
+        changed = true;
+      }
+    }
+
+    if (sortBefore !== undefined) {
+      const nextSortBefore = sortBefore === true;
+      if (this._delegate?._placementSortBeforeAnchor !== nextSortBefore) {
+        try { this._delegate._placementSortBeforeAnchor = nextSortBefore; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (Number.isFinite(Number(elevation))) {
+      const nextElevation = Number(elevation);
+      const currentElevation = targetIsFill
+        ? Number(state?.fillElevation?.value ?? NaN)
+        : Number(this._delegate?._previewElevation ?? NaN);
+      if (!Number.isFinite(currentElevation) || currentElevation !== nextElevation) {
+        const handlerId = targetIsFill ? 'setFillElevation' : 'setElevation';
+        if (typeof handlers?.[handlerId] === 'function') handlers[handlerId](nextElevation, true);
+        else if (!targetIsFill) this._delegate._previewElevation = nextElevation;
+        changed = true;
+      }
+    }
+
+    if (sort !== undefined && Number.isFinite(Number(sort))) {
+      const nextSort = Number(sort);
+      const previousSort = targetIsFill
+        ? Number(this._delegate?._fillPreviewSort ?? NaN)
+        : Number(this._delegate?._previewSort ?? NaN);
+      if (previousSort !== nextSort) {
+        try {
+          if (targetIsFill) this._delegate._fillPreviewSort = nextSort;
+          else this._delegate._previewSort = nextSort;
+        } catch (_) {}
+        changed = true;
+      }
+      const nextPreviewSort = previewSort !== undefined && Number.isFinite(Number(previewSort))
+        ? Number(previewSort)
+        : nextSort;
+      const previousPreviewSort = targetIsFill
+        ? Number(this._delegate?._fillPreviewRenderSort ?? NaN)
+        : Number(this._delegate?._previewRenderSort ?? NaN);
+      if (previousPreviewSort !== nextPreviewSort) {
+        try {
+          if (targetIsFill) this._delegate._fillPreviewRenderSort = nextPreviewSort;
+          else this._delegate._previewRenderSort = nextPreviewSort;
+        } catch (_) {}
+        changed = true;
+      }
+    }
+
+    const requestedPlacementUpdate = (
+      placementLevelId !== undefined
+      || anchorTileId !== undefined
+      || sortBefore !== undefined
+      || Number.isFinite(Number(elevation))
+      || sort !== undefined
+      || previewSort !== undefined
+    );
+    if (!changed && !requestedPlacementUpdate) return false;
+    const resolvedFillElevation = previewKind === 'building-fill-preview' && Number.isFinite(Number(elevation))
+      ? Number(elevation)
+      : Number(state?.fillElevation?.value ?? this._delegate?._fillElevation ?? NaN);
+    const resolvedFillSort = previewKind === 'building-fill-preview' && Number.isFinite(Number(sort))
+      ? Number(this._delegate?._fillPreviewSort ?? sort)
+      : Number(this._delegate?._fillPreviewSort ?? NaN);
+    this._rememberLayerManagerPreviewPlacement({
+      previewKind,
+      elevation: targetIsFill
+        ? resolvedFillElevation
+        : Number(this._delegate?._previewElevation ?? elevation ?? NaN),
+      sort: targetIsFill
+        ? resolvedFillSort
+        : Number(this._delegate?._previewSort ?? sort ?? NaN),
+      previewSort: targetIsFill
+        ? Number(this._delegate?._fillPreviewRenderSort ?? previewSort ?? NaN)
+        : Number(this._delegate?._previewRenderSort ?? previewSort ?? NaN),
+      placementLevelId,
+      anchorTileId,
+      sortBefore
+    });
+    this._applyCurrentPreviewLayerOrdering({ fillElevation: resolvedFillElevation, fillSort: resolvedFillSort });
+    try {
+      if (this._delegate?._previewLayer) this._delegate._previewLayer.faNexusPreviewActive = !targetIsFill;
+      if (this._delegate?._fillPreviewLayer) this._delegate._fillPreviewLayer.faNexusPreviewActive = targetIsFill;
+    } catch (_) {}
+    try { this._delegate?._updateWallTexturePreview?.(); } catch (_) {}
+    try { this._delegate?._updateFillTexturePreview?.(); } catch (_) {}
+    try { this._delegate?._updateDoorFramePreview?.(); } catch (_) {}
+    try { this._delegate?._updateWindowPreview?.(); } catch (_) {}
+    this._applyCurrentPreviewLayerOrdering({
+      fillElevation: resolvedFillElevation,
+      fillSort: resolvedFillSort,
+      ensurePreviewLayer: false,
+      ensureFillLayer: false
+    });
+    try {
+      if (this._delegate?._previewLayer) this._delegate._previewLayer.faNexusPreviewActive = !targetIsFill;
+      if (this._delegate?._fillPreviewLayer) this._delegate._fillPreviewLayer.faNexusPreviewActive = targetIsFill;
+    } catch (_) {}
+    this._syncToolOptionsState({
+      suppressRender: false,
+      suppressSubtoolPersistence: true,
+      suppressToolDefaultsPersistence: true
+    });
+    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source: 'building-preview-layer-manager' });
+    return true;
   }
 
   _buildToolOptionsDescriptor() {
@@ -1266,31 +1917,39 @@ export class BuildingManager {
     suppressSubtoolPersistence = false,
     suppressToolDefaultsPersistence = false
   } = {}) {
-    try {
-      this._ensureMeasurementsEnabled();
-      const descriptor = this._buildToolOptionsDescriptor();
-      toolOptionsController.setToolOptions(FEATURE_ID, {
-        ...descriptor,
-        suppressRender
-      });
-      this._persistSubtoolFromState(descriptor.legacyState, { suppress: suppressSubtoolPersistence });
-      if (!suppressToolDefaultsPersistence) this._scheduleToolDefaultsPersist();
-      // Notify callback listeners of state change
-      if (typeof this._onToolOptionsChange === 'function') {
+    const descriptor = this._buildToolOptionsDescriptor();
+    syncHostedToolOptions({
+      toolId: FEATURE_ID,
+      descriptor,
+      suppressRender,
+      legacyState: descriptor.legacyState,
+      persistSubtoolFromState: (state) => this._persistSubtoolFromState(state),
+      suppressSubtoolPersistence,
+      scheduleToolDefaultsPersist: () => this._scheduleToolDefaultsPersist(),
+      suppressToolDefaultsPersistence,
+      beforeSync: () => this._ensureMeasurementsEnabled(),
+      afterSync: ({ legacyState, handlers }) => {
+        if (typeof this._onToolOptionsChange !== 'function') return;
         try {
-          this._onToolOptionsChange(descriptor.legacyState, descriptor.handlers);
+          this._onToolOptionsChange(legacyState, handlers);
         } catch (cbError) {
           Logger.warn?.('BuildingManager.toolOptionsChangeCallback.failed', { error: String(cbError?.message || cbError) });
         }
-      }
-    } catch (_) {}
+      },
+      loggerPrefix: 'BuildingManager'
+    });
+    this._notifyPreviewLayerChangeIfNeeded(descriptor, { source: 'building-preview' });
   }
 
   _persistDelegateToolDefaults() {
     const delegate = this._delegate;
     if (!delegate) return;
     if (typeof delegate._persistToolDefaults !== 'function') return;
-    try { delegate._persistToolDefaults(); } catch (_) {}
+    try {
+      delegate._persistToolDefaults();
+    } catch (error) {
+      Logger.warn?.('BuildingManager.delegateToolDefaults.persistFailed', { error: stringifyError(error) });
+    }
   }
 
   _scheduleToolDefaultsPersist() {

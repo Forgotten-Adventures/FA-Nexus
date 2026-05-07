@@ -329,12 +329,38 @@ export class FolderFilterController {
       return;
     }
 
-    const window = this._ensureFilterWindow();
-    if (!window) return;
-    window.render(true);
-    this.syncWindowPosition();
+    const filterWindow = this._ensureFilterWindow();
+    if (!filterWindow) return;
+    if (typeof this.app?.renderChild !== 'function') {
+      Logger.error('FolderFilter.renderChild.unavailable', {
+        appId: this.app?.id ?? null,
+        windowId: filterWindow.id ?? null
+      });
+      return;
+    }
 
-    const panel = window.getPanelElement();
+    const hydrateRenderedWindow = () => {
+      this.syncWindowPosition();
+      const panel = filterWindow.getPanelElement();
+      const toggle = this.app.element?.querySelector('.fa-nexus-folder-toggle') || null;
+      if (toggle) this._folderFilter.attach({ panel, toggleButton: toggle });
+      this._folderFilter?.setAvailable(supports);
+      this._applyActiveTabData();
+      try { filterWindow.requestFitToContent?.(); } catch (_) {}
+    };
+
+    Promise.resolve(this.app.renderChild(filterWindow)).then(() => {
+      hydrateRenderedWindow();
+    }).catch((error) => {
+      Logger.error('FolderFilter.renderChild.failed', {
+        error: String(error?.message || error),
+        appId: this.app?.id ?? null,
+        windowId: filterWindow.id ?? null
+      });
+    });
+
+    this.syncWindowPosition();
+    const panel = filterWindow.getPanelElement();
     const toggle = this.app.element?.querySelector('.fa-nexus-folder-toggle') || null;
     if (toggle) this._folderFilter.attach({ panel, toggleButton: toggle });
     this._applyActiveTabData();

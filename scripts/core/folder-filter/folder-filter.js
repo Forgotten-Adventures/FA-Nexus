@@ -6,6 +6,11 @@ import {
   mergeFolderSelectionExcludes
 } from '../../content/content-sources/content-sources-utils.js';
 import { ensureFolderTreeIndex } from '../../content/folder-tree-index.js';
+import { normalizeFolderPath as normalizeSharedFolderPath } from '../../storage/path-utils.js';
+
+/**
+ * @typedef {import('../fa-nexus-types.js').FaNexusFolderSelection} FaNexusFolderSelection
+ */
 
 const ROOT_KEY = '__ROOT__';
 const DEFAULT_ALL_LABEL = 'All Items';
@@ -33,7 +38,8 @@ export class FolderFilter {
     this._allNodeEl = null;
     this._unassignedNodeEl = null;
     this._treeVersion = null;
-    this._selection = { type: 'all' };
+    /** @type {FaNexusFolderSelection} */
+    this._selection = { type: 'all', includePaths: [], includePathLowers: [] };
     this._selectionKey = 'all';
     this._expanded = new Set([ROOT_KEY]);
     this._includeSelection = new Set();
@@ -434,13 +440,7 @@ export class FolderFilter {
 
   _normalizePath(value) {
     if (!value && value !== '') return '';
-    const raw = String(value || '');
-    const normalized = raw
-      .replace(/\\/g, '/')
-      .replace(/\/+/g, '/')
-      .replace(/^\/+/, '')
-      .replace(/\/+$/, '');
-    return normalized.trim();
+    return normalizeSharedFolderPath(value);
   }
 
   _reconcileExpanded() {

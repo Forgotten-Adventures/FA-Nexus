@@ -1,3 +1,15 @@
+import {
+  normalizeFolderPath as normalizeSharedFolderPath,
+  normalizePathLower
+} from '../storage/path-utils.js';
+
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusFolderCountEntry} FaNexusFolderCountEntry
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusFolderTreeNode} FaNexusFolderTreeNode
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusFolderTreeIndex} FaNexusFolderTreeIndex
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusPathCountsInput} FaNexusPathCountsInput
+ */
+
 /**
  * Normalize a folder path by converting backslashes to forward slashes,
  * collapsing duplicate separators, and trimming any leading or trailing slashes.
@@ -5,21 +17,14 @@
  * @returns {string}
  */
 export function normalizeFolderPath(value) {
-  if (!value && value !== '') return '';
-  const raw = String(value || '');
-  return raw
-    .replace(/\\/g, '/')
-    .replace(/\/+/g, '/')
-    .replace(/^\/+/, '')
-    .replace(/\/+$/, '')
-    .trim();
+  return normalizeSharedFolderPath(value);
 }
 
 /**
  * Build a reusable folder tree index from a collection of path counts.
  * Accepts Maps, arrays of tuples/objects, or plain objects keyed by path.
- * @param {Map<string, number>|Array|Object} pathCounts
- * @returns {{nodes:Array, pathSet:Set<string>, pathKeys:Array<string>, pathMap:Map<string,string>, totalCount:number}}
+ * @param {FaNexusPathCountsInput} pathCounts
+ * @returns {FaNexusFolderTreeIndex}
  */
 export function createFolderTreeIndex(pathCounts, options = {}) {
   const version = Number.isFinite(options?.version) ? Number(options.version) : null;
@@ -44,10 +49,11 @@ export function createFolderTreeIndex(pathCounts, options = {}) {
     let fullLower = '';
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
+      const segmentLower = normalizePathLower(seg);
       fullPath = fullPath ? `${fullPath}/${seg}` : seg;
-      fullLower = fullLower ? `${fullLower}/${seg.toLowerCase()}` : seg.toLowerCase();
+      fullLower = fullLower ? `${fullLower}/${segmentLower}` : segmentLower;
 
-      let node = currentMap.get(seg.toLowerCase());
+      let node = currentMap.get(segmentLower);
       if (!node) {
         node = {
           name: seg,
@@ -56,7 +62,7 @@ export function createFolderTreeIndex(pathCounts, options = {}) {
           count: 0,
           childMap: new Map()
         };
-        currentMap.set(seg.toLowerCase(), node);
+        currentMap.set(segmentLower, node);
         pathMap.set(fullLower, fullPath);
       }
 
@@ -104,7 +110,7 @@ export function createFolderTreeIndex(pathCounts, options = {}) {
 
 /**
  * Produce a new empty tree index instance.
- * @returns {{nodes:Array, pathSet:Set<string>, pathKeys:Array<string>, pathMap:Map<string,string>, totalCount:number}}
+ * @returns {FaNexusFolderTreeIndex}
  */
 export function createEmptyFolderTreeIndex(version = 0) {
   return {
@@ -125,7 +131,7 @@ function deriveCollectionsFromNodes(nodes) {
   while (queue.length) {
     const node = queue.pop();
     if (!node) continue;
-    const lower = typeof node.pathLower === 'string' ? node.pathLower.toLowerCase() : '';
+    const lower = normalizePathLower(typeof node.pathLower === 'string' ? node.pathLower : node.path);
     const path = typeof node.path === 'string' ? node.path : '';
     if (lower) {
       pathSet.add(lower);
@@ -140,7 +146,7 @@ function deriveCollectionsFromNodes(nodes) {
 
 function coercePathSet(value) {
   if (value instanceof Set) return value;
-  if (Array.isArray(value)) return new Set(value.map((entry) => String(entry || '').toLowerCase()).filter(Boolean));
+  if (Array.isArray(value)) return new Set(value.map((entry) => normalizePathLower(entry)).filter(Boolean));
   return new Set();
 }
 
@@ -159,8 +165,8 @@ function coerceTotalCount(value, fallback) {
 
 /**
  * Ensure the provided data resolves to a valid folder tree index.
- * @param {object} data
- * @returns {{nodes:Array, pathSet:Set<string>, pathKeys:Array<string>, pathMap:Map<string,string>, totalCount:number}}
+ * @param {import('../core/fa-nexus-types.js').FaNexusFolderTreeIndexInput} data
+ * @returns {FaNexusFolderTreeIndex}
  */
 export function ensureFolderTreeIndex(data) {
   const candidate = data && typeof data === 'object' ? (data.tree || data) : null;

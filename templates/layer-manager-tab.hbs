@@ -97,19 +97,12 @@
         <div class="fa-nexus-layer-manager__actions-bar">
           <button type="button"
                   class="fa-nexus-layer-manager__icon-btn"
-                  data-action="collapse-all-groups"
-                  title="Collapse all visible groups"
-                  aria-label="Collapse all visible groups"
-                  {{#if collapseAllDisabled}}disabled aria-disabled="true"{{/if}}>
-            <i class="fa-solid fa-angles-up"></i>
-          </button>
-          <button type="button"
-                  class="fa-nexus-layer-manager__icon-btn"
-                  data-action="expand-all-groups"
-                  title="Expand all visible groups"
-                  aria-label="Expand all visible groups"
-                  {{#if expandAllDisabled}}disabled aria-disabled="true"{{/if}}>
-            <i class="fa-solid fa-angles-down"></i>
+                  data-action="toggle-all-groups"
+                  data-group-toggle-all-action="{{groupToggleAllAction}}"
+                  title="{{groupToggleAllTitle}}"
+                  aria-label="{{groupToggleAllTitle}}"
+                  {{#if groupToggleAllDisabled}}disabled aria-disabled="true"{{/if}}>
+            <i class="fa-solid {{groupToggleAllIcon}}"></i>
           </button>
         </div>
       </div>
@@ -120,16 +113,39 @@
     <ol class="fa-nexus-layer-manager__list" role="listbox" aria-multiselectable="true">
       {{#each entries}}
         {{#if separator}}
-          {{#if foregroundSeparator}}
-            <li class="fa-nexus-layer-manager__separator fa-nexus-layer-manager__separator--foreground"
-                data-elevation-key="{{elevationKey}}"
-                data-foreground-elevation="{{foregroundElevationValue}}">
-              <span>Foreground starts at Elev {{foregroundElevation}}</span>
-            </li>
-          {{else}}
-            <li class="fa-nexus-layer-manager__separator {{#if groupHasCustomName}}has-custom-name{{/if}}"
+          {{#if levelBoundarySeparator}}
+            <li class="fa-nexus-layer-manager__separator fa-nexus-layer-manager__separator--level-boundary"
+                data-level-boundary="{{levelBoundaryId}}"
+                data-level-boundary-key="{{levelBoundaryKey}}"
+                data-level-ids="{{levelBoundaryLevelIds}}"
                 data-elevation="{{elevationValue}}"
                 data-elevation-key="{{elevationKey}}"
+                data-tree-depth="{{treeDepth}}">
+              <div class="fa-nexus-layer-manager__separator-main">
+                {{#each levelBoundaryMembers}}
+                  <span class="fa-nexus-layer-manager__level-boundary-marker"
+                        data-level-boundary-kind="{{kind}}">
+                    <span class="fa-nexus-layer-manager__level-boundary-kind"
+                          title="{{#if (eq kind 'T')}}Top boundary{{else}}Bottom boundary{{/if}}"
+                          aria-label="{{#if (eq kind 'T')}}Top boundary{{else}}Bottom boundary{{/if}}">
+                      <i class="{{iconClass}}"></i>
+                    </span>
+                    <span class="fa-nexus-layer-manager__separator-name">{{levelName}}</span>
+                  </span>
+                  {{#unless @last}}
+                    <span class="fa-nexus-layer-manager__level-boundary-join" aria-hidden="true">/</span>
+                  {{/unless}}
+                {{/each}}
+                <span class="fa-nexus-layer-manager__separator-elevation">Elev {{levelBoundaryElevationLabel}}</span>
+              </div>
+            </li>
+          {{else}}
+            <li class="fa-nexus-layer-manager__separator {{#if groupHasCustomName}}has-custom-name{{/if}} {{groupClass}}"
+                data-elevation="{{elevationValue}}"
+                data-elevation-key="{{elevationKey}}"
+                data-group-can-rename="{{#if groupCanRename}}true{{else}}false{{/if}}"
+                data-group-can-edit-elevation="{{#if groupCanEditElevation}}true{{else}}false{{/if}}"
+                data-group-can-header-drop="{{#if groupCanHeaderDrop}}true{{else}}false{{/if}}"
                 data-tree-depth="{{treeDepth}}">
               <button class="fa-nexus-layer-manager__visibility fa-nexus-layer-manager__visibility--group"
                       type="button"
@@ -160,15 +176,14 @@
                 {{else}}
                   {{#if editingGroupElevation}}
                     {{#if groupHasCustomName}}
-                      <span class="fa-nexus-layer-manager__separator-name"
-                            title="Double-click to rename elevation group">{{groupDisplayName}}</span>
+                      <span class="fa-nexus-layer-manager__separator-name">{{groupDisplayName}}</span>
                     {{/if}}
                   {{else}}
                     <span class="fa-nexus-layer-manager__separator-name {{#unless groupHasCustomName}}is-elevation-fallback{{/unless}}"
-                          title="Double-click to rename elevation group, Right-click to edit elevation">{{groupDisplayName}}</span>
+                          {{#if groupCanRename}}title="Double-click to rename elevation group{{#if groupCanEditElevation}}, Right-click to edit elevation{{/if}}"{{else}}{{#if groupCanEditElevation}}title="Right-click to edit elevation group"{{/if}}{{/if}}>{{groupDisplayName}}</span>
                   {{/if}}
                 {{/if}}
-                {{#if groupHasCustomName}}
+                {{#if groupShowElevationLabel}}
                   {{#if editingGroupElevation}}
                     <input class="fa-nexus-layer-manager__separator-group-elevation-input"
                            type="number"
@@ -178,18 +193,10 @@
                            spellcheck="false"
                            aria-label="Edit elevation group value" />
                   {{else}}
-                    <span class="fa-nexus-layer-manager__separator-elevation"
-                          title="Right-click to edit elevation group">Elev {{elevation}}</span>
-                  {{/if}}
-                {{else}}
-                  {{#if editingGroupElevation}}
-                    <input class="fa-nexus-layer-manager__separator-group-elevation-input"
-                           type="number"
-                           step="0.001"
-                           value="{{groupElevationValue}}"
-                           autocomplete="off"
-                           spellcheck="false"
-                           aria-label="Edit elevation group value" />
+                    {{#unless groupHideDuplicateElevationLabel}}
+                      <span class="fa-nexus-layer-manager__separator-elevation"
+                            {{#if groupCanEditElevation}}title="Right-click to edit elevation group"{{/if}}>Elev {{elevation}}</span>
+                    {{/unless}}
                   {{/if}}
                 {{/if}}
               </div>
@@ -203,16 +210,23 @@
                 {{matchingCount}}
               </span>
             </li>
-          {{/if}}
-        {{else}}
+        {{/if}}
+      {{else}}
           {{#if marker}}
-            <li class="fa-nexus-layer-manager__item fa-nexus-layer-manager__marker {{#if selected}}is-selected{{/if}}"
-                role="option"
-                aria-selected="{{#if selected}}true{{else}}false{{/if}}"
-                data-scene-marker="{{markerKind}}"
+            <li class="fa-nexus-layer-manager__item fa-nexus-layer-manager__marker {{#if hidden}}is-hidden{{/if}}"
+                role="presentation"
+                data-scene-marker="{{markerId}}"
                 data-elevation-key="{{elevationKey}}"
                 data-tree-depth="{{treeDepth}}"
                 data-elevation="{{elevation}}">
+              <button class="fa-nexus-layer-manager__visibility"
+                      type="button"
+                      data-action="toggle-scene-marker-visibility"
+                      aria-pressed="{{#if hidden}}false{{else}}true{{/if}}"
+                      {{#unless canToggleVisibility}}disabled aria-disabled="true"{{/unless}}>
+                <i class="fa-solid {{#if hidden}}fa-eye-slash{{else}}fa-eye{{/if}}"></i>
+              </button>
+              <span class="fa-nexus-layer-manager__divider" aria-hidden="true"></span>
               <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
               <span class="fa-nexus-layer-manager__icon" title="{{typeLabel}}">
                 <i class="{{typeIcon}}"></i>
@@ -225,7 +239,10 @@
                   role="presentation"
                   data-elevation-key="{{elevationKey}}"
                   data-tree-depth="{{treeDepth}}"
-                  data-preview-id="{{previewId}}">
+                  data-preview-id="{{previewId}}"
+                  data-preview-key="{{previewKey}}"
+                  data-preview-kind="{{previewKind}}"
+                  draggable="{{#if canDragPreview}}true{{else}}false{{/if}}">
                 <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
                 <span class="fa-nexus-layer-manager__icon" title="{{typeLabel}}">
                   <i class="{{typeIcon}}"></i>
@@ -264,6 +281,11 @@
                     <i class="fa-solid fa-mask"></i>
                   </span>
                 {{/if}}
+                {{#if hasShadowOnly}}
+                  <span class="fa-nexus-layer-manager__badge fa-nexus-layer-manager__badge--shadow-only" title="Shadow only">
+                    <i class="fa-solid fa-s"></i>
+                  </span>
+                {{/if}}
                 {{#if editing}}
                   <input class="fa-nexus-layer-manager__rename-input"
                          type="text"
@@ -285,10 +307,10 @@
                 {{/if}}
               </li>
             {{/if}}
+            {{/if}}
           {{/if}}
-        {{/if}}
-      {{/each}}
-    </ol>
+    {{/each}}
+  </ol>
     <footer class="fa-nexus-layer-manager__footer" data-flatten-footer {{#unless flattenVisible}}hidden{{/unless}}>
       <button type="button"
               class="fa-nexus-layer-manager__flatten"

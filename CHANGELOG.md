@@ -2,7 +2,116 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.4.0] - 2026-04-07
+## [0.5.1] - 2026-05-07
+
+This is the Foundry v14 transition release. FA Nexus now targets Foundry VTT v14 and is not backwards compatible with Foundry v13.
+
+### Added
+- **Foundry v14 Support:**
+    - Updated FA Nexus for the current Foundry VTT v14 runtime, with compatibility work across Asset Placement, Tokens, Layer Manager, Paths, Texture Painting, Buildings, flatten/deconstruct workflows, scene transitions, detached windows, and level-aware tile ordering.
+    - FA Nexus tools now understand v14 scene levels, keep tile ordering predictable, preserve important v14 tile data, and behave more reliably in Levels-style scenes.
+
+- **Tile Masking:**
+    - Compatible tiles can now be masked with FA Nexus through the premium Texture Painting editor, bringing mask editing beyond texture-painting output and letting you remove parts of a tile image directly.
+    - The Tile HUD can now open FA Nexus mask editing for compatible tiles.
+    - Added FA Nexus mask clearing from Tile Config and Layer Manager context actions.
+
+- **Shadow Only Mode:**
+    - Added a `Shadow Only` option to Drop Shadow controls so placed or edited tiles can keep their generated FA shadow while hiding the source artwork.
+    - Shadow-only tiles are also marked in Layer Manager so they are easy to identify after placement, including through searches for `shadow`.
+
+- **Composite Building Tiles & Regions:**
+    - Building commits now produce foreground/background composite tiles instead of separate tiles for every generated building element.
+    - Outer and inner walls, portal frames, and static windows are combined into a foreground tile, while fills and window sills are combined into a background tile.
+    - Disconnected building islands are kept separate, so one committed building can still produce clean per-island background and foreground output.
+    - Building commits now create Foundry Regions from generated outer walls when region geometry is available, with predefined `Define Surface` and `Suppress Weather` behaviors.
+
+- **Level-aware Flatten & Scene Export:**
+    - Flatten and scene export can now target the current viewed level or all scene levels.
+    - The dialog now makes the action explicit: flatten into scene tiles or export image files.
+    - Outputs can be split into level background, middle, and foreground images/tiles, with an option to merge middle elevations into the background or foreground output.
+    - Flattened tiles track level membership more safely, so deconstructing them restores content to the intended level.
+
+- **FA Nexus Tile Config Controls:** 
+    - Added 'FA Nexus' tab to Tile Config with options for 'Parent Level', HSBC, clearing masks, and Shadow toggles/settings.
+    - `Parent Level` tells FA Nexus which v14 level owns a tile when that tile is visible on multiple levels. FA Nexus uses it for level-aware Layer Manager grouping, ground/foreground band sorting, flatten/deconstruct behavior, and opening the tile on the intended level for editing.
+    - Tiles that only belong to one level can usually leave `Parent Level` on `Auto / Unset`; FA Nexus auto-populates it based on which level the tile was placed.
+    - Shadow settings in Tile Config now preview live before being applied.
+
+- **Texture Painting Blend Modes:**
+    - Texture Painting now supports blend modes for painted texture layers, including Normal, Overlay, Soft Light, Multiply, Screen, and Add.
+    - Blend modes let texture work such as dirt, moss, water, scorch marks, highlights, and color passes blend into the scene underneath instead of only rendering as normal opaque texture layers.
+
+- **Paths Improvements:**
+    - All editable paths within a session have visible control points and throughline in 'Edit shapes' mode so you can identify which paths can be edited. The throughline hides while a control point is being moved so the edited path stays easier to see.
+    - Control point visuals have also been adjusted for better visibility.
+    - Older FA paths made before v0.3 now migrate to Paths v2 when used in v14, and the legacy path editor has been retired.
+
+- **Grid Sorting:**
+    - Asset, Token, Texture, Path, and Building Fill grids now include a persistent sort toggle for `Newest` or `Category` order.
+    - The Solid Color texture remains pinned at the top of texture grids regardless of the active sort mode.
+
+- **Layer Manager Level Actions:**
+    - Current-level boundary markers in Layer Manager can now select all tiles in the viewed level band.
+    - Right-clicking a current-level boundary marker toggles visibility for tiles outside the viewed level band, making level isolation faster while working in v14 scenes.
+
+- **Token Eye Level Controls:**
+    - Added an FA Nexus `Eye Level Height` field to Token Config vision settings for per-token v14 line-of-sight testing.
+    - Added a world setting that can use a higher default eye level based on the top of a token's v14 Size Z cube instead of Foundry's mid-height default.
+    - This helps avoid default midpoint eye-level cases where tokens at different elevations cannot see each other as expected.
+
+### Changed
+- **Keep Ground Props Under Tokens:** 
+    - Reworked `Shift BG & Tile Elevation Down` into `Keep Ground Props Under Tokens`.
+    - Tiles within the first 1 elevation unit of a level now stay under tokens on that same level without changing token elevation or shifting the level background and foreground planes.
+    Example: on a level that starts at 10, tiles placed from 10.000 to 10.999 stay under tokens at elev 10. Normally tile even at 10.001 would be rendered above tokens.
+
+- **Level-aware Placement and Editing:**
+    - Asset Placement, Token Placement, Paths, Texture Painting, Buildings, and Building Fill now respect the currently viewed v14 level more consistently when starting sessions and committing tiles.
+    - FA Nexus now blocks level switching while an Asset, Path, Texture, or Building session is active so previews and commits do not drift to a different level mid-session.
+    - Editing FA Nexus tiles from the canvas or Layer Manager now switches to the tile's Parent Level when needed before opening the editor.
+
+- **Token Placement:** 
+    - Token placement now targets the currently viewed v14 level and uses that level's bottom elevation as the elevation of the placed token.
+    - Token placement and prototype updates now set v14 Size Z/depth from the token footprint so large, huge, and gargantuan tokens get matching vertical size by default.
+    - Actor type mappings were updated for Call of Cthulhu 7th Edition, Cyberpunk RED, Alien RPG, Forbidden Lands, Starfinder, World of Darkness 5th Edition/VTM5e, and Daggerheart.
+    - Daggerheart actor creation now uses the system's expected actor type and applies token size after actor creation, so oversized FA tokens become the matching Daggerheart size.
+
+- **Building Tool Portals:**
+    - Door/window selection previews now show the selected portal, or the default portal when no specific portal is selected.
+    - Portal texture pickers now use the shared Nexus grid with search, hover previews, better sizing, better performance, and clearer portal labels.
+    - Door, window, frame, sill, and glass previews now size small and explicit grid-width portal textures more accurately.
+    - Animated door/window portal visuals and shadows now stay in sync on visible non-current v14 levels.
+
+- **Texture and Path Selection Feedback:**
+    - Launching Texture Painting or Paths from an asset card now visibly selects the active card in the grid.
+    - Changing the Solid Color texture swatch now updates the active Texture Painting session immediately instead of waiting for a new session.
+
+- **Shadow Rendering:**
+    - Drop-shadow rendering now chunks large shadow layers and keeps per-tile alpha/blur settings, improving stability and performance on heavy or roughened scenes.
+
+- **Level-aware Layer Manager, Placement, and Editing:**
+    - Level background/foreground markers are scoped to the current viewed level.
+    - Each level gets dedicated `<level> Background` and `<level> Foreground` folders for tiles within the level's special ground/foreground bands; when a tile is visible on multiple levels, `Parent Level` decides which level owns those folders/bands.
+    - 'Preview' layer of the current placement/premium editor session now appears in the expected position and can be drag-and-dropped to adjust current placement elevation and ordering.
+    - Active Asset Placement, Scatter, Path, Texture Painting, Building, and Building Fill previews now appear as selectable Layer Manager rows; multi-preview rows such as Paths and Scatter are numbered.
+    - Dragging tiles or preview rows through level-aware Layer Manager groups now updates elevation, sort order, placement level, and level membership together.
+    - Tile context actions now include FA Nexus mask editing/clearing and Tile Config access where available.
+    - Layer Manager preserves its scroll position during preview reordering and uses a single expand/collapse-all button for visible groups.
+    - Selecting, toggling visibility, and locking multiple tiles is much more performant.
+
+### Fixed
+- Define Surface region changes now refresh Foundry's occlusion surfaces immediately.
+- Building edit cleanup now more reliably removes linked generated walls, fills, and tiles without leaving orphaned tiles or duplicate delete noise.
+- Building sessions now anchor fill elevation, placement level, and preview ordering from the selected tile or current viewed level more consistently.
+- Committed masked textures now render correctly immediately after placement without requiring players looking at the placement spot to refresh the canvas.
+- Expected auth probes, local-inventory checks, import repair messages, preview updates, rollback notes, and mask cleanup paths now log at lower severity so real errors are easier to spot.
+
+### Technical Notes
+- Texture rendering, mask handling, tile payload creation, level membership, scene transition readiness, and canvas readiness code were split into smaller internal modules to support the v14 runtime more reliably.
+- Content source, Forge/S3 folder browsing, local inventory, and download path handling now fail more visibly when configuration or permissions are wrong, making setup problems easier to diagnose.
+
+## [0.4.0] - 2026-04-08
 
 ### Added
 - **Re-coloring for Assets, Paths, Textures, and Buildings:** 

@@ -5,8 +5,15 @@
 
 import { cloneFolderSelection } from '../../content/content-sources/content-sources-utils.js';
 
+/**
+ * @typedef {import('../fa-nexus-types.js').FaNexusBookmark} FaNexusBookmark
+ * @typedef {import('../fa-nexus-types.js').FaNexusBookmarkMap} FaNexusBookmarkMap
+ * @typedef {import('../fa-nexus-types.js').FaNexusFolderSelection} FaNexusFolderSelection
+ */
+
 export class BookmarkManager {
   constructor() {
+    /** @type {FaNexusBookmarkMap} */
     this._bookmarks = {};
     this._loadBookmarks();
   }
@@ -40,7 +47,7 @@ export class BookmarkManager {
   /**
    * Get bookmarks for a specific tab
    * @param {string} tabId
-   * @returns {Array<Object>} Array of bookmark objects
+   * @returns {FaNexusBookmark[]} Array of bookmark objects
    */
   getBookmarksForTab(tabId) {
     return this._bookmarks[tabId] || [];
@@ -49,7 +56,7 @@ export class BookmarkManager {
   /**
    * Replace the bookmark array for a tab and persist.
    * @param {string} tabId
-   * @param {Array<Object>} bookmarks
+   * @param {FaNexusBookmark[]} bookmarks
    */
   _setBookmarksForTab(tabId, bookmarks) {
     this._bookmarks[tabId] = Array.isArray(bookmarks) ? bookmarks : [];
@@ -61,8 +68,8 @@ export class BookmarkManager {
    * @param {string} tabId - The tab this bookmark belongs to
    * @param {string} title - User-provided title
    * @param {string} searchQuery - Current search query
-   * @param {Object} folderSelection - Current folder browser selection
-   * @returns {Object} The created bookmark
+   * @param {FaNexusFolderSelection|null} folderSelection - Current folder browser selection
+   * @returns {FaNexusBookmark} The created bookmark
    */
   createBookmark(tabId, title, searchQuery, folderSelection) {
     const bookmark = {
@@ -87,7 +94,7 @@ export class BookmarkManager {
    * Update an existing bookmark
    * @param {string} tabId
    * @param {string} bookmarkId
-   * @param {Object} updates - Partial bookmark updates
+   * @param {Partial<FaNexusBookmark>} updates - Partial bookmark updates
    * @returns {boolean} Success
    */
   updateBookmark(tabId, bookmarkId, updates) {
@@ -177,7 +184,7 @@ export class BookmarkManager {
    * Get a specific bookmark
    * @param {string} tabId
    * @param {string} bookmarkId
-   * @returns {Object|null}
+   * @returns {FaNexusBookmark|null}
    */
   getBookmark(tabId, bookmarkId) {
     const bookmarks = this.getBookmarksForTab(tabId);
@@ -186,7 +193,7 @@ export class BookmarkManager {
 
   /**
    * Get all bookmarks across all tabs
-   * @returns {Object} Bookmarks keyed by tabId
+   * @returns {FaNexusBookmarkMap} Bookmarks keyed by tabId
    */
   getAllBookmarks() {
     return { ...this._bookmarks };

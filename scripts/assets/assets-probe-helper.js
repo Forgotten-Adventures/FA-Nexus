@@ -83,6 +83,8 @@ export class AssetsTabProbeHelper {
       if (job.cancelled || !found || !card.isConnected) return;
       try { card.setAttribute('data-url', found); } catch (_) {}
       try { card.setAttribute('data-cached', 'true'); } catch (_) {}
+      try { card.classList.remove('locked-token'); } catch (_) {}
+      try { card.removeAttribute('data-locked'); } catch (_) {}
       if (item) item.cachedLocalPath = item.cachedLocalPath || found;
       const icon = card.querySelector('.fa-nexus-status-icon');
       if (icon) {
@@ -92,7 +94,12 @@ export class AssetsTabProbeHelper {
         icon.innerHTML = '<i class="fas fa-cloud-check"></i>';
       }
     } catch (error) {
-      Logger.warn('AssetsTab.probe.error', { error: String(error?.message || error) });
+      Logger.debug('AssetsTab.probe.error', {
+        filename: card.getAttribute('data-filename') || item?.filename || '',
+        file_path: card.getAttribute('data-file-path') || '',
+        path: card.getAttribute('data-path') || '',
+        error: String(error?.message || error)
+      });
     }
   }
 }

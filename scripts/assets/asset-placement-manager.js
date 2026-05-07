@@ -1,15 +1,33 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { createCanvasGestureSession } from '../canvas/canvas-gesture-session.js';
 import { getCanvasInteractionController, announceChange } from '../canvas/canvas-interaction-controller.js';
 import { getAssetShadowManager } from './asset-shadow-manager.js';
 import { readShadowQualityConfig } from './shadow-quality.js';
-import { getTileRenderElevation } from '../canvas/elevation-band-utils.js';
+import {
+  getCurrentLevelBottomElevation,
+  resolveInitialFaNexusPlacementElevation,
+  resolvePlacementAnchorTile
+} from '../canvas/elevation-band-utils.js';
+import {
+  getDefaultTilePlacementLevelId,
+  getTileExplicitPlacementLevelId,
+  resolveTileRenderOrder
+} from '../canvas/tile-band-utils.js';
+import {
+  normalizeTileCreatePayloadForV14,
+  preserveTileDocumentCustomSettingsForUpdate
+} from '../canvas/tile-document-payloads.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
 import { PlacementOverlay, createPlacementSpinner } from '../core/placement/placement-overlay.js';
 import { PlacementPrefetchQueue } from '../core/placement/placement-prefetch-queue.js';
+import {
+  activatePlacementToolOptions,
+  createManagedPlacementGestureSession,
+  deactivatePlacementToolOptions,
+  stopManagedPlacementGestureSession
+} from '../core/placement/placement-session-utils.js';
 import { getGridSnapStep } from '../core/grid-snap-utils.js';
 import { getZoomAtCursorView } from '../canvas/canvas-pointer-utils.js';
-import { getSharedTexture } from '../textures/texture-render.js';
+import { getSharedTexture } from '../textures/texture-runtime-core.js';
 import {
   applyHsbcToDisplayObject,
   buildHsbcToolOptionsControls,
@@ -35,6 +53,11 @@ import {
   resolveEffectivePolarity
 } from '../core/editor-shortcuts.js';
 import './asset-scatter-tiles.js';
+import './shadow-only-runtime.js';
+
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusPoint} FaNexusPoint
+ */
 
 const quantizeElevation = (value) => {
   const numeric = Number(value);
@@ -50,6 +73,41 @@ const formatElevation = (value) => {
   const normalized = Number(rounded.toFixed(3));
   const safeValue = Object.is(normalized, -0) ? 0 : normalized;
   return safeValue.toString();
+};
+
+const getCenteredTileAnchorPosition = ({ x = 0, y = 0, width = 0, height = 0 } = {}) => ({
+  x: (Number(x) || 0) + ((Number(width) || 0) / 2),
+  y: (Number(y) || 0) + ((Number(height) || 0) / 2)
+});
+
+const getTileVisualCenterWorld = (doc) => {
+  const x = Number(doc?.x || 0);
+  const y = Number(doc?.y || 0);
+  const width = Number(doc?.width || 0);
+  const height = Number(doc?.height || 0);
+  const anchorX = Number(doc?.texture?.anchorX);
+  const anchorY = Number(doc?.texture?.anchorY);
+  const resolvedAnchorX = Number.isFinite(anchorX) ? anchorX : 0.5;
+  const resolvedAnchorY = Number.isFinite(anchorY) ? anchorY : 0.5;
+  return {
+    x: x + (width * (0.5 - resolvedAnchorX)),
+    y: y + (height * (0.5 - resolvedAnchorY))
+  };
+};
+
+const getTileVisualTopLeftWorld = (doc) => {
+  const x = Number(doc?.x || 0);
+  const y = Number(doc?.y || 0);
+  const width = Number(doc?.width || 0);
+  const height = Number(doc?.height || 0);
+  const anchorX = Number(doc?.texture?.anchorX);
+  const anchorY = Number(doc?.texture?.anchorY);
+  const resolvedAnchorX = Number.isFinite(anchorX) ? anchorX : 0.5;
+  const resolvedAnchorY = Number.isFinite(anchorY) ? anchorY : 0.5;
+  return {
+    x: x - (width * resolvedAnchorX),
+    y: y - (height * resolvedAnchorY)
+  };
 };
 
 const ELEVATION_STEP_DEFAULT = 0.01;
@@ -173,12 +231,14 @@ export class AssetPlacementManager {
     this._scatterPolarityInvertHeld = false;
     this._scatterEditing = false;
     this._scatterEditTile = null;
+    this._scatterEditPointerLockScreen = null;
     this._scatterPreviewContainer = null;
     this._scatterPreviewGroups = new Map();
     this._scatterPreviewActiveKey = null;
     this._scatterPreviewInstances = [];
     this._scatterPreviewSprites = new Map();
     this._scatterPreviewTextures = new Map();
+    this._scatterPreviewTextureFailures = new Set();
     this._scatterPreviewShadowFrame = null;
     this._scatterPreviewShadowForce = false;
     this._scatterPreviewShadowDirty = new Set();
@@ -211,6 +271,11 @@ export class AssetPlacementManager {
     // Elevation for the active placement session (Alt+wheel)
     this._previewElevation = 0;
     this._previewSort = 0;
+    this._previewRenderSort = 0;
+    this._previewPlacementLevelId = null;
+    this._placementSortAnchorTileId = null;
+    this._placementSortAnchorPlacementLevelId = null;
+    this._placementSortBeforeAnchor = false;
     this._lastElevationAnnounce = 0;
     this._pendingElevationAnnouncePoint = null;
     this._elevationAnnounceTimer = null;
@@ -228,6 +293,7 @@ export class AssetPlacementManager {
       this._getShadowOffsetMax()
     );
     this._dropShadowOffsetAngle = this._readShadowSetting('assetDropShadowOffsetAngle', 135, 0, 359, { wrapAngle: true });
+    this._dropShadowOnly = this._readDropShadowOnlySetting();
     this._shadowPresets = this._loadShadowPresets();
     this._shadowSettingsCollapsed = this._readShadowSettingsCollapsed();
     this._shadowElevationContext = { elevation: 0, tileCount: 0, hasTiles: false, source: 'default' };
@@ -267,6 +333,48 @@ export class AssetPlacementManager {
     this._installToolOptionsActivityListener();
     this._installDropShadowSettingsHook();
     this._syncToolOptionsState();
+  }
+
+  destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+
+    try { this.cancelPlacement('destroy'); }
+    catch (error) {
+      Logger.warn('Placement.destroy.cancelFailed', { error: String(error?.message || error) });
+    }
+
+    if (this._editingCommitTimer) {
+      try { clearTimeout(this._editingCommitTimer); }
+      catch (_) {}
+      this._editingCommitTimer = null;
+    }
+    try { this._clearElevationAnnounceTimer(); } catch (_) {}
+    try { this._stopInteractionSession(); } catch (_) {}
+    try { this._stopZoomWatcher(); } catch (_) {}
+    try { this._removePreviewElement(); } catch (_) {}
+    try { this._hideLoadingOverlay(); } catch (_) {}
+    try { this._clearScatterOverlay(); } catch (_) {}
+    try { this._clearScatterPreviewOverlay(); } catch (_) {}
+    try { this._clearShadowOffsetPreview(); } catch (_) {}
+    try { this._removePlacementFeedback(); } catch (_) {}
+    try { this._deactivateToolOptions(); } catch (_) {}
+    try { document?.removeEventListener?.(TOOL_OPTIONS_ACTIVITY_EVENT, this._boundToolOptionsActivity); } catch (_) {}
+
+    const hooks = globalThis?.Hooks;
+    if (hooks && typeof hooks.off === 'function' && this._dropShadowSettingsHook) {
+      try { hooks.off('updateSetting', this._dropShadowSettingsHook); }
+      catch (error) {
+        Logger.warn('Placement.destroy.dropShadowHookRemoveFailed', { error: String(error?.message || error) });
+      }
+    }
+    this._dropShadowSettingsHook = null;
+
+    try { this._randomPrefetch?.reset?.(); }
+    catch (error) {
+      Logger.warn('Placement.destroy.prefetchResetFailed', { error: String(error?.message || error) });
+    }
+    this.app = null;
   }
 
   _handleDropShadowOffsetChange(distance, angle, commit = false) {
@@ -476,7 +584,9 @@ export class AssetPlacementManager {
   }
 
   startPlacement(assetData, stickyMode = false, options = {}) {
-    const selectedElevation = this._getHighestControlledTileElevation();
+    const controlledTiles = Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled.slice() : [];
+    const initialElevation = resolveInitialFaNexusPlacementElevation({ fallback: this._lastElevationUsed });
+    const placementSortAnchorTileId = this._capturePlacementSortAnchor(controlledTiles);
     try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
     const storedPreference = this._readDropShadowPreference();
     const preservedHsbc = cloneHsbc(this._hsbc);
@@ -489,23 +599,26 @@ export class AssetPlacementManager {
     this.isPlacementActive = true;
     this.isStickyMode = stickyMode;
     this.currentAsset = assetData;
+    this._placementSortAnchorTileId = placementSortAnchorTileId;
+    this._placementSortBeforeAnchor = false;
     this.isRandomMode = false;
     this.randomAssets = [];
     this._pendingEditState = null;
     this._scatterMode = this._readStoredScatterMode();
     this._restorePlacementTransformState({ mode: this._scatterMode, regenerateOffsets: true });
-    this._setScatterMode(this._scatterMode);
-    this._updateRandomPrefetchCount();
-    this._activateToolOptions();
-    try { Logger.info('Placement.start', { sticky: !!stickyMode, kind: 'single', asset: assetData?.filename || assetData?.path }); } catch (_) {}
-    const initialElevation = Number.isFinite(selectedElevation)
-      ? selectedElevation
-      : (Number.isFinite(this._lastElevationUsed) ? this._lastElevationUsed : 0);
     this._previewElevation = initialElevation;
-    this._previewSort = this._interactionController.computeNextSortAtElevation?.(initialElevation) ?? 0;
+    this._previewPlacementLevelId = this._normalizePlacementLevelId(
+      this._placementSortAnchorPlacementLevelId || getDefaultTilePlacementLevelId()
+    );
+    this._adoptPlacementSortContext(this._resolvePlacementSortContext(initialElevation));
     this._lastElevationUsed = this._previewElevation;
     this._lastElevationAnnounce = 0;
     this._clearElevationAnnounceTimer();
+    this._setScatterMode(this._scatterMode);
+    this._syncPreviewOrdering();
+    this._updateRandomPrefetchCount();
+    this._activateToolOptions();
+    try { Logger.info('Placement.start', { sticky: !!stickyMode, kind: 'single', asset: assetData?.filename || assetData?.path }); } catch (_) {}
     this._refreshShadowElevationContext({ adopt: true });
     this._activateTilesLayer();
     this._startInteractionSession();
@@ -559,11 +672,7 @@ export class AssetPlacementManager {
         if (options.pointerWorld && Number.isFinite(options.pointerWorld.x) && Number.isFinite(options.pointerWorld.y)) {
           return { x: Number(options.pointerWorld.x), y: Number(options.pointerWorld.y) };
         }
-        const px = Number(doc.x || 0);
-        const py = Number(doc.y || 0);
-        const w = Number(doc.width || 0);
-        const h = Number(doc.height || 0);
-        return { x: px + w / 2, y: py + h / 2 };
+        return getTileVisualCenterWorld(doc);
       })();
 
       const pointerOption = (() => {
@@ -588,10 +697,17 @@ export class AssetPlacementManager {
         pointerWorld: options.pointerWorld || centerWorld
       });
 
-      const initialElevation = Number.isFinite(doc.elevation) ? Number(doc.elevation) : (Number.isFinite(this._lastElevationUsed) ? this._lastElevationUsed : 0);
+      const initialElevation = Number.isFinite(doc.elevation)
+        ? Number(doc.elevation)
+        : resolveInitialFaNexusPlacementElevation({ fallback: this._lastElevationUsed });
       this._previewElevation = initialElevation;
       this._lastElevationUsed = this._previewElevation;
       this._previewSort = Number(doc.sort ?? 0) || 0;
+      this._previewRenderSort = this._previewSort;
+      this._previewPlacementLevelId = this._resolveDocumentPlacementLevelId(doc);
+      this._placementSortAnchorTileId = doc?.id || null;
+      this._placementSortAnchorPlacementLevelId = this._previewPlacementLevelId;
+      this._placementSortBeforeAnchor = false;
       this._lastElevationAnnounce = 0;
       this._clearElevationAnnounceTimer();
 
@@ -634,7 +750,9 @@ export class AssetPlacementManager {
   startPlacementRandom(assetList, stickyMode = true, options = {}) {
     try {
       if (!Array.isArray(assetList) || !assetList.length) { this.startPlacement(assetList?.[0], stickyMode, options); return; }
-      const selectedElevation = this._getHighestControlledTileElevation();
+      const controlledTiles = Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled.slice() : [];
+      const initialElevation = resolveInitialFaNexusPlacementElevation({ fallback: this._lastElevationUsed });
+      const placementSortAnchorTileId = this._capturePlacementSortAnchor(controlledTiles);
       try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
       const storedPreference = this._readDropShadowPreference();
       const preservedHsbc = cloneHsbc(this._hsbc);
@@ -646,21 +764,24 @@ export class AssetPlacementManager {
       this.isPlacementActive = true;
       this.isStickyMode = stickyMode;
       this.isRandomMode = true;
+      this._placementSortAnchorTileId = placementSortAnchorTileId;
+      this._placementSortBeforeAnchor = false;
       this.randomAssets = assetList.slice();
       this.currentAsset = null;
       try { this._randomPrefetch?.setPool?.(this.randomAssets); } catch (_) {}
       this._scatterMode = this._readStoredScatterMode();
       this._restorePlacementTransformState({ mode: this._scatterMode, regenerateOffsets: true });
-      this._setScatterMode(this._scatterMode);
-      this._activateToolOptions();
-      const initialElevation = Number.isFinite(selectedElevation)
-        ? selectedElevation
-        : (Number.isFinite(this._lastElevationUsed) ? this._lastElevationUsed : 0);
       this._previewElevation = initialElevation;
-      this._previewSort = this._interactionController.computeNextSortAtElevation?.(initialElevation) ?? 0;
+      this._previewPlacementLevelId = this._normalizePlacementLevelId(
+        this._placementSortAnchorPlacementLevelId || getDefaultTilePlacementLevelId()
+      );
+      this._adoptPlacementSortContext(this._resolvePlacementSortContext(initialElevation));
       this._lastElevationUsed = this._previewElevation;
       this._lastElevationAnnounce = 0;
       this._clearElevationAnnounceTimer();
+      this._setScatterMode(this._scatterMode);
+      this._syncPreviewOrdering();
+      this._activateToolOptions();
       Logger.info('Placement.startRandom', { sticky: !!stickyMode, count: this.randomAssets.length });
       this._activateTilesLayer();
       this._refreshShadowElevationContext({ adopt: true });
@@ -679,7 +800,7 @@ export class AssetPlacementManager {
       ? assetList.filter(Boolean)
       : (assetList ? [assetList] : []);
     if (!list.length) return false;
-    if (!this.isPlacementActive || this._isEditingExistingTile || this._scatterEditing) return false;
+    if (!this.isPlacementActive || this._isEditingExistingTile) return false;
     this._ensurePointerSnapshot(options);
     const useRandom = list.length > 1;
     this.isRandomMode = useRandom;
@@ -711,6 +832,8 @@ export class AssetPlacementManager {
     this.isPlacementActive = false;
     this.isStickyMode = false;
     this.currentAsset = null;
+    this._placementSortAnchorTileId = null;
+    this._placementSortAnchorPlacementLevelId = null;
     this._restoreEditingTileVisibility();
     this._resumeEditingTileShadow();
     this._editingTileObject = null;
@@ -743,6 +866,7 @@ export class AssetPlacementManager {
     this._clearScatterOverlay();
     this._scatterEditing = false;
     this._scatterEditTile = null;
+    this._scatterEditPointerLockScreen = null;
     this._scatterEraseEnabled = false;
     this._toolOptionsPreviewActive = false;
     this._toolOptionsPreviewRestoreWorld = null;
@@ -798,6 +922,75 @@ export class AssetPlacementManager {
 
   _getAssetBasePxPerSquare() { return 200; }
 
+  _createPlacementTextureConfig(assetPath, flipState = null, { encoded = false } = {}) {
+    return {
+      src: encoded ? String(assetPath || '') : this._encodeAssetPath(assetPath || ''),
+      scaleX: flipState?.horizontal ? -1 : 1,
+      scaleY: flipState?.vertical ? -1 : 1
+    };
+  }
+
+  _buildPlacementModuleFlags(baseFlags = {}, { dropShadowEnabled = false, standardTileMask = null } = {}) {
+    const moduleFlags = this._applyHsbcToModuleFlags(Object.assign({}, baseFlags || {}));
+    if (dropShadowEnabled) {
+      moduleFlags.shadow = true;
+      moduleFlags.shadowAlpha = this._roundShadowValue(this._dropShadowAlpha, 3);
+      moduleFlags.shadowDilation = this._roundShadowValue(this._dropShadowDilation, 3);
+      moduleFlags.shadowBlur = this._roundShadowValue(this._dropShadowBlur, 3);
+      moduleFlags.shadowOffsetDistance = this._roundShadowValue(this._dropShadowOffsetDistance, 2);
+      moduleFlags.shadowOffsetAngle = this._roundShadowValue(this._normalizeShadowAngle(this._dropShadowOffsetAngle), 1);
+      const offsetVec = this._computeShadowOffsetVector();
+      moduleFlags.shadowOffsetX = this._roundShadowValue(offsetVec.x, 2);
+      moduleFlags.shadowOffsetY = this._roundShadowValue(offsetVec.y, 2);
+      moduleFlags.shadowOnly = !!this._dropShadowOnly;
+    }
+    if (standardTileMask) {
+      moduleFlags.standardTileMask = standardTileMask;
+    }
+    return moduleFlags;
+  }
+
+  _buildPlacementTileData({
+    assetPath,
+    width,
+    height,
+    x,
+    y,
+    rotation = 0,
+    sort = 0,
+    elevation = this._previewElevation,
+    flipState = null,
+    encodedAssetPath = false,
+    baseFlags = null,
+    dropShadowEnabled = false,
+    standardTileMask = null
+  }) {
+    const textureConfig = this._createPlacementTextureConfig(assetPath, flipState, { encoded: encodedAssetPath });
+    const tileData = normalizeTileCreatePayloadForV14({
+      texture: { ...textureConfig, anchorX: 0.5, anchorY: 0.5 },
+      width,
+      height,
+      x,
+      y,
+      rotation,
+      hidden: false,
+      locked: false,
+      elevation,
+      sort: Number(sort || 0) || 0
+    });
+    const placementLevelId = this._resolveActivePlacementLevelId();
+    const moduleFlags = this._buildPlacementModuleFlags(baseFlags || tileData.flags?.['fa-nexus'] || {}, {
+      dropShadowEnabled,
+      standardTileMask
+    });
+    if (placementLevelId) moduleFlags.placementLevelId = placementLevelId;
+    if (Object.keys(moduleFlags).length) {
+      tileData.flags = tileData.flags || {};
+      tileData.flags['fa-nexus'] = moduleFlags;
+    }
+    return { tileData, textureConfig };
+  }
+
   _getHighestControlledTileElevation() {
     try {
       const controlled = Array.isArray(canvas?.tiles?.controlled) ? canvas.tiles.controlled : [];
@@ -816,8 +1009,8 @@ export class AssetPlacementManager {
   /**
    * Apply grid snapping to world coordinates for asset placement
    * Uses half-grid increments for more precise positioning (corners, edges, centers)
-   * @param {Object} worldCoords - World coordinates {x, y}
-   * @returns {Object} Snapped coordinates {x, y}
+   * @param {FaNexusPoint} worldCoords - World coordinates {x, y}
+   * @returns {FaNexusPoint} Snapped coordinates {x, y}
    */
   _applyGridSnapping(worldCoords) {
     if (!canvas.grid || !canvas.scene || !this.currentAsset) {
@@ -967,11 +1160,14 @@ export class AssetPlacementManager {
   }
 
   _pickScatterPreviewAsset(randomFn = Math.random) {
+    const canPreviewAsset = (asset) => !!asset && !this._assetRequiresDownload(asset) && !!(asset.cachedLocalPath || asset.path || asset.url);
     if (this.isRandomMode && Array.isArray(this.randomAssets) && this.randomAssets.length) {
-      const index = Math.floor(randomFn() * this.randomAssets.length);
-      return this.randomAssets[index] || this.currentAsset;
+      const previewable = this.randomAssets.filter(canPreviewAsset);
+      if (!previewable.length) return canPreviewAsset(this.currentAsset) ? this.currentAsset : null;
+      const index = Math.floor(randomFn() * previewable.length);
+      return previewable[index] || (canPreviewAsset(this.currentAsset) ? this.currentAsset : null);
     }
-    return this.currentAsset;
+    return canPreviewAsset(this.currentAsset) ? this.currentAsset : null;
   }
 
   _buildScatterHoverPreviewInstances(worldX, worldY) {
@@ -1342,14 +1538,15 @@ export class AssetPlacementManager {
   }
 
   _activateToolOptions() {
-    try {
-      this._syncToolOptionsState({ suppressRender: false });
-      toolOptionsController.activateTool('asset.placement', { label: 'Asset Placement' });
-    } catch (_) {}
+    activatePlacementToolOptions({
+      toolId: 'asset.placement',
+      label: 'Asset Placement',
+      syncToolOptions: (options) => this._syncToolOptionsState(options)
+    });
   }
 
   _deactivateToolOptions() {
-    try { toolOptionsController.deactivateTool('asset.placement'); } catch (_) {}
+    deactivatePlacementToolOptions('asset.placement');
   }
 
   refreshToolOptions() {
@@ -1970,6 +2167,7 @@ export class AssetPlacementManager {
       setDropShadowOffsetDistance: (value, commit) => this._handleDropShadowOffsetDistanceChange(value, commit),
       setDropShadowOffsetMax: (value, commit) => this._handleDropShadowOffsetMaxChange(value, commit),
       setDropShadowOffsetAngle: (value, commit) => this._handleDropShadowOffsetAngleChange(value, commit),
+      setDropShadowOnly: (enabled) => this._handleDropShadowOnlyToggle(enabled),
       toggleDropShadowCollapsed: () => this._handleDropShadowCollapseToggle(),
       handleDropShadowPreset: (index, save) => this._handleDropShadowPresetAction(index, { save: !!save }),
       resetDropShadowOffset: () => this._handleDropShadowOffsetReset(),
@@ -2267,11 +2465,7 @@ export class AssetPlacementManager {
       try {
         const doc = this._editingTile?.document ?? this._editingTile;
         if (!doc) return null;
-        const x = Number(doc.x || 0);
-        const y = Number(doc.y || 0);
-        const width = Number(doc.width || 0);
-        const height = Number(doc.height || 0);
-        return { x: x + (width / 2), y: y + (height / 2) };
+        return getTileVisualCenterWorld(doc);
       } catch (_) {
         return null;
       }
@@ -2487,7 +2681,7 @@ export class AssetPlacementManager {
       max: ELEVATION_INPUT_LIMIT,
       step: ELEVATION_STEP_FINE,
       value,
-      defaultValue: 0,
+      defaultValue: quantizeElevation(getCurrentLevelBottomElevation()),
       display: formatElevation(value),
       tooltip: 'Preview tile elevation in Foundry scene units.',
       hint: 'Manual elevation entry for the current placement preview.',
@@ -2572,6 +2766,7 @@ export class AssetPlacementManager {
         min: 0,
         max: 100,
         step: 1,
+        defaultValue: Math.round(DEFAULT_SHADOW_SETTINGS.alpha * 100),
         display: `${Math.round(alphaPercent)}%`,
         hint: 'Transparency of the rendered shadow.',
         disabled
@@ -2582,6 +2777,7 @@ export class AssetPlacementManager {
         min: 0,
         max: MAX_SHADOW_DILATION,
         step: 0.1,
+        defaultValue: DEFAULT_SHADOW_SETTINGS.dilation,
         display: `${dilation.toFixed(1)} px`,
         hint: 'Expands the shadow mask before blurring (world pixels).',
         disabled
@@ -2592,6 +2788,7 @@ export class AssetPlacementManager {
         min: 0,
         max: MAX_SHADOW_BLUR,
         step: 0.1,
+        defaultValue: DEFAULT_SHADOW_SETTINGS.blur,
         display: `${blur.toFixed(1)} px`,
         hint: 'Softens the shadow edges using a post-process blur.',
         disabled
@@ -2601,6 +2798,7 @@ export class AssetPlacementManager {
         distance: offsetDistance,
         angle: offsetAngle,
         maxDistance: this._getShadowOffsetMax(),
+        maxDistanceDefault: DEFAULT_SHADOW_OFFSET_MAX,
         maxDistanceMin: MIN_SHADOW_OFFSET_MAX,
         maxDistanceLimit: SHADOW_OFFSET_MAX_CEILING,
         maxDistanceStep: 1,
@@ -2612,6 +2810,13 @@ export class AssetPlacementManager {
         disabled
       },
       preview,
+      shadowOnly: {
+        available: allowed,
+        enabled: !!this._dropShadowOnly,
+        label: 'Shadow only',
+        tooltip: 'Hide the placed asset art while keeping its FA Nexus shadow visible.',
+        disabled
+      },
       context: this._buildDropShadowContextState()
     };
   }
@@ -2818,6 +3023,7 @@ export class AssetPlacementManager {
       this._dropShadowPreference = null;
       this._persistDropShadowPreference(null);
       this._updatePreviewShadow({ force: true });
+      this._syncDropShadowOnlyPreview();
       this._scheduleScatterPreviewShadowUpdate({ force: true });
       this._notifyDropShadowChanged();
       if (this._isEditingExistingTile) this._scheduleEditingCommit(true);
@@ -2835,8 +3041,23 @@ export class AssetPlacementManager {
     this._dropShadowPreference = next;
     this._persistDropShadowPreference(next);
     this._updatePreviewShadow({ force: true });
+    this._syncDropShadowOnlyPreview();
     this._scheduleScatterPreviewShadowUpdate({ force: true });
     this._notifyDropShadowChanged();
+    if (this._isEditingExistingTile) this._scheduleEditingCommit(true);
+    return true;
+  }
+
+  _handleDropShadowOnlyToggle(enabled) {
+    const next = !!enabled;
+    if (this._dropShadowOnly === next) {
+      this._syncToolOptionsState();
+      return true;
+    }
+    this._dropShadowOnly = next;
+    this._persistShadowSetting('assetDropShadowOnly', next);
+    this._syncDropShadowOnlyPreview();
+    this._syncToolOptionsState({ suppressRender: false });
     if (this._isEditingExistingTile) this._scheduleEditingCommit(true);
     return true;
   }
@@ -3123,8 +3344,15 @@ export class AssetPlacementManager {
         && !this._isEditingExistingTile
         && !this._scatterEditing
       ) {
+        if (!this._scatterMergeEnabled) {
+          this._scatterMergeEnabled = true;
+          this._persistScatterSetting('assetScatterMerge', true);
+        }
         this._ensureScatterOverlay();
-        if (this._scatterMergeEnabled) this._ensureScatterPreviewOverlay();
+        if (this._scatterMergeEnabled) {
+          this._ensureScatterPreviewOverlay();
+          this._syncScatterPreviewOrdering();
+        }
       }
       this._syncPlacementPreviewVisibility();
       if (next === ASSET_SCATTER_MODE_BRUSH) this._updateScatterCursor();
@@ -3226,7 +3454,389 @@ export class AssetPlacementManager {
 
   _syncPlacementPreviewVisibility() {
     if (!this._previewContainer) return;
-    this._previewContainer.visible = this._scatterMode !== ASSET_SCATTER_MODE_BRUSH;
+    const visible = this._scatterMode !== ASSET_SCATTER_MODE_BRUSH;
+    let changed = false;
+    if (this._previewContainer.visible !== visible) {
+      this._previewContainer.visible = visible;
+      changed = true;
+    }
+    if (this._previewContainer.faNexusPreviewActive !== visible) {
+      this._previewContainer.faNexusPreviewActive = visible;
+      changed = true;
+    }
+    if (this._previewContainer.faNexusPreviewHasContent !== visible) {
+      this._previewContainer.faNexusPreviewHasContent = visible;
+      changed = true;
+    }
+    if (changed) this._notifyPreviewLayerChange('asset-placement');
+    this._syncDropShadowOnlyPreview();
+  }
+
+  _syncDropShadowOnlyPreview() {
+    const shadowOnlyActive = !!(this._isGlobalDropShadowEnabled() && this.isDropShadowEnabled() && this._dropShadowOnly);
+    const visible = !shadowOnlyActive;
+    try {
+      const sprite = this._previewContainer?._sprite || null;
+      if (sprite && !sprite.destroyed) {
+        sprite.visible = visible;
+        sprite.renderable = visible;
+      }
+    } catch (_) {}
+    try {
+      for (const sprite of this._scatterPreviewSprites?.values?.() || []) {
+        if (!sprite || sprite.destroyed) continue;
+        sprite.visible = visible;
+        sprite.renderable = visible;
+      }
+    } catch (_) {}
+  }
+
+  _capturePlacementSortAnchor(controlledTiles = canvas?.tiles?.controlled) {
+    const anchorTile = resolvePlacementAnchorTile(controlledTiles);
+    const anchorDoc = anchorTile?.document || anchorTile || null;
+    const anchorTileId = String(anchorTile?.document?.id || anchorTile?.id || '').trim() || null;
+    this._placementSortAnchorTileId = anchorTileId;
+    this._placementSortAnchorPlacementLevelId = this._resolveDocumentPlacementLevelId(anchorDoc);
+    this._placementSortBeforeAnchor = false;
+    Logger.debug('Placement.sortAnchor.capture', {
+      anchorTileId,
+      elevation: Number(anchorTile?.document?.elevation ?? anchorTile?.elevation ?? 0) || 0,
+      sort: Number(anchorTile?.document?.sort ?? anchorTile?.sort ?? 0) || 0
+    });
+    return anchorTileId;
+  }
+
+  _adoptPlacementSortAnchor(target) {
+    const anchorTileId = String(target?.document?.id || target?.id || '').trim() || null;
+    this._placementSortAnchorTileId = anchorTileId;
+    this._placementSortAnchorPlacementLevelId = this._resolveDocumentPlacementLevelId(target?.document || target || null);
+    this._placementSortBeforeAnchor = false;
+    this._previewPlacementLevelId = this._placementSortAnchorPlacementLevelId;
+    Logger.debug('Placement.sortAnchor.adopt', {
+      anchorTileId,
+      elevation: Number(target?.document?.elevation ?? target?.elevation ?? 0) || 0,
+      sort: Number(target?.document?.sort ?? target?.sort ?? 0) || 0
+    });
+    return anchorTileId;
+  }
+
+  _resolvePlacementSortContext(elevation = this._previewElevation, { count = 1 } = {}) {
+    const normalizedElevation = Number.isFinite(Number(elevation)) ? Number(elevation) : 0;
+    const editingDoc = ((this._isEditingExistingTile || this._replaceOriginalOnPlace) && this._editingTile) ? this._editingTile : null;
+    if (editingDoc) {
+      const sort = Number(editingDoc?.sort ?? this._previewSort) || 0;
+      return {
+        sort,
+        placementSorts: [sort],
+        previewSort: sort,
+        previewSorts: [sort],
+        strategy: 'editing-document',
+        anchorTileId: editingDoc?.id || null,
+        anchorTileSort: sort,
+        siblingUpdates: []
+      };
+    }
+
+    const resolved = this._interactionController?.resolvePlacementSortAtElevation?.(normalizedElevation, {
+      anchorTileId: this._placementSortAnchorTileId,
+      sortBefore: this._placementSortBeforeAnchor === true,
+      scene: canvas?.scene,
+      count
+    });
+    if (resolved && Array.isArray(resolved.placementSorts) && resolved.placementSorts.length) {
+      return resolved;
+    }
+
+    const fallbackSort = this._interactionController?.computeNextSortAtElevation?.(normalizedElevation) ?? this._previewSort ?? 0;
+    if (this._placementSortAnchorTileId) {
+      Logger.warn('Placement.sort.resolve.missingContext', {
+        elevation: normalizedElevation,
+        anchorTileId: this._placementSortAnchorTileId,
+        count
+      });
+    } else {
+      Logger.debug('Placement.sort.resolve.missingContext', {
+        elevation: normalizedElevation,
+        anchorTileId: this._placementSortAnchorTileId,
+        count
+      });
+    }
+    return {
+      sort: Number(fallbackSort) || 0,
+      placementSorts: [Number(fallbackSort) || 0],
+      previewSort: Number(fallbackSort) || 0,
+      previewSorts: [Number(fallbackSort) || 0],
+      strategy: 'top-of-elevation',
+      anchorTileId: this._placementSortAnchorTileId,
+      anchorTileSort: null,
+      siblingUpdates: []
+    };
+  }
+
+  _applyPlacementPreviewOrdering(sortContext = null) {
+    const context = sortContext || this._resolvePlacementSortContext(this._previewElevation);
+    this._adoptPlacementSortContext(context);
+    if (!this._previewContainer) return context;
+    const renderOrder = this._resolvePreviewRenderOrder(this._previewElevation, this._previewRenderSort);
+    this._previewContainer.sortLayer = renderOrder.sortLayer;
+    this._previewContainer.sort = renderOrder.sort;
+    this._previewContainer.faNexusSort = renderOrder.sort;
+    this._previewContainer.faNexusPlacementSort = this._previewSort;
+    this._previewContainer.faNexusPreviewSort = this._previewRenderSort;
+    this._previewContainer.faNexusElevationDoc = this._previewElevation;
+    this._previewContainer.faNexusElevation = renderOrder.elevation;
+    this._previewContainer.faNexusPlacementLevelId = renderOrder.placementLevelId || null;
+    this._previewContainer.faNexusBandKind = renderOrder.kind || 'normal';
+    this._previewContainer.elevation = renderOrder.elevation;
+    this._previewContainer.zIndex = renderOrder.kind !== 'normal' ? this._previewRenderSort : 0;
+    const parent = this._previewContainer.parent;
+    if (parent && 'sortDirty' in parent) parent.sortDirty = true;
+    parent?.sortChildren?.();
+    return context;
+  }
+
+  _normalizePlacementLevelId(value) {
+    const normalized = String(value || '').trim();
+    return normalized || null;
+  }
+
+  _resolveDocumentPlacementLevelId(doc = null) {
+    return this._normalizePlacementLevelId(getTileExplicitPlacementLevelId(doc));
+  }
+
+  _adoptPlacementSortContext(context = null) {
+    const placementSort = Number(context?.sort);
+    const nextSort = Number.isFinite(placementSort)
+      ? placementSort
+      : (Array.isArray(context?.placementSorts) ? Number(context.placementSorts[0]) : this._previewSort);
+    this._previewSort = Number.isFinite(nextSort) ? nextSort : 0;
+    const previewSort = Number(
+      context?.previewSort
+      ?? (Array.isArray(context?.previewSorts) ? context.previewSorts[0] : undefined)
+      ?? this._previewSort
+    );
+    this._previewRenderSort = Number.isFinite(previewSort) ? previewSort : this._previewSort;
+    return context;
+  }
+
+  _resolveActivePlacementLevelId(doc = null) {
+    return this._normalizePlacementLevelId(
+      this._previewPlacementLevelId
+      ?? this._resolveDocumentPlacementLevelId(doc)
+    );
+  }
+
+  applyLayerManagerPreviewPlacement({
+    elevation = this._previewElevation,
+    sort = undefined,
+    previewSort = undefined,
+    previewKind = 'asset-placement-preview',
+    previewId = null,
+    previewKey = null,
+    placementLevelId = undefined,
+    anchorTileId = undefined,
+    sortBefore = undefined,
+    announce = true,
+    immediate = true,
+    worldPoint = null
+  } = {}) {
+    let changed = false;
+
+    if (placementLevelId !== undefined) {
+      const nextPlacementLevelId = this._normalizePlacementLevelId(placementLevelId);
+      if (nextPlacementLevelId !== this._previewPlacementLevelId) {
+        this._previewPlacementLevelId = nextPlacementLevelId;
+        changed = true;
+      }
+    }
+
+    if (anchorTileId !== undefined) {
+      const nextAnchorTileId = String(anchorTileId || '').trim() || null;
+      if (nextAnchorTileId !== this._placementSortAnchorTileId) {
+        this._placementSortAnchorTileId = nextAnchorTileId;
+        changed = true;
+      }
+    }
+
+    if (sortBefore !== undefined) {
+      const nextSortBefore = sortBefore === true;
+      if (nextSortBefore !== this._placementSortBeforeAnchor) {
+        this._placementSortBeforeAnchor = nextSortBefore;
+        changed = true;
+      }
+    }
+
+    const directSort = sort !== undefined && Number.isFinite(Number(sort)) ? Number(sort) : null;
+    const directPreviewSort = previewSort !== undefined && Number.isFinite(Number(previewSort))
+      ? Number(previewSort)
+      : directSort;
+    const isScatterPreviewPlacement = directSort !== null && previewKind === 'scatter-preview';
+
+    if (directSort !== null && Number(this._previewSort) !== directSort) {
+      this._previewSort = directSort;
+      changed = true;
+    }
+    if (directPreviewSort !== null && Number(this._previewRenderSort) !== directPreviewSort) {
+      this._previewRenderSort = directPreviewSort;
+      changed = true;
+    }
+
+    if (isScatterPreviewPlacement) {
+      changed = this._applyScatterPreviewGroupPlacement({
+        previewId,
+        previewKey,
+        elevation,
+        sort: directSort,
+        previewSort: directPreviewSort
+      }) || changed;
+    }
+
+    const elevationChanged = this._setPreviewElevation(elevation, {
+      announce,
+      immediate,
+      syncToolOptions: true,
+      worldPoint
+    });
+    changed = changed || elevationChanged;
+    if (!changed) return false;
+    if (directSort !== null) {
+      if (this._previewContainer) {
+        this._applyPlacementPreviewOrdering({
+          sort: directSort,
+          placementSorts: [directSort],
+          previewSort: directPreviewSort,
+          previewSorts: [directPreviewSort],
+          strategy: 'layer-manager-direct-sort',
+          anchorTileId: this._placementSortAnchorTileId,
+          anchorTileSort: null,
+          siblingUpdates: []
+        });
+      }
+      this._applyScatterHoverOrdering();
+      this._syncScatterPreviewOrdering();
+      this._notifyPreviewLayerChange('asset-placement');
+      this._refreshShadowElevationContext({ adopt: true });
+      this._syncToolOptionsState();
+    } else if (!elevationChanged) {
+      this._syncPreviewOrdering();
+      this._refreshShadowElevationContext({ adopt: true });
+      this._syncToolOptionsState();
+    }
+    return true;
+  }
+
+  _normalizeScatterPreviewGroupKey({ previewKey = null, previewId = null, elevation = null } = {}) {
+    const explicit = String(previewKey || '').trim();
+    if (explicit) return explicit;
+    const id = String(previewId || '').trim();
+    if (id.startsWith('scatter-preview-')) return id.slice('scatter-preview-'.length);
+    const numeric = Number(elevation);
+    return Number.isFinite(numeric) ? this._getScatterPreviewGroupKey(numeric) : '';
+  }
+
+  _applyScatterPreviewGroupPlacement({
+    previewId = null,
+    previewKey = null,
+    elevation = null,
+    sort = undefined,
+    previewSort = undefined
+  } = {}) {
+    if (!this._scatterPreviewGroups?.size) return false;
+    const sourceKey = this._normalizeScatterPreviewGroupKey({ previewId, previewKey, elevation });
+    const targetElevation = Number(elevation);
+    const targetKey = Number.isFinite(targetElevation) ? this._getScatterPreviewGroupKey(targetElevation) : sourceKey;
+    const nextSort = Number(sort);
+    const group = this._scatterPreviewGroups.get(sourceKey);
+    if (!group) {
+      Logger.warn('Placement.scatter.previewGroup.missing', {
+        previewId,
+        previewKey,
+        sourceKey,
+        targetKey
+      });
+      return false;
+    }
+
+    let changed = false;
+    if (targetKey && sourceKey !== targetKey) {
+      const existingTarget = this._scatterPreviewGroups.get(targetKey);
+      if (existingTarget && existingTarget !== group) {
+        Logger.warn('Placement.scatter.previewGroup.targetExists', {
+          previewId,
+          sourceKey,
+          targetKey,
+          targetElevation
+        });
+        return false;
+      }
+      this._scatterPreviewGroups.delete(sourceKey);
+      group.key = targetKey;
+      group.elevation = Number.isFinite(targetElevation) ? quantizeElevation(targetElevation) : group.elevation;
+      this._scatterPreviewGroups.set(targetKey, group);
+      if (group.container) {
+        group.container.faNexusScatterPreviewKey = targetKey;
+        group.container.name = `fa-nexus-scatter-preview-${targetKey}`;
+      }
+      for (const instance of group.instances || []) {
+        if (!instance) continue;
+        instance._scatterGroupKey = targetKey;
+        instance._scatterElevation = group.elevation;
+      }
+      const sessionGroup = this._scatterSessionGroups?.get?.(sourceKey);
+      if (sessionGroup) {
+        this._scatterSessionGroups.delete(sourceKey);
+        sessionGroup.elevation = group.elevation;
+        sessionGroup.sort = group.sort;
+        this._scatterSessionGroups.set(targetKey, sessionGroup);
+      }
+      const shadowSettings = this._scatterPreviewShadowSettings.get(sourceKey);
+      if (shadowSettings && !this._scatterPreviewShadowSettings.has(targetKey)) {
+        this._scatterPreviewShadowSettings.set(targetKey, shadowSettings);
+      }
+      this._scatterPreviewShadowSettings.delete(sourceKey);
+      if (this._scatterPreviewActiveKey === sourceKey) this._scatterPreviewActiveKey = targetKey;
+      changed = true;
+    }
+
+    if (Number.isFinite(nextSort) && Number(group.sort) !== nextSort) {
+      group.sort = nextSort;
+      const sessionGroup = this._scatterSessionGroups?.get?.(targetKey);
+      if (sessionGroup) sessionGroup.sort = nextSort;
+      changed = true;
+    }
+    const nextPreviewSort = Number(previewSort);
+    if (Number.isFinite(nextPreviewSort) && Number(group.previewSort) !== nextPreviewSort) {
+      group.previewSort = nextPreviewSort;
+      changed = true;
+    }
+
+    this._scatterPreviewContainer = group.container;
+    this._scatterPreviewActiveKey = targetKey;
+    this._applyScatterPreviewOrdering(group);
+    this._syncScatterPreviewFlags();
+    return changed;
+  }
+
+  async _applyPlacementSiblingSortUpdates(siblingUpdates, { reason = 'unknown' } = {}) {
+    const updates = Array.isArray(siblingUpdates)
+      ? siblingUpdates.filter((entry) => entry && entry._id && Number.isFinite(Number(entry.sort)))
+      : [];
+    if (!updates.length) return [];
+    if (!canvas?.scene) throw new Error(`Canvas scene unavailable while applying sort updates for ${reason}`);
+    Logger.debug('Placement.sort.reindex.apply', {
+      reason,
+      updates: updates.map((entry) => ({ _id: entry._id, sort: Number(entry.sort) }))
+    });
+    try {
+      return await canvas.scene.updateEmbeddedDocuments('Tile', updates, { diff: false });
+    } catch (error) {
+      Logger.error('Placement.sort.reindex.failed', {
+        reason,
+        updates: updates.map((entry) => ({ _id: entry._id, sort: Number(entry.sort) })),
+        error: String(error?.message || error)
+      });
+      throw error;
+    }
   }
 
   _coerceScatterControlNumericValue(value, { control = 'unknown', commit = false } = {}) {
@@ -3382,6 +3992,11 @@ export class AssetPlacementManager {
           } catch (_) {
             this._shadowPresets = this._loadShadowPresets();
           }
+          this._syncToolOptionsState({ suppressRender: false });
+          break;
+        case 'assetDropShadowOnly':
+          this._dropShadowOnly = !!setting.value;
+          this._syncDropShadowOnlyPreview();
           this._syncToolOptionsState({ suppressRender: false });
           break;
         case 'assetDropShadowQuality':
@@ -4263,6 +4878,9 @@ export class AssetPlacementManager {
     container.sortableChildren = true;
     container.eventMode = 'none';
     container.name = 'fa-nexus-asset-preview';
+    container.faNexusAssetPlacementPreview = true;
+    container.faNexusPreviewHasContent = false;
+    container.faNexusPreviewActive = false;
     this._previewContainer = container;
 
      // Create sprite
@@ -4320,13 +4938,7 @@ export class AssetPlacementManager {
        catch (_) { return 0; }
      })();
      container.sortLayer = tilesSortLayer;
-     container.sort = this._previewSort;
-     container.faNexusSort = this._previewSort;
-     const renderElevation = getTileRenderElevation(this._previewElevation);
-     container.faNexusElevationDoc = this._previewElevation;
-     container.faNexusElevation = renderElevation;
-     container.elevation = renderElevation;
-     container.zIndex = 0;
+     this._applyPlacementPreviewOrdering();
 
      // Add to canvas
      const parent = primary || canvas?.stage;
@@ -4364,7 +4976,11 @@ export class AssetPlacementManager {
       this._applyTileStateToPlacement(this._editingTile, { force: true });
     }
     this._scheduleShadowOffsetPreviewUpdate({ force: true });
-    if (this._scatterMode === ASSET_SCATTER_MODE_BRUSH) this._updateScatterCursor();
+    if (this._scatterMode === ASSET_SCATTER_MODE_BRUSH) {
+      if (this._scatterMergeEnabled) this._ensureScatterPreviewOverlay();
+      this._syncScatterPreviewOrdering();
+      this._updateScatterCursor();
+    }
   }
 
   _ensurePointerSnapshot(options = {}) {
@@ -4386,6 +5002,19 @@ export class AssetPlacementManager {
   }
 
   _capturePointerSnapshot(options = {}) {
+    const explicitPointerWorld = (options?.pointerWorld && Number.isFinite(options.pointerWorld.x) && Number.isFinite(options.pointerWorld.y))
+      ? { x: Number(options.pointerWorld.x), y: Number(options.pointerWorld.y) }
+      : null;
+    if (explicitPointerWorld) {
+      const explicitPointer = (options?.pointer && Number.isFinite(options.pointer.x) && Number.isFinite(options.pointer.y))
+        ? { x: Number(options.pointer.x), y: Number(options.pointer.y) }
+        : (this._canvasToScreen(explicitPointerWorld.x, explicitPointerWorld.y) || null);
+      return {
+        screen: explicitPointer,
+        world: explicitPointerWorld
+      };
+    }
+
     const candidates = [];
     const push = (screen, world, weight) => {
       if (!screen) return;
@@ -4603,18 +5232,23 @@ export class AssetPlacementManager {
       }
 
       const instances = this._normalizeScatterInstances(payload.instances || []);
-      const originX = Number(doc.x || 0);
-      const originY = Number(doc.y || 0);
+      const origin = getTileVisualTopLeftWorld(doc);
+      const originX = origin.x;
+      const originY = origin.y;
       const worldInstances = instances.map((instance) => ({
         ...instance,
         x: instance.x + originX,
         y: instance.y + originY
       }));
 
-      const initialElevation = Number.isFinite(doc.elevation) ? Number(doc.elevation) : (Number.isFinite(this._lastElevationUsed) ? this._lastElevationUsed : 0);
+      const initialElevation = Number.isFinite(doc.elevation)
+        ? Number(doc.elevation)
+        : resolveInitialFaNexusPlacementElevation({ fallback: this._lastElevationUsed });
       this._previewElevation = initialElevation;
       this._lastElevationUsed = this._previewElevation;
       this._previewSort = Number(doc.sort ?? 0) || 0;
+      this._previewRenderSort = this._previewSort;
+      this._previewPlacementLevelId = this._resolveDocumentPlacementLevelId(doc);
       this._beginScatterPreviewSession(worldInstances, { elevation: this._previewElevation });
       this._applyScatterPreviewHsbc();
       this._resetScatterHistory();
@@ -4624,9 +5258,7 @@ export class AssetPlacementManager {
         if (options.pointerWorld && Number.isFinite(options.pointerWorld.x) && Number.isFinite(options.pointerWorld.y)) {
           return { x: Number(options.pointerWorld.x), y: Number(options.pointerWorld.y) };
         }
-        const w = Number(doc.width || 0);
-        const h = Number(doc.height || 0);
-        return { x: originX + w / 2, y: originY + h / 2 };
+        return getTileVisualCenterWorld(doc);
       })();
 
       const pointerOption = (() => {
@@ -4645,6 +5277,24 @@ export class AssetPlacementManager {
         }
         return null;
       })();
+
+      const interactionPointerScreen = (() => {
+        try {
+          const controllerScreen = this._interactionController?.getPointerState?.()?.screen;
+          if (controllerScreen && Number.isFinite(controllerScreen.x) && Number.isFinite(controllerScreen.y)) {
+            return { x: Number(controllerScreen.x), y: Number(controllerScreen.y) };
+          }
+        } catch (_) {}
+        const rendererPointer = this._resolveRendererPointer?.();
+        if (rendererPointer && Number.isFinite(rendererPointer.x) && Number.isFinite(rendererPointer.y)) {
+          return { x: Number(rendererPointer.x), y: Number(rendererPointer.y) };
+        }
+        if (this._lastPointer && Number.isFinite(this._lastPointer.x) && Number.isFinite(this._lastPointer.y)) {
+          return { x: Number(this._lastPointer.x), y: Number(this._lastPointer.y) };
+        }
+        return null;
+      })();
+      this._scatterEditPointerLockScreen = interactionPointerScreen;
 
       this._ensurePointerSnapshot({
         pointer: pointerOption || options.pointer || null,
@@ -4836,6 +5486,7 @@ export class AssetPlacementManager {
       this._editingTile = doc;
       const shadowEnabled = !!doc.getFlag('fa-nexus', 'shadow');
       this._dropShadowPreference = shadowEnabled ? true : false;
+      this._dropShadowOnly = !!doc.getFlag('fa-nexus', 'shadowOnly');
 
       const readFlag = (key, fallback) => {
         try {
@@ -4891,10 +5542,7 @@ export class AssetPlacementManager {
 
       this._pendingEditState = null;
 
-      const center = {
-        x: Number(doc.x || 0) + Number(doc.width || 0) / 2,
-        y: Number(doc.y || 0) + Number(doc.height || 0) / 2
-      };
+      const center = getTileVisualCenterWorld(doc);
       this._lastPointerWorld = { ...center };
       this._previewContainer.x = center.x;
       this._previewContainer.y = center.y;
@@ -4902,6 +5550,8 @@ export class AssetPlacementManager {
       this._previewElevation = Number(doc.elevation ?? 0) || 0;
       this._lastElevationUsed = this._previewElevation;
       this._previewSort = Number(doc.sort ?? 0) || 0;
+      this._previewRenderSort = this._previewSort;
+      this._previewPlacementLevelId = this._resolveDocumentPlacementLevelId(doc);
       this._applyPreviewHsbc();
       this._syncPreviewOrdering();
 
@@ -4920,6 +5570,7 @@ export class AssetPlacementManager {
       this._pendingFlipHorizontal = this._flipHorizontal;
       this._pendingFlipVertical = this._flipVertical;
       this._applyPendingFlipToPreview({ forceShadow: true });
+      this._syncDropShadowOnlyPreview();
 
       this._updatePreviewShadow({ force: true });
 
@@ -5101,8 +5752,10 @@ export class AssetPlacementManager {
   }
 
   _removePreviewElement() {
+    let removed = false;
     try {
       if (this._previewContainer) {
+        removed = true;
         this._cleanupPreviewShadowResources(this._previewContainer);
         this._previewContainer.parent?.removeChild(this._previewContainer);
         this._previewContainer.destroy({ children: true });
@@ -5112,29 +5765,45 @@ export class AssetPlacementManager {
     this.previewElement = null;
     this._shadowPreviewTextureListener = null;
     this._clearShadowOffsetPreview();
+    if (removed) this._notifyPreviewLayerChange('asset-placement');
   }
 
   _ensureScatterOverlay() {
-    if (this._scatterOverlay && !this._scatterOverlay.destroyed && this._scatterGfx && this._scatterGhostContainer) return;
+    if (
+      this._scatterOverlay
+      && !this._scatterOverlay.destroyed
+      && this._scatterGfx
+      && this._scatterGhostContainer
+      && !this._scatterGhostContainer.destroyed
+    ) {
+      this._applyScatterHoverOrdering();
+      return;
+    }
     try {
       const overlay = new PIXI.Container();
       overlay.eventMode = 'none';
+      overlay.name = 'fa-nexus-scatter-hover-overlay';
       overlay.zIndex = 999999;
       const ghostContainer = new PIXI.Container();
       ghostContainer.eventMode = 'none';
       ghostContainer.sortableChildren = false;
       ghostContainer.name = 'fa-nexus-scatter-hover-preview';
+      ghostContainer.visible = false;
       const gfx = new PIXI.Graphics();
       gfx.eventMode = 'none';
-      overlay.addChild(ghostContainer);
       overlay.addChild(gfx);
-      const parent = canvas?.stage || canvas?.primary;
-      parent?.addChild?.(overlay);
-      if (parent && 'sortDirty' in parent) parent.sortDirty = true;
-      parent?.sortChildren?.();
+      const overlayParent = canvas?.stage || canvas?.primary;
+      overlayParent?.addChild?.(overlay);
+      if (overlayParent && 'sortDirty' in overlayParent) overlayParent.sortDirty = true;
+      overlayParent?.sortChildren?.();
+      const ghostParent = canvas?.primary || canvas?.stage;
+      ghostParent?.addChild?.(ghostContainer);
+      if (ghostParent && 'sortDirty' in ghostParent) ghostParent.sortDirty = true;
+      ghostParent?.sortChildren?.();
       this._scatterOverlay = overlay;
       this._scatterGfx = gfx;
       this._scatterGhostContainer = ghostContainer;
+      this._applyScatterHoverOrdering();
     } catch (_) {
       this._scatterOverlay = null;
       this._scatterGfx = null;
@@ -5150,6 +5819,10 @@ export class AssetPlacementManager {
       }
     }
     this._scatterGhostSprites = [];
+    if (this._scatterGhostContainer) {
+      try { this._scatterGhostContainer.parent?.removeChild?.(this._scatterGhostContainer); } catch (_) {}
+      try { this._scatterGhostContainer.destroy?.({ children: true }); } catch (_) {}
+    }
     this._scatterGhostContainer = null;
     if (this._scatterGfx) {
       try { this._scatterGfx.clear(); } catch (_) {}
@@ -5162,9 +5835,33 @@ export class AssetPlacementManager {
     this._scatterGfx = null;
   }
 
+  _applyScatterHoverOrdering() {
+    const container = this._scatterGhostContainer;
+    if (!container || container.destroyed) return;
+    const nextSort = Number.isFinite(this._previewSort) ? this._previewSort : 0;
+    const nextPreviewSort = Number.isFinite(this._previewRenderSort) ? this._previewRenderSort : nextSort;
+    const elevation = Number.isFinite(this._previewElevation) ? this._previewElevation : 0;
+    const renderOrder = this._resolvePreviewRenderOrder(elevation, nextPreviewSort);
+    try { container.sortLayer = renderOrder.sortLayer; } catch (_) {}
+    try { container.sort = renderOrder.sort; } catch (_) {}
+    try { container.faNexusSort = renderOrder.sort; } catch (_) {}
+    try { container.faNexusPlacementSort = nextSort; } catch (_) {}
+    try { container.faNexusPreviewSort = nextPreviewSort; } catch (_) {}
+    try { container.faNexusElevationDoc = elevation; } catch (_) {}
+    try { container.faNexusElevation = renderOrder.elevation; } catch (_) {}
+    try { container.faNexusPlacementLevelId = renderOrder.placementLevelId || null; } catch (_) {}
+    try { container.faNexusBandKind = renderOrder.kind || 'normal'; } catch (_) {}
+    try { container.elevation = renderOrder.elevation; } catch (_) {}
+    try { container.zIndex = renderOrder.kind !== 'normal' ? nextPreviewSort : 0; } catch (_) {}
+    const parent = container.parent;
+    if (parent && 'sortDirty' in parent) parent.sortDirty = true;
+    parent?.sortChildren?.();
+  }
+
   _syncScatterHoverPreview(worldX = null, worldY = null) {
     const container = this._scatterGhostContainer;
     if (!container) return;
+    this._applyScatterHoverOrdering();
     const instances = this._buildScatterHoverPreviewInstances(worldX, worldY);
     if (!instances.length) {
       container.visible = false;
@@ -5287,6 +5984,7 @@ export class AssetPlacementManager {
     this._scatterPreviewActiveKey = null;
     this._scatterPreviewInstances = [];
     this._scatterPreviewSprites.clear();
+    this._scatterPreviewTextureFailures.clear();
     this._notifyPreviewLayerChange();
   }
 
@@ -5326,9 +6024,20 @@ export class AssetPlacementManager {
   _getScatterPreviewTexture(src) {
     if (!src) return null;
     if (this._scatterPreviewTextures.has(src)) return this._scatterPreviewTextures.get(src);
-    const texture = getSharedTexture(src);
-    this._scatterPreviewTextures.set(src, texture);
-    return texture;
+    try {
+      const texture = getSharedTexture(src);
+      this._scatterPreviewTextures.set(src, texture);
+      return texture;
+    } catch (error) {
+      if (!this._scatterPreviewTextureFailures.has(src)) {
+        this._scatterPreviewTextureFailures.add(src);
+        Logger.error('Placement.scatterPreview.texture.failed', {
+          src,
+          error: String(error?.message || error)
+        });
+      }
+      return null;
+    }
   }
 
   _addScatterPreviewInstance(instance) {
@@ -5357,6 +6066,7 @@ export class AssetPlacementManager {
     if (instance.id) {
       this._scatterPreviewSprites.set(instance.id, sprite);
     }
+    this._syncDropShadowOnlyPreview();
     this._syncScatterPreviewFlags();
     this._scheduleScatterPreviewShadowUpdate({ key: group.key });
   }
@@ -5573,8 +6283,8 @@ export class AssetPlacementManager {
     return this._getScatterSessionKey(elevation);
   }
 
-  _notifyPreviewLayerChange() {
-    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source: 'scatter' }); } catch (_) {}
+  _notifyPreviewLayerChange(source = 'scatter') {
+    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source }); } catch (_) {}
   }
 
   _syncScatterPreviewFlags() {
@@ -5852,7 +6562,7 @@ export class AssetPlacementManager {
     return null;
   }
 
-  _buildScatterGroupTileData(instances, elevationOverride = null, shadowSettings = null) {
+  _buildScatterGroupTileData(instances, elevationOverride = null, shadowSettings = null, sortOverride = null) {
     const bounds = this._computeScatterBounds(instances);
     if (!bounds) return null;
     const localInstances = instances.map((instance) => ({
@@ -5869,7 +6579,10 @@ export class AssetPlacementManager {
     const textureSrc = this._resolveScatterTileTextureSrc(instances);
     if (!textureSrc) return null;
     const elevation = Number.isFinite(elevationOverride) ? elevationOverride : this._previewElevation;
-    const nextSort = this._interactionController.computeNextSortAtElevation?.(elevation) ?? 0;
+    const numericSortOverride = Number(sortOverride);
+    const nextSort = Number.isFinite(numericSortOverride)
+      ? numericSortOverride
+      : (this._interactionController.computeNextSortAtElevation?.(elevation) ?? 0);
     const moduleFlags = {
       [SCATTER_FLAG_KEY]: {
         version: SCATTER_VERSION,
@@ -5890,25 +6603,20 @@ export class AssetPlacementManager {
       moduleFlags.shadowOffsetAngle = this._roundShadowValue(this._normalizeShadowAngle(settings.offsetAngle), 1);
       moduleFlags.shadowOffsetX = this._roundShadowValue(offsetVec.x, 2);
       moduleFlags.shadowOffsetY = this._roundShadowValue(offsetVec.y, 2);
+      moduleFlags.shadowOnly = !!this._dropShadowOnly;
     }
-    return {
-      texture: { src: textureSrc },
+    const { tileData } = this._buildPlacementTileData({
+      assetPath: textureSrc,
       width: bounds.width,
       height: bounds.height,
-      x: bounds.x,
-      y: bounds.y,
+      ...getCenteredTileAnchorPosition(bounds),
       rotation: 0,
-      hidden: false,
-      locked: false,
-      elevation,
       sort: Number(nextSort) || 0,
-      overhead: false,
-      roof: false,
-      occlusion: { mode: 0, alpha: 0 },
-      flags: {
-        'fa-nexus': moduleFlags
-      }
-    };
+      elevation,
+      encodedAssetPath: true,
+      baseFlags: moduleFlags
+    });
+    return tileData;
   }
 
   _buildScatterGroupTileUpdate(instances, tileDoc) {
@@ -5929,12 +6637,13 @@ export class AssetPlacementManager {
     if (!textureSrc) return null;
     const update = {
       _id: tileDoc.id,
-      x: bounds.x,
-      y: bounds.y,
+      ...getCenteredTileAnchorPosition(bounds),
       width: bounds.width,
       height: bounds.height,
       rotation: 0,
       'texture.src': textureSrc,
+      'texture.anchorX': 0.5,
+      'texture.anchorY': 0.5,
       [`flags.fa-nexus.${SCATTER_FLAG_KEY}`]: {
         version: SCATTER_VERSION,
         instances: localInstances
@@ -5953,16 +6662,19 @@ export class AssetPlacementManager {
       const offsetVec = this._computeShadowOffsetVector();
       update['flags.fa-nexus.shadowOffsetX'] = this._roundShadowValue(offsetVec.x, 2);
       update['flags.fa-nexus.shadowOffsetY'] = this._roundShadowValue(offsetVec.y, 2);
+      update['flags.fa-nexus.shadowOnly'] = !!this._dropShadowOnly;
     }
     return update;
   }
 
   _collectScatterCommitGroups() {
     const groups = [];
-    for (const group of this._scatterSessionGroups.values()) {
+    for (const [key, group] of this._scatterSessionGroups.entries()) {
       if (!group?.instances?.length) continue;
+      const previewGroup = this._scatterPreviewGroups?.get?.(key) || null;
       groups.push({
         elevation: group.elevation,
+        sort: Number.isFinite(group.sort) ? group.sort : (Number.isFinite(previewGroup?.sort) ? previewGroup.sort : null),
         instances: group.instances.slice(),
         shadowSettings: group.shadowSettings ? { ...group.shadowSettings } : null
       });
@@ -5971,7 +6683,13 @@ export class AssetPlacementManager {
     if (!groups.length && fallbackInstances.length) {
       const key = this._getScatterSessionKey(this._previewElevation);
       const shadowSettings = this._scatterPreviewShadowSettings.get(key) || this._snapshotScatterPreviewShadowSettings();
-      groups.push({ elevation: this._previewElevation, instances: fallbackInstances.slice(), shadowSettings });
+      const previewGroup = this._scatterPreviewGroups?.get?.(key) || null;
+      groups.push({
+        elevation: this._previewElevation,
+        sort: Number.isFinite(previewGroup?.sort) ? previewGroup.sort : (Number.isFinite(this._previewSort) ? this._previewSort : null),
+        instances: fallbackInstances.slice(),
+        shadowSettings
+      });
     }
     return groups;
   }
@@ -5981,7 +6699,7 @@ export class AssetPlacementManager {
     const tileDataList = [];
     for (const group of groups) {
       const elevation = Number.isFinite(group.elevation) ? group.elevation : this._previewElevation;
-      const tileData = this._buildScatterGroupTileData(group.instances, elevation, group.shadowSettings || null);
+      const tileData = this._buildScatterGroupTileData(group.instances, elevation, group.shadowSettings || null, group.sort);
       if (tileData) tileDataList.push(tileData);
     }
     if (!tileDataList.length) return;
@@ -6022,6 +6740,7 @@ export class AssetPlacementManager {
     const update = this._buildScatterGroupTileUpdate(instances, this._scatterEditTile);
     if (!update) return;
     try {
+      preserveTileDocumentCustomSettingsForUpdate(this._scatterEditTile, update);
       const updated = await canvas.scene.updateEmbeddedDocuments('Tile', [update], { diff: false });
       if (Array.isArray(updated) && updated[0]) {
         this._scatterEditTile = updated[0];
@@ -6204,11 +6923,7 @@ export class AssetPlacementManager {
       }
       if (!positions.length) return;
 
-      const controller = this._interactionController;
-      let nextSort = controller?.computeNextSortAtElevation?.(this._previewElevation);
-      if (!Number.isFinite(nextSort)) nextSort = this._previewSort || 0;
-
-      const tileDataList = [];
+      const plannedPlacements = [];
       for (const pos of positions) {
         const asset = this._pickScatterAsset();
         if (!asset) continue;
@@ -6216,21 +6931,37 @@ export class AssetPlacementManager {
           try { await this._ensureAssetLocal(asset); }
           catch (_) { continue; }
         }
-        const snapped = this._applyGridSnapping(pos);
-        const rotation = this._getScatterRotation();
-        const scale = this._getScatterScale();
-        const flip = this._getScatterFlipState();
-        const tileData = this._buildScatterTileData(asset, snapped, {
-          rotation,
-          scale,
-          flip,
-          sort: nextSort
+        plannedPlacements.push({
+          asset,
+          snapped: this._applyGridSnapping(pos),
+          rotation: this._getScatterRotation(),
+          scale: this._getScatterScale(),
+          flip: this._getScatterFlipState()
         });
-        if (!tileData) continue;
-        tileDataList.push(tileData);
-        nextSort += 2;
       }
 
+      if (!plannedPlacements.length) return;
+      const sortContext = this._resolvePlacementSortContext(this._previewElevation, {
+        count: plannedPlacements.length
+      });
+      await this._applyPlacementSiblingSortUpdates(sortContext.siblingUpdates, {
+        reason: 'scatter-stamp'
+      });
+
+      const tileDataList = [];
+      for (let index = 0; index < plannedPlacements.length; index += 1) {
+        const placement = plannedPlacements[index];
+        const sort = Array.isArray(sortContext?.placementSorts) && Number.isFinite(Number(sortContext.placementSorts[index]))
+          ? Number(sortContext.placementSorts[index])
+          : ((Number(sortContext?.sort) || 0) + (index * 2));
+        const tileData = this._buildScatterTileData(placement.asset, placement.snapped, {
+          rotation: placement.rotation,
+          scale: placement.scale,
+          flip: placement.flip,
+          sort
+        });
+        if (tileData) tileDataList.push(tileData);
+      }
       if (!tileDataList.length) return;
       const created = await canvas.scene.createEmbeddedDocuments('Tile', tileDataList);
       const createdDocs = Array.isArray(created) ? created : [created];
@@ -6246,7 +6977,13 @@ export class AssetPlacementManager {
           }
         } catch (_) {}
       }
-      this._previewSort = nextSort;
+      const lastCreated = createdDocs[createdDocs.length - 1] || null;
+      if (lastCreated) this._adoptPlacementSortAnchor(lastCreated);
+      const lastSort = Number(lastCreated?.sort);
+      if (Number.isFinite(lastSort)) {
+        this._previewSort = lastSort;
+        this._previewRenderSort = lastSort;
+      }
       if (this.isPlacementActive) {
         this._syncPreviewOrdering();
       }
@@ -6290,51 +7027,20 @@ export class AssetPlacementManager {
     const dims = this._computeWorldSizeForAsset(asset, scale);
     const placedWidth = Math.round(Number(dims.worldWidth || assetPx));
     const placedHeight = Math.round(Number(dims.worldHeight || assetPx));
-    const x = Math.round(worldPoint.x - placedWidth / 2);
-    const y = Math.round(worldPoint.y - placedHeight / 2);
-    const textureConfig = {
-      src: this._encodeAssetPath(asset.path || asset.url || ''),
-      scaleX: flip?.horizontal ? -1 : 1,
-      scaleY: flip?.vertical ? -1 : 1
-    };
-    const tileData = {
-      texture: textureConfig,
-      width: placedWidth,
-      height: placedHeight,
-      x,
-      y,
-      rotation: rotation ?? 0,
-      hidden: false,
-      locked: false,
-      elevation: this._previewElevation,
-      sort: Number(sort || 0) || 0,
-      overhead: false,
-      roof: false,
-      occlusion: { mode: 0, alpha: 0 }
-    };
     const globalDropShadowEnabled = this._isGlobalDropShadowEnabled();
     const dropShadowEnabled = globalDropShadowEnabled && this.isDropShadowEnabled();
-    if (dropShadowEnabled) {
-      tileData.flags = tileData.flags || {};
-      const moduleFlags = Object.assign({}, tileData.flags['fa-nexus'] || {});
-      this._applyHsbcToModuleFlags(moduleFlags);
-      moduleFlags.shadow = true;
-      moduleFlags.shadowAlpha = this._roundShadowValue(this._dropShadowAlpha, 3);
-      moduleFlags.shadowDilation = this._roundShadowValue(this._dropShadowDilation, 3);
-      moduleFlags.shadowBlur = this._roundShadowValue(this._dropShadowBlur, 3);
-      moduleFlags.shadowOffsetDistance = this._roundShadowValue(this._dropShadowOffsetDistance, 2);
-      moduleFlags.shadowOffsetAngle = this._roundShadowValue(this._normalizeShadowAngle(this._dropShadowOffsetAngle), 1);
-      const offsetVec = this._computeShadowOffsetVector();
-      moduleFlags.shadowOffsetX = this._roundShadowValue(offsetVec.x, 2);
-      moduleFlags.shadowOffsetY = this._roundShadowValue(offsetVec.y, 2);
-      tileData.flags['fa-nexus'] = moduleFlags;
-    } else {
-      const moduleFlags = this._applyHsbcToModuleFlags(Object.assign({}, tileData.flags?.['fa-nexus'] || {}));
-      if (Object.keys(moduleFlags).length) {
-        tileData.flags = tileData.flags || {};
-        tileData.flags['fa-nexus'] = moduleFlags;
-      }
-    }
+    const { tileData } = this._buildPlacementTileData({
+      assetPath: asset.path || asset.url || '',
+      width: placedWidth,
+      height: placedHeight,
+      x: Math.round(worldPoint.x),
+      y: Math.round(worldPoint.y),
+      rotation: rotation ?? 0,
+      sort,
+      elevation: this._previewElevation,
+      flipState: flip,
+      dropShadowEnabled
+    });
     return tileData;
   }
 
@@ -6348,6 +7054,19 @@ export class AssetPlacementManager {
     const pointerMoveHandler = (event, { pointer }) => {
       if (!this.isPlacementActive) return;
       if (this._isEditingExistingTile) return;
+      if (this._scatterEditing && this._scatterEditPointerLockScreen) {
+        const incomingScreen = pointer?.screen && Number.isFinite(pointer.screen.x) && Number.isFinite(pointer.screen.y)
+          ? { x: Number(pointer.screen.x), y: Number(pointer.screen.y) }
+          : ((typeof event?.clientX === 'number' && typeof event?.clientY === 'number')
+            ? { x: Number(event.clientX), y: Number(event.clientY) }
+            : null);
+        if (incomingScreen) {
+          const dx = incomingScreen.x - this._scatterEditPointerLockScreen.x;
+          const dy = incomingScreen.y - this._scatterEditPointerLockScreen.y;
+          if (Math.hypot(dx, dy) <= 0.5) return;
+        }
+        this._scatterEditPointerLockScreen = null;
+      }
       this._setScatterPolarityInvertHeld(!!event?.altKey && this._scatterMode === ASSET_SCATTER_MODE_BRUSH && this._scatterMergeEnabled, {
         sync: false
       });
@@ -6519,6 +7238,7 @@ export class AssetPlacementManager {
 
     const pointerDownHandler = async (event, { pointer }) => {
       if (!this.isPlacementActive) return;
+      if (this._scatterEditPointerLockScreen) this._scatterEditPointerLockScreen = null;
       this._setScatterPolarityInvertHeld(!!event?.altKey && this._scatterMode === ASSET_SCATTER_MODE_BRUSH && this._scatterMergeEnabled, {
         sync: false
       });
@@ -6723,7 +7443,7 @@ export class AssetPlacementManager {
       });
     };
 
-    this._gestureSession = createCanvasGestureSession({
+    this._gestureSession = createManagedPlacementGestureSession({
       pointermove: { handler: pointerMoveHandler, respectZIndex: false },
       wheel: { handler: wheelHandler, respectZIndex: true },
       pointerdown: pointerDownHandler,
@@ -6732,29 +7452,27 @@ export class AssetPlacementManager {
       keydown: keyDownHandler,
       keyup: keyUpHandler
     }, {
+      cancelPlacement: (reason) => this.cancelPlacement(reason),
       lockTileInteractivity: true,
-      onCanvasTearDown: () => this.cancelPlacement('canvas-teardown'),
-      onStop: () => {
-        this._gestureSession = null;
-        this._stopZoomWatcher();
-        this._suppressDragSelect = false;
-        this._gridSnapShortcutHeld = false;
-        this._gridSnapShortcutPendingToggle = false;
-        this._setScatterPolarityInvertHeld(false, { sync: false });
-      }
+      onStop: () => this._cleanupInteractionSessionState()
     });
 
     this._startZoomWatcher();
   }
 
-  _stopInteractionSession() {
-    if (this._gestureSession) {
-      try { this._gestureSession.stop('manual'); }
-      catch (_) { /* no-op */ }
-      return;
-    }
+  _cleanupInteractionSessionState() {
+    this._gestureSession = null;
     this._stopZoomWatcher();
     this._suppressDragSelect = false;
+    this._gridSnapShortcutHeld = false;
+    this._gridSnapShortcutPendingToggle = false;
+    this._setScatterPolarityInvertHeld(false, { sync: false });
+  }
+
+  _stopInteractionSession() {
+    stopManagedPlacementGestureSession(this._gestureSession, {
+      cleanup: () => this._cleanupInteractionSessionState()
+    });
   }
 
   async _handleCanvasPlacement(event, pointerContext = null) {
@@ -6815,33 +7533,7 @@ export class AssetPlacementManager {
       }
       if (!this.currentAsset) return;
       const editingDoc = ((this._isEditingExistingTile || this._replaceOriginalOnPlace) && this._editingTile) ? this._editingTile : null;
-      // Re-evaluate sort order before every placement so consecutive drops
-      // during the same session continue stacking correctly.
-      if (editingDoc) {
-        this._previewSort = Number(editingDoc.sort ?? 0) || 0;
-        if (this._previewContainer) {
-          this._previewContainer.sort = this._previewSort;
-          this._previewContainer.faNexusSort = this._previewSort;
-          const parent = this._previewContainer.parent;
-          if (parent && 'sortDirty' in parent) parent.sortDirty = true;
-          parent?.sortChildren?.();
-        }
-      } else {
-        try {
-          const controller = this._interactionController;
-          const computed = controller?.computeNextSortAtElevation?.(this._previewElevation);
-          if (Number.isFinite(computed)) {
-            this._previewSort = computed;
-            if (this._previewContainer) {
-              this._previewContainer.sort = computed;
-              this._previewContainer.faNexusSort = computed;
-              const parent = this._previewContainer.parent;
-              if (parent && 'sortDirty' in parent) parent.sortDirty = true;
-              parent?.sortChildren?.();
-            }
-          }
-        } catch (_) { /* no-op */ }
-      }
+      const sortContext = this._applyPlacementPreviewOrdering(this._resolvePlacementSortContext(this._previewElevation));
       this._syncScatterPreviewOrdering();
       // If in random lazy mode and the current asset is cloud without local cache, ensure now
       if (this.isRandomMode && this.currentAsset && String(this.currentAsset.source || '').toLowerCase() === 'cloud' && !this.currentAsset.cachedLocalPath) {
@@ -6877,66 +7569,46 @@ export class AssetPlacementManager {
       const sm = this._getPendingScale();
       const placedWidth = Math.round((this._previewContainer?._tileWidth || assetPx) * gridScaleFactor * sm);
       const placedHeight = Math.round((this._previewContainer?._tileHeight || assetPx) * gridScaleFactor * sm);
-      const x = Math.round(snappedWorld.x - placedWidth / 2);
-      const y = Math.round(snappedWorld.y - placedHeight / 2);
+      const x = Math.round(snappedWorld.x);
+      const y = Math.round(snappedWorld.y);
       const globalDropShadowEnabled = this._isGlobalDropShadowEnabled();
       const dropShadowEnabled = globalDropShadowEnabled && this.isDropShadowEnabled();
       const placementRotation = this._getPendingRotation();
       const flipState = this._getPendingFlipState();
-      const textureConfig = {
-        src: this._encodeAssetPath(this.currentAsset.path),
-        scaleX: flipState.horizontal ? -1 : 1,
-        scaleY: flipState.vertical ? -1 : 1
-      };
-      const tileData = {
-        texture: textureConfig,
-        width: placedWidth, height: placedHeight, x, y,
-        rotation: placementRotation, hidden: false, locked: false,
-        elevation: this._previewElevation, sort: this._previewSort,
-        overhead: false, roof: false, occlusion: { mode: 0, alpha: 0 }
-      };
-      if (dropShadowEnabled) {
-        tileData.flags = tileData.flags || {};
-        const moduleFlags = Object.assign({}, tileData.flags['fa-nexus'] || {});
-        this._applyHsbcToModuleFlags(moduleFlags);
-        moduleFlags.shadow = true;
-        moduleFlags.shadowAlpha = this._roundShadowValue(this._dropShadowAlpha, 3);
-        moduleFlags.shadowDilation = this._roundShadowValue(this._dropShadowDilation, 3);
-        moduleFlags.shadowBlur = this._roundShadowValue(this._dropShadowBlur, 3);
-        moduleFlags.shadowOffsetDistance = this._roundShadowValue(this._dropShadowOffsetDistance, 2);
-        moduleFlags.shadowOffsetAngle = this._roundShadowValue(this._normalizeShadowAngle(this._dropShadowOffsetAngle), 1);
-        const offsetVec = this._computeShadowOffsetVector();
-        moduleFlags.shadowOffsetX = this._roundShadowValue(offsetVec.x, 2);
-        moduleFlags.shadowOffsetY = this._roundShadowValue(offsetVec.y, 2);
-        tileData.flags['fa-nexus'] = moduleFlags;
-      } else {
-        const moduleFlags = this._applyHsbcToModuleFlags(Object.assign({}, tileData.flags?.['fa-nexus'] || {}));
-        if (Object.keys(moduleFlags).length) {
-          tileData.flags = tileData.flags || {};
-          tileData.flags['fa-nexus'] = moduleFlags;
-        }
-      }
-      if (!canvas || !canvas.scene) throw new Error('Canvas unavailable');
-
       const replaceDoc = (this._replaceOriginalOnPlace && this._editingTile) ? this._editingTile : null;
+      let standardTileMask = null;
       if (replaceDoc) {
-        let standardTileMask = null;
         try { standardTileMask = replaceDoc.getFlag?.('fa-nexus', 'standardTileMask') ?? null; } catch (_) {}
         if (standardTileMask) {
           const deepClone = foundry?.utils?.deepClone;
           if (typeof deepClone !== 'function') {
             Logger.error('Placement.replaceTile.standardMaskCloneUnavailable', { tileId: replaceDoc.id || null });
-            throw new Error('foundry.utils.deepClone unavailable while preserving standard tile mask');
+            throw new Error('foundry.utils.deepClone unavailable while preserving tile mask');
           }
-          tileData.flags = tileData.flags || {};
-          const moduleFlags = Object.assign({}, tileData.flags['fa-nexus'] || {});
-          moduleFlags.standardTileMask = deepClone(standardTileMask);
-          tileData.flags['fa-nexus'] = moduleFlags;
+          standardTileMask = deepClone(standardTileMask);
           Logger.info('Placement.replaceTile.standardMaskPreserved', {
             tileId: replaceDoc.id || null,
             maskType: standardTileMask?.maskType || null
           });
         }
+      }
+      const { tileData, textureConfig } = this._buildPlacementTileData({
+        assetPath: this.currentAsset.path,
+        width: placedWidth,
+        height: placedHeight,
+        x,
+        y,
+        rotation: placementRotation,
+        sort: this._previewSort,
+        elevation: this._previewElevation,
+        flipState,
+        dropShadowEnabled,
+        standardTileMask
+      });
+      if (!canvas || !canvas.scene) throw new Error('Canvas unavailable');
+      if (replaceDoc) {
+        preserveTileDocumentCustomSettingsForUpdate(replaceDoc, tileData);
+        normalizeTileCreatePayloadForV14(tileData);
       }
 
       if (editingDoc && !replaceDoc) {
@@ -6950,8 +7622,11 @@ export class AssetPlacementManager {
           elevation: this._previewElevation,
           sort: this._previewSort,
           'texture.scaleX': textureConfig.scaleX,
-          'texture.scaleY': textureConfig.scaleY
+          'texture.scaleY': textureConfig.scaleY,
+          'texture.anchorX': 0.5,
+          'texture.anchorY': 0.5
         };
+        update['flags.fa-nexus.placementLevelId'] = this._resolveActivePlacementLevelId(editingDoc) || null;
         if (textureConfig.src && textureConfig.src !== editingDoc.texture?.src) {
           update['texture.src'] = textureConfig.src;
         }
@@ -6966,6 +7641,7 @@ export class AssetPlacementManager {
           const offsetVec = this._computeShadowOffsetVector();
           update['flags.fa-nexus.shadowOffsetX'] = this._roundShadowValue(offsetVec.x, 2);
           update['flags.fa-nexus.shadowOffsetY'] = this._roundShadowValue(offsetVec.y, 2);
+          update['flags.fa-nexus.shadowOnly'] = !!this._dropShadowOnly;
         } else {
           this._applyHsbcToTileUpdate(update);
           update['flags.fa-nexus.shadow'] = false;
@@ -6976,7 +7652,9 @@ export class AssetPlacementManager {
           update['flags.fa-nexus.shadowOffsetAngle'] = null;
           update['flags.fa-nexus.shadowOffsetX'] = null;
           update['flags.fa-nexus.shadowOffsetY'] = null;
+          update['flags.fa-nexus.shadowOnly'] = null;
         }
+        preserveTileDocumentCustomSettingsForUpdate(editingDoc, update);
         const updated = await canvas.scene.updateEmbeddedDocuments('Tile', [update], { diff: false });
         if (Array.isArray(updated) && updated[0]) {
           this._editingTile = updated[0];
@@ -6986,6 +7664,9 @@ export class AssetPlacementManager {
         return;
       }
 
+      await this._applyPlacementSiblingSortUpdates(sortContext?.siblingUpdates, {
+        reason: replaceDoc ? 'replace-asset-placement' : 'asset-placement'
+      });
       const created = await canvas.scene.createEmbeddedDocuments('Tile', [tileData]);
       const createdDocs = Array.isArray(created) ? created : [created];
       const primaryCreated = createdDocs[0] || null;
@@ -7006,6 +7687,8 @@ export class AssetPlacementManager {
         this._replaceOriginalOnPlace = false;
         this._editingTileShadowSuspended = false;
       }
+
+      if (primaryCreated) this._adoptPlacementSortAnchor(primaryCreated);
 
       if (dropShadowEnabled) {
         try {
@@ -7188,6 +7871,11 @@ export class AssetPlacementManager {
       ? 'global'
       : (value ? 'on' : 'off');
     this._persistPlacementSetting('assetPlacementDropShadowPreference', stored);
+  }
+
+  _readDropShadowOnlySetting() {
+    try { return !!globalThis?.game?.settings?.get?.('fa-nexus', 'assetDropShadowOnly'); }
+    catch (_) { return false; }
   }
 
   _readStoredScatterBrushSize() {
@@ -7459,7 +8147,8 @@ export class AssetPlacementManager {
       'flags.fa-nexus.shadowOffsetDistance': this._roundShadowValue(this._dropShadowOffsetDistance, 2),
       'flags.fa-nexus.shadowOffsetAngle': this._roundShadowValue(this._normalizeShadowAngle(this._dropShadowOffsetAngle), 1),
       'flags.fa-nexus.shadowOffsetX': this._roundShadowValue(offsetVec.x, 2),
-      'flags.fa-nexus.shadowOffsetY': this._roundShadowValue(offsetVec.y, 2)
+      'flags.fa-nexus.shadowOffsetY': this._roundShadowValue(offsetVec.y, 2),
+      'flags.fa-nexus.shadowOnly': !!(enabled && this._dropShadowOnly)
     };
     this._applyHsbcToTileUpdate(payload);
 
@@ -7468,6 +8157,9 @@ export class AssetPlacementManager {
     if (Number.isFinite(rotation)) payload.rotation = rotation;
     payload['texture.scaleX'] = flipState.horizontal ? -1 : 1;
     payload['texture.scaleY'] = flipState.vertical ? -1 : 1;
+    payload['texture.anchorX'] = 0.5;
+    payload['texture.anchorY'] = 0.5;
+    preserveTileDocumentCustomSettingsForUpdate(doc, payload);
 
     const applyUpdates = canvas.scene.updateEmbeddedDocuments('Tile', [payload], { diff: false })
       .then((updated) => {
@@ -7521,25 +8213,40 @@ export class AssetPlacementManager {
   _applyScatterPreviewOrdering(group) {
     const container = group?.container;
     if (!container) return;
-    const primary = canvas?.primary;
-    const tilesSortLayer = (() => {
-      try { return primary?.constructor?.SORT_LAYERS?.TILES ?? 0; }
-      catch (_) { return 0; }
-    })();
-    container.sortLayer = tilesSortLayer;
     const nextSort = Number.isFinite(group?.sort) ? group.sort : 0;
-    container.sort = nextSort;
-    container.faNexusSort = nextSort;
+    const nextPreviewSort = Number.isFinite(group?.previewSort) ? group.previewSort : nextSort;
     const elevation = Number.isFinite(group?.elevation) ? group.elevation : 0;
-    const renderElevation = getTileRenderElevation(elevation);
+    const renderOrder = this._resolvePreviewRenderOrder(elevation, nextPreviewSort);
+    container.sortLayer = renderOrder.sortLayer;
+    container.sort = renderOrder.sort;
+    container.faNexusSort = renderOrder.sort;
+    container.faNexusPlacementSort = nextSort;
+    container.faNexusPreviewSort = nextPreviewSort;
     container.faNexusElevationDoc = elevation;
-    container.faNexusElevation = renderElevation;
-    container.elevation = renderElevation;
+    container.faNexusElevation = renderOrder.elevation;
+    container.faNexusPlacementLevelId = renderOrder.placementLevelId || null;
+    container.faNexusBandKind = renderOrder.kind || 'normal';
+    container.elevation = renderOrder.elevation;
     if (container.parent === canvas?.stage) container.zIndex = SCATTER_PREVIEW_Z_INDEX;
-    else if (container.parent) container.zIndex = 0;
+    else if (container.parent) container.zIndex = renderOrder.kind !== 'normal' ? nextPreviewSort : 0;
     const parent = container.parent;
     if (parent && 'sortDirty' in parent) parent.sortDirty = true;
     parent?.sortChildren?.();
+  }
+
+  _resolvePreviewRenderOrder(elevation = this._previewElevation, sort = this._previewSort) {
+    const editingDoc = ((this._isEditingExistingTile || this._replaceOriginalOnPlace) && this._editingTile)
+      ? this._editingTile
+      : null;
+    const placementLevelId = this._resolveActivePlacementLevelId(editingDoc);
+    if (editingDoc) {
+      return resolveTileRenderOrder(editingDoc, { elevation, sort, placementLevelId });
+    }
+    return resolveTileRenderOrder({ elevation, sort }, {
+      elevation,
+      sort,
+      placementLevelId
+    });
   }
 
   _syncScatterPreviewOrdering() {
@@ -7557,31 +8264,37 @@ export class AssetPlacementManager {
         return;
       }
       if (Number.isFinite(this._previewSort)) group.sort = this._previewSort;
+      if (Number.isFinite(this._previewRenderSort)) group.previewSort = this._previewRenderSort;
       this._scatterPreviewContainer = group.container;
       this._scatterPreviewActiveKey = key;
       this._applyScatterPreviewOrdering(group);
       this._syncScatterPreviewFlags();
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn('Placement.scatterPreviewOrdering.failed', {
+        error: String(error?.message || error),
+        elevation: this._previewElevation,
+        sort: this._previewSort,
+        scatterMode: this._scatterMode,
+        mergeEnabled: !!this._scatterMergeEnabled
+      });
+    }
   }
 
   _syncPreviewOrdering() {
     try {
-      if (this._previewContainer) {
-        const controller = this._interactionController;
-        const nextSort = controller.computeNextSortAtElevation?.(this._previewElevation) ?? this._previewSort;
-        this._previewSort = nextSort;
-        this._previewContainer.sort = nextSort;
-        this._previewContainer.faNexusSort = nextSort;
-        const renderElevation = getTileRenderElevation(this._previewElevation);
-        this._previewContainer.faNexusElevationDoc = this._previewElevation;
-        this._previewContainer.faNexusElevation = renderElevation;
-        this._previewContainer.elevation = renderElevation;
-        const parent = this._previewContainer.parent;
-        if (parent && 'sortDirty' in parent) parent.sortDirty = true;
-        parent?.sortChildren?.();
-      }
+      if (this._previewContainer) this._applyPlacementPreviewOrdering();
+      this._applyScatterHoverOrdering();
       this._syncScatterPreviewOrdering();
-    } catch (_) {}
+      this._notifyPreviewLayerChange('asset-placement');
+    } catch (error) {
+      Logger.warn('Placement.previewOrdering.failed', {
+        error: String(error?.message || error),
+        elevation: this._previewElevation,
+        sort: this._previewSort,
+        hasPreview: !!this._previewContainer,
+        scatterMode: this._scatterMode
+      });
+    }
   }
 
   _clearElevationAnnounceTimer() {
@@ -7768,7 +8481,14 @@ export class AssetPlacementManager {
       try {
         await this._ensureAssetLocal(next);
       } catch (e) {
-        Logger.warn('Placement.lazyPrime.failed', String(e?.message || e));
+        Logger.error('Placement.lazyPrime.failed', {
+          filename: next?.filename || null,
+          path: next?.path || next?.file_path || null,
+          error: String(e?.message || e)
+        });
+        this.isDownloading = false;
+        this._hideLoadingOverlay();
+        return;
       }
     }
     this.currentAsset = next;

@@ -1,9 +1,17 @@
 import { NexusLogger as Logger } from '../nexus-logger.js';
 
 /**
+ * @typedef {import('../fa-nexus-types.js').FaNexusSelectionItem} FaNexusSelectionItem
+ * @typedef {import('../fa-nexus-types.js').PlacementPrefetchQueueOptions<FaNexusSelectionItem>} PlacementPrefetchQueueOptions
+ */
+
+/**
  * Maintains a rolling queue of items to prefetch for random placement workflows.
  */
 export class PlacementPrefetchQueue {
+  /**
+   * @param {PlacementPrefetchQueueOptions} [options]
+   */
   constructor(options = {}) {
     this._pool = [];
     this._queue = [];
@@ -42,7 +50,7 @@ export class PlacementPrefetchQueue {
 
   /**
    * Prime the queue without consuming an item (useful before showing preview).
-   * @param {any|null} currentItem Optional item to exclude from prefetch duplication.
+   * @param {FaNexusSelectionItem|null} currentItem Optional item to exclude from prefetch duplication.
    */
   prime(currentItem = null) {
     this._ensurePrefetch(currentItem);
@@ -50,7 +58,7 @@ export class PlacementPrefetchQueue {
 
   /**
    * Retrieve the next item for placement, ensuring the queue continues to fill.
-   * @param {any|null} currentItem Item that is currently in use to avoid requeueing.
+   * @param {FaNexusSelectionItem|null} currentItem Item that is currently in use to avoid requeueing.
    */
   next(currentItem = null) {
     if (!Array.isArray(this._pool) || !this._pool.length) return null;

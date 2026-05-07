@@ -5,6 +5,11 @@ import {
   cleanupPathWallsForTile,
   clearTileMeshWaiters
 } from './path-geometry.js';
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import {
+  migrateLegacyPathTileDocument,
+  migrateLegacyPathTilesInScene
+} from './legacy-path-migration.js';
 
 export { applyPathTile, rehydrateAllPathTiles, cleanupPathOverlay };
 
@@ -22,48 +27,74 @@ function shouldSkipPathWallCleanup(doc = null, options = {}) {
   }
 }
 
-function shouldHandlePathWallCleanup(userId) {
+function stringifyError(error) {
+  return String(error?.message || error);
+}
+
+function findTileForDocument(doc) {
   try {
-    const currentUserId = game?.user?.id || null;
-    if (!currentUserId) return false;
-    if (userId) return userId === currentUserId;
-    const activeGmIds = Array.from(game?.users || [])
-      .filter((user) => user?.active && user?.isGM && user?.id)
-      .map((user) => user.id)
-      .sort();
-    if (!activeGmIds.length) return true;
-    return activeGmIds[0] === currentUserId;
+    const tileId = doc?.id || doc?._id || null;
+    if (!tileId) return null;
+    return canvas?.tiles?.placeables?.find((tile) => tile?.document?.id === tileId) || null;
   } catch (_) {
-    return false;
+    return null;
   }
+}
+
+async function migrateAndApplyPathTile(doc, reason) {
+  try {
+    await migrateLegacyPathTileDocument(doc, { reason });
+  } catch (error) {
+    Logger.error?.('LegacyPathMigration.hook.failed', {
+      tileId: doc?.id || doc?._id || null,
+      reason,
+      error: stringifyError(error)
+    });
+  }
+  const tile = findTileForDocument(doc);
+  if (tile) await applyPathTile(tile);
 }
 
 try {
   Hooks.on('canvasReady', () => {
-    try { rehydrateAllPathTiles(); } catch (_) {}
+    void (async () => {
+      await migrateLegacyPathTilesInScene(canvas?.scene, { reason: 'canvasReady' });
+      rehydrateAllPathTiles();
+    })().catch((error) => {
+      Logger.error?.('LegacyPathMigration.canvasReady.failed', { error: stringifyError(error) });
+    });
   });
   Hooks.on('drawTile', (tile) => {
     try { applyPathTile(tile); } catch (_) {}
   });
   Hooks.on('createTile', (doc) => {
-    try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
-      if (tile) applyPathTile(tile);
-    } catch (_) {}
+    void migrateAndApplyPathTile(doc, 'createTile').catch((error) => {
+      Logger.error?.('PathTiles.createTile.failed', {
+        tileId: doc?.id || null,
+        error: stringifyError(error)
+      });
+    });
   });
   Hooks.on('updateTile', (doc) => {
-    try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
-      if (tile) applyPathTile(tile);
-    } catch (_) {}
+    void migrateAndApplyPathTile(doc, 'updateTile').catch((error) => {
+      Logger.error?.('PathTiles.updateTile.failed', {
+        tileId: doc?.id || null,
+        error: stringifyError(error)
+      });
+    });
   });
-  Hooks.on('deleteTile', (doc, options, userId) => {
+  Hooks.on('deleteTile', (doc, options) => {
     try {
       const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
       if (tile) cleanupPathOverlay(tile);
     } catch (_) {}
-    if (shouldHandlePathWallCleanup(userId) && !shouldSkipPathWallCleanup(doc, options)) {
-      try { cleanupPathWallsForTile(doc); } catch (_) {}
+    if (!shouldSkipPathWallCleanup(doc, options)) {
+      Promise.resolve(cleanupPathWallsForTile(doc)).catch((error) => {
+        Logger.warn?.('PathTiles.deleteTile.cleanup.failed', {
+          tileId: doc?.id || null,
+          error: stringifyError(error)
+        });
+      });
     }
   });
   Hooks.on('canvasTearDown', () => {

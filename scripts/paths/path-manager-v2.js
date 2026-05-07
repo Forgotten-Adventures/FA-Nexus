@@ -1,7 +1,37 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { premiumFeatureBroker } from '../premium/premium-feature-broker.js';
-import { premiumEntitlementsService } from '../premium/premium-entitlements-service.js';
-import { ensurePremiumFeaturesRegistered } from '../premium/premium-feature-registry.js';
+import {
+  resolveTileDocument
+} from '../premium/session-host/editing-targets.js';
+import { resolvePremiumFeatureDelegate } from '../premium/session-host/delegate-bootstrap.js';
+import {
+  buildHostedSessionContextDetails,
+  getCurrentSceneId,
+  isHostedSessionSceneCurrent,
+  isApplicationHostReady
+} from '../premium/session-host/host-context.js';
+import {
+  cancelToolWindowMonitor,
+  startHostedToolWindowMonitor
+} from '../premium/session-host/tool-window-monitor.js';
+import {
+  beginEditingTileTracking,
+  endEditingTileWithRefresh
+} from '../premium/session-host/editing-session-state.js';
+import {
+  handleSessionLaunchFailure as handleHostedSessionLaunchFailure,
+  hasHostedSessionChanges,
+  runHostedSessionLaunch,
+  stopSessionWithFinalize,
+  stopOrphanedSession as stopHostedOrphanedSession
+} from '../premium/session-host/session-lifecycle.js';
+import {
+  handleEntitlementRevalidationFailure,
+  scheduleEntitlementRevalidation
+} from '../premium/session-host/entitlement-revalidation.js';
+import {
+  syncHostedToolOptions
+} from '../premium/session-host/tool-options-sync.js';
+import { createSubtoolPreferenceBridge } from '../premium/session-host/subtool-preference-bridge.js';
 import { applyPathTile, cleanupPathOverlay } from './path-tiles.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
 import {
@@ -11,6 +41,8 @@ import {
 import { createShortcut, createStandardEditorShortcuts, mergeShortcutLists } from '../core/editor-shortcuts.js';
 import { buildHsbcToolOptionsControls } from '../core/hsbc.js';
 import { requestSelectionFilterRefresh } from '../canvas/selection-filter-refresh.js';
+import { resolvePlacementAnchorTile } from '../canvas/elevation-band-utils.js';
+import { resolvePlacementSortAtElevation } from '../canvas/canvas-interaction-controller.js';
 
 const MODULE_ID = 'fa-nexus';
 const PATH_SUBTOOL_SETTING_KEY = 'pathToolActiveSubtool';
@@ -18,41 +50,7 @@ const PATH_ACTIVE_SUBTOOL_IDS = new Set(['curve', 'draw', 'edit-shapes']);
 const PATH_PERSISTED_SUBTOOL_IDS = new Set(['curve', 'draw']);
 const EDITING_TILES_KEY = '__faNexusPathEditingTiles';
 const PATH_MIN_SPLITTABLE_POINTS = 3;
-
-function getEditingTileSet() {
-  try {
-    const root = globalThis || window;
-    const existing = root?.[EDITING_TILES_KEY];
-    if (existing instanceof Set) return existing;
-    const created = new Set();
-    if (root) root[EDITING_TILES_KEY] = created;
-    return created;
-  } catch (_) {
-    return new Set();
-  }
-}
-
-function resolveTileDocument(target) {
-  if (!target) return null;
-  const TileDocument = globalThis?.foundry?.documents?.TileDocument;
-  if (TileDocument && target instanceof TileDocument) return target;
-  if (TileDocument && target?.document instanceof TileDocument) return target.document;
-  if (target?.document) return target.document;
-  if (typeof target === 'string' && canvas?.scene?.tiles?.get) {
-    try { return canvas.scene.tiles.get(target) || null; } catch (_) { return null; }
-  }
-  return null;
-}
-
-function resolveTilePlaceableById(id) {
-  if (!id) return null;
-  try {
-    const list = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
-    return list.find((tile) => tile?.document?.id === id) || null;
-  } catch (_) {
-    return null;
-  }
-}
+const PREVIEW_LAYER_HOOK = 'fa-nexus-preview-layers-changed';
 
 function clonePathControlPoint(point = {}) {
   return {
@@ -84,10 +82,20 @@ export class PathManagerV2 {
     this._loading = null;
     this._entitlementProbe = null;
     this._toolMonitor = null;
-    this._lastPersistedSubtool = null;
-    this._toolDefaultsPersistTimer = null;
+    this._sessionSceneId = null;
+    this._hostUnavailableReason = 'host-context-unavailable';
+    this._pendingLaunchPlacementAnchorTileId = undefined;
+    this._subtoolPreferenceBridge = createSubtoolPreferenceBridge({
+      moduleId: MODULE_ID,
+      settingKey: PATH_SUBTOOL_SETTING_KEY,
+      activeSubtoolIds: PATH_ACTIVE_SUBTOOL_IDS,
+      persistedSubtoolIds: PATH_PERSISTED_SUBTOOL_IDS,
+      getDelegate: () => this._delegate,
+      requestSubtoolToggle: (id, enabled) => toolOptionsController?.requestCustomToggle?.(id, enabled)
+    });
     this._editingTileId = null;
     this._sessionShortcutKeydownHandler = null;
+    this._lastPreviewLayerSignature = null;
     this._syncToolOptionsState();
   }
 
@@ -96,13 +104,7 @@ export class PathManagerV2 {
   }
 
   hasSessionChanges() {
-    if (!this._delegate?.isActive) return false;
-    try {
-      if (typeof this._delegate?.hasSessionChanges === 'function') {
-        return !!this._delegate.hasSessionChanges();
-      }
-    } catch (_) {}
-    return true;
+    return hasHostedSessionChanges(this._delegate);
   }
 
   get pathTension() {
@@ -116,26 +118,19 @@ export class PathManagerV2 {
 
   async _ensureDelegate() {
     if (this._delegate) return this._delegate;
-    ensurePremiumFeaturesRegistered();
     if (this._loading) return this._loading;
-    this._loading = (async () => {
-      const helper = await premiumFeatureBroker.resolve('path.edit.v2');
-      let instance = null;
-      if (helper?.create) instance = helper.create(this._app);
-      else if (typeof helper === 'function') instance = new helper(this._app);
-      if (!instance) throw new Error('Premium path editor v2 bundle missing PathManager implementation');
-      this._delegate = instance;
-      try { instance.attachHost?.(this); }
-      catch (_) {}
-      try {
-        Logger.info?.('PathEditorV2.bundle.loaded', { version: instance?.version || '0.0.15' });
-        const hooks = globalThis?.Hooks;
-        hooks?.callAll?.('fa-nexus-path-editor-v2-loaded', { version: instance?.version || '0.0.15' });
-      } catch (logError) {
-        Logger.warn?.('PathEditorV2.bundle.loaded.logFailed', String(logError?.message || logError));
-      }
-      return instance;
-    })();
+    this._loading = resolvePremiumFeatureDelegate({
+      featureId: 'path.edit.v2',
+      app: this._app,
+      host: this,
+      assignDelegate: (instance) => {
+        this._delegate = instance;
+      },
+      missingMessage: 'Premium path editor v2 bundle missing PathManagerV2 implementation',
+      loadedLogName: 'PathEditorV2.bundle.loaded',
+      loadedHookName: 'fa-nexus-path-editor-v2-loaded',
+      fallbackVersion: '0.0.15'
+    });
     try {
       return await this._loading;
     } finally {
@@ -144,134 +139,147 @@ export class PathManagerV2 {
   }
 
   async start(...args) {
-    this._cancelPlacementSessions();
     const delegate = await this._ensureDelegate();
     const wasActive = !!delegate?.isActive;
     if (!wasActive) this._clearEditingTile();
-    let result;
-    try {
-      this._refreshDelegateToolDefaults();
-      result = delegate.start?.(...args);
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      this._syncToolOptionsState({
-        suppressSubtoolPersistence: true,
-        suppressToolDefaultsPersistence: true
-      });
-      toolOptionsController.activateTool('path.edit.v2', { label: 'Path Editor v2' });
-      this._beginToolWindowMonitor('path.edit.v2', delegate);
-      this._installSessionShortcutListener();
-      if (!wasActive) this._restoreSubtoolPreference();
-      result = this._wrapSessionLaunchPromise(result, { phase: 'start' });
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, { phase: 'start' });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._captureLaunchPlacementAnchorTileId();
+        this._snapshotSessionScene(null, 'start');
+        this._cancelPlacementSessions();
+        this._refreshDelegateToolDefaults();
+      },
+      launchSession: () => delegate.start?.(...args),
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._applyPendingLaunchPlacementAnchorTileId();
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        this._syncToolOptionsState({
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+        toolOptionsController.activateTool('path.edit.v2', { label: 'Path Editor v2' });
+        this._beginToolWindowMonitor('path.edit.v2', delegate);
+        this._installSessionShortcutListener();
+        if (!wasActive) this._restoreSubtoolPreference();
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, { phase: 'start' }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
+    });
   }
 
   async editTile(targetTile, options = {}) {
-    this._cancelPlacementSessions();
     const delegate = await this._ensureDelegate();
     if (!delegate || typeof delegate.editTile !== 'function') {
       throw new Error('Installed path editor bundle does not support editing existing tiles.');
     }
     const doc = resolveTileDocument(targetTile);
     if (doc) this._markEditingTile(doc);
-    let result;
-    try {
-      this._refreshDelegateToolDefaults();
-      result = delegate.editTile(targetTile, options);
-      try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-      this._syncToolOptionsState({
-        suppressSubtoolPersistence: true,
-        suppressToolDefaultsPersistence: true
-      });
-      toolOptionsController.activateTool('path.edit.v2', { label: 'Path Editor v2' });
-      this._beginToolWindowMonitor('path.edit.v2', delegate);
-      this._installSessionShortcutListener();
-      result = this._wrapSessionLaunchPromise(result, { phase: 'edit', tileDoc: doc });
-    } catch (error) {
-      await this._handleSessionLaunchFailure(error, { phase: 'edit', tileDoc: doc });
-      throw error;
-    } finally {
-      this._scheduleEntitlementProbe();
-    }
-    return result;
-  }
-
-  _wrapSessionLaunchPromise(result, { phase = 'start', tileDoc = null } = {}) {
-    if (!result || typeof result.then !== 'function') return result;
-    return Promise.resolve(result).catch(async (error) => {
-      await this._handleSessionLaunchFailure(error, { phase, tileDoc });
-      throw error;
+    return runHostedSessionLaunch({
+      beforeLaunch: () => {
+        this._snapshotSessionScene(targetTile, 'edit');
+        this._cancelPlacementSessions();
+        this._refreshDelegateToolDefaults();
+      },
+      launchSession: () => delegate.editTile(targetTile, options),
+      afterLaunch: () => {
+        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
+        this._syncDelegatePreviewRenderSort();
+        this._applyCurrentPreviewLayerOrdering();
+        this._syncToolOptionsState({
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+        toolOptionsController.activateTool('path.edit.v2', { label: 'Path Editor v2' });
+        this._beginToolWindowMonitor('path.edit.v2', delegate);
+        this._installSessionShortcutListener();
+      },
+      handleLaunchFailure: (error) => this._handleSessionLaunchFailure(error, { phase: 'edit', tileDoc: doc }),
+      scheduleEntitlementProbe: () => this._scheduleEntitlementProbe()
     });
   }
 
   async _handleSessionLaunchFailure(error, { phase = 'start', tileDoc = null } = {}) {
-    Logger.error?.('PathManagerV2.session.launchFailed', {
+    return handleHostedSessionLaunchFailure({
+      error,
       phase,
-      error: String(error?.message || error),
-      delegateActive: !!this._delegate?.isActive,
-      editingTileId: tileDoc?.id || this._editingTileId || null,
-      canvasReady: !!canvas?.ready,
-      hasCanvasStage: !!canvas?.stage
+      loggerPrefix: 'PathManagerV2',
+      details: buildHostedSessionContextDetails({
+        app: this._app,
+        delegate: this._delegate,
+        editingTileId: tileDoc?.id || this._editingTileId || null
+      }),
+      cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
+      stopSession: ({ reason }) => this.stop({ reason }),
+      onFallbackCleanup: () => {
+        try { toolOptionsController.deactivateTool('path.edit.v2'); } catch (_) {}
+        this._clearEditingTile(tileDoc);
+      }
     });
-    this._cancelToolWindowMonitor();
-    try {
-      await Promise.resolve(this.stop({ reason: `${phase}-failed` }));
-    } catch (stopError) {
-      Logger.error?.('PathManagerV2.session.launchFailed.stopFailed', {
-        phase,
-        error: String(stopError?.message || stopError)
-      });
-      try { toolOptionsController.deactivateTool('path.edit.v2'); } catch (_) {}
-      this._clearEditingTile(tileDoc);
-    }
   }
 
   _isEditorHostReady() {
-    try {
-      if (!canvas?.ready || !canvas?.stage) return false;
-      if (!this._app) return false;
-      if (this._app.rendered === false) return false;
-      if (!this._app.element) return false;
-      return true;
-    } catch (_) {
+    return isApplicationHostReady(this._app);
+  }
+
+  _snapshotSessionScene(target = null, phase = 'start') {
+    const doc = resolveTileDocument(target);
+    const sceneId = String(doc?.parent?.id || getCurrentSceneId() || '').trim();
+    this._sessionSceneId = sceneId || null;
+    if (!sceneId) {
+      Logger.warn?.('PathManagerV2.session.sceneIdMissing', { phase });
+    }
+    return this._sessionSceneId;
+  }
+
+  _isSessionHostReady() {
+    if (!this._isEditorHostReady()) {
+      this._hostUnavailableReason = 'host-context-unavailable';
       return false;
     }
+    if (!isHostedSessionSceneCurrent(this._sessionSceneId)) {
+      this._hostUnavailableReason = 'scene-changed-during-editor-session';
+      return false;
+    }
+    this._hostUnavailableReason = 'host-context-unavailable';
+    return true;
+  }
+
+  _handleInactiveMonitorStop() {
+    if (this._sessionSceneId && !isHostedSessionSceneCurrent(this._sessionSceneId)) {
+      Logger.warn?.('PathManagerV2.session.sceneChangedInactive', {
+        reason: 'scene-changed-during-editor-session',
+        sessionSceneId: this._sessionSceneId || null,
+        currentSceneId: getCurrentSceneId() || null,
+        editingTileId: this._editingTileId || null
+      });
+    }
+    this._sessionSceneId = null;
   }
 
   _stopOrphanedSession({ reason = 'host-context-unavailable' } = {}) {
-    Logger.error?.('PathManagerV2.session.orphaned', {
+    return stopHostedOrphanedSession({
       reason,
-      delegateActive: !!this._delegate?.isActive,
-      editingTileId: this._editingTileId || null,
-      canvasReady: !!canvas?.ready,
-      hasCanvasStage: !!canvas?.stage,
-      appRendered: !!this._app?.rendered,
-      hasAppElement: !!this._app?.element
-    });
-    this._cancelToolWindowMonitor();
-    try {
-      const result = this.stop({ reason });
-      if (result && typeof result.catch === 'function') {
-        result.catch((stopError) => {
-          Logger.error?.('PathManagerV2.session.orphaned.stopFailed', {
-            reason,
-            error: String(stopError?.message || stopError)
-          });
-        });
+      loggerPrefix: 'PathManagerV2',
+      details: buildHostedSessionContextDetails({
+        app: this._app,
+        delegate: this._delegate,
+        includeAppState: true,
+        editingTileId: this._editingTileId || null,
+        extra: {
+          sessionSceneId: this._sessionSceneId || null,
+          currentSceneId: getCurrentSceneId() || null
+        }
+      }),
+      cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
+      stopSession: ({ reason: stopReason }) => this.stop({ reason: stopReason }),
+      onFallbackCleanup: () => {
+        this._sessionSceneId = null;
+        try { toolOptionsController.deactivateTool('path.edit.v2'); } catch (_) {}
+        this._clearEditingTile();
       }
-    } catch (stopError) {
-      Logger.error?.('PathManagerV2.session.orphaned.stopFailed', {
-        reason,
-        error: String(stopError?.message || stopError)
-      });
-      try { toolOptionsController.deactivateTool('path.edit.v2'); } catch (_) {}
-      this._clearEditingTile();
-    }
+    });
   }
 
   _installSessionShortcutListener() {
@@ -314,32 +322,27 @@ export class PathManagerV2 {
   }
 
   stop(...args) {
-    this._cancelToolWindowMonitor();
-    this._removeSessionShortcutListener();
-    const finalize = () => {
-      this._clearEditingTile();
-      toolOptionsController.deactivateTool('path.edit.v2');
-      requestSelectionFilterRefresh({
-        reason: 'path-editor-v2-stop',
-        source: 'path-manager-v2'
-      });
-    };
-    if (!this._delegate) {
-      finalize();
-      return;
-    }
-    try {
-      if (this._delegate?.isActive) this._persistDelegateToolDefaults();
-      const result = this._delegate.stop?.(...args);
-      if (result && typeof result.then === 'function') {
-        return Promise.resolve(result).finally(finalize);
+    return stopSessionWithFinalize({
+      delegate: this._delegate,
+      beforeStop: () => {
+        this._cancelToolWindowMonitor();
+        this._removeSessionShortcutListener();
+      },
+      persistToolDefaults: () => this._persistDelegateToolDefaults(),
+      stopSession: (delegate) => delegate.stop?.(...args),
+      finalize: () => {
+        this._sessionSceneId = null;
+        this._clearEditingTile();
+        toolOptionsController.deactivateTool('path.edit.v2');
+        requestSelectionFilterRefresh({
+          reason: 'path-editor-v2-stop',
+          source: 'path-manager-v2'
+        });
+      },
+      onStopError: (error) => {
+        Logger.warn?.('PathManagerV2.stop.failed', { error: String(error?.message || error) });
       }
-      finalize();
-      return result;
-    } catch (error) {
-      finalize();
-      throw error;
-    }
+    });
   }
 
   async savePath(...args) {
@@ -353,66 +356,25 @@ export class PathManagerV2 {
   }
 
   _scheduleEntitlementProbe() {
-    ensurePremiumFeaturesRegistered();
-    if (this._entitlementProbe) return this._entitlementProbe;
-    const probe = (async () => {
-      try {
-        await premiumFeatureBroker.require('path.edit.v2', { revalidate: true, reason: 'path-edit-v2:revalidate' });
-      } catch (error) {
-        this._handleEntitlementFailure(error);
-      } finally {
-        if (this._entitlementProbe === probe) this._entitlementProbe = null;
+    return scheduleEntitlementRevalidation(this, {
+      featureId: 'path.edit.v2',
+      revalidateReason: 'path-edit-v2:revalidate',
+      onFailure: (error) => this._handleEntitlementFailure(error)
+    });
+  }
+
+  async _handleEntitlementFailure(error) {
+    return handleEntitlementRevalidationFailure({
+      error,
+      featureId: 'path.edit.v2',
+      loggerPrefix: 'PathManagerV2',
+      clearReason: 'path-revalidate-failed',
+      warningMessage: 'Authentication expired - premium path editing v2 has been disabled. Please reconnect Patreon.',
+      stopSession: () => this.stop?.(),
+      resetState: () => {
+        this._delegate = null;
       }
-    })();
-    this._entitlementProbe = probe;
-    probe.catch(() => {});
-    return probe;
-  }
-
-  _handleEntitlementFailure(error) {
-    try { this.stop?.(); }
-    catch (_) {}
-    this._delegate = null;
-    const hasAuth = this._hasPremiumAuth();
-    if (!hasAuth) {
-      Logger.info?.('PathManager.entitlement.skipDisconnect', {
-        code: error?.code || error?.name,
-        message: String(error?.message || error)
-      });
-      return;
-    }
-    const message = '🔐 Authentication expired - premium path editing v2 has been disabled. Please reconnect Patreon.';
-    if (this._isAuthFailure(error)) {
-      try { premiumEntitlementsService?.clear?.({ reason: 'path-revalidate-failed' }); }
-      catch (_) {}
-      try { game?.settings?.set?.('fa-nexus', 'patreon_auth_data', null); }
-      catch (_) {}
-      ui?.notifications?.warn?.(message);
-    } else {
-      const fallback = `Unable to confirm premium access: ${error?.message || error}`;
-      ui?.notifications?.error?.(fallback);
-    }
-    try { Hooks?.callAll?.('fa-nexus-premium-auth-lost', { featureId: 'path.edit.v2', error }); }
-    catch (_) {}
-  }
-
-  _isAuthFailure(error) {
-    if (!error) return false;
-    const code = String(error?.code || error?.name || '').toUpperCase();
-    if (code && (/AUTH/.test(code) || ['STATE_MISSING', 'ENTITLEMENT_REQUIRED', 'HTTP_401', 'HTTP_403', 'SESSION_EXPIRED', 'STATE_INVALID'].includes(code))) {
-      return true;
-    }
-    const message = String(error?.message || '').toLowerCase();
-    return message.includes('auth') || message.includes('state');
-  }
-
-  _hasPremiumAuth() {
-    try {
-      const authData = game?.settings?.get?.('fa-nexus', 'patreon_auth_data');
-      return !!(authData && authData.authenticated && authData.state);
-    } catch (_) {
-      return false;
-    }
+    });
   }
 
   _cancelPlacementSessions() {
@@ -439,104 +401,64 @@ export class PathManagerV2 {
   _beginToolWindowMonitor(toolId, delegate) {
     this._cancelToolWindowMonitor();
     if (!delegate) return;
-    const token = { cancelled: false, handle: null, usingTimeout: false, toolId, lastOptionsSync: 0 };
-    const schedule = (callback) => {
-      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
-        token.usingTimeout = false;
-        token.handle = window.requestAnimationFrame(callback);
-      } else {
-        token.usingTimeout = true;
-        token.handle = setTimeout(callback, 200);
-      }
-    };
-    const maybeSyncToolOptions = () => {
-      const now = Date.now();
-      if (token.lastOptionsSync && now - token.lastOptionsSync < 200) return;
-      token.lastOptionsSync = now;
-      this._syncToolOptionsState({
-        suppressRender: true,
-        suppressSubtoolPersistence: true,
-        suppressToolDefaultsPersistence: true
-      });
-    };
-    const tick = () => {
-      if (token.cancelled) return;
-      let active = false;
-      try { active = !!delegate?.isActive; }
-      catch (_) { active = false; }
-      if (!active) {
-        this._clearEditingTile();
-        toolOptionsController.deactivateTool(toolId);
-        this._cancelToolWindowMonitor();
+    this._toolMonitor = startHostedToolWindowMonitor({
+      delegate,
+      toolId,
+      isHostReady: () => this._isSessionHostReady(),
+      clearEditingTile: () => this._clearEditingTile(),
+      cancelMonitor: () => this._cancelToolWindowMonitor(),
+      stopOrphanedSession: (details) => this._stopOrphanedSession({
+        ...details,
+        reason: this._hostUnavailableReason || details?.reason
+      }),
+      onInactive: () => {
+        this._handleInactiveMonitorStop();
         requestSelectionFilterRefresh({
           reason: 'path-editor-v2-monitor-stop',
           source: 'path-manager-v2'
         });
-        return;
-      }
-      if (!this._isEditorHostReady()) {
-        if (!token.hostFailureHandled) {
-          token.hostFailureHandled = true;
-          this._stopOrphanedSession({ reason: 'host-context-unavailable' });
-        }
-        return;
-      }
-      maybeSyncToolOptions();
-      schedule(tick);
-    };
-    this._toolMonitor = token;
-    schedule(tick);
+      },
+      assignMonitorToken: (nextToken) => {
+        this._toolMonitor = nextToken;
+      },
+      syncToolOptions: () => {
+        this._syncToolOptionsState({
+          suppressRender: true,
+          suppressSubtoolPersistence: true,
+          suppressToolDefaultsPersistence: true
+        });
+      },
+      monitorSyncLoggerPrefix: 'PathManagerV2'
+    });
   }
 
   _cancelToolWindowMonitor() {
-    const token = this._toolMonitor;
-    if (!token) return;
-    token.cancelled = true;
-    if (token.handle != null) {
-      try {
-        if (token.usingTimeout) clearTimeout(token.handle);
-        else if (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(token.handle);
-      } catch (_) {}
-    }
-    this._toolMonitor = null;
+    this._toolMonitor = cancelToolWindowMonitor(this._toolMonitor);
   }
 
   _markEditingTile(doc) {
-    const id = doc?.id;
+    const { tileId: id, tile } = beginEditingTileTracking(this, {
+      target: doc,
+      sharedSetKey: EDITING_TILES_KEY,
+      onReplace: (previousTileId) => this._clearEditingTile(previousTileId)
+    });
     if (!id) return;
-    if (this._editingTileId && this._editingTileId !== id) {
-      this._clearEditingTile(this._editingTileId);
-    }
-    this._editingTileId = id;
-    try { getEditingTileSet().add(id); } catch (_) {}
-    const tile = doc?.object || resolveTilePlaceableById(id);
     if (tile) {
       try { cleanupPathOverlay(tile); } catch (_) {}
     }
   }
 
   _clearEditingTile(target = null) {
-    const id = typeof target === 'string' ? target : target?.id || this._editingTileId;
-    if (!id) return;
-    try { getEditingTileSet().delete(id); } catch (_) {}
-    if (this._editingTileId === id) this._editingTileId = null;
-    const tile = (typeof target === 'object' && target?.object) ? target.object : resolveTilePlaceableById(id);
-    if (tile) {
-      try {
-        Promise.resolve(applyPathTile(tile)).finally(() => {
-          requestSelectionFilterRefresh({
-            reason: 'path-editor-v2-edit-exit',
-            source: 'path-manager-v2',
-            tileIds: [id]
-          });
-        });
-      } catch (_) {}
-      return;
-    }
-    requestSelectionFilterRefresh({
-      reason: 'path-editor-v2-edit-exit',
-      source: 'path-manager-v2',
-      tileIds: [id]
+    endEditingTileWithRefresh(this, {
+      target,
+      sharedSetKey: EDITING_TILES_KEY,
+      loggerPrefix: 'PathManagerV2',
+      collectRefreshJobs: ({ tile }) => applyPathTile(tile),
+      refreshAfterJobs: ({ tileId }) => requestSelectionFilterRefresh({
+        reason: 'path-editor-v2-edit-exit',
+        source: 'path-manager-v2',
+        tileIds: [tileId]
+      })
     });
   }
 
@@ -569,6 +491,315 @@ export class PathManagerV2 {
     }
     const state = { ...delegateState, hints: mergedHints };
     return { state, handlers };
+  }
+
+  _notifyPreviewLayerChangeIfNeeded(descriptor = null, { force = false, source = 'path-preview' } = {}) {
+    const previewState = {
+      active: !!this._delegate?.isActive,
+      elevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : null,
+      sort: Number.isFinite(this._delegate?._previewSort) ? Number(this._delegate._previewSort) : null,
+      activePathId: this._delegate?._activePathId || null,
+      mode: descriptor?.descriptor?.activeMode || null
+    };
+    const signature = JSON.stringify(previewState);
+    if (!force && signature === this._lastPreviewLayerSignature) return;
+    this._lastPreviewLayerSignature = signature;
+    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source, previewState }); } catch (_) {}
+  }
+
+  _captureLaunchPlacementAnchorTileId(controlledTiles = canvas?.tiles?.controlled) {
+    const anchorTile = resolvePlacementAnchorTile(controlledTiles, { source: 'path-manager-v2-start' });
+    const anchorTileId = String(anchorTile?.document?.id || anchorTile?.id || '').trim() || null;
+    this._pendingLaunchPlacementAnchorTileId = anchorTileId;
+    Logger.debug?.('PathManagerV2.sortAnchor.launchCapture', {
+      anchorTileId,
+      elevation: Number(anchorTile?.document?.elevation ?? anchorTile?.elevation ?? 0) || 0,
+      sort: Number(anchorTile?.document?.sort ?? anchorTile?.sort ?? 0) || 0
+    });
+    return anchorTileId;
+  }
+
+  _applyPendingLaunchPlacementAnchorTileId() {
+    if (this._pendingLaunchPlacementAnchorTileId === undefined) return null;
+    const anchorTileId = this._pendingLaunchPlacementAnchorTileId || null;
+    this._pendingLaunchPlacementAnchorTileId = undefined;
+    if (!this._delegate) return anchorTileId;
+    try { this._delegate._placementSortAnchorTileId = anchorTileId; } catch (_) {}
+    try { this._delegate._placementSortBeforeAnchor = false; } catch (_) {}
+    Logger.debug?.('PathManagerV2.sortAnchor.launchApply', { anchorTileId });
+    return anchorTileId;
+  }
+
+  _syncDelegatePreviewRenderSort() {
+    const delegate = this._delegate;
+    if (!delegate) return null;
+    const currentSort = Number(delegate?._previewSort ?? 0);
+    if (this._editingTileId) {
+      const resolvedSort = Number.isFinite(currentSort) ? currentSort : 0;
+      try { delegate._previewRenderSort = resolvedSort; } catch (_) {}
+      return resolvedSort;
+    }
+    const elevation = Number(delegate?._previewElevation ?? 0);
+    const normalizedElevation = Number.isFinite(elevation) ? elevation : 0;
+    const resolved = resolvePlacementSortAtElevation(normalizedElevation, {
+      anchorTileId: delegate?._placementSortAnchorTileId,
+      sortBefore: delegate?._placementSortBeforeAnchor === true,
+      scene: canvas?.scene,
+      count: 1
+    });
+    const placementSort = Number(resolved?.sort ?? currentSort);
+    if (Number.isFinite(placementSort) && Number.isFinite(currentSort) && Math.abs(placementSort - currentSort) > 0.000001) {
+      Logger.warn?.('PathManagerV2.previewSort.delegateMismatch', {
+        delegateSort: currentSort,
+        resolvedSort: placementSort,
+        elevation: normalizedElevation,
+        anchorTileId: delegate?._placementSortAnchorTileId || null
+      });
+      try { delegate._previewSort = placementSort; } catch (_) {}
+    }
+    const renderSort = Number(resolved?.previewSort ?? placementSort);
+    const nextRenderSort = Number.isFinite(renderSort)
+      ? renderSort
+      : (Number.isFinite(placementSort) ? placementSort : 0);
+    try { delegate._previewRenderSort = nextRenderSort; } catch (_) {}
+    const key = normalizedElevation.toFixed(3);
+    const group = delegate?._previewGroups?.get?.(key) || null;
+    if (group) {
+      try { group.placementSort = Number.isFinite(placementSort) ? placementSort : currentSort; } catch (_) {}
+      try { group.sort = nextRenderSort; } catch (_) {}
+    }
+    return nextRenderSort;
+  }
+
+  _applyPathPreviewPlacementMetadata() {
+    const delegate = this._delegate;
+    if (!delegate) return;
+    const placementSort = Number.isFinite(Number(delegate?._previewSort)) ? Number(delegate._previewSort) : 0;
+    const renderSort = Number.isFinite(Number(delegate?._previewRenderSort)) ? Number(delegate._previewRenderSort) : placementSort;
+    const applyMetadata = (container, finalSort, previewSort) => {
+      if (!container || container.destroyed) return;
+      try { container.faNexusPlacementSort = finalSort; } catch (_) {}
+      try { container.faNexusPreviewSort = previewSort; } catch (_) {}
+    };
+    applyMetadata(delegate._layer, placementSort, renderSort);
+    if (!delegate._previewGroups?.size) return;
+    for (const group of delegate._previewGroups.values()) {
+      const groupPlacementSort = Number.isFinite(Number(group?.placementSort))
+        ? Number(group.placementSort)
+        : placementSort;
+      const groupRenderSort = Number.isFinite(Number(group?.sort)) ? Number(group.sort) : groupPlacementSort;
+      applyMetadata(group?.container, groupPlacementSort, groupRenderSort);
+    }
+  }
+
+  _applyCurrentPreviewLayerOrdering() {
+    const placementSort = Number(this._delegate?._previewSort ?? 0);
+    const renderSort = Number(this._delegate?._previewRenderSort ?? this._syncDelegatePreviewRenderSort() ?? placementSort);
+    try { this._delegate?._syncElevationGroupOrdering?.(); } catch (_) {}
+    try { this._delegate?._applyPreviewLayerOrdering?.(Number.isFinite(renderSort) ? renderSort : placementSort); } catch (_) {}
+    this._applyPathPreviewPlacementMetadata();
+  }
+
+  _normalizePreviewGroupKey({ previewKey = null, previewId = null, elevation = null } = {}) {
+    const explicit = String(previewKey || '').trim();
+    if (explicit) return explicit;
+    const id = String(previewId || '').trim();
+    if (id.startsWith('path-preview-')) return id.slice('path-preview-'.length);
+    const numeric = Number(elevation);
+    return Number.isFinite(numeric) ? numeric.toFixed(3) : '';
+  }
+
+  _getPathEntryElevation(entry, fallback = this._delegate?._previewElevation) {
+    const delegate = this._delegate;
+    try {
+      if (typeof delegate?._getEntryElevation === 'function') {
+        const resolved = Number(delegate._getEntryElevation(entry, fallback));
+        if (Number.isFinite(resolved)) return resolved;
+      }
+    } catch (_) {}
+    const direct = Number(entry?.elevation);
+    if (Number.isFinite(direct)) return direct;
+    const fallbackNumber = Number(fallback);
+    return Number.isFinite(fallbackNumber) ? fallbackNumber : 0;
+  }
+
+  _applyPathPreviewGroupPlacement({
+    previewKey = null,
+    previewId = null,
+    elevation = null,
+    sort = undefined,
+    previewSort = undefined
+  } = {}) {
+    const delegate = this._delegate;
+    if (!delegate?.isActive) return false;
+    const sourceKey = this._normalizePreviewGroupKey({ previewKey, previewId, elevation });
+    const targetElevation = Number(elevation);
+    const targetKey = Number.isFinite(targetElevation) ? targetElevation.toFixed(3) : sourceKey;
+    const nextSort = Number(sort);
+    let changed = false;
+
+    if (sourceKey && targetKey && sourceKey !== targetKey && Array.isArray(delegate._sessionPaths)) {
+      for (const entry of delegate._sessionPaths) {
+        const entryKey = this._getPathEntryElevation(entry).toFixed(3);
+        if (entryKey !== sourceKey) continue;
+        entry.elevation = targetElevation;
+        changed = true;
+      }
+      if (Number(delegate._previewElevation).toFixed(3) === sourceKey) {
+        delegate._previewElevation = targetElevation;
+        changed = true;
+      }
+      if (changed) {
+        try { delegate._syncSessionMeshOrder?.({ includeActive: true }); } catch (_) {}
+      }
+    }
+
+    if (Number.isFinite(nextSort)) {
+      const nextPreviewSort = Number.isFinite(Number(previewSort)) ? Number(previewSort) : nextSort;
+      const group = delegate._previewGroups?.get?.(targetKey)
+        || delegate._previewGroups?.get?.(sourceKey)
+        || null;
+      if (group && (Number(group.placementSort) !== nextSort || Number(group.sort) !== nextPreviewSort)) {
+        group.placementSort = nextSort;
+        group.sort = nextPreviewSort;
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  applyLayerManagerPreviewPlacement({
+    elevation = null,
+    sort = undefined,
+    previewSort = undefined,
+    previewId = null,
+    previewKey = null,
+    anchorTileId = undefined,
+    sortBefore = undefined
+  } = {}) {
+    if (!this._delegate?.isActive) return false;
+    const { handlers } = this._buildToolOptionsState();
+    let changed = false;
+
+    if (anchorTileId !== undefined) {
+      const nextAnchorTileId = String(anchorTileId || '').trim() || null;
+      if (String(this._delegate?._placementSortAnchorTileId || '').trim() !== String(nextAnchorTileId || '').trim()) {
+        try { this._delegate._placementSortAnchorTileId = nextAnchorTileId; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (sortBefore !== undefined) {
+      const nextSortBefore = sortBefore === true;
+      if (this._delegate?._placementSortBeforeAnchor !== nextSortBefore) {
+        try { this._delegate._placementSortBeforeAnchor = nextSortBefore; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    if (Number.isFinite(Number(elevation))) {
+      const nextElevation = Number(elevation);
+      if (Number(this._delegate?._previewElevation) !== nextElevation) {
+        if (typeof handlers?.setElevation === 'function') handlers.setElevation(nextElevation, true);
+        else this._delegate._previewElevation = nextElevation;
+        changed = true;
+      }
+    }
+
+    if (sort !== undefined && Number.isFinite(Number(sort))) {
+      const nextSort = Number(sort);
+      if (Number(this._delegate?._previewSort) !== nextSort) {
+        try { this._delegate._previewSort = nextSort; } catch (_) {}
+        changed = true;
+      }
+      const nextPreviewSort = previewSort !== undefined && Number.isFinite(Number(previewSort))
+        ? Number(previewSort)
+        : nextSort;
+      if (Number(this._delegate?._previewRenderSort) !== nextPreviewSort) {
+        try { this._delegate._previewRenderSort = nextPreviewSort; } catch (_) {}
+        changed = true;
+      }
+    }
+
+    changed = this._applyPathPreviewGroupPlacement({
+      previewId,
+      previewKey,
+      elevation,
+      sort,
+      previewSort
+    }) || changed;
+
+    if (!changed) return false;
+    this._applyCurrentPreviewLayerOrdering();
+    try { this._delegate?._refreshCursorPreview?.(); } catch (_) {}
+    this._syncToolOptionsState({
+      suppressRender: false,
+      suppressSubtoolPersistence: true,
+      suppressToolDefaultsPersistence: true
+    });
+    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source: 'path-preview-layer-manager' });
+    return true;
+  }
+
+  selectLayerManagerPreview({
+    previewId = null,
+    previewKey = null,
+    elevation = null
+  } = {}) {
+    const delegate = this._delegate;
+    if (!delegate?.isActive) return false;
+    const sourceKey = this._normalizePreviewGroupKey({ previewKey, previewId, elevation });
+    const targetElevation = Number(elevation);
+    const targetKey = sourceKey || (Number.isFinite(targetElevation) ? targetElevation.toFixed(3) : '');
+    let activatedEditShapes = false;
+    if (!delegate._editShapesMode && typeof delegate._setSubtoolMode === 'function') {
+      activatedEditShapes = !!delegate._setSubtoolMode('edit-shapes');
+      if (!activatedEditShapes) {
+        Logger.warn('PathManagerV2.previewSelect.editShapesUnavailable', {
+          previewId,
+          previewKey,
+          elevation: Number.isFinite(targetElevation) ? targetElevation : null
+        });
+        return false;
+      }
+    }
+
+    const entries = Array.isArray(delegate._sessionPaths) ? delegate._sessionPaths : [];
+    const matching = entries.filter((entry) => this._getPathEntryElevation(entry).toFixed(3) === targetKey);
+    const activeEntry = matching.find((entry) => entry?.id && entry.id === delegate._activePathId) || null;
+    const targetEntry = activeEntry || matching[matching.length - 1] || null;
+    if (!targetEntry?.id) {
+      Logger.warn('PathManagerV2.previewSelect.pathMissing', {
+        previewId,
+        previewKey,
+        elevation: Number.isFinite(targetElevation) ? targetElevation : null,
+        targetKey,
+        editShapesMode: !!delegate._editShapesMode,
+        activatedEditShapes
+      });
+      return false;
+    }
+
+    const selected = typeof delegate._selectSessionPath === 'function'
+      ? !!delegate._selectSessionPath(targetEntry.id)
+      : false;
+    if (!selected) {
+      Logger.warn('PathManagerV2.previewSelect.failed', {
+        previewId,
+        previewKey,
+        pathId: targetEntry.id,
+        targetKey
+      });
+      return false;
+    }
+    this._syncToolOptionsState({
+      suppressRender: false,
+      suppressSubtoolPersistence: true,
+      suppressToolDefaultsPersistence: true
+    });
+    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source: 'path-preview-layer-manager-select' });
+    return true;
   }
 
   _resolveHoveredSplitTarget() {
@@ -804,15 +1035,19 @@ export class PathManagerV2 {
     suppressSubtoolPersistence = false,
     suppressToolDefaultsPersistence = false
   } = {}) {
-    try {
-      const descriptor = this._buildToolOptionsDescriptor();
-      toolOptionsController.setToolOptions('path.edit.v2', {
-        ...descriptor,
-        suppressRender
-      });
-      this._persistSubtoolFromState(descriptor.legacyState, { suppress: suppressSubtoolPersistence });
-      if (!suppressToolDefaultsPersistence) this._scheduleToolDefaultsPersist();
-    } catch (_) {}
+    const descriptor = this._buildToolOptionsDescriptor();
+    syncHostedToolOptions({
+      toolId: 'path.edit.v2',
+      descriptor,
+      suppressRender,
+      legacyState: descriptor.legacyState,
+      persistSubtoolFromState: (state) => this._persistSubtoolFromState(state),
+      suppressSubtoolPersistence,
+      scheduleToolDefaultsPersist: () => this._scheduleToolDefaultsPersist(),
+      suppressToolDefaultsPersistence,
+      loggerPrefix: 'PathManagerV2'
+    });
+    this._notifyPreviewLayerChangeIfNeeded(descriptor, { source: 'path-preview' });
   }
 
   requestToolOptionsUpdate(options = {}) {
@@ -820,61 +1055,27 @@ export class PathManagerV2 {
   }
 
   _persistDelegateToolDefaults() {
-    const delegate = this._delegate;
-    if (!delegate) return;
-    if (typeof delegate._persistToolDefaults !== 'function') return;
-    try { delegate._persistToolDefaults(); } catch (_) {}
+    this._subtoolPreferenceBridge.persistDelegateToolDefaults();
   }
 
   _refreshDelegateToolDefaults() {
-    const delegate = this._delegate;
-    if (!delegate) return;
-    try {
-      if (typeof delegate._readToolDefaults === 'function') {
-        const defaults = delegate._readToolDefaults();
-        delegate._toolDefaults = defaults && typeof defaults === 'object' ? defaults : null;
-      } else if ('_toolDefaults' in delegate) {
-        delegate._toolDefaults = null;
-      }
-    } catch (_) {}
+    this._subtoolPreferenceBridge.refreshDelegateToolDefaults();
   }
 
   _scheduleToolDefaultsPersist() {
-    if (!this._delegate?.isActive) return;
-    if (this._toolDefaultsPersistTimer) return;
-    this._toolDefaultsPersistTimer = setTimeout(() => {
-      this._toolDefaultsPersistTimer = null;
-      if (!this._delegate?.isActive) return;
-      this._persistDelegateToolDefaults();
-    }, 200);
-  }
-
-  _readSubtoolPreference() {
-    try {
-      const value = game?.settings?.get?.(MODULE_ID, PATH_SUBTOOL_SETTING_KEY);
-      const normalized = typeof value === 'string' ? value : '';
-      return PATH_PERSISTED_SUBTOOL_IDS.has(normalized) ? normalized : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  _persistSubtoolPreference(value) {
-    if (!value || !PATH_PERSISTED_SUBTOOL_IDS.has(value)) return;
-    if (this._lastPersistedSubtool === value) return;
-    this._lastPersistedSubtool = value;
-    try { game?.settings?.set?.(MODULE_ID, PATH_SUBTOOL_SETTING_KEY, value); } catch (_) {}
+    this._subtoolPreferenceBridge.scheduleToolDefaultsPersist();
   }
 
   _extractActiveSubtoolId(state) {
-    const toggles = Array.isArray(state?.subtoolToggles) ? state.subtoolToggles : [];
-    for (const toggle of toggles) {
-      if (!toggle || typeof toggle !== 'object') continue;
-      if (!toggle.enabled) continue;
-      const id = String(toggle.id || '');
-      if (PATH_ACTIVE_SUBTOOL_IDS.has(id)) return id;
-    }
-    return null;
+    return this._subtoolPreferenceBridge.extractActiveSubtoolId(state);
+  }
+
+  _persistSubtoolFromState(state, options = {}) {
+    this._subtoolPreferenceBridge.persistSubtoolFromState(state, options);
+  }
+
+  _restoreSubtoolPreference() {
+    this._subtoolPreferenceBridge.restoreSubtoolPreference();
   }
 
   _buildDeclarativeToolOptionsConfig(legacyState = {}) {
@@ -1295,30 +1496,6 @@ export class PathManagerV2 {
     return { controls, sections };
   }
 
-  _persistSubtoolFromState(state, { suppress = false } = {}) {
-    if (suppress) return;
-    const active = this._extractActiveSubtoolId(state);
-    if (!active) return;
-    this._persistSubtoolPreference(active);
-  }
-
-  _restoreSubtoolPreference() {
-    const preferred = this._readSubtoolPreference();
-    if (!preferred) return;
-    this._lastPersistedSubtool = preferred;
-    const apply = () => {
-      try {
-        const result = toolOptionsController?.requestCustomToggle?.(preferred, true);
-        if (result === false) {
-          setTimeout(() => {
-            try { toolOptionsController?.requestCustomToggle?.(preferred, true); } catch (_) {}
-          }, 50);
-        }
-      } catch (_) {}
-    };
-    if (typeof queueMicrotask === 'function') queueMicrotask(apply);
-    else setTimeout(apply, 0);
-  }
 }
 
 export default PathManagerV2;

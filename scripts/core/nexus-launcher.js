@@ -1,4 +1,5 @@
 import { NexusLogger as Logger } from './nexus-logger.js';
+import { preserveCurrentTileSelectionForNexus } from '../canvas/tile-selection-context.js';
 
 const MODULE_ID = 'fa-nexus';
 let themeObserver = null;
@@ -141,9 +142,16 @@ function ensureLauncher(onOpen) {
 
   const button = panel.querySelector('.fa-nexus-launch-btn');
   if (button) {
+    const preserveTileSelection = (source) => {
+      try { preserveCurrentTileSelectionForNexus(source); }
+      catch (err) { Logger?.warn?.('Launcher.tileSelectionContext.preserveFailed', { source, error: String(err?.message || err) }); }
+    };
+    button.addEventListener('pointerdown', () => preserveTileSelection('launcher-pointerdown'), { capture: true });
+    button.addEventListener('mousedown', () => preserveTileSelection('launcher-mousedown'), { capture: true });
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
+      preserveTileSelection('launcher-click');
       try { onOpen?.(); }
       catch (err) { Logger?.warn?.('Launcher.open.failed', err); }
     });

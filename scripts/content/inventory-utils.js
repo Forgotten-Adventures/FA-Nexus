@@ -4,12 +4,19 @@
  */
 
 /**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusAssetInventoryRecord} FaNexusAssetInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenInventoryRecord} FaNexusTokenInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenSize} FaNexusTokenSize
+ */
+
+/**
  * Parse grid size and scale from a token filename.
  * Supports size keywords (Gargantuan/Huge/Large) and `scaleNN` suffix.
  * @param {string} [filename]
- * @returns {{gridWidth:number,gridHeight:number,scale:number}}
+ * @returns {FaNexusTokenSize}
  */
-export function parseTokenSize(filename = '') {
+function parseTokenSize(filename = '') {
   const name = String(filename || '').toLowerCase();
   let gridWidth = 1, gridHeight = 1, scale = 1;
   const MAX_GRID_SIZE = 100;
@@ -47,7 +54,7 @@ export function parseTokenSize(filename = '') {
  * @param {string} [filename]
  * @returns {{baseNameWithoutVariant:string,colorVariant:string|null,isMainColorVariant:boolean,hasColorVariant:boolean}}
  */
-export function detectColorVariant(filename = '') {
+function detectColorVariant(filename = '') {
   const noExt = String(filename || '').replace(/\.[^/.]+$/, '');
   const m = noExt.match(/^(.+)_(\d+)$/);
   if (m) {
@@ -73,7 +80,7 @@ export function detectColorVariant(filename = '') {
  * @param {string} [filename]
  * @returns {string}
  */
-export function deriveDisplayName(filename = '') {
+function deriveDisplayName(filename = '') {
   const noExt = String(filename || '').replace(/\.[^/.]+$/, '');
   const cleaned = noExt.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
   return cleaned.replace(/\b\w/g, (l) => l.toUpperCase());
@@ -84,7 +91,7 @@ export function deriveDisplayName(filename = '') {
  * @param {string} [filename]
  * @returns {{displayName:string,variant:string,size:string,creatureType:string}}
  */
-export function parseTokenDisplayName(filename = '') {
+function parseTokenDisplayName(filename = '') {
   const nameWithoutExt = String(filename || '').replace(/\.[^/.]+$/, '');
   const parts = nameWithoutExt.split('_');
 
@@ -156,7 +163,7 @@ export function parseTokenDisplayName(filename = '') {
  * Map a local token scan item to a cloud-parity inventory record
  * @param {{path?:string,filename:string,url?:string}} localItem
  * @param {string|null} [tier]
- * @returns {object}
+ * @returns {FaNexusTokenInventoryRecord}
  */
 export function localToTokenInventoryRecord(localItem, tier = null) {
   const filename = localItem.filename || '';
@@ -206,7 +213,7 @@ export function localToTokenInventoryRecord(localItem, tier = null) {
  * @param {string} [filename]
  * @returns {{gridWidth:number,gridHeight:number}}
  */
-export function parseAssetGrid(filename = '') {
+function parseAssetGrid(filename = '') {
   const name = String(filename || '');
   const noExt = name.replace(/\.[^/.]+$/, '');
   const m = noExt.match(/(?:^|[_\-\s])(\d+)x(\d+)$/i);
@@ -223,7 +230,7 @@ export function parseAssetGrid(filename = '') {
  * - `grid_width`/`grid_height` parsed from trailing NxM
  * - `width`/`height` estimated at 200px per grid square
  * @param {{path?:string,filename:string,url?:string}} localItem
- * @returns {object}
+ * @returns {FaNexusAssetInventoryRecord}
  */
 export function localToAssetInventoryRecord(localItem) {
   const filename = localItem.filename || '';

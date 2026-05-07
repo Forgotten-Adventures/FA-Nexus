@@ -1,5 +1,10 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 
+/**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusFolderCountEntry} FaNexusFolderCountEntry
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ */
+
 export class NexusIndexDB {
   /**
    * IndexedDB wrapper for caching large, folder-scoped indexes.
@@ -47,7 +52,7 @@ export class NexusIndexDB {
    * Load cached records for a given type and folder
    * @param {'assets'|'tokens'|string} type
    * @param {string} folder
-   * @returns {Promise<Array<object>>}
+   * @returns {Promise<FaNexusInventoryRecord[]>}
    */
   async load(type, folder) {
     try {
@@ -92,14 +97,17 @@ export class NexusIndexDB {
       Logger.info('IndexDB.load:legacy', { type, folder, count: Array.isArray(legacy) ? legacy.length : 0 });
       Logger.timeEnd(`idb-load:${type}:${folder}`);
       return legacy;
-    } catch (_) { return []; }
+    } catch (error) {
+      Logger.error('IndexDB.load.failed', { type, folder, error: String(error?.message || error) });
+      return [];
+    }
   }
 
   /**
    * Save records for a given type and folder. Uses chunked storage when large.
    * @param {'assets'|'tokens'|string} type
    * @param {string} folder
-   * @param {Array<object>} records
+   * @param {FaNexusInventoryRecord[]} records
    * @returns {Promise<boolean>}
    */
   async save(type, folder, records) {
@@ -166,7 +174,10 @@ export class NexusIndexDB {
       Logger.info('IndexDB.save:legacy', { type, folder, count: recs.length });
       Logger.timeEnd(`idb-save:${type}:${folder}`);
       return true;
-    } catch (_) { return false; }
+    } catch (error) {
+      Logger.error('IndexDB.save.failed', { type, folder, error: String(error?.message || error) });
+      return false;
+    }
   }
 
   /**
@@ -209,13 +220,16 @@ export class NexusIndexDB {
         } catch (_) {}
       });
       return true;
-    } catch (_) { return false; }
+    } catch (error) {
+      Logger.error('IndexDB.clear.failed', { type, folder, error: String(error?.message || error) });
+      return false;
+    }
   }
 
   /**
    * List known folders for a type with approximate record counts
    * @param {'assets'|'tokens'|string} type
-   * @returns {Promise<Array<{folder:string,count:number}>>}
+   * @returns {Promise<FaNexusFolderCountEntry[]>}
    */
   async list(type) {
     try {
@@ -263,7 +277,10 @@ export class NexusIndexDB {
       const result = Array.from(counts.entries()).map(([folder, count]) => ({ folder, count }));
       Logger.info('IndexDB.list:done', { type, entries: result.length });
       return result;
-    } catch (_) { return []; }
+    } catch (error) {
+      Logger.error('IndexDB.list.failed', { type, error: String(error?.message || error) });
+      return [];
+    }
   }
 
   /**
@@ -279,6 +296,9 @@ export class NexusIndexDB {
         await this.clear(type, folder);
       }
       return true;
-    } catch (_) { return false; }
+    } catch (error) {
+      Logger.error('IndexDB.clearAll.failed', { type, error: String(error?.message || error) });
+      return false;
+    }
   }
 }

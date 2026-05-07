@@ -1,20 +1,31 @@
 const GET_CACHE_PATCH_KEY = '__faNexusTextureLoaderGetCachePatched';
 const LOAD_TEXTURE_PATCH_KEY = '__faNexusTextureLoaderLoadTexturePatched';
 
+function isCachedBaseTextureUsable(baseTexture) {
+  return !!baseTexture && !baseTexture.destroyed && baseTexture.valid !== false;
+}
+
+function isCachedTextureUsable(texture) {
+  if (!texture || texture.destroyed) return false;
+  const baseTexture = texture.baseTexture || null;
+  if (!baseTexture) return true;
+  return isCachedBaseTextureUsable(baseTexture);
+}
+
 function unwrapCachedTexture(candidate) {
   try {
     if (!candidate || candidate.destroyed) return null;
     if (candidate instanceof PIXI.Texture) {
-      return candidate.destroyed ? null : candidate;
+      return isCachedTextureUsable(candidate) ? candidate : null;
     }
     const directTexture = candidate?.texture;
-    if (directTexture instanceof PIXI.Texture && !directTexture.destroyed) {
+    if (directTexture instanceof PIXI.Texture && isCachedTextureUsable(directTexture)) {
       return directTexture;
     }
     const baseTexture = (
       (candidate instanceof PIXI.BaseTexture) ? candidate : null
     ) || candidate?.baseTexture || null;
-    if (baseTexture && !baseTexture.destroyed) {
+    if (isCachedBaseTextureUsable(baseTexture)) {
       try { return new PIXI.Texture(baseTexture); } catch (_) {}
     }
   } catch (_) {}

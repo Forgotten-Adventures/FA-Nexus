@@ -1,4 +1,9 @@
 /**
+ * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
+ * @typedef {import('../core/fa-nexus-types.js').LoadAndMergeCloudRecordsOptions<FaNexusInventoryRecord>} LoadAndMergeCloudRecordsOptions
+ */
+
+/**
  * Shared catalog pipeline helpers for browser tabs that blend local and cloud inventory.
  */
 
@@ -12,7 +17,7 @@ export function abortError() {
 
 /**
  * Detect standard abort failures across browser and Foundry contexts.
- * @param {unknown} error
+ * @param {Error|{name?:string}} error
  * @returns {boolean}
  */
 export function isAbortError(error) {
@@ -41,17 +46,11 @@ export function formatCatalogLoaderText(label, count, total, fallbackLabel = 'Lo
  * Shared control flow for fetching cloud records and merging them into a local catalog.
  * `fetchCloud` must return `{ items, error, partial }`.
  * `mergeItems` must return the final merged array.
- * @param {object} options
+ * @param {LoadAndMergeCloudRecordsOptions} options
  * @param {boolean} [options.cloudEnabled=true]
- * @param {Array<object>} [options.localItems=[]]
+ * @param {FaNexusInventoryRecord[]} [options.localItems=[]]
  * @param {AbortSignal|null} [options.signal=null]
- * @param {Function} options.fetchCloud
- * @param {Function} options.mergeItems
- * @param {Function} [options.onCloudItems]
- * @param {Function} [options.onCloudError]
- * @param {Function} [options.onResult]
- * @param {Function} [options.onTotal]
- * @returns {Promise<{items:Array<object>, error:string|null, partial:boolean}>}
+ * @returns {Promise<{items:FaNexusInventoryRecord[], error:string|null, partial:boolean, errorObject?:Error|object|null}>}
  */
 export async function loadAndMergeCloudRecords({
   cloudEnabled = true,
@@ -77,18 +76,21 @@ export async function loadAndMergeCloudRecords({
 
   let cloudItems = [];
   let cloudError = null;
+  let cloudErrorObject = null;
   let partial = false;
 
   try {
     const cloudResult = await fetchCloud({ signal });
     cloudItems = Array.isArray(cloudResult?.items) ? cloudResult.items : [];
     cloudError = cloudResult?.error ? String(cloudResult.error) : null;
+    cloudErrorObject = cloudResult?.errorObject ?? null;
     partial = !!cloudResult?.partial;
     try { onTotal?.(cloudItems.length); } catch (_) {}
     try { onCloudItems?.(cloudItems, cloudResult); } catch (_) {}
   } catch (error) {
     if (isAbortError(error)) throw error;
     cloudError = String(error?.message || error);
+    cloudErrorObject = error ?? null;
     partial = false;
     try { onCloudError?.(cloudError, error); } catch (_) {}
   }
@@ -96,7 +98,7 @@ export async function loadAndMergeCloudRecords({
   if (signal?.aborted) throw abortError();
   if (cloudError && !partial && safeLocal.length) partial = true;
   if (cloudError && !partial && !safeLocal.length) {
-    const result = { items: [], error: cloudError, partial: false };
+    const result = { items: [], error: cloudError, partial: false, errorObject: cloudErrorObject };
     try { onResult?.(result, { localItems: safeLocal, cloudItems }); } catch (_) {}
     return result;
   }
@@ -111,7 +113,8 @@ export async function loadAndMergeCloudRecords({
   const result = {
     items: Array.isArray(merged) ? merged : [],
     error: cloudError,
-    partial
+    partial,
+    errorObject: cloudErrorObject
   };
   try { onResult?.(result, { localItems: safeLocal, cloudItems }); } catch (_) {}
   return result;

@@ -4,6 +4,7 @@ import { AssetsTab } from '../assets/assets-tab.js';
 import { TexturesTab } from '../textures/textures-tab.js';
 import { PathsTab } from '../paths/paths-tab.js';
 import { BuildingsTab } from '../buildings/buildings-tab.js';
+import { preserveCurrentTileSelectionForNexus } from '../canvas/tile-selection-context.js';
 
 /**
  * TabManager
@@ -17,6 +18,10 @@ export class TabManager {
     this._activeTabObj = null;
     this._tabsLocked = false;
     this._tabLockMessage = '';
+  }
+
+  _logLifecycleFailure(scope, error, details = {}) {
+    Logger.warn(scope, { ...details, error });
   }
 
   /**
@@ -65,7 +70,8 @@ export class TabManager {
   loadActiveTabFromSettings() {
     try {
       return game.settings.get('fa-nexus', 'activeTab') || 'tokens';
-    } catch (_) {
+    } catch (error) {
+      this._logLifecycleFailure('TabManager.activeTab.loadFailed', error);
       return 'tokens';
     }
   }
@@ -77,7 +83,9 @@ export class TabManager {
   saveActiveTabToSettings(tabId) {
     try {
       game.settings.set('fa-nexus', 'activeTab', tabId);
-    } catch (_) {}
+    } catch (error) {
+      this._logLifecycleFailure('TabManager.activeTab.saveFailed', error, { tab: tabId });
+    }
   }
 
   /**
@@ -99,16 +107,19 @@ export class TabManager {
     this._applyTabLockState();
   }
 
-  syncTabButtons() {
-    this._syncTabButtons();
-  }
-
   bindTabButtons({ element, events }) {
     if (!element || !events) return;
     const buttons = element.querySelectorAll('.fa-nexus-tabs .fa-nexus-tab');
     if (!buttons?.length) return;
 
     buttons.forEach((button) => {
+      const preserveTileSelection = () => {
+        const requested = button?.dataset?.nexusTab || 'tokens';
+        try { preserveCurrentTileSelectionForNexus(`tab-button:${requested}`); }
+        catch (error) { this._logLifecycleFailure('TabSwitch.tileSelectionContext.buttonPreserveFailed', error, { requested }); }
+      };
+      events.on(button, 'pointerdown', preserveTileSelection, { capture: true });
+      events.on(button, 'mousedown', preserveTileSelection, { capture: true });
       events.on(button, 'click', () => {
         const requested = button?.dataset?.nexusTab || 'tokens';
         Logger.info('TabSwitch.click', { requested, locked: this.areTabsLocked() });
@@ -117,7 +128,7 @@ export class TabManager {
       });
     });
 
-    this.syncTabButtons();
+    this._syncTabButtons();
   }
 
   /**
@@ -144,6 +155,8 @@ export class TabManager {
    */
   async switchToTab(tabId) {
     Logger.info('TabSwitch._activateTab:start', { requested: tabId, current: this._activeTab });
+    try { preserveCurrentTileSelectionForNexus('tab-switch-start'); }
+    catch (error) { this._logLifecycleFailure('TabSwitch.tileSelectionContext.preserveFailed', error, { requested: tabId }); }
 
     this.initializeTabs();
     const safeId = (tabId && this._tabs && this._tabs[tabId]) ? tabId : 'tokens';
@@ -154,7 +167,10 @@ export class TabManager {
     Logger.info('TabSwitch._activateTab:proceed', { from: this._activeTab, to: safeId });
 
     // Deactivate current tab
-    try { this._activeTabObj?.onDeactivate?.(); } catch (_) {}
+    try { this._activeTabObj?.onDeactivate?.(); }
+    catch (error) {
+      this._logLifecycleFailure('TabSwitch.deactivateFailed', error, { tab: this._activeTab });
+    }
 
     // Update active tab
     this._activeTab = safeId;
@@ -165,7 +181,10 @@ export class TabManager {
 
     // Clean up old grid
     if (this.app._grid) {
-      try { this.app._grid.destroy(); } catch (_) {}
+      try { this.app._grid.destroy(); }
+      catch (error) {
+        this._logLifecycleFailure('TabSwitch.gridDestroyFailed', error, { from: this._activeTab, to: safeId });
+      }
       this.app._grid = null;
     }
 
@@ -174,7 +193,6 @@ export class TabManager {
 
     const tabInstance = this._activeTabObj;
 
-    // Show placeholder immediately
     try {
       const placeholderMetrics = tabInstance?.getPlaceholderCardSize?.() || null;
       if (placeholderMetrics) {
@@ -187,15 +205,18 @@ export class TabManager {
     }
 
     // Bind footer controls
-    try { this.app._footerController?.bindGlobalFooter?.(); } catch (_) {}
-    try { tabInstance?.bindFooter?.(); } catch (_) {}
+    try { this.app._footerController?.bindGlobalFooter?.(); }
+    catch (error) { this._logLifecycleFailure('TabSwitch.bindGlobalFooterFailed', error, { tab: safeId }); }
+    try { tabInstance?.bindFooter?.(); }
+    catch (error) { this._logLifecycleFailure('TabSwitch.bindTabFooterFailed', error, { tab: safeId }); }
 
     Logger.info('TabSwitch.scheduleActivation', { tab: safeId });
 
     const activationPromise = this._scheduleTabActivation(tabInstance);
 
     Logger.info('TabSwitch.syncButtonsFinal', { tab: safeId });
-    try { this.syncTabButtons(); } catch (_) {}
+    try { this._syncTabButtons(); }
+    catch (error) { this._logLifecycleFailure('TabSwitch.syncButtonsFailed', error, { tab: safeId }); }
 
     Logger.info('TabSwitch.deferFolderOps', { tab: safeId });
     Promise.resolve().then(() => {
@@ -244,7 +265,9 @@ export class TabManager {
     return new Promise((resolve, reject) => {
       const finish = (error) => {
         try { this.app._gridManager.releaseInitialGridPlaceholderSuppression(); }
-        catch (_) {}
+        catch (suppressionError) {
+          this._logLifecycleFailure('TabSwitch.placeholderSuppressionReleaseFailed', suppressionError, { tab: owner.id });
+        }
         if (error) reject(error);
         else resolve();
       };
@@ -295,7 +318,13 @@ export class TabManager {
   cancelActiveOperations(reason = 'unknown') {
     if (!this._tabs) return;
     for (const tab of Object.values(this._tabs)) {
-      try { tab.cancelActiveOperations?.(reason); } catch (_) {}
+      try { tab.cancelActiveOperations?.(reason); }
+      catch (error) {
+        this._logLifecycleFailure('TabManager.cancelActiveOperationsFailed', error, {
+          tab: tab?.id || null,
+          reason
+        });
+      }
     }
   }
 
@@ -307,7 +336,17 @@ export class TabManager {
     this.cancelActiveOperations('cleanup');
 
     // Deactivate current tab
-    try { this._activeTabObj?.onDeactivate?.(); } catch (_) {}
+    try { this._activeTabObj?.onDeactivate?.(); }
+    catch (error) {
+      this._logLifecycleFailure('TabManager.cleanupDeactivateFailed', error, { tab: this._activeTab });
+    }
+
+    for (const [tabId, tab] of Object.entries(this._tabs || {})) {
+      try { tab?.destroy?.(); }
+      catch (error) {
+        this._logLifecycleFailure('TabManager.cleanupDestroyFailed', error, { tab: tabId });
+      }
+    }
 
     // Clear references
     this._tabs = null;

@@ -1,6 +1,19 @@
 import { NexusLogger as Logger } from '../nexus-logger.js';
 
 /**
+ * @typedef {object} GridLoaderState
+ * @property {HTMLElement} element
+ * @property {string|null} owner
+ */
+
+/**
+ * @typedef {object} GridPlaceholderMetrics
+ * @property {number} width
+ * @property {number} height
+ * @property {number} gap
+ */
+
+/**
  * GridManager
  * Manages grid loading states, placeholders, and virtual grid for FA Nexus
  */
@@ -16,8 +29,8 @@ export class GridManager {
   /**
    * Show a loading overlay on the grid
    * @param {string} message - Loading message to display
-   * @param {object} options - Options
-   * @param {any} options.owner - Owner identifier for the loader
+   * @param {{owner?:string|null}} [options] - Options
+   * @param {string|null} [options.owner] - Owner identifier for the loader
    * @returns {HTMLElement|null} The loader element
    */
   showGridLoader(message = '', { owner = null } = {}) {
@@ -65,8 +78,8 @@ export class GridManager {
   /**
    * Update the loading message on an existing loader
    * @param {string} message - New loading message
-   * @param {object} options - Options
-   * @param {any} options.owner - Owner identifier
+   * @param {{owner?:string|null}} [options] - Options
+   * @param {string|null} [options.owner] - Owner identifier
    */
   updateGridLoader(message = '', { owner = null } = {}) {
     const state = this._gridLoader;
@@ -79,7 +92,7 @@ export class GridManager {
 
   /**
    * Hide the loading overlay
-   * @param {any} owner - Owner identifier
+   * @param {string|null} owner - Owner identifier
    */
   hideGridLoader(owner = null) {
     const state = this._gridLoader;
@@ -140,7 +153,7 @@ export class GridManager {
 
   /**
    * Check if the grid loader is owned by a specific owner
-   * @param {any} owner - Owner identifier
+   * @param {string|null} owner - Owner identifier
    * @returns {boolean} True if the loader is owned by the specified owner
    */
   isGridLoaderOwnedBy(owner) {
@@ -149,11 +162,7 @@ export class GridManager {
 
   /**
    * Show a skeleton placeholder for the grid
-   * @param {object} options - Placeholder options
-   * @param {string} options.tab - Tab identifier
-   * @param {number} options.width - Card width
-   * @param {number} options.height - Card height
-   * @param {number} options.gap - Gap between cards
+   * @param {{tab?:string|null,width?:number,height?:number,gap?:number}} [options] - Placeholder options
    */
   showGridPlaceholder({ tab = null, width, height, gap } = {}) {
     if (this._suppressGridPlaceholder) return;
@@ -190,11 +199,7 @@ export class GridManager {
 
   /**
    * Update the size of the grid placeholder
-   * @param {object} options - Size options
-   * @param {string} options.tab - Tab identifier
-   * @param {number} options.width - Card width
-   * @param {number} options.height - Card height
-   * @param {number} options.gap - Gap between cards
+   * @param {{tab?:string|null,width?:number,height?:number,gap?:number}} [options] - Size options
    */
   updateGridPlaceholderSize({ tab = null, width, height, gap } = {}) {
     const state = this._gridPlaceholder;
@@ -239,9 +244,9 @@ export class GridManager {
   /**
    * Resolve placeholder metrics from requested values and fallbacks
    * @private
-   * @param {object} requested - Requested metrics
-   * @param {object} fallback - Fallback metrics
-   * @returns {object} Resolved metrics
+   * @param {{width?:number,height?:number,gap?:number}} requested - Requested metrics
+   * @param {GridPlaceholderMetrics|null} fallback - Fallback metrics
+   * @returns {GridPlaceholderMetrics} Resolved metrics
    */
   _resolvePlaceholderMetrics(requested = {}, fallback = null) {
     const base = fallback || {
@@ -265,7 +270,7 @@ export class GridManager {
    * Apply placeholder metrics as CSS custom properties
    * @private
    * @param {HTMLElement} element - Placeholder element
-   * @param {object} metrics - Metrics to apply
+   * @param {GridPlaceholderMetrics} metrics - Metrics to apply
    */
   _applyGridPlaceholderMetrics(element, metrics) {
     if (!element || !metrics) return;

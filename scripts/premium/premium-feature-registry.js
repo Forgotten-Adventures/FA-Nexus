@@ -18,19 +18,6 @@ export function ensurePremiumFeaturesRegistered() {
     })
   });
 
-  premiumFeatureBroker.registerFeature('path.edit', {
-    entitlementKey: 'path.edit',
-    bundleId: 'path-editor',
-    factory: (mod) => ({
-      create(app) {
-        if (typeof mod?.createPathManager === 'function') return mod.createPathManager(app);
-        const Klass = mod?.PathManager || mod?.default;
-        if (typeof Klass !== 'function') throw new Error('Premium path bundle missing PathManager export');
-        return new Klass(app);
-      }
-    })
-  });
-
   premiumFeatureBroker.registerFeature('path.edit.v2', {
     entitlementKey: 'path.edit',
     bundleId: 'path-editor-v2',
