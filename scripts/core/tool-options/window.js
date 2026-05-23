@@ -348,6 +348,7 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._pendingScrollState = null;
     this._pendingContentStyle = null;
     this._resetScrollNextRender = false;
+    this._scrollRestoreToken = 0;
     this._syncWindowTitle();
   }
 
@@ -473,6 +474,7 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._pendingScrollState = null;
     this._pendingContentStyle = null;
     this._resetScrollNextRender = false;
+    this._scrollRestoreToken = (this._scrollRestoreToken || 0) + 1;
     try { this._controller?._handleWindowClosed(this); } catch (_) {}
     super._onClose(options);
   }

@@ -67,6 +67,11 @@ function isBuildingFillDocument(doc = null) {
   return !!readBuildingFlag(doc, 'buildingFill');
 }
 
+function isBuildingCompositeSillDocument(doc = null) {
+  const composite = readBuildingFlag(doc, 'buildingComposite');
+  return String(composite?.role || '').toLowerCase() === 'sill';
+}
+
 function shouldSkipLinkedBuildingDeletes(doc = null, options = {}) {
   try {
     if (isBuildingFillDocument(doc) && options?.[SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION]) return true;
@@ -289,17 +294,29 @@ function resolveBuildingCleanupTargets(doc, scene = null) {
   try {
     const buildingData = readBuildingFlag(doc, 'building');
     if (buildingData) return [{ doc, data: buildingData }];
-    if (!readBuildingFlag(doc, 'buildingFill')) return [];
+    const isFill = !!readBuildingFlag(doc, 'buildingFill');
+    const isSill = isBuildingCompositeSillDocument(doc);
+    if (!isFill && !isSill) return [];
     const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
     if (!resolvedScene?.tiles?.size) return [];
     const targets = [];
+    const composite = isSill ? readBuildingFlag(doc, 'buildingComposite') : null;
+    const explicitWallTileId = String(composite?.wallTileId || '').trim();
+    if (explicitWallTileId) {
+      const owner = resolvedScene.tiles?.get?.(explicitWallTileId) || null;
+      const ownerData = readBuildingFlag(owner, 'building');
+      if (ownerData) targets.push({ doc: owner, data: ownerData });
+    }
     for (const tileDoc of resolvedScene.tiles) {
       if (!tileDoc || tileDoc.id === doc.id) continue;
       const data = readBuildingFlag(tileDoc, 'building');
       if (!data) continue;
       const fillTileId = data?.meta?.fillTileId || null;
-      if (fillTileId !== doc.id) continue;
-      targets.push({ doc: tileDoc, data });
+      const sillTileId = data?.meta?.sillTileId || data?.meta?.composite?.sillTileId || null;
+      if (isFill && fillTileId === doc.id) targets.push({ doc: tileDoc, data });
+      else if (isSill && sillTileId === doc.id && !targets.some((target) => target?.doc?.id === tileDoc.id)) {
+        targets.push({ doc: tileDoc, data });
+      }
     }
     return targets;
   } catch (_) {
@@ -1669,6 +1686,12 @@ async function deleteLinkedFillAndWalls(doc, { scene = null, data = null, option
         [SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION]: true
       }, 'BuildingTiles.delete.fill');
     }
+    const sillTileId = meta?.sillTileId || meta?.composite?.sillTileId || null;
+    if (sillTileId && sillTileId !== doc.id) {
+      await deleteLinkedTilesRobustly(resolvedScene, [sillTileId], {
+        [PRESERVE_LINKED_TILE_CLEANUP_OPTION]: true
+      }, 'BuildingTiles.delete.sillComposite');
+    }
     // NOTE: We intentionally do NOT use meta.wallIds here, as those can be stale.
     // When multiple islands are committed, wall IDs may get reassigned to different
     // tiles during _assignWallsToCommittedIslands. The meta.wallIds stored at commit
@@ -1924,14 +1947,21 @@ async function cleanupLinkedBuildingTiles(doc, options = {}) {
     const targets = resolveBuildingCleanupTargets(doc, scene);
     if (!targets.length) return;
     const isFillTrigger = !isBuildingTileDocument(doc) && isBuildingFillDocument(doc);
-    if (isFillTrigger) {
+    const isSillTrigger = !isBuildingTileDocument(doc) && isBuildingCompositeSillDocument(doc);
+    if (isFillTrigger || isSillTrigger) {
       const ownerTileIds = Array.from(new Set(
         targets.map((target) => target?.doc?.id).filter(Boolean)
       ));
       if (!ownerTileIds.length) return;
-      await deleteLinkedTilesRobustly(scene, ownerTileIds, {
-        [SKIP_LINKED_BUILDING_FILL_DELETE_OPTION]: true
-      }, 'BuildingTiles.delete.fillOwners');
+      const triggerOptions = isFillTrigger
+        ? { [SKIP_LINKED_BUILDING_FILL_DELETE_OPTION]: true }
+        : null;
+      await deleteLinkedTilesRobustly(
+        scene,
+        ownerTileIds,
+        triggerOptions,
+        isFillTrigger ? 'BuildingTiles.delete.fillOwners' : 'BuildingTiles.delete.sillOwners'
+      );
       return;
     }
     for (const target of targets) {

@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-05-22
+
+### Added
+- **Building Tool Portal Texture Flips:**
+    - Door and window portal textures now have separate `Flip Horizontal` and `Flip Vertical` controls.
+
+### Changed
+- **Scatter Rendering Performance:**
+    - Large scatter tiles now use cached single or chunked render textures instead of keeping every scatter stamp live all the time.
+    - Scatter tiles now refresh visible live sprites while panning and zooming, reducing canvas work while preserving interaction and pixel selection behavior.
+    - Scatter shadow generation can reuse the runtime scatter cache and falls back to chunked shadow stamps when needed, improving heavy-scene stability and reducing redundant shadow rendering.
+    - Scatter overhead proxies now filter at the container level to reduce overhead rendering work.
+
+- **Building Composite Tiles:**
+    - Building window sills are now managed as their own linked composite tile instead of being folded into the background composite.
+
+### Fixed
+- Premium editor loading after update
+- Cached token records with stale display names, creature sizes, creature types, or grid dimensions now correct themselves more reliably during Nexus browsing.
+- Building portal gap rendering now uses exact gap bounds instead of extra render bleed, reducing small over-cuts around generated door/window openings.
+- Texture Painting previews now apply Texture Opacity to the texture content instead of the masked preview layer, so semi-transparent previews match committed masked tiles.
+- Asset Placement & Scatter tool options panel no longer jumps to the top when adjsuting shadow offset & sliders
+
 ## [0.5.1] - 2026-05-07
 
 This is the Foundry v14 transition release. FA Nexus now targets Foundry VTT v14 and is not backwards compatible with Foundry v13.

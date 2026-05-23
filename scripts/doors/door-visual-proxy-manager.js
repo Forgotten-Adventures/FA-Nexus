@@ -1,4 +1,5 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { syncPortalTextureFlipForMesh } from './portal-texture-flip-runtime.js';
 
 const MODULE_ID = 'fa-nexus';
 const PROXY_REFRESH_HOOK = 'faNexusDoorVisualProxyRefresh';
@@ -321,11 +322,14 @@ export class DoorVisualProxyManager {
   _wallUpdateRequiresRebuild(diff = {}) {
     if (!diff || typeof diff !== 'object') return false;
     const coreFlags = diff.flags?.core || {};
+    const faFlags = diff.flags?.[MODULE_ID] || {};
     return ('c' in diff)
       || ('levels' in diff)
       || ('door' in diff)
       || ('animation' in diff)
-      || Object.prototype.hasOwnProperty.call(coreFlags, 'textureGridSize');
+      || Object.prototype.hasOwnProperty.call(coreFlags, 'textureGridSize')
+      || Object.prototype.hasOwnProperty.call(faFlags, 'buildingDoor')
+      || Object.prototype.hasOwnProperty.call(faFlags, 'buildingWindow');
   }
 
   _rebuildScene(reason) {
@@ -426,6 +430,7 @@ export class DoorVisualProxyManager {
       const meshes = [];
       for (const style of styles) {
         const mesh = new DoorMesh({ object: proxy, texture, style, ...animation });
+        syncPortalTextureFlipForMesh(doc, mesh, { reason: 'doorVisualProxyBuild' });
         applySmallAnimatedWindowPadding(doc, mesh, texture, { style, ...animation });
         mesh.name = `fa-nexus-door-visual-proxy:${wallId}:${level.id}:${style}`;
         mesh.eventMode = 'none';

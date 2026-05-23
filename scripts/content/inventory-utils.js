@@ -10,6 +10,13 @@
  * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenSize} FaNexusTokenSize
  */
 
+const TOKEN_SIZE_OPTIONS = ['Tiny','Small','Medium','Large','Huge','Gargantuan'];
+const TOKEN_CREATURE_TYPES = [
+  'Aberration','Beast','Celestial','Construct','Dragon','Elemental','Fey','Fiend','Giant',
+  'Humanoid','Monstrosity','Ooze','Plant','Undead','Human','Elf','Dwarf','Halfling',
+  'Dragonborn','Tiefling','Orc','Goblin','Kobold','Gnoll','Hobgoblin'
+];
+
 /**
  * Parse grid size and scale from a token filename.
  * Supports size keywords (Gargantuan/Huge/Large) and `scaleNN` suffix.
@@ -47,6 +54,64 @@ function parseTokenSize(filename = '') {
   }
 
   return { gridWidth, gridHeight, scale };
+}
+
+function matchTokenSizePart(part = '') {
+  return TOKEN_SIZE_OPTIONS.find((s) => s.toLowerCase() === String(part || '').toLowerCase()) || '';
+}
+
+function matchTokenCreatureTypePart(part = '') {
+  return TOKEN_CREATURE_TYPES.find((c) => c.toLowerCase() === String(part || '').toLowerCase()) || '';
+}
+
+function isTokenVariantPart(part = '') {
+  return /^[A-Z]\d+$/i.test(part)
+    || /^[A-Z]{2}\d+$/i.test(part)
+    || /^[A-Z]\d{2,}$/i.test(part)
+    || /^\d{3}[A-Z]$/i.test(part);
+}
+
+function isGridDimensionPart(part = '') {
+  return /^\d+x\d+$/i.test(String(part || ''));
+}
+
+function findImplicitTokenMetadataIndex(parts = []) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (!matchTokenSizePart(parts[i])) continue;
+    const suffix = parts.slice(i + 1);
+    const hasCreatureType = suffix.some((p) => !!matchTokenCreatureTypePart(p));
+    const hasGridDimensions = suffix.some((p) => isGridDimensionPart(p));
+    if (hasCreatureType || hasGridDimensions) return i;
+  }
+  return -1;
+}
+
+function parseTokenMetadataParts(parts = []) {
+  let size = '';
+  let creatureType = '';
+  for (const p of parts) {
+    const matchSize = matchTokenSizePart(p);
+    if (matchSize) {
+      size = matchSize;
+      continue;
+    }
+    const matchCt = matchTokenCreatureTypePart(p);
+    if (matchCt) creatureType = matchCt;
+  }
+  return { size, creatureType };
+}
+
+function getCreatureSizeFromGridDimensions(gridWidth, gridHeight) {
+  const width = Number(gridWidth);
+  const height = Number(gridHeight);
+  const maxDimension = Math.max(
+    Number.isFinite(width) ? width : 1,
+    Number.isFinite(height) ? height : 1
+  );
+  if (maxDimension >= 4) return 'Gargantuan';
+  if (maxDimension >= 3) return 'Huge';
+  if (maxDimension >= 2) return 'Large';
+  return 'Medium';
 }
 
 /**
@@ -99,8 +164,8 @@ function parseTokenDisplayName(filename = '') {
     return {
       displayName: nameWithoutExt.replace(/_/g, ' '),
       variant: '',
-      size: 'Medium',
-      creatureType: 'Humanoid'
+      size: '',
+      creatureType: ''
     };
   }
 
@@ -109,54 +174,77 @@ function parseTokenDisplayName(filename = '') {
   let variant = '';
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
-    if (/^[A-Z]\d+$/.test(p) || /^[A-Z]{2}\d+$/.test(p) || /^[A-Z]\d{2,}$/.test(p) || /^\d{3}[A-Z]$/.test(p)) {
+    if (isTokenVariantPart(p)) {
       variantIndex = i;
       variant = p;
       break;
     }
   }
 
+  let nameParts = parts;
+  let info = [];
   if (variantIndex === -1) {
-    const dn = parts.join(' ').replace(/([a-z])([A-Z])/g, '$1 $2');
-    return {
-      displayName: dn,
-      variant: '',
-      size: 'Medium',
-      creatureType: 'Humanoid'
-    };
+    const metadataIndex = findImplicitTokenMetadataIndex(parts);
+    if (metadataIndex !== -1) {
+      nameParts = parts.slice(0, metadataIndex);
+      info = parts.slice(metadataIndex);
+    }
+  } else {
+    nameParts = parts.slice(0, variantIndex);
+    info = parts.slice(variantIndex + 1);
   }
 
-  const nameParts = parts.slice(0, variantIndex);
-  const info = parts.slice(variantIndex + 1);
+  const { size, creatureType } = parseTokenMetadataParts(info);
 
-  const sizeOptions = ['Tiny','Small','Medium','Large','Huge','Gargantuan'];
-  const creatureTypes = [
-    'Aberration','Beast','Celestial','Construct','Dragon','Elemental','Fey','Fiend','Giant',
-    'Humanoid','Monstrosity','Ooze','Plant','Undead','Human','Elf','Dwarf','Halfling',
-    'Dragonborn','Tiefling','Orc','Goblin','Kobold','Gnoll','Hobgoblin'
-  ];
-
-  let size = '';
-  let creatureType = '';
-  for (const p of info) {
-    const matchSize = sizeOptions.find(s => s.toLowerCase() === p.toLowerCase());
-    if (matchSize) {
-      size = matchSize;
-      continue;
-    }
-    const matchCt = creatureTypes.find(c => c.toLowerCase() === p.toLowerCase());
-    if (matchCt) {
-      creatureType = matchCt;
-    }
-  }
-  if (!creatureType) creatureType = 'Humanoid';
-  if (!size) size = 'Medium';
-
-  const displayName = nameParts.join(' ')
+  const displaySource = nameParts.length ? nameParts : parts;
+  const displayName = displaySource.join(' ')
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/\s+/g, ' ').trim();
 
   return { displayName, variant, size, creatureType };
+}
+
+/**
+ * Normalize token metadata from filename and dimensions without trusting stale cached labels.
+ * @param {FaNexusTokenInventoryRecord} record
+ * @returns {FaNexusTokenInventoryRecord}
+ */
+export function normalizeTokenInventoryRecord(record) {
+  if (!record || typeof record !== 'object') return record;
+  const filePath = String(record.file_path || record.path || '');
+  const filename = String(record.filename || filePath.split('/').pop() || '');
+  const parsedSize = parseTokenSize(filename);
+  const parsedDisplay = parseTokenDisplayName(filename);
+  const resolveGridDimension = (raw, parsed) => {
+    const value = Number(raw);
+    const parsedValue = Number(parsed);
+    if (Number.isFinite(parsedValue) && parsedValue > 1 && (!Number.isFinite(value) || value <= 1)) return parsedValue;
+    if (Number.isFinite(value) && value > 0) return value;
+    if (Number.isFinite(parsedValue) && parsedValue > 0) return parsedValue;
+    return 1;
+  };
+  const gridWidth = resolveGridDimension(record.grid_width, parsedSize.gridWidth);
+  const gridHeight = resolveGridDimension(record.grid_height, parsedSize.gridHeight);
+  const derivedSize = getCreatureSizeFromGridDimensions(gridWidth, gridHeight);
+  const existingSize = String(record.size || '').trim();
+  const existingCreatureType = String(record.creature_type || '').trim();
+  const existingDisplayName = String(record.display_name || '').trim();
+  const filenameDisplayName = filename ? deriveDisplayName(filename) : '';
+  const next = { ...record };
+
+  if (filename && !next.filename) next.filename = filename;
+  next.grid_width = gridWidth;
+  next.grid_height = gridHeight;
+  if (!next.scale && Number.isFinite(parsedSize.scale)) next.scale = `${parsedSize.scale}x`;
+  if (parsedDisplay.size) next.size = parsedDisplay.size;
+  else if (!existingSize || (existingSize === 'Medium' && derivedSize !== 'Medium')) next.size = derivedSize;
+  if (parsedDisplay.creatureType) next.creature_type = parsedDisplay.creatureType;
+  else if (!existingCreatureType) next.creature_type = 'Humanoid';
+  if (parsedDisplay.displayName && (!existingDisplayName || existingDisplayName === filenameDisplayName)) {
+    next.display_name = parsedDisplay.displayName;
+  }
+
+  return next;
 }
 
 /**
@@ -172,9 +260,11 @@ export function localToTokenInventoryRecord(localItem, tier = null) {
   const { baseNameWithoutVariant, colorVariant, isMainColorVariant, hasColorVariant } = detectColorVariant(filename);
   const parsed = parseTokenDisplayName(filename);
   const displayName = parsed.displayName || deriveDisplayName(filename);
+  const size = parsed.size || getCreatureSizeFromGridDimensions(gridWidth, gridHeight);
+  const creatureType = parsed.creatureType || 'Humanoid';
 
   // Rough pixel estimation (same idea as reference script)
-  const isGarg = /gargantuan/i.test(filename) || (parsed.size && parsed.size.toLowerCase() === 'gargantuan');
+  const isGarg = /gargantuan/i.test(filename) || size.toLowerCase() === 'gargantuan';
   const basePx = isGarg ? 200 : 400;
   const width = Math.round(gridWidth * basePx * scale);
   const height = Math.round(gridHeight * basePx * scale);
@@ -188,8 +278,8 @@ export function localToTokenInventoryRecord(localItem, tier = null) {
     filename,
     display_name: displayName,
     variant: parsed.variant || '',
-    size: parsed.size || ((gridWidth >= 4 || gridHeight >= 4) ? 'Gargantuan' : (gridWidth === 3 ? 'Huge' : (gridWidth === 2 ? 'Large' : 'Medium'))),
-    creature_type: parsed.creatureType || 'Humanoid',
+    size,
+    creature_type: creatureType,
     grid_width: gridWidth,
     grid_height: gridHeight,
     scale: scale+'x',

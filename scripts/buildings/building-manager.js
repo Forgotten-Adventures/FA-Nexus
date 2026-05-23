@@ -33,7 +33,7 @@ import {
   syncHostedToolOptions
 } from '../premium/session-host/tool-options-sync.js';
 import { toolOptionsController } from '../core/tool-options-controller.js';
-import { applyBuildingTile, applyDoorFrameTile } from './building-tiles.js';
+import { applyBuildingTile, applyBuildingCompositeTile, applyDoorFrameTile } from './building-tiles.js';
 import { TOOL_OPTIONS_RENDERER_MODE, createNormalizedToolOptionsDescriptor } from '../core/tool-options-descriptor.js';
 import {
   createShortcut,
@@ -779,6 +779,7 @@ export class BuildingManager {
       if (!tileId) return;
       if (tile) {
         applyBuildingTile(tile);
+        applyBuildingCompositeTile(tile);
         applyDoorFrameTile(tile);
       }
     } catch (_) {}
@@ -791,6 +792,7 @@ export class BuildingManager {
       loggerPrefix: 'BuildingManager',
       collectRefreshJobs: ({ tile }) => {
         refreshJobs.push(Promise.resolve(applyBuildingTile(tile)));
+        refreshJobs.push(Promise.resolve(applyBuildingCompositeTile(tile)));
         refreshJobs.push(Promise.resolve(applyDoorFrameTile(tile)));
         return refreshJobs;
       }

@@ -1,7 +1,7 @@
 {
   "id": "fa-nexus",
   "title": "FA Nexus",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "compatibility": {
     "minimum": "14",
     "verified": "14"
@@ -38,6 +38,7 @@
     "scripts/assets/assets-content-sources-dialog.js",
     "scripts/assets/assets-preview-manager.js",
     "scripts/textures/texture-paint-manager.js",
+    "scripts/doors/portal-texture-flip-runtime.js",
     "scripts/doors/door-visual-proxy-manager.js",
     "scripts/doors/door-shadow-manager.js",
     "scripts/layers/layer-manager-tab.js",
@@ -46,6 +47,6 @@
   "styles": [
     "styles/nexus-app.css"
   ],
-  "manifest": "https://raw.githubusercontent.com/Forgotten-Adventures/FA-Nexus/main/module.json",
-  "download": "https://github.com/Forgotten-Adventures/FA-Nexus/raw/main/fa-nexus.zip"
+  "manifest": "https://github.com/Forgotten-Adventures/FA-Nexus/releases/download/v0.5.2-beta/module.json",
+  "download": "https://github.com/Forgotten-Adventures/FA-Nexus/releases/download/v0.5.2-beta/fa-nexus.zip"
 }

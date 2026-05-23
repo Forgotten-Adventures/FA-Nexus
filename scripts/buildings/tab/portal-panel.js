@@ -473,6 +473,17 @@ export const portalPanelMethods = {
       if (!Number.isFinite(numeric)) return null;
       return Math.round(numeric * 1000) / 1000;
     };
+    const normalizeFlip = (config = {}) => {
+      const raw = config?.textureFlip && typeof config.textureFlip === 'object' ? config.textureFlip : {};
+      return {
+        horizontal: Object.prototype.hasOwnProperty.call(raw, 'horizontal')
+          ? !!raw.horizontal
+          : !!(config?.flipHorizontal ?? config?.flipX),
+        vertical: Object.prototype.hasOwnProperty.call(raw, 'vertical')
+          ? !!raw.vertical
+          : !!config?.flip
+      };
+    };
     const normalizeFrame = (frame) => {
       const cfg = frame && typeof frame === 'object' ? frame : {};
       return {
@@ -489,11 +500,11 @@ export const portalPanelMethods = {
     return JSON.stringify({
       door: {
         texture: safeString(door.textureLocal || door.textureKey),
-        flip: !!door.flip,
+        textureFlip: normalizeFlip(door),
         frame: normalizeFrame(door.frame)
       },
       window: {
-        flip: !!window.flip,
+        textureFlip: normalizeFlip(window),
         sill: {
           texture: safeString(window.sill?.textureLocal || window.sill?.textureKey),
           scale: round(window.sill?.scale),
@@ -591,9 +602,20 @@ export const portalPanelMethods = {
     if (!isDoor && !isWindow) return;
 
     const data = config && typeof config === 'object' ? config : {};
+    const resolveTextureFlip = (cfg = {}) => {
+      const raw = cfg?.textureFlip && typeof cfg.textureFlip === 'object' ? cfg.textureFlip : {};
+      return {
+        horizontal: Object.prototype.hasOwnProperty.call(raw, 'horizontal')
+          ? !!raw.horizontal
+          : !!(cfg?.flipHorizontal ?? cfg?.flipX),
+        vertical: Object.prototype.hasOwnProperty.call(raw, 'vertical')
+          ? !!raw.vertical
+          : !!cfg?.flip
+      };
+    };
 
     const doorPath = isDoor ? String(data.textureLocal || data.textureKey || '') : '';
-    const doorFlip = isDoor ? !!data.flip : false;
+    const doorFlip = isDoor ? resolveTextureFlip(data) : { horizontal: false, vertical: false };
     const frameConfig = data.frame && typeof data.frame === 'object' ? data.frame : {};
     const framePath = String(frameConfig.textureLocal || frameConfig.textureKey || '');
 
@@ -601,7 +623,7 @@ export const portalPanelMethods = {
     const glassConfig = isWindow ? (data.texture && typeof data.texture === 'object' ? data.texture : {}) : {};
     const sillPath = String(sillConfig.textureLocal || sillConfig.textureKey || '');
     const glassPath = String(glassConfig.textureLocal || glassConfig.textureKey || '');
-    const glassFlip = isWindow ? !!data.flip : false;
+    const glassFlip = isWindow ? resolveTextureFlip(data) : { horizontal: false, vertical: false };
 
     const hasAny =
       (isDoor && (doorPath || framePath)) ||
@@ -868,8 +890,8 @@ export const portalPanelMethods = {
             height: desiredH,
             offsetX: 0,
             offsetY: 0,
-            flipX: doorFlip,
-            flipY: false,
+            flipX: doorFlip.horizontal,
+            flipY: doorFlip.vertical,
             z: 0
           })
         );
@@ -899,7 +921,7 @@ export const portalPanelMethods = {
         const width = gapLen * (isSmallPortalTexturePath(glassPath) ? 2 : 1);
         const offsetX = clamp(glassConfig?.offsetX, -1, 1, 0) * width * 0.5;
         const offsetY = clamp(glassConfig?.offsetY, -1, 1, 0) * height * 0.5;
-        commands.push(...toCommandsForElement({ img: glassImg, width, height, offsetX, offsetY, flipX: false, flipY: glassFlip, z: 5 }));
+        commands.push(...toCommandsForElement({ img: glassImg, width, height, offsetX, offsetY, flipX: glassFlip.horizontal, flipY: glassFlip.vertical, z: 5 }));
       }
       if (frameImg) {
         commands.push(

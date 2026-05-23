@@ -20,6 +20,12 @@ import {
 } from '../textures/texture-mask-runtime.js';
 import { applyPathTile } from '../paths/path-geometry.js';
 import {
+  applyAssetScatterTile,
+  refreshAllAssetScatterViewportLayers,
+  restoreAssetScatterCaptureLayer,
+  syncAssetScatterCaptureLayer
+} from '../assets/asset-scatter-geometry.js';
+import {
   appendStoragePath,
   buildGeneratedRoot,
   getConfiguredAssetsDir,
@@ -2110,7 +2116,8 @@ export class TileFlattenManager {
         } catch (_) {}
         
         await this._nextFrame(); // Extra frame for transforms to settle
-        
+        await this._prepareScatterForCapture(tiles, renderBounds, 'flatten-capture', { resolution });
+
         // Render the stage (which shows only visible tiles due to visibility state)
         try {
           renderer.render(stage, {
@@ -2187,6 +2194,7 @@ export class TileFlattenManager {
         if (typeof restoreShadowBlur === 'function') {
           try { restoreShadowBlur(); } catch (_) {}
         }
+        await this._restoreScatterAfterCapture(tiles);
       }
 
       const canvasEl = renderer.extract.canvas(renderTexture);
@@ -2471,6 +2479,12 @@ export class TileFlattenManager {
               renderer.screen.width = renderPixelWidth;
               renderer.screen.height = renderPixelHeight;
             }
+            await this._prepareScatterForCapture(tiles, {
+              x: chunkWorldX - overlapWorldX,
+              y: chunkWorldY - overlapWorldY,
+              width: chunkWorldWidth + (overlapWorldX * 2),
+              height: chunkWorldHeight + (overlapWorldY * 2)
+            }, 'flatten-chunk-capture', { resolution });
 
             const renderTexture = PIXI.RenderTexture.create({
               width: renderPixelWidth,
@@ -2601,6 +2615,7 @@ export class TileFlattenManager {
         if (typeof restoreShadowBlur === 'function') {
           try { restoreShadowBlur(); } catch (_) {}
         }
+        await this._restoreScatterAfterCapture(tiles);
       }
     } finally {
       if (visibilityState) {
@@ -2698,6 +2713,12 @@ export class TileFlattenManager {
             task: Promise.resolve(applyPathTile(placeable))
           });
         }
+        if (doc.getFlag?.('fa-nexus', 'assetScatter')) {
+          jobs.push({
+            tileId: doc?.id || null,
+            task: Promise.resolve(applyAssetScatterTile(placeable))
+          });
+        }
       } catch (error) {
         failures.push(error);
         Logger.warn?.('TileFlatten.capture.prepareTile.failed', {
@@ -2719,6 +2740,153 @@ export class TileFlattenManager {
     }
     if (failures.length) {
       throw new Error(`Tile flatten capture prep failed for ${failures.length} job(s).`);
+    }
+  }
+
+  async _prepareScatterForCapture(tiles, renderBounds, reason = 'flatten-capture', options = {}) {
+    const scatterTiles = [];
+    for (const doc of Array.isArray(tiles) ? tiles : []) {
+      try {
+        if (!doc?.getFlag?.('fa-nexus', 'assetScatter')) continue;
+        if (renderBounds && !this._tileOverlapsBounds(doc, renderBounds)) continue;
+        const placeable = doc.object;
+        if (!placeable || placeable.destroyed) {
+          throw new Error(`Scatter tile ${doc.id || '(unknown)'} has no active placeable for capture.`);
+        }
+        const container = placeable?.mesh?.faNexusAssetScatterContainer || placeable?.faNexusAssetScatterContainer || null;
+        if (!container || container.destroyed) await applyAssetScatterTile(placeable);
+        const localBounds = this._computeScatterCaptureLocalBounds(doc, renderBounds);
+        if (!localBounds) {
+          throw new Error(`Scatter tile ${doc.id || '(unknown)'} could not resolve capture bounds.`);
+        }
+        syncAssetScatterCaptureLayer(placeable, localBounds, {
+          reason,
+          resolution: options?.resolution
+        });
+        scatterTiles.push(placeable);
+      } catch (error) {
+        Logger.warn?.('TileFlatten.capture.scatterPrepare.failed', {
+          tileId: doc?.id || null,
+          error: String(error?.message || error)
+        });
+        throw error;
+      }
+    }
+
+    if (!scatterTiles.length) return;
+
+    const failures = [];
+    for (const tile of scatterTiles) {
+      const container = tile?.mesh?.faNexusAssetScatterContainer || tile?.faNexusAssetScatterContainer || null;
+      if (!container || container.destroyed) {
+        failures.push({
+          tileId: tile?.document?.id || null,
+          reason: 'container-missing'
+        });
+        continue;
+      }
+      if (!container.faNexusAssetScatterCached || container.faNexusAssetScatterCacheMode === 'live') continue;
+      const cacheStillEnabled = container.faNexusAssetScatterCacheVisualEnabled !== false;
+      if (!cacheStillEnabled) continue;
+      failures.push({
+        tileId: tile?.document?.id || null,
+        reason: 'capture-live-layer-unavailable',
+        cacheMode: container.faNexusAssetScatterCacheMode || null,
+        instances: Array.isArray(container.faNexusAssetScatterInstancesWithBounds)
+          ? container.faNexusAssetScatterInstancesWithBounds.length
+          : null,
+        liveInstances: Number(container.faNexusAssetScatterViewportLiveCount) || 0
+      });
+    }
+
+    if (failures.length) {
+      Logger.error('TileFlatten.capture.scatterFullResolution.failed', { reason, failures });
+      throw new Error('Scatter flatten/export could not switch to full-resolution capture. Try a smaller chunk size or reduce visible scatter density.');
+    }
+  }
+
+  _computeScatterCaptureLocalBounds(doc, bounds) {
+    try {
+      if (!doc || !bounds) return null;
+      const width = Math.max(1, Number(doc.width) || 0);
+      const height = Math.max(1, Number(doc.height) || 0);
+      const anchorX = Number(doc?.texture?.anchorX);
+      const anchorY = Number(doc?.texture?.anchorY);
+      const resolvedAnchorX = Number.isFinite(anchorX) ? anchorX : 0.5;
+      const resolvedAnchorY = Number.isFinite(anchorY) ? anchorY : 0.5;
+      const scaleX = Number(doc?.texture?.scaleX ?? 1);
+      const scaleY = Number(doc?.texture?.scaleY ?? 1);
+      const resolvedScaleX = Number.isFinite(scaleX) && Math.abs(scaleX) > 1e-6 ? scaleX : 1;
+      const resolvedScaleY = Number.isFinite(scaleY) && Math.abs(scaleY) > 1e-6 ? scaleY : 1;
+      const originX = Number(doc.x) || 0;
+      const originY = Number(doc.y) || 0;
+      const rotation = ((Number(doc.rotation) || 0) * Math.PI) / 180;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      const points = [
+        { x: bounds.x, y: bounds.y },
+        { x: bounds.x + bounds.width, y: bounds.y },
+        { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+        { x: bounds.x, y: bounds.y + bounds.height }
+      ];
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const point of points) {
+        const dx = (Number(point.x) || 0) - originX;
+        const dy = (Number(point.y) || 0) - originY;
+        const unrotatedX = (dx * cos) + (dy * sin);
+        const unrotatedY = (-dx * sin) + (dy * cos);
+        const localX = (unrotatedX / resolvedScaleX) + (width * resolvedAnchorX);
+        const localY = (unrotatedY / resolvedScaleY) + (height * resolvedAnchorY);
+        minX = Math.min(minX, localX);
+        minY = Math.min(minY, localY);
+        maxX = Math.max(maxX, localX);
+        maxY = Math.max(maxY, localY);
+      }
+      if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
+      const padding = 2;
+      return {
+        x: minX - padding,
+        y: minY - padding,
+        width: Math.max(1, (maxX - minX) + (padding * 2)),
+        height: Math.max(1, (maxY - minY) + (padding * 2))
+      };
+    } catch (error) {
+      Logger.warn?.('TileFlatten.capture.scatterBounds.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
+      return null;
+    }
+  }
+
+  async _restoreScatterAfterCapture(tiles) {
+    try {
+      const hasScatter = Array.isArray(tiles)
+        && tiles.some((doc) => {
+          try { return !!doc?.getFlag?.('fa-nexus', 'assetScatter'); }
+          catch (_) { return false; }
+        });
+      if (!hasScatter) return;
+      for (const doc of tiles) {
+        try {
+          if (!doc?.getFlag?.('fa-nexus', 'assetScatter')) continue;
+          const placeable = doc.object;
+          if (placeable && !placeable.destroyed) restoreAssetScatterCaptureLayer(placeable);
+        } catch (error) {
+          Logger.warn?.('TileFlatten.capture.scatterTileRestore.failed', {
+            tileId: doc?.id || null,
+            error: String(error?.message || error)
+          });
+        }
+      }
+      refreshAllAssetScatterViewportLayers('flatten-capture-restore', { force: true });
+    } catch (error) {
+      Logger.warn?.('TileFlatten.capture.scatterRestore.failed', {
+        error: String(error?.message || error)
+      });
     }
   }
 
@@ -4801,6 +4969,7 @@ export class TileFlattenManager {
       if (building) {
         const meta = building?.meta || {};
         const nextFillTileId = meta?.fillTileId ? restoredIdMap.get(meta.fillTileId) : null;
+        const nextSillTileId = meta?.sillTileId ? restoredIdMap.get(meta.sillTileId) : null;
         const nextParentWallTileId = (
           (meta?.parentWallTileId ? restoredIdMap.get(meta.parentWallTileId) : null)
           || (meta?.parentWallGroupId ? buildingGroupToTileId.get(meta.parentWallGroupId) : null)
@@ -4809,8 +4978,32 @@ export class TileFlattenManager {
           'flags.fa-nexus.building.meta.fillTileId': nextFillTileId && nextFillTileId !== meta.fillTileId
             ? nextFillTileId
             : undefined,
+          'flags.fa-nexus.building.meta.sillTileId': nextSillTileId && nextSillTileId !== meta.sillTileId
+            ? nextSillTileId
+            : undefined,
+          'flags.fa-nexus.building.meta.composite.sillTileId': nextSillTileId && nextSillTileId !== meta?.composite?.sillTileId
+            ? nextSillTileId
+            : undefined,
           'flags.fa-nexus.building.meta.parentWallTileId': nextParentWallTileId && nextParentWallTileId !== meta.parentWallTileId
             ? nextParentWallTileId
+            : undefined
+        });
+      }
+
+      const composite = tileDoc.getFlag?.('fa-nexus', 'buildingComposite');
+      if (composite) {
+        const nextWallTileId = composite?.wallTileId ? restoredIdMap.get(composite.wallTileId) : null;
+        const nextBackgroundTileId = composite?.backgroundTileId ? restoredIdMap.get(composite.backgroundTileId) : null;
+        const nextSillTileId = composite?.sillTileId ? restoredIdMap.get(composite.sillTileId) : null;
+        plan.tileFieldUpdates += this._planEmbeddedUpdate(plan.tileUpdates, plan.rollbackTileUpdates, tileDoc, {
+          'flags.fa-nexus.buildingComposite.wallTileId': nextWallTileId && nextWallTileId !== composite.wallTileId
+            ? nextWallTileId
+            : undefined,
+          'flags.fa-nexus.buildingComposite.backgroundTileId': nextBackgroundTileId && nextBackgroundTileId !== composite.backgroundTileId
+            ? nextBackgroundTileId
+            : undefined,
+          'flags.fa-nexus.buildingComposite.sillTileId': nextSillTileId && nextSillTileId !== composite.sillTileId
+            ? nextSillTileId
             : undefined
         });
       }

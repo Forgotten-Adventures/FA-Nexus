@@ -4,6 +4,8 @@ import {
   tileUsesSurfaceTileOcclusion
 } from './tile-occlusion.js';
 import { getFaNexusTileCapabilities } from './tile-capabilities.js';
+import { getCachedPixiTexture } from '../core/foundry-texture-loader-patch.js';
+import { encodeTexturePath } from '../textures/texture-runtime-core.js';
 
 const DEFAULT_ALPHA_THRESHOLD = 1 / 255;
 const MASK_ALPHA_THRESHOLD = 1 / 255;
@@ -12,6 +14,7 @@ const DEFAULT_ALPHA_RESOLUTION = 0.25;
 const BUILDING_ALPHA_TARGET_PX = 1024;
 const BUILDING_ALPHA_EXPAND_RADIUS = 1;
 const MIN_ALPHA_RESOLUTION = 0.05;
+const SCATTER_HIT_INDEX_CELL_SIZE = 256;
 const INTERACTION_PRIORITY_EPSILON = 1e-9;
 const INTERACTION_PRIORITY_KEYS = Object.freeze([
   'elevation',
@@ -632,20 +635,9 @@ export class TilePixelSelection {
 
       const scatterContainer = mesh.faNexusAssetScatterContainer || tile.faNexusAssetScatterContainer;
       if (scatterContainer) {
-        const sprites = scatterContainer.children || [];
-        let inspected = false;
-        let sampled = false;
-        for (const sprite of sprites) {
-          if (!sprite || sprite.destroyed) continue;
-          inspected = true;
-          if (!sprite.texture?.valid) continue;
-          sampled = true;
-          const alpha = this._sampleSpriteAlpha(sprite, worldX, worldY, { useLumaWhenOpaque: true });
-          if (alpha === null) return true;
-          if (alpha >= DEFAULT_ALPHA_THRESHOLD) return true;
-        }
-        if (sampled) return false;
-        if (inspected) return true;
+        const scatterAlpha = this._sampleScatterContainerAlpha(scatterContainer, worldX, worldY);
+        if (scatterAlpha === null) return true;
+        return scatterAlpha >= DEFAULT_ALPHA_THRESHOLD;
       }
 
       const flattenContainer = mesh.faNexusFlattenChunkContainer || tile.faNexusFlattenChunkContainer;
@@ -711,6 +703,272 @@ export class TilePixelSelection {
     } catch (err) {
       Logger.debug('TilePixelSelection._pointHasVisibleAlpha failed', err);
       return true;
+    }
+  }
+
+  static _sampleScatterContainerAlpha(scatterContainer, worldX, worldY) {
+    try {
+      if (!scatterContainer || scatterContainer.destroyed) return null;
+
+      const cacheAlpha = this._sampleScatterCacheAlpha(scatterContainer, worldX, worldY);
+      if (cacheAlpha !== null && cacheAlpha >= DEFAULT_ALPHA_THRESHOLD) return cacheAlpha;
+
+      const instanceAlpha = this._sampleScatterInstanceIndexAlpha(scatterContainer, worldX, worldY);
+      if (instanceAlpha !== null) return instanceAlpha;
+
+      const displayAlpha = this._sampleScatterDisplayAlpha(scatterContainer, worldX, worldY);
+      if (displayAlpha !== null) return displayAlpha;
+
+      return cacheAlpha;
+    } catch (err) {
+      Logger.debug('TilePixelSelection._sampleScatterContainerAlpha failed', err);
+      return null;
+    }
+  }
+
+  static _sampleScatterCacheAlpha(scatterContainer, worldX, worldY) {
+    try {
+      const cachedSprites = Array.isArray(scatterContainer.faNexusAssetScatterCacheSprites)
+        ? scatterContainer.faNexusAssetScatterCacheSprites
+        : (scatterContainer.faNexusAssetScatterCacheSprite ? [scatterContainer.faNexusAssetScatterCacheSprite] : []);
+      let sampled = false;
+      let indeterminate = false;
+      for (const cachedSprite of cachedSprites) {
+        if (!cachedSprite || cachedSprite.destroyed) continue;
+        if (!cachedSprite.texture?.valid) continue;
+        sampled = true;
+        const alpha = this._sampleSpriteAlpha(cachedSprite, worldX, worldY, { useLumaWhenOpaque: true });
+        if (alpha === null) {
+          indeterminate = true;
+          continue;
+        }
+        if (alpha >= DEFAULT_ALPHA_THRESHOLD) return alpha;
+      }
+      if (sampled) return indeterminate ? null : 0;
+      return null;
+    } catch (err) {
+      Logger.debug('TilePixelSelection._sampleScatterCacheAlpha failed', err);
+      return null;
+    }
+  }
+
+  static _sampleScatterInstanceIndexAlpha(scatterContainer, worldX, worldY) {
+    try {
+      const transform = scatterContainer?.worldTransform;
+      if (!transform?.applyInverse) return null;
+      const local = transform.applyInverse({ x: worldX, y: worldY }, _tempPointB);
+      const localX = Number(local?.x);
+      const localY = Number(local?.y);
+      if (!Number.isFinite(localX) || !Number.isFinite(localY)) return null;
+
+      const index = this._getScatterHitIndex(scatterContainer);
+      if (!index?.cells) return null;
+      const cellX = Math.floor(localX / index.cellSize);
+      const cellY = Math.floor(localY / index.cellSize);
+      const entries = index.cells.get(`${cellX}:${cellY}`);
+      if (!Array.isArray(entries) || !entries.length) return 0;
+
+      let sampled = false;
+      let indeterminate = false;
+      for (let i = entries.length - 1; i >= 0; i -= 1) {
+        const entry = entries[i];
+        const bounds = entry?.bounds;
+        if (!this._scatterBoundsContainPoint(bounds, localX, localY)) continue;
+
+        const instance = entry?.instance;
+        const texture = this._getCachedScatterTexture(instance?.src);
+        if (!texture || (!texture.valid && !texture.baseTexture?.valid)) {
+          indeterminate = true;
+          continue;
+        }
+
+        const alpha = this._sampleScatterInstanceAlpha(instance, texture, localX, localY);
+        if (alpha === null) {
+          indeterminate = true;
+          continue;
+        }
+        sampled = true;
+        if (alpha >= DEFAULT_ALPHA_THRESHOLD) return alpha;
+      }
+
+      if (sampled) return 0;
+      return indeterminate ? null : 0;
+    } catch (err) {
+      Logger.debug('TilePixelSelection._sampleScatterInstanceIndexAlpha failed', err);
+      return null;
+    }
+  }
+
+  static _getScatterHitIndex(scatterContainer) {
+    try {
+      const entries = Array.isArray(scatterContainer?.faNexusAssetScatterInstancesWithBounds)
+        ? scatterContainer.faNexusAssetScatterInstancesWithBounds
+        : [];
+      if (!entries.length) return null;
+
+      const contentVersion = Number(scatterContainer.faNexusAssetScatterContentVersion) || 0;
+      const existing = scatterContainer.faNexusAssetScatterHitIndex;
+      if (existing
+        && existing.entries === entries
+        && existing.contentVersion === contentVersion
+        && existing.cellSize === SCATTER_HIT_INDEX_CELL_SIZE) {
+        return existing;
+      }
+
+      const cells = new Map();
+      const cellSize = SCATTER_HIT_INDEX_CELL_SIZE;
+      for (const entry of entries) {
+        const bounds = entry?.bounds;
+        const instance = entry?.instance;
+        if (!instance || !bounds) continue;
+        const minX = Number(bounds.minX);
+        const minY = Number(bounds.minY);
+        const maxX = Number(bounds.maxX);
+        const maxY = Number(bounds.maxY);
+        if (!Number.isFinite(minX) || !Number.isFinite(minY)
+          || !Number.isFinite(maxX) || !Number.isFinite(maxY)) continue;
+
+        const startX = Math.floor(minX / cellSize);
+        const endX = Math.floor(maxX / cellSize);
+        const startY = Math.floor(minY / cellSize);
+        const endY = Math.floor(maxY / cellSize);
+        for (let y = startY; y <= endY; y += 1) {
+          for (let x = startX; x <= endX; x += 1) {
+            const key = `${x}:${y}`;
+            let cell = cells.get(key);
+            if (!cell) {
+              cell = [];
+              cells.set(key, cell);
+            }
+            cell.push(entry);
+          }
+        }
+      }
+
+      const index = {
+        entries,
+        contentVersion,
+        cellSize,
+        cells
+      };
+      scatterContainer.faNexusAssetScatterHitIndex = index;
+      return index;
+    } catch (err) {
+      Logger.debug('TilePixelSelection._getScatterHitIndex failed', err);
+      return null;
+    }
+  }
+
+  static _getCachedScatterTexture(src) {
+    try {
+      if (!src) return null;
+      const direct = getCachedPixiTexture(src);
+      if (direct) return direct;
+      const encoded = encodeTexturePath(src);
+      if (encoded && encoded !== src) return getCachedPixiTexture(encoded);
+    } catch (err) {
+      Logger.debug('TilePixelSelection._getCachedScatterTexture failed', err);
+    }
+    return null;
+  }
+
+  static _scatterBoundsContainPoint(bounds, x, y) {
+    if (!bounds) return false;
+    const minX = Number(bounds.minX);
+    const minY = Number(bounds.minY);
+    const maxX = Number(bounds.maxX);
+    const maxY = Number(bounds.maxY);
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)
+      || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return false;
+    const epsilon = 1e-4;
+    return x >= (minX - epsilon)
+      && x <= (maxX + epsilon)
+      && y >= (minY - epsilon)
+      && y <= (maxY + epsilon);
+  }
+
+  static _sampleScatterInstanceAlpha(instance, texture, localX, localY) {
+    try {
+      if (!instance || !texture || (!texture.valid && !texture.baseTexture?.valid)) return null;
+      const width = Math.max(1, Number(instance.w) || 0);
+      const height = Math.max(1, Number(instance.h) || 0);
+      const centerX = Number(instance.x) || 0;
+      const centerY = Number(instance.y) || 0;
+      const rotation = -((Number(instance.r) || 0) * Math.PI) / 180;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      const dx = localX - centerX;
+      const dy = localY - centerY;
+      let unrotatedX = (dx * cos) - (dy * sin);
+      let unrotatedY = (dx * sin) + (dy * cos);
+      if (instance.flipH) unrotatedX = -unrotatedX;
+      if (instance.flipV) unrotatedY = -unrotatedY;
+
+      const displayX = unrotatedX + (width / 2);
+      const displayY = unrotatedY + (height / 2);
+      if (displayX < 0 || displayY < 0 || displayX >= width || displayY >= height) return 0;
+
+      const textureWidth = Math.max(1, Number(texture.width) || Number(texture.orig?.width) || Number(texture.baseTexture?.realWidth) || 1);
+      const textureHeight = Math.max(1, Number(texture.height) || Number(texture.orig?.height) || Number(texture.baseTexture?.realHeight) || 1);
+      const textureX = displayX * (textureWidth / width);
+      const textureY = displayY * (textureHeight / height);
+
+      const alphaData = this._getAlphaData(texture, { resolution: 1 });
+      if (!alphaData?.alpha) return null;
+      const px = Math.floor(textureX * (alphaData.width / textureWidth));
+      const py = Math.floor(textureY * (alphaData.height / textureHeight));
+      const alphaWidth = Math.max(1, alphaData.width || 1);
+      const alphaHeight = Math.max(1, alphaData.height || 1);
+      if (px < 0 || px >= alphaWidth || py < 0 || py >= alphaHeight) return 0;
+      const minX = alphaData.minX ?? 0;
+      const minY = alphaData.minY ?? 0;
+      const maxX = alphaData.maxX ?? alphaWidth;
+      const maxY = alphaData.maxY ?? alphaHeight;
+      if (px < minX || px >= maxX || py < minY || py >= maxY) return 0;
+      const index = (py * alphaWidth) + px;
+      const alphaByte = alphaData.alpha[index];
+      return Number.isFinite(alphaByte) ? alphaByte / 255 : 0;
+    } catch (err) {
+      Logger.debug('TilePixelSelection._sampleScatterInstanceAlpha failed', err);
+      return null;
+    }
+  }
+
+  static _sampleScatterDisplayAlpha(scatterContainer, worldX, worldY) {
+    try {
+      const liveLayer = scatterContainer?.faNexusAssetScatterViewportLayer;
+      if (liveLayer
+        && !liveLayer.destroyed
+        && liveLayer.visible !== false
+        && liveLayer.renderable !== false
+        && Array.isArray(liveLayer.children)
+        && liveLayer.children.length) {
+        const alpha = this._sampleDisplayObjectAlpha(liveLayer, worldX, worldY, { resolution: 1 });
+        if (alpha !== null) return alpha;
+      }
+
+      const children = Array.isArray(scatterContainer?.children) ? scatterContainer.children : [];
+      let sampled = false;
+      let indeterminate = false;
+      for (let i = children.length - 1; i >= 0; i -= 1) {
+        const child = children[i];
+        if (!child || child.destroyed) continue;
+        if (child.faNexusAssetScatterCacheSprite === true || child.faNexusAssetScatterViewportLayer === true) continue;
+        if (child.visible === false || child.renderable === false || Number(child.worldAlpha) <= 0) continue;
+
+        const alpha = this._sampleDisplayObjectAlpha(child, worldX, worldY, { resolution: 1 });
+        if (alpha === null) {
+          indeterminate = true;
+          continue;
+        }
+        sampled = true;
+        if (alpha >= DEFAULT_ALPHA_THRESHOLD) return alpha;
+      }
+      if (sampled) return indeterminate ? null : 0;
+      return null;
+    } catch (err) {
+      Logger.debug('TilePixelSelection._sampleScatterDisplayAlpha failed', err);
+      return null;
     }
   }
 

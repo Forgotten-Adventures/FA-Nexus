@@ -6,6 +6,7 @@ import {
   mergeLocalAndCloudRecords
 } from '../content/nexus-content-service.js';
 import { abortError, formatCatalogLoaderText, isAbortError, loadAndMergeCloudRecords } from '../content/catalog-pipeline.js';
+import { normalizeTokenInventoryRecord } from '../content/inventory-utils.js';
 import { TokenDataService } from './token-data-service.js';
 import { TokenPreviewManager } from './token-preview-manager.js';
 import { FaNexusTokensFolderSelectionDialog } from './tokens-content-sources-dialog.js';
@@ -733,7 +734,10 @@ export class TokensTab extends GridBrowseTab {
       const localResult = await collectLocalInventory({
         loggerTag: 'TokensTab.local',
         folders,
-        loadCached: (folder) => this._tokenData.loadCachedTokens(folder),
+        loadCached: async (folder) => {
+          const records = await this._tokenData.loadCachedTokens(folder);
+          return Array.isArray(records) ? records.map((record) => normalizeTokenInventoryRecord(record)) : records;
+        },
         saveIndex: (folder, records) => this._tokenData.saveTokensIndex(folder, records),
         streamFolder: (folder, onBatch, options) => this._tokenData.streamLocalTokens(folder, onBatch, options),
         streamOptions: { batchSize: 1500, sleepMs: 8 },
@@ -908,14 +912,14 @@ export class TokensTab extends GridBrowseTab {
         const lastSlash = filePath.lastIndexOf('/');
         folderPath = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
       }
-      const record = {
+      const record = normalizeTokenInventoryRecord({
         ...item,
         filename,
         file_path: filePath,
         path: folderPath,
         source: 'cloud',
         tier: item?.tier === 'premium' || item?.tier === 'free' ? item.tier : 'free'
-      };
+      });
       try {
         const local = downloadManager?.getLocalPath?.('tokens', record);
         if (local) record.cachedLocalPath = local;

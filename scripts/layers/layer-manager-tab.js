@@ -991,6 +991,7 @@ function collectEditedTileIds() {
       const meta = data?.meta || {};
       if (meta?.wallGroupId) wallGroupIds.add(meta.wallGroupId);
       if (meta?.fillTileId) hiddenIds.add(meta.fillTileId);
+      if (meta?.sillTileId) hiddenIds.add(meta.sillTileId);
     }
 
     if (!wallGroupIds.size && !primaryIds.size) return hiddenIds;

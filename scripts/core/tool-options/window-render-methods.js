@@ -1529,6 +1529,17 @@ class ToolOptionsWindowRenderMethods {
 
     const selectionLabel = coerceString(raw.selectionLabel, '');
     const selectionDisabled = disabled || !raw.hasSelection;
+    const normalizePortalTextureFlip = (source = {}) => {
+      const flip = source?.textureFlip && typeof source.textureFlip === 'object' ? source.textureFlip : {};
+      return {
+        horizontal: Object.prototype.hasOwnProperty.call(flip, 'horizontal')
+          ? !!flip.horizontal
+          : !!(source?.flipHorizontal ?? source?.flipX),
+        vertical: Object.prototype.hasOwnProperty.call(flip, 'vertical')
+          ? !!flip.vertical
+          : !!source?.flip
+      };
+    };
 
     if (inferredVariant === 'door') {
       const animations = makeOptions(raw.animations, (_, index) => index);
@@ -1541,6 +1552,7 @@ class ToolOptionsWindowRenderMethods {
       const frame = raw.frameSettings && typeof raw.frameSettings === 'object' ? raw.frameSettings : null;
       const colorTarget = raw.colorTarget && typeof raw.colorTarget === 'object' ? raw.colorTarget : null;
       const hsbc = raw.hsbc && typeof raw.hsbc === 'object' ? raw.hsbc : null;
+      const textureFlip = normalizePortalTextureFlip(raw);
 
       const headerActions = [
         registerAction(makeAction({
@@ -1576,12 +1588,20 @@ class ToolOptionsWindowRenderMethods {
           visible: true,
           items: [
             makeToggle({
-              id: 'flip',
-              label: 'Flip Texture',
-              title: 'Mirror the selected door texture',
-              checked: !!raw.flip,
+              id: 'flip-horizontal',
+              label: 'Flip Horizontal',
+              title: 'Mirror the selected door texture along the portal width',
               disabled,
-              handlerId: 'setDoorFlip'
+              checked: !!textureFlip.horizontal,
+              handlerId: 'setDoorFlipHorizontal'
+            }),
+            makeToggle({
+              id: 'flip-vertical',
+              label: 'Flip Vertical',
+              title: 'Mirror the selected door texture across the wall thickness',
+              checked: !!textureFlip.vertical,
+              disabled,
+              handlerId: 'setDoorFlipVertical'
             }),
             makeToggle({
               id: 'double',
@@ -1830,6 +1850,7 @@ class ToolOptionsWindowRenderMethods {
     const frame = raw.frameSettings && typeof raw.frameSettings === 'object' ? raw.frameSettings : null;
     const colorTarget = raw.colorTarget && typeof raw.colorTarget === 'object' ? raw.colorTarget : null;
     const hsbc = raw.hsbc && typeof raw.hsbc === 'object' ? raw.hsbc : null;
+    const textureFlip = normalizePortalTextureFlip(raw);
 
     const headerActions = [
       registerAction(makeAction({
@@ -1873,12 +1894,20 @@ class ToolOptionsWindowRenderMethods {
             handlerId: 'setWindowAnimated'
           }),
           makeToggle({
-            id: 'flip',
-            label: 'Flip Texture',
-            title: 'Mirror window glass texture',
-            checked: !!raw.flip,
+            id: 'flip-horizontal',
+            label: 'Flip Horizontal',
+            title: 'Mirror window glass texture along the portal width',
+            checked: !!textureFlip.horizontal,
             disabled,
-            handlerId: 'setWindowFlip'
+            handlerId: 'setWindowFlipHorizontal'
+          }),
+          makeToggle({
+            id: 'flip-vertical',
+            label: 'Flip Vertical',
+            title: 'Mirror window glass texture across the wall thickness',
+            checked: !!textureFlip.vertical,
+            disabled,
+            handlerId: 'setWindowFlipVertical'
           })
         ]
       }),

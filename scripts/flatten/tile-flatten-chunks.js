@@ -22,6 +22,7 @@ import {
 const MODULE_ID = 'fa-nexus';
 const REPAIR_ATTEMPTS = new Map();
 const REPAIR_COOLDOWN_MS = 10000;
+const FLATTEN_CHUNK_APPLY_RETRY_DELAYS = [0, 16, 60, 140, 300];
 
 function normalizeSrc(value) {
   const trimmed = String(value || '').trim();
@@ -142,6 +143,62 @@ function buildRenderKey(chunks) {
   return chunks.map((chunk) => `${chunk.src}|${chunk.x}|${chunk.y}|${chunk.width}|${chunk.height}`).join(';');
 }
 
+function requestFlattenedChunkRefresh(tile, reason = 'flatten-refresh') {
+  const refresh = () => {
+    try {
+      if (!canvas?.ready || !tile || tile.destroyed) return;
+      try { tile.renderFlags?.set?.({ refreshState: true }); } catch (_) {}
+      try { canvas?.tiles?.setAllRenderFlags?.({ refreshState: true }); } catch (_) {}
+    } catch (error) {
+      Logger.debug?.('TileFlatten.chunkRefresh.failed', {
+        tileId: tile?.document?.id || null,
+        reason,
+        error: String(error?.message || error)
+      });
+    }
+  };
+  refresh();
+  try { requestAnimationFrame(() => refresh()); } catch (_) {}
+  try { setTimeout(refresh, 80); } catch (_) {}
+}
+
+function tileHasFlattenChunkOverlay(tile) {
+  return !!(tile?.faNexusFlattenChunkContainer || tile?.mesh?.faNexusFlattenChunkContainer);
+}
+
+function scheduleFlattenedChunkApply(doc, reason = 'tile-change') {
+  const id = doc?.id || doc?._id || '';
+  if (!id) return;
+  const initialTile = resolveFlattenChunkPlaceable(doc);
+  if (!resolveFlattenedMeta(doc) && !tileHasFlattenChunkOverlay(initialTile)) return;
+  const run = (attempt = 0) => {
+    try {
+      const tile = resolveFlattenChunkPlaceable(doc);
+      if (tile && !tile.destroyed) {
+        Promise.resolve(applyFlattenedChunks(tile))
+          .then(() => requestFlattenedChunkRefresh(tile, reason))
+          .catch((error) => Logger.debug?.('TileFlatten.chunkApply.scheduledFailed', {
+            tileId: id,
+            reason,
+            attempt,
+            error: String(error?.message || error)
+          }));
+        return;
+      }
+      const nextDelay = FLATTEN_CHUNK_APPLY_RETRY_DELAYS[attempt + 1];
+      if (Number.isFinite(nextDelay)) setTimeout(() => run(attempt + 1), nextDelay);
+    } catch (error) {
+      Logger.debug?.('TileFlatten.chunkApply.scheduleFailed', {
+        tileId: id,
+        reason,
+        attempt,
+        error: String(error?.message || error)
+      });
+    }
+  };
+  run(0);
+}
+
 function syncFlattenContainerTransform(container, mesh, doc) {
   if (!container || container.destroyed || !mesh || mesh.destroyed) return;
   const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
@@ -224,6 +281,7 @@ export async function applyFlattenedChunks(tile) {
         }
       });
       invalidateCustomTileOverhead(tile, 'flatten-refresh');
+      requestFlattenedChunkRefresh(tile, 'flatten-reuse');
       return;
     }
 
@@ -293,6 +351,7 @@ export async function applyFlattenedChunks(tile) {
         }
       });
       invalidateCustomTileOverhead(tile, 'flatten-refresh');
+      requestFlattenedChunkRefresh(tile, 'flatten-build');
     })();
 
     try {
@@ -361,20 +420,19 @@ try {
   });
   Hooks.on('createTile', (doc) => {
     try {
-      const tile = resolveFlattenChunkPlaceable(doc);
-      if (tile) applyFlattenedChunks(tile);
+      scheduleFlattenedChunkApply(doc, 'createTile');
     } catch (_) {}
   });
   Hooks.on('updateTile', (doc) => {
     try {
-      const tile = resolveFlattenChunkPlaceable(doc);
-      if (tile) applyFlattenedChunks(tile);
+      scheduleFlattenedChunkApply(doc, 'updateTile');
     } catch (_) {}
   });
   Hooks.on('deleteTile', (doc) => {
     try {
       const tile = resolveFlattenChunkPlaceable(doc);
       if (tile) cleanupFlattenedChunks(tile);
+      try { setTimeout(() => rehydrateAllFlattenedChunks(), 80); } catch (_) {}
     } catch (_) {}
   });
 } catch (_) {}

@@ -8,7 +8,7 @@ import {
 const SHARED_TEXTURE_CACHE = new Map();
 let TRANSPARENT_TEXTURE = null;
 
-const TRANSPARENT_SRC = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+const TRANSPARENT_SRC = 'modules/fa-nexus/images/transparent.png';
 const LEGACY_ORIGINAL_TEXTURE_KEY = 'faNexusOriginalTexture';
 const FLATTENED_FLAG = 'flattened';
 

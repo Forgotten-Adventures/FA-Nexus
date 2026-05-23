@@ -34,6 +34,7 @@ const CORNER_DOT_THRESHOLD = Math.cos(Math.PI / 12); // ~15°
 
 let TRANSPARENT_TEXTURE = null;
 let PATH_PROGRAM = null;
+const TRANSPARENT_TEXTURE_SRC = 'modules/fa-nexus/images/transparent.png';
 const VISIBLE_ALPHA_THRESHOLD = 10;
 const LINEAR_TENSION_THRESHOLD = 0.999;
 const WIDTH_MULTIPLIER_EPSILON = 1e-3;
@@ -1017,7 +1018,7 @@ export function computeBoundsFromSamples(samples, pathWidth) {
 }
 
 export function getTransparentTextureSrc() {
-  return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  return TRANSPARENT_TEXTURE_SRC;
 }
 
 export function getTransparentTexture() {

@@ -81,6 +81,38 @@ class ToolOptionsWindowControlMethods {
     }
   }
 
+  _applyScrollState(container, state) {
+    if (!container || !state || typeof state !== 'object') return;
+    if (Number.isFinite(state.top)) container.scrollTop = state.top;
+    if (Number.isFinite(state.left)) container.scrollLeft = state.left;
+  }
+
+  _scheduleScrollStateRestore(state) {
+    if (!state || typeof state !== 'object') return;
+    const requestFrame = globalThis?.requestAnimationFrame;
+    if (typeof requestFrame !== 'function') return;
+    const top = Number(state.top);
+    const left = Number(state.left);
+    if (!Number.isFinite(top) && !Number.isFinite(left)) return;
+    const snapshot = {
+      top: Number.isFinite(top) ? top : 0,
+      left: Number.isFinite(left) ? left : 0
+    };
+    const token = (this._scrollRestoreToken || 0) + 1;
+    this._scrollRestoreToken = token;
+    const restore = () => {
+      if (this._scrollRestoreToken !== token) return;
+      const container = this._getScrollContainer();
+      if (!container) return;
+      this._applyScrollState(container, snapshot);
+    };
+    // Foundry/browser focus work can run after _onRender; keep the measured scroll through the next paints.
+    requestFrame(() => {
+      restore();
+      requestFrame(restore);
+    });
+  }
+
   _restoreScrollState() {
     const container = this._getScrollContainer();
     if (!container) {
@@ -89,11 +121,11 @@ class ToolOptionsWindowControlMethods {
     }
     const state = this._pendingScrollState;
     if (state && typeof state === 'object') {
-      if (Number.isFinite(state.top)) container.scrollTop = state.top;
-      if (Number.isFinite(state.left)) container.scrollLeft = state.left;
+      this._applyScrollState(container, state);
+      this._scheduleScrollStateRestore(state);
     } else if (this._resetScrollNextRender) {
-      container.scrollTop = 0;
-      container.scrollLeft = 0;
+      const resetState = { top: 0, left: 0 };
+      this._applyScrollState(container, resetState);
     }
     this._pendingScrollState = null;
   }

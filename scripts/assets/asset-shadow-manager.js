@@ -56,6 +56,7 @@ const SCATTER_SHADOW_MAX_INSTANCES = 8000;
 // Scatter stamps use the active quality ceiling; this guard only prevents runaway sizes above the
 // current highest experimental tier and still respects the detected GPU cap.
 const SCATTER_SHADOW_MAX_DIMENSION = 8192;
+const SCATTER_SHADOW_CHUNK_BLEED = 2;
 const SHADOW_BLANK_VALIDATION_MAX_PIXELS = 4_000_000;
 const SHADOW_BLANK_RECOVERY_COOLDOWN_MS = 10_000;
 const SHADOW_BLANK_VALIDATION_BUDGET = 12;
@@ -256,6 +257,7 @@ export class AssetShadowManager {
     this._boundUpdateTile = (doc, changes) => this._onUpdateTile(doc, changes);
     this._boundDeleteTile = (doc) => this._onDeleteTile(doc);
     this._boundCanvasPan = () => this._onCanvasPan();
+    this._boundScatterCacheReady = (tile) => this._onScatterCacheReady(tile);
     this._boundElevationBandChanged = () => {
       try {
         for (const layer of this._layers.values()) this._syncLayerOrdering(layer);
@@ -282,6 +284,8 @@ export class AssetShadowManager {
       catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'canvasPan' }); }
       try { hooks.on('fa-nexus-token-elevation-offset-changed', this._boundElevationBandChanged); }
       catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'fa-nexus-token-elevation-offset-changed' }); }
+      try { hooks.on('fa-nexus-asset-scatter-cache-ready', this._boundScatterCacheReady); }
+      catch (error) { logShadowLifecycleFailure('hook-registration', error, { hook: 'fa-nexus-asset-scatter-cache-ready' }); }
     }
   }
 
@@ -530,6 +534,20 @@ export class AssetShadowManager {
       }
     } catch (e) {
       Logger.warn('AssetShadow.onCanvasPan.failed', String(e?.message || e));
+    }
+  }
+
+  _onScatterCacheReady(tile) {
+    try {
+      const doc = tile?.document ?? tile;
+      const tileId = doc?.id;
+      if (!tileId) return;
+      const layerKey = this._tileIndex.get(tileId);
+      if (!layerKey) return;
+      this._clearScatterShadowCache(tileId);
+      this._scheduleRebuild(layerKey);
+    } catch (e) {
+      Logger.warn('AssetShadow.scatterCacheReady.failed', String(e?.message || e));
     }
   }
 
@@ -1073,17 +1091,28 @@ export class AssetShadowManager {
 
         const scatterStamp = await this._getScatterShadowStamp(doc, cfg, scale, renderer);
         assertCurrentRebuild();
-        if (scatterStamp?.texture) {
-          const sprite = this._createDocShadowSprite(scatterStamp.texture, doc, scatterStamp.bounds, {
-            scale,
-            sceneRect: sr,
-            offsetX: applyOffsetX,
-            offsetY: applyOffsetY,
-            anchorMode: 'doc'
-          });
-          if (sprite) {
-            drawContainer.addChild(sprite);
-            tempDisplayObjects.push(sprite);
+        if (scatterStamp?.texture || Array.isArray(scatterStamp?.chunks)) {
+          const chunks = Array.isArray(scatterStamp.chunks) && scatterStamp.chunks.length
+            ? scatterStamp.chunks
+            : [{ texture: scatterStamp.texture, bounds: scatterStamp.bounds }];
+          const stampOffsets = Array.isArray(scatterStamp.offsets) && scatterStamp.offsets.length
+            ? scatterStamp.offsets
+            : [{ x: 0, y: 0 }];
+          for (const chunk of chunks) {
+            if (!chunk?.texture || !chunk?.bounds) continue;
+            for (const stampOffset of stampOffsets) {
+              const sprite = this._createDocShadowSprite(chunk.texture, doc, chunk.bounds, {
+                scale,
+                sceneRect: sr,
+                offsetX: applyOffsetX + (Number(stampOffset?.x || 0) || 0),
+                offsetY: applyOffsetY + (Number(stampOffset?.y || 0) || 0),
+                anchorMode: 'doc'
+              });
+              if (sprite) {
+                drawContainer.addChild(sprite);
+                tempDisplayObjects.push(sprite);
+              }
+            }
           }
           continue;
         }
@@ -1891,6 +1920,64 @@ export class AssetShadowManager {
     };
   }
 
+  _rectsIntersect(a, b) {
+    if (!a || !b) return false;
+    return a.minX < b.maxX
+      && a.maxX > b.minX
+      && a.minY < b.maxY
+      && a.maxY > b.minY;
+  }
+
+  _expandBounds(bounds, amount = 0) {
+    const pad = Math.max(0, Number(amount) || 0);
+    return {
+      minX: Number(bounds?.minX || 0) - pad,
+      minY: Number(bounds?.minY || 0) - pad,
+      maxX: Number(bounds?.maxX || 0) + pad,
+      maxY: Number(bounds?.maxY || 0) + pad
+    };
+  }
+
+  _resolveScatterShadowChunks(bounds, renderScale) {
+    const scale = Math.max(0.01, Number(renderScale) || 1);
+    const maxTextureSize = this._getMaxTextureSize();
+    const textureCap = Math.max(1024, Math.min(SCATTER_SHADOW_MAX_DIMENSION, maxTextureSize));
+    const bleed = Math.max(0, SCATTER_SHADOW_CHUNK_BLEED / scale);
+    const chunkLocalSize = Math.max(1, (textureCap / scale) - (bleed * 2));
+    const width = Math.max(1, Number(bounds?.width || 0));
+    const height = Math.max(1, Number(bounds?.height || 0));
+    const chunks = [];
+    for (let y = Number(bounds?.minY || 0); y < Number(bounds?.minY || 0) + height; y += chunkLocalSize) {
+      const chunkHeight = Math.min(chunkLocalSize, Number(bounds?.minY || 0) + height - y);
+      for (let x = Number(bounds?.minX || 0); x < Number(bounds?.minX || 0) + width; x += chunkLocalSize) {
+        const chunkWidth = Math.min(chunkLocalSize, Number(bounds?.minX || 0) + width - x);
+        chunks.push({
+          x,
+          y,
+          width: chunkWidth,
+          height: chunkHeight,
+          renderX: x - bleed,
+          renderY: y - bleed,
+          renderWidth: chunkWidth + (bleed * 2),
+          renderHeight: chunkHeight + (bleed * 2),
+          bounds: {
+            minX: x,
+            minY: y,
+            maxX: x + chunkWidth,
+            maxY: y + chunkHeight
+          },
+          renderBounds: {
+            minX: x - bleed,
+            minY: y - bleed,
+            maxX: x + chunkWidth + bleed,
+            maxY: y + chunkHeight + bleed
+          }
+        });
+      }
+    }
+    return chunks;
+  }
+
   _clearSourceTextureCache(reason = 'unknown', options = {}) {
     const includeSharedRuntime = !!options?.includeSharedRuntime;
     const resetPrograms = !!options?.resetPrograms;
@@ -1931,22 +2018,167 @@ export class AssetShadowManager {
 
   _clearScatterShadowCache(tileId = null) {
     try {
+      const destroyEntry = (entry) => {
+        if (!entry) return;
+        if (entry.ownsTextures === false) return;
+        if (entry.texture && !entry.texture.destroyed) {
+          try { entry.texture.destroy(true); } catch (_) {}
+        }
+        if (Array.isArray(entry.chunks)) {
+          for (const chunk of entry.chunks) {
+            if (chunk?.texture && !chunk.texture.destroyed) {
+              try { chunk.texture.destroy(true); } catch (_) {}
+            }
+          }
+        }
+      };
       if (!tileId) {
         for (const entry of this._scatterShadowCache.values()) {
-          if (entry?.texture && !entry.texture.destroyed) {
-            try { entry.texture.destroy(true); } catch (_) {}
-          }
+          destroyEntry(entry);
         }
         this._scatterShadowCache.clear();
         return;
       }
       const entry = this._scatterShadowCache.get(tileId);
       if (!entry) return;
-      if (entry.texture && !entry.texture.destroyed) {
-        try { entry.texture.destroy(true); } catch (_) {}
-      }
+      destroyEntry(entry);
       this._scatterShadowCache.delete(tileId);
     } catch (_) {}
+  }
+
+  _isScatterShadowCacheEntryLive(entry) {
+    if (!entry) return false;
+    const isLiveTexture = (texture) => !!texture && !texture.destroyed && !texture.baseTexture?.destroyed;
+    if (entry.texture) return isLiveTexture(entry.texture);
+    if (Array.isArray(entry.chunks) && entry.chunks.length) {
+      return entry.chunks.every((chunk) => isLiveTexture(chunk?.texture));
+    }
+    return false;
+  }
+
+  _getRuntimeScatterContainer(doc) {
+    try {
+      const tileId = doc?.id || doc?._id;
+      if (!tileId) return null;
+      const placeables = canvas?.tiles?.placeables;
+      if (!Array.isArray(placeables)) return null;
+      const tile = placeables.find((entry) => entry?.document?.id === tileId);
+      if (!tile || tile.destroyed) return null;
+      return tile.faNexusAssetScatterContainer || tile.mesh?.faNexusAssetScatterContainer || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _getRuntimeScatterShadowStamp(doc, cfg, scale, offsets, instanceCount = 0) {
+    try {
+      const tileId = doc?.id || doc?._id;
+      if (!tileId) return null;
+      const container = this._getRuntimeScatterContainer(doc);
+      if (!container || container.destroyed || !container.faNexusAssetScatterCached) return null;
+
+      const sourceSprites = Array.isArray(container.faNexusAssetScatterCacheSprites)
+        ? container.faNexusAssetScatterCacheSprites
+        : (container.faNexusAssetScatterCacheSprite ? [container.faNexusAssetScatterCacheSprite] : []);
+      if (!sourceSprites.length) return null;
+
+      const chunks = [];
+      const textureKeys = [];
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+
+      for (let i = 0; i < sourceSprites.length; i += 1) {
+        const sprite = sourceSprites[i];
+        if (!sprite || sprite.destroyed) continue;
+        const texture = sprite.texture;
+        const baseTexture = texture?.baseTexture;
+        if (!texture || texture.destroyed || baseTexture?.destroyed) continue;
+        const chunk = sprite.faNexusAssetScatterCacheChunk || {};
+        const x = Number(chunk.x ?? sprite.x ?? 0) || 0;
+        const y = Number(chunk.y ?? sprite.y ?? 0) || 0;
+        const width = Math.max(1, Number(chunk.width ?? sprite.width ?? texture.width ?? 0) || 0);
+        const height = Math.max(1, Number(chunk.height ?? sprite.height ?? texture.height ?? 0) || 0);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) continue;
+
+        chunks.push({
+          texture,
+          bounds: { x, y, width, height }
+        });
+        textureKeys.push(`${baseTexture?.uid ?? texture.uid ?? i}:${Math.round(x)},${Math.round(y)},${Math.round(width)},${Math.round(height)}`);
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + width);
+        maxY = Math.max(maxY, y + height);
+      }
+
+      if (!chunks.length) return null;
+
+      const safeScale = Number(scale) || 1;
+      const signature = JSON.stringify({
+        kind: 'runtime-cache',
+        tileId,
+        contentVersion: Number(container.faNexusAssetScatterContentVersion) || 0,
+        cacheMode: String(container.faNexusAssetScatterCacheMode || ''),
+        cacheKey: String(container.faNexusAssetScatterCacheKey || ''),
+        instanceCount: Number(instanceCount) || 0,
+        chunkCount: chunks.length,
+        textureKeys,
+        dilation: Math.round((Number(cfg?.dilation) || 0) * 1000) / 1000,
+        scale: Math.round(safeScale * 10000) / 10000,
+        offsets: Array.isArray(offsets) ? offsets.length : 0
+      });
+
+      const cached = this._scatterShadowCache.get(tileId);
+      if (cached && cached.signature === signature && this._isScatterShadowCacheEntryLive(cached)) {
+        return cached;
+      }
+      if (cached) this._clearScatterShadowCache(tileId);
+
+      if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+        minX = 0;
+        minY = 0;
+        maxX = Math.max(1, Number(doc?.width || 0));
+        maxY = Math.max(1, Number(doc?.height || 0));
+      }
+
+      const entry = {
+        signature,
+        texture: chunks.length === 1 ? chunks[0].texture : null,
+        chunks,
+        bounds: {
+          x: minX,
+          y: minY,
+          width: Math.max(1, maxX - minX),
+          height: Math.max(1, maxY - minY)
+        },
+        scale: safeScale,
+        offsets: Array.isArray(offsets) && offsets.length
+          ? offsets.map((offset) => ({
+            x: Number(offset?.x || 0) || 0,
+            y: Number(offset?.y || 0) || 0
+          }))
+          : [{ x: 0, y: 0 }],
+        ownsTextures: false,
+        source: 'runtime-cache'
+      };
+      this._scatterShadowCache.set(tileId, entry);
+      Logger.debug?.('AssetShadow.scatterShadow.runtimeCache', {
+        tileId,
+        instances: Number(instanceCount) || 0,
+        chunks: chunks.length,
+        offsets: entry.offsets.length,
+        scale: safeScale
+      });
+      return entry;
+    } catch (error) {
+      Logger.warn?.('AssetShadow.scatterShadow.runtimeCacheFailed', {
+        tileId: doc?.id || doc?._id || null,
+        error: String(error?.message || error)
+      });
+      return null;
+    }
   }
 
   _clearStandardMaskShadowCache(tileId = null) {
@@ -2850,6 +3082,28 @@ export class AssetShadowManager {
       const tileId = doc?.id;
       if (!tileId) return null;
       if (!renderer) return null;
+      const payload = this._readScatterPayload(doc);
+      if (!payload || typeof payload !== 'object') {
+        this._clearScatterShadowCache(tileId);
+        return null;
+      }
+      const version = Number(payload.version || SCATTER_VERSION);
+      if (version !== SCATTER_VERSION) {
+        this._clearScatterShadowCache(tileId);
+        return null;
+      }
+      const rawInstances = Array.isArray(payload.instances) ? payload.instances : [];
+      if (!rawInstances.length) {
+        this._clearScatterShadowCache(tileId);
+        return null;
+      }
+
+      const renderScale = Math.max(0.01, Number(scale) || 1);
+      const dilationRadius = Math.max(0, Number(cfg?.dilation || 0)) * renderScale;
+      const offsets = this._buildScatterDilationOffsets(dilationRadius, rawInstances.length);
+      const runtimeStamp = this._getRuntimeScatterShadowStamp(doc, cfg, renderScale, offsets, rawInstances.length);
+      if (runtimeStamp) return runtimeStamp;
+
       const instances = this._resolveScatterInstances(doc);
       if (!instances.length) {
         this._clearScatterShadowCache(tileId);
@@ -2858,25 +3112,28 @@ export class AssetShadowManager {
 
       const bounds = this._getScatterShadowBounds(doc, instances);
       if (!bounds) return null;
-
-      const renderScale = this._computeScatterShadowScale(scale, bounds);
-      const dilationRadius = Math.max(0, Number(cfg?.dilation || 0)) * renderScale;
-      const offsets = this._buildScatterDilationOffsets(dilationRadius, instances.length);
-      const instanceLimit = this._computeScatterShadowInstanceLimit(offsets.length);
-      const sample = this._sampleScatterShadowInstances(instances, instanceLimit);
-      const sampledInstances = sample.instances;
-
-      const signature = this._buildScatterShadowSignature(sampledInstances, cfg, renderScale, {
+      const signature = this._buildScatterShadowSignature(instances, cfg, renderScale, {
         c: instances.length,
-        t: sample.stride,
+        chunked: true,
         w: Math.round(bounds.width || 0),
         h: Math.round(bounds.height || 0)
       });
       const cached = this._scatterShadowCache.get(tileId);
-      if (cached && cached.signature === signature && cached.texture && !cached.texture.destroyed) {
+      if (cached && cached.signature === signature && this._isScatterShadowCacheEntryLive(cached)) {
         return cached;
       }
       if (cached) this._clearScatterShadowCache(tileId);
+
+      Logger.debug?.('AssetShadow.scatterShadow.instanceChunked', {
+        tileId,
+        instances: instances.length,
+        reason: 'runtime-cache-unavailable'
+      });
+
+      const instanceBounds = instances.map((instance) => ({
+        instance,
+        bounds: this._computeScatterInstanceBounds(instance)
+      }));
 
       const dilation = Math.max(0, Number(cfg?.dilation || 0));
       const minX = bounds.minX - dilation;
@@ -2885,19 +3142,10 @@ export class AssetShadowManager {
       const maxY = bounds.maxY + dilation;
       const width = Math.max(1, maxX - minX);
       const height = Math.max(1, maxY - minY);
+      const shadowBounds = { minX, minY, maxX, maxY, width, height };
+      const chunks = this._resolveScatterShadowChunks(shadowBounds, renderScale);
+      if (!chunks.length) return null;
 
-      const pixelWidth = Math.max(4, Math.ceil(width * renderScale));
-      const pixelHeight = Math.max(4, Math.ceil(height * renderScale));
-      if (!Number.isFinite(pixelWidth) || !Number.isFinite(pixelHeight)) return null;
-
-      const rt = PIXI.RenderTexture.create({
-        width: pixelWidth,
-        height: pixelHeight,
-        scaleMode: PIXI.SCALE_MODES.LINEAR
-      });
-
-      const drawContainer = new PIXI.Container();
-      const tempDisplayObjects = [];
       const textureCache = new Map();
       const getTexture = async (src) => {
         if (!src) return null;
@@ -2907,52 +3155,104 @@ export class AssetShadowManager {
         return texture;
       };
 
-      for (const instance of sampledInstances) {
-        const tex = await getTexture(instance.src);
-        if (!tex) continue;
-        const baseWidth = Math.max(1, Number(instance.w) || 0) * renderScale;
-        const baseHeight = Math.max(1, Number(instance.h) || 0) * renderScale;
-        const baseX = ((Number(instance.x) || 0) - minX) * renderScale;
-        const baseY = ((Number(instance.y) || 0) - minY) * renderScale;
-        const rotationDeg = Number(instance.r || 0) * (Math.PI / 180);
+      const stampChunks = [];
+      const instancePadding = dilation + (SCATTER_SHADOW_CHUNK_BLEED / renderScale);
+      for (const chunk of chunks) {
+        const chunkEntries = [];
+        for (const entry of instanceBounds) {
+          const expanded = this._expandBounds(entry.bounds, instancePadding);
+          if (this._rectsIntersect(expanded, chunk.renderBounds)) chunkEntries.push(entry.instance);
+        }
+        if (!chunkEntries.length) continue;
 
-        for (const offset of offsets) {
-          const sprite = new PIXI.Sprite(tex);
-          sprite.anchor.set(0.5, 0.5);
-          sprite.width = baseWidth;
-          sprite.height = baseHeight;
-          if (instance.flipH) sprite.scale.x *= -1;
-          if (instance.flipV) sprite.scale.y *= -1;
-          sprite.position.set(baseX + offset.x, baseY + offset.y);
-          sprite.rotation = rotationDeg;
-          sprite.alpha = 1;
-          sprite.eventMode = 'none';
-          drawContainer.addChild(sprite);
-          tempDisplayObjects.push(sprite);
+        const pixelWidth = Math.max(4, Math.ceil(chunk.renderWidth * renderScale));
+        const pixelHeight = Math.max(4, Math.ceil(chunk.renderHeight * renderScale));
+        if (!Number.isFinite(pixelWidth) || !Number.isFinite(pixelHeight)) continue;
+
+        const rt = PIXI.RenderTexture.create({
+          width: pixelWidth,
+          height: pixelHeight,
+          scaleMode: PIXI.SCALE_MODES.LINEAR
+        });
+        const drawContainer = new PIXI.Container();
+        const tempDisplayObjects = [];
+        try {
+          for (const instance of chunkEntries) {
+            const tex = await getTexture(instance.src);
+            if (!tex) continue;
+            const baseWidth = Math.max(1, Number(instance.w) || 0) * renderScale;
+            const baseHeight = Math.max(1, Number(instance.h) || 0) * renderScale;
+            const baseX = ((Number(instance.x) || 0) - chunk.renderX) * renderScale;
+            const baseY = ((Number(instance.y) || 0) - chunk.renderY) * renderScale;
+            const rotationDeg = Number(instance.r || 0) * (Math.PI / 180);
+
+            for (const offset of offsets) {
+              const sprite = new PIXI.Sprite(tex);
+              sprite.anchor.set(0.5, 0.5);
+              sprite.width = baseWidth;
+              sprite.height = baseHeight;
+              if (instance.flipH) sprite.scale.x *= -1;
+              if (instance.flipV) sprite.scale.y *= -1;
+              sprite.position.set(baseX + offset.x, baseY + offset.y);
+              sprite.rotation = rotationDeg;
+              sprite.alpha = 1;
+              sprite.eventMode = 'none';
+              drawContainer.addChild(sprite);
+              tempDisplayObjects.push(sprite);
+            }
+          }
+
+          if (!tempDisplayObjects.length) {
+            try { rt.destroy(true); } catch (_) {}
+            continue;
+          }
+
+          renderer.render(drawContainer, { renderTexture: rt, clear: true });
+          stampChunks.push({
+            texture: rt,
+            bounds: {
+              x: chunk.renderX,
+              y: chunk.renderY,
+              width: chunk.renderWidth,
+              height: chunk.renderHeight
+            }
+          });
+        } catch (error) {
+          try { rt.destroy(true); } catch (_) {}
+          throw error;
+        } finally {
+          for (const displayObject of tempDisplayObjects) {
+            try { displayObject.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+          }
+          try { drawContainer.destroy({ children: false }); } catch (_) {}
         }
       }
 
-      if (!tempDisplayObjects.length) {
-        try { rt.destroy(true); } catch (_) {}
+      if (!stampChunks.length) {
         return null;
       }
 
-      renderer.render(drawContainer, { renderTexture: rt, clear: true });
-
-      for (const displayObject of tempDisplayObjects) {
-        try { displayObject.destroy({ children: true, texture: false, baseTexture: false }); } catch (_) {}
-      }
-      try { drawContainer.destroy({ children: false }); } catch (_) {}
-
       const entry = {
         signature,
-        texture: rt,
+        texture: stampChunks.length === 1 ? stampChunks[0].texture : null,
+        chunks: stampChunks,
         bounds: { x: minX, y: minY, width, height },
         scale: renderScale
       };
       this._scatterShadowCache.set(tileId, entry);
+      Logger.debug?.('AssetShadow.scatterShadow.chunked', {
+        tileId,
+        instances: instances.length,
+        chunks: stampChunks.length,
+        offsets: offsets.length,
+        scale: renderScale
+      });
       return entry;
-    } catch (_) {
+    } catch (error) {
+      Logger.warn?.('AssetShadow.scatterShadow.failed', {
+        tileId: doc?.id || null,
+        error: String(error?.message || error)
+      });
       return null;
     }
   }
