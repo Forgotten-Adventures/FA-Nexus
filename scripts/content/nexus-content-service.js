@@ -276,96 +276,102 @@ export class NexusContentService {
 
       if (plan.mode === 'full') {
         Logger.time(`ContentService.full:${kind}`);
-        this.progressEmitter.emit('sync:phase', { kind, phase: 'full', url: plan.full.url });
+        try {
+          this.progressEmitter.emit('sync:phase', { kind, phase: 'full', url: plan.full.url });
 
-        const items = await retryWithBackoff(
-          async () => {
-            const fullRes = await fetch(plan.full.url, { headers: { 'Accept': 'application/json' }, signal });
-            if (!fullRes.ok) throw new Error(`Full manifest fetch failed (${fullRes.status})`);
-            return fullRes.json();
-          },
-          {
-            maxRetries: 2,
-            initialDelay: 2000,
-            maxDelay: 15000,
-            signal,
-            onRetry: ({ attempt, maxRetries, delay }) => {
-              this.progressEmitter.emit('sync:retry', { kind, phase: 'full', attempt, maxRetries, delay });
+          const items = await retryWithBackoff(
+            async () => {
+              const fullRes = await fetch(plan.full.url, { headers: { 'Accept': 'application/json' }, signal });
+              if (!fullRes.ok) throw new Error(`Full manifest fetch failed (${fullRes.status})`);
+              return fullRes.json();
+            },
+            {
+              maxRetries: 2,
+              initialDelay: 2000,
+              maxDelay: 15000,
+              signal,
+              onRetry: ({ attempt, maxRetries, delay }) => {
+                this.progressEmitter.emit('sync:retry', { kind, phase: 'full', attempt, maxRetries, delay });
+              }
             }
-          }
-        );
+          );
 
-        await db.replaceAll(kind, items, {
-          onProgress: (count, total) => emitProgress('replaceAll', count, total),
-          progressBatch: options.progressBatch,
-          signal
-        });
-        const builtAt = new Date().toISOString();
-        await db.setMeta(kind, {
-          id: 'meta',
-          latest: plan.latest,
-          count: items.length,
-          builtAt,
-          chunksLatest: plan.latest,
-          chunksBuiltAt: builtAt
-        });
-        emitProgress('meta', items.length, items.length);
-        Logger.timeEnd(`ContentService.full:${kind}`);
-        Logger.info('ContentService.sync:done', { kind, mode: 'full', latest: plan.latest, count: items.length });
-        this.progressEmitter.emit('sync:complete', { kind, mode: 'full', latest: plan.latest, count: items.length });
-        return plan.latest;
+          await db.replaceAll(kind, items, {
+            onProgress: (count, total) => emitProgress('replaceAll', count, total),
+            progressBatch: options.progressBatch,
+            signal
+          });
+          const builtAt = new Date().toISOString();
+          await db.setMeta(kind, {
+            id: 'meta',
+            latest: plan.latest,
+            count: items.length,
+            builtAt,
+            chunksLatest: plan.latest,
+            chunksBuiltAt: builtAt
+          });
+          emitProgress('meta', items.length, items.length);
+          Logger.info('ContentService.sync:done', { kind, mode: 'full', latest: plan.latest, count: items.length });
+          this.progressEmitter.emit('sync:complete', { kind, mode: 'full', latest: plan.latest, count: items.length });
+          return plan.latest;
+        } finally {
+          Logger.timeEnd(`ContentService.full:${kind}`);
+        }
       }
 
       if (plan.mode === 'deltas') {
         Logger.time(`ContentService.deltas:${kind}`);
-        this.progressEmitter.emit('sync:phase', { kind, phase: 'deltas', count: plan.deltas?.length || 0 });
+        try {
+          this.progressEmitter.emit('sync:phase', { kind, phase: 'deltas', count: plan.deltas?.length || 0 });
 
-        for (const [index, d] of (plan.deltas || []).entries()) {
-          await retryWithBackoff(
-            async () => {
-              this.progressEmitter.emit('sync:delta', { kind, index, total: plan.deltas.length, url: d.url });
-              const res = await fetch(d.url, { headers: { 'Accept': 'application/json' }, signal });
-              if (!res.ok) throw new Error(`Delta fetch failed (${res.status})`);
-              const t = await res.text();
-              for (const line of t.split('\n')) {
-                if (!line.trim()) continue;
-                const op = JSON.parse(line);
-                await db.applyDelta(kind, op);
+          for (const [index, d] of (plan.deltas || []).entries()) {
+            await retryWithBackoff(
+              async () => {
+                this.progressEmitter.emit('sync:delta', { kind, index, total: plan.deltas.length, url: d.url });
+                const res = await fetch(d.url, { headers: { 'Accept': 'application/json' }, signal });
+                if (!res.ok) throw new Error(`Delta fetch failed (${res.status})`);
+                const t = await res.text();
+                for (const line of t.split('\n')) {
+                  if (!line.trim()) continue;
+                  const op = JSON.parse(line);
+                  await db.applyDelta(kind, op);
+                }
+              },
+              {
+                maxRetries: 2,
+                initialDelay: 1500,
+                maxDelay: 12000,
+                signal,
+                onRetry: ({ attempt, maxRetries, delay }) => {
+                  this.progressEmitter.emit('sync:retry', { kind, phase: 'delta', index, attempt, maxRetries, delay });
+                }
               }
-            },
-            {
-              maxRetries: 2,
-              initialDelay: 1500,
-              maxDelay: 12000,
-              signal,
-              onRetry: ({ attempt, maxRetries, delay }) => {
-                this.progressEmitter.emit('sync:retry', { kind, phase: 'delta', index, attempt, maxRetries, delay });
-              }
-            }
-          );
+            );
+          }
+
+          const count = await db.count(kind);
+          const builtAt = new Date().toISOString();
+          let prevMeta = null;
+          try { prevMeta = await db.getMeta(kind); } catch (_) {}
+          const prevChunksLatest = prevMeta?.chunksLatest ?? prevMeta?.latest ?? null;
+          const prevChunksBuiltAt = prevMeta?.chunksBuiltAt ?? null;
+          await db.setMeta(kind, {
+            id: 'meta',
+            latest: plan.latest,
+            count,
+            builtAt,
+            chunksLatest: prevChunksLatest,
+            chunksBuiltAt: prevChunksBuiltAt
+          });
+          // Rebuild chunked index asynchronously so unfiltered list stays sorted by file_path
+          scheduleChunkRebuild(plan.latest, count, builtAt);
+          emitProgress('meta', count, count);
+          Logger.info('ContentService.sync:done', { kind, mode: 'deltas', latest: plan.latest, count });
+          this.progressEmitter.emit('sync:complete', { kind, mode: 'deltas', latest: plan.latest, count });
+          return plan.latest;
+        } finally {
+          Logger.timeEnd(`ContentService.deltas:${kind}`);
         }
-
-        const count = await db.count(kind);
-        const builtAt = new Date().toISOString();
-        let prevMeta = null;
-        try { prevMeta = await db.getMeta(kind); } catch (_) {}
-        const prevChunksLatest = prevMeta?.chunksLatest ?? prevMeta?.latest ?? null;
-        const prevChunksBuiltAt = prevMeta?.chunksBuiltAt ?? null;
-        await db.setMeta(kind, {
-          id: 'meta',
-          latest: plan.latest,
-          count,
-          builtAt,
-          chunksLatest: prevChunksLatest,
-          chunksBuiltAt: prevChunksBuiltAt
-        });
-        // Rebuild chunked index asynchronously so unfiltered list stays sorted by file_path
-        scheduleChunkRebuild(plan.latest, count, builtAt);
-        emitProgress('meta', count, count);
-        Logger.timeEnd(`ContentService.deltas:${kind}`);
-        Logger.info('ContentService.sync:done', { kind, mode: 'deltas', latest: plan.latest, count });
-        this.progressEmitter.emit('sync:complete', { kind, mode: 'deltas', latest: plan.latest, count });
-        return plan.latest;
       }
       throw new Error('Unexpected update response');
     } catch (error) {

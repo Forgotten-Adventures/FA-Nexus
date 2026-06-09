@@ -1308,6 +1308,16 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     return normalized.split('/').filter(Boolean);
   }
 
+  _isMissingOutputFolderBrowseError(error, source, target) {
+    if (String(source || 'data').toLowerCase() !== 'data') return false;
+    if (!this._splitCollisionBrowseTarget(target).length) return false;
+
+    const message = String(error?.message || error || '');
+    if (!message) return false;
+    if (/permission|not permitted|not allowed|FILES_BROWSE/i.test(message)) return false;
+    return /does not exist|not found|ENOENT|no such file or directory/i.test(message);
+  }
+
   _directoryListIncludesCollisionChild(result, parentTarget, childSegment) {
     const dirs = result?.dirs;
     if (!Array.isArray(dirs)) return null;
@@ -1609,6 +1619,15 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
           source,
           target,
           folder: requestedFolder
+        });
+        return [];
+      }
+      if (this._isMissingOutputFolderBrowseError(error, source, target)) {
+        Logger.debug?.('TileFlatten.outputCollisionCheck.missingFolderClearFromError', {
+          source,
+          target,
+          folder: requestedFolder,
+          error: String(error?.message || error)
         });
         return [];
       }

@@ -124,15 +124,14 @@ function getRayClass() {
   return Ray;
 }
 
-function getSortedLevelIndex(scene, level) {
-  const sorted = scene?.levels?.sorted || [];
-  const index = sorted.findIndex((candidate) => candidate?.id === level?.id);
-  return index >= 0 ? index : 0;
-}
-
 function getLevelTextureConfig(scene, level) {
   const configs = scene?._configureLevelTextures?.() || [];
   return configs.find((config) => config?.level?.id === level?.id && config.name === 'foreground') || null;
+}
+
+function getLevelForegroundSort(level, foregroundConfig = null) {
+  const rawSort = Number(foregroundConfig?.sort ?? level?.foreground?.sort ?? 0);
+  return Number.isFinite(rawSort) ? rawSort : 0;
 }
 
 function isUpperForegroundLevel(scene, level, foregroundConfig = null) {
@@ -149,8 +148,7 @@ function resolveLevelDoorRenderState(scene, level) {
   const rawElevation = Number(foreground?.elevation ?? level?.elevation?.top);
   if (Number.isNaN(rawElevation)) throw new Error(`Level ${level?.id || '(unknown)'} has no usable foreground elevation.`);
   const elevation = rawElevation;
-  const rawSort = Number(foreground?.sort);
-  const sortBase = Number.isFinite(rawSort) ? rawSort : getSortedLevelIndex(scene, level);
+  const sortBase = getLevelForegroundSort(level, foreground);
   const occlusionMode = isUpperForegroundLevel(scene, level, foreground)
     ? (globalThis?.CONST?.OCCLUSION_MODES?.SURFACE ?? 0)
     : (globalThis?.CONST?.OCCLUSION_MODES?.NONE ?? 0);

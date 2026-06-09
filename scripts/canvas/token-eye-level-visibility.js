@@ -3,6 +3,7 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
 const MODULE_ID = 'fa-nexus';
 const EYE_LEVEL_HEIGHT_FLAG = 'eyeLevelHeightFt';
 const OVERWRITE_EYE_LEVEL_SETTING = 'overwriteEyeLevel';
+const OVERWRITE_EYE_LEVEL_TOP_CLEARANCE = 0.5;
 const PATCHED_KEY = Symbol.for('fa-nexus.TokenDocument.eyeLevelVisibility.patched');
 const ORIGINAL_GET_VISION_ORIGIN_KEY = Symbol.for('fa-nexus.TokenDocument.eyeLevelVisibility.originalGetVisionOrigin');
 const ORIGINAL_GET_VISIBILITY_TEST_POINTS_KEY = Symbol.for('fa-nexus.TokenDocument.eyeLevelVisibility.originalGetVisibilityTestPoints');
@@ -27,6 +28,19 @@ function resolveGridDistance(tokenDocument) {
     throw new Error(`Invalid token visibility grid distance: ${grid?.distance}`);
   }
   return distance;
+}
+
+function getTokenDepthGridHeight(tokenDocument, data = {}) {
+  const depth = Number(data.depth ?? tokenDocument?.depth);
+  if (!Number.isFinite(depth) || depth < 0) {
+    throw new Error(`Invalid token visibility depth: ${data.depth ?? tokenDocument?.depth}`);
+  }
+  return depth * resolveGridDistance(tokenDocument);
+}
+
+function getOverwrittenEyeLevelHeight(tokenDocument, data = {}) {
+  const tokenHeight = getTokenDepthGridHeight(tokenDocument, data);
+  return Math.max(0, tokenHeight - OVERWRITE_EYE_LEVEL_TOP_CLEARANCE);
 }
 
 function isOverwriteEyeLevelEnabled() {
@@ -89,19 +103,15 @@ export function getTokenVisibilityEyeElevation(tokenDocument, data = {}) {
   }
   if (eyeLevelHeight !== null) return elevation + eyeLevelHeight;
   if (!isOverwriteEyeLevelEnabled()) return null;
-  const depth = Number(data.depth ?? tokenDocument?.depth);
-  if (!Number.isFinite(depth) || depth < 0) {
-    throw new Error(`Invalid token visibility depth: ${data.depth ?? tokenDocument?.depth}`);
-  }
-  return elevation + (depth * resolveGridDistance(tokenDocument));
+  return elevation + getOverwrittenEyeLevelHeight(tokenDocument, data);
 }
 
 function getDefaultEyeLevelPlaceholder(tokenDocument) {
-  const depth = Number(tokenDocument?.depth ?? tokenDocument?._source?.depth);
-  if (!Number.isFinite(depth) || depth < 0) return '';
   try {
-    const multiplier = isOverwriteEyeLevelEnabled() ? 1 : 0.5;
-    return String(Math.round((depth * resolveGridDistance(tokenDocument) * multiplier) * 100) / 100);
+    const height = isOverwriteEyeLevelEnabled()
+      ? getOverwrittenEyeLevelHeight(tokenDocument)
+      : (getTokenDepthGridHeight(tokenDocument) * 0.5);
+    return String(Math.round(height * 100) / 100);
   } catch (error) {
     Logger.error('TokenEyeLevelVisibility.config.placeholderFailed', {
       tokenId: tokenDocument?.id || null,

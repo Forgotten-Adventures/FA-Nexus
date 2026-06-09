@@ -765,14 +765,9 @@ export class TokenPlacementManager {
     const originTier = cardElement.getAttribute('data-tier') || '';
     const sizeInfo = TokenDragDropManager._readSizeInfoFromCard(cardElement);
 
-    let localPath = cardElement._resolvedLocalPath || cardElement.getAttribute('data-url') || '';
-    const looksLikeFile = (p) => /\.(webp|png|jpg|jpeg|gif|svg)$/i.test(String(p || ''));
-    if (!localPath || !looksLikeFile(localPath)) {
-      const pathAttr = cardElement.getAttribute('data-path') || '';
-      if (looksLikeFile(pathAttr)) localPath = pathAttr;
-    }
-
     const isCloud = (originSource || '').toLowerCase() === 'cloud';
+    const looksLikeFile = TokenDragDropManager._looksLikeImagePath;
+    let localPath = TokenDragDropManager._getResolvedCardImagePath(cardElement);
     let pendingDownload = false;
     let ensureLocalPromise = null;
     if (isCloud && (!localPath || !looksLikeFile(localPath))) {
@@ -1015,26 +1010,21 @@ export class TokenPlacementManager {
   }
 
   _resolveCurrentUrl(card, payload) {
-    const looksFile = (p) => {
-      if (!p) return false;
-      let path = String(p);
-      try {
-        const url = new URL(path, window.location.origin);
-        path = url.pathname || path;
-      } catch (_) { /* not an absolute URL */ }
-      return /\.(webp|png|jpg|jpeg|gif|svg)$/i.test(path);
-    };
     const attrs = card || {};
-    const attrUrl = typeof attrs.getAttribute === 'function' ? attrs.getAttribute('data-url') : '';
-    const resolved = attrs._resolvedLocalPath || '';
-    if (looksFile(resolved)) return resolved;
-    if (looksFile(attrUrl)) return attrUrl;
-    if (looksFile(payload?.url)) return payload.url;
+    const resolved = TokenDragDropManager._getResolvedCardImagePath(attrs);
+    if (resolved) return resolved;
+    const source = typeof attrs.getAttribute === 'function' ? (attrs.getAttribute('data-source') || '').toLowerCase() : '';
+    const isCached = typeof attrs.getAttribute === 'function' ? attrs.getAttribute('data-cached') === 'true' : false;
+    if (TokenDragDropManager._looksLikeImagePath(payload?.url)) {
+      if (source !== 'cloud' || isCached || TokenDragDropManager._isAbsoluteHttpUrl(payload.url)) return payload.url;
+      return '';
+    }
     return payload?.url || '';
   }
 
   _createEntryFromCard(cardElement, payload = null) {
     if (!cardElement) return null;
+    const resolvedImagePath = TokenDragDropManager._getResolvedCardImagePath(cardElement) || payload?.url || '';
     const entry = {
       card: cardElement,
       source: cardElement.getAttribute('data-source') || 'local',
@@ -1042,7 +1032,7 @@ export class TokenPlacementManager {
       filename: cardElement.getAttribute('data-filename') || payload?.filename || '',
       file_path: cardElement.getAttribute('data-file-path') || payload?.file_path || '',
       path: cardElement.getAttribute('data-path') || payload?.path || '',
-      cachedLocalPath: cardElement._resolvedLocalPath || cardElement.getAttribute('data-url') || payload?.url || '',
+      cachedLocalPath: resolvedImagePath,
       display_name: cardElement.getAttribute('data-display-name') || payload?.displayName || '',
       grid_width: Number(cardElement.getAttribute('data-grid-w') || payload?.tokenSize?.gridWidth || 1) || 1,
       grid_height: Number(cardElement.getAttribute('data-grid-h') || payload?.tokenSize?.gridHeight || 1) || 1,
@@ -1247,8 +1237,10 @@ export class TokenPlacementManager {
     try {
       if (entry.cachedLocalPath) {
         card.setAttribute('data-url', entry.cachedLocalPath);
-        card.setAttribute('data-cached', 'true');
         card._resolvedLocalPath = entry.cachedLocalPath;
+        if (!/^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(entry.cachedLocalPath)) {
+          card.setAttribute('data-cached', 'true');
+        }
       }
     } catch (_) {}
     try { card.setAttribute('data-display-name', entry.display_name || ''); } catch (_) {}

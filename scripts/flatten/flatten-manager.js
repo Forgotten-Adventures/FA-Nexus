@@ -1046,10 +1046,13 @@ export class TileFlattenManager {
                   overlay.setStatus(`Saving ${layerLabel.toLowerCase()} tile chunk ${i + 1} of ${capturedChunks.length}...`);
                   await this._saveCapturedFlattenWebP(capturedChunks[i], flattenContext, metadata);
                 }
+                filePath = capturedChunks[0]?.src || filePath;
               } else {
                 overlay.setStatus(`Saving ${layerLabel.toLowerCase()} tile image...`);
-                await this._saveCapturedFlattenWebP(singleOutput, flattenContext, metadata);
+                filePath = await this._saveCapturedFlattenWebP(singleOutput, flattenContext, metadata);
               }
+              metadata.filePath = filePath || metadata.filePath;
+              if (metadata.embeddedMetadata) metadata.embeddedMetadata.primaryFilePath = metadata.filePath || null;
               pendingFlattenCreates.push({
                 bounds: renderBounds,
                 filePath,
@@ -1684,9 +1687,12 @@ export class TileFlattenManager {
           overlay.setProgress?.(0.84 + (0.05 * ((i + 1) / capturedChunks.length)));
           await this._saveCapturedFlattenWebP(capturedChunks[i], uploadContext, metadata);
         }
+        filePath = capturedChunks[0]?.src || filePath;
       } else {
-        await this._saveCapturedFlattenWebP(singleOutput, uploadContext, metadata);
+        filePath = await this._saveCapturedFlattenWebP(singleOutput, uploadContext, metadata);
       }
+      metadata.filePath = filePath || metadata.filePath;
+      if (metadata.embeddedMetadata) metadata.embeddedMetadata.primaryFilePath = metadata.filePath || null;
 
       overlay.setStatus('Creating flattened tile...');
       overlay.setProgress?.(0.9);
@@ -4202,6 +4208,7 @@ export class TileFlattenManager {
         restoredCount: payloads.length,
         createdCount: transaction.createdDocs.length,
         flattenedId: tileDoc.id,
+        preservedNestedFlattened: restoration.preservedNestedFlattened || 0,
         relinkedTileDocuments: transaction.relinkPlan?.tileUpdates?.size || 0,
         relinkedWallDocuments: transaction.relinkPlan?.wallUpdates?.size || 0
       });
@@ -4285,47 +4292,76 @@ export class TileFlattenManager {
     ));
   }
 
-  _resolveEmbeddedFlattenMetadataSource(tileDoc, metadata = null) {
+  _resolveEmbeddedFlattenMetadataSources(tileDoc, metadata = null) {
+    const sources = [];
+    const seen = new Set();
+    const push = (source, kind) => {
+      const normalized = String(source || '').trim();
+      if (!normalized) return;
+      const key = this._normalizeUploadPathForComparison(normalized);
+      if (seen.has(key)) return;
+      seen.add(key);
+      sources.push({ source: normalized, kind });
+    };
+
+    push(this._resolveTileTextureSourceForFlattenMetadata(tileDoc), 'tile-texture');
+
     if (metadata && this._requiresEmbeddedFlattenMetadata(metadata)) {
-      const src = String(
-        metadata?.embeddedMetadata?.primaryFilePath
-        || metadata?.filePath
-        || metadata?.chunks?.[0]?.src
-        || ''
-      ).trim();
-      if (!src) {
+      push(metadata?.embeddedMetadata?.primaryFilePath, 'metadata-primary');
+      push(metadata?.filePath, 'metadata-file');
+      push(metadata?.chunks?.[0]?.src, 'metadata-first-chunk');
+      if (!sources.length) {
         throw new Error('Flatten metadata requires embedded WebP metadata but does not identify the generated WebP file.');
       }
-      return src;
+      return sources;
     }
 
-    const src = String(
+    if (!sources.length) {
+      throw new Error('Selected tile does not contain FA Nexus flatten data or a readable WebP texture source.');
+    }
+    return sources;
+  }
+
+  async _readEmbeddedFlattenMetadata(tileDoc, metadata = null) {
+    const sources = this._resolveEmbeddedFlattenMetadataSources(tileDoc, metadata);
+    let lastError = null;
+
+    for (const entry of sources) {
+      const source = entry?.source || '';
+      const url = encodeTexturePath(source);
+      try {
+        const envelope = await readFlattenMetadataFromWebPUrl(url);
+        return this._deepClone(envelope.flattened);
+      } catch (error) {
+        lastError = error;
+        Logger.warn('TileFlatten.embeddedMetadata.sourceReadFailed', {
+          tileId: tileDoc?.id || null,
+          source,
+          sourceKind: entry?.kind || null,
+          error: String(error?.message || error)
+        });
+      }
+    }
+
+    Logger.error('TileFlatten.embeddedMetadata.readFailed', {
+      tileId: tileDoc?.id || null,
+      sources: sources.map((entry) => ({
+        source: entry?.source || '',
+        kind: entry?.kind || null
+      })),
+      error: String(lastError?.message || lastError || 'No readable embedded metadata source')
+    });
+    throw new Error(`Cannot read embedded FA Nexus flatten metadata from generated WebP source: ${lastError?.message || lastError}`);
+  }
+
+  _resolveTileTextureSourceForFlattenMetadata(tileDoc) {
+    return String(
       tileDoc?.texture?.src
       || tileDoc?._source?.texture?.src
       || tileDoc?.img
       || tileDoc?._source?.img
       || ''
     ).trim();
-    if (!src) {
-      throw new Error('Selected tile does not contain FA Nexus flatten data or a readable WebP texture source.');
-    }
-    return src;
-  }
-
-  async _readEmbeddedFlattenMetadata(tileDoc, metadata = null) {
-    const source = this._resolveEmbeddedFlattenMetadataSource(tileDoc, metadata);
-    const url = encodeTexturePath(source);
-    try {
-      const envelope = await readFlattenMetadataFromWebPUrl(url);
-      return this._deepClone(envelope.flattened);
-    } catch (error) {
-      Logger.error('TileFlatten.embeddedMetadata.readFailed', {
-        tileId: tileDoc?.id || null,
-        source,
-        error: String(error?.message || error)
-      });
-      throw new Error(`Cannot read embedded FA Nexus flatten metadata from "${source}": ${error?.message || error}`);
-    }
   }
 
   async _assertEmbeddedFlattenMetadataReadable(tileDoc, metadata) {
@@ -4383,16 +4419,6 @@ export class TileFlattenManager {
     return embedded;
   }
 
-  _resolveTileTextureSourceForFlattenMetadata(tileDoc) {
-    return String(
-      tileDoc?.texture?.src
-      || tileDoc?._source?.texture?.src
-      || tileDoc?.img
-      || tileDoc?._source?.img
-      || ''
-    ).trim();
-  }
-
   _resolveFlattenMetadataChunkForTile(tileDoc, metadata) {
     const chunks = Array.isArray(metadata?.chunks) ? metadata.chunks : [];
     if (!chunks.length) return null;
@@ -4408,7 +4434,11 @@ export class TileFlattenManager {
       if (!chunkSrc) continue;
       const chunkKey = this._normalizeUploadPathForComparison(chunkSrc);
       if (!chunkKey) continue;
-      if (chunkKey === sourceKey || chunkKey.toLowerCase() === sourceKeyLower) {
+      if (
+        chunkKey === sourceKey
+        || chunkKey.toLowerCase() === sourceKeyLower
+        || this._storageObjectKeysMatch(chunkSrc, source)
+      ) {
         return { chunk, index };
       }
     }
@@ -4611,6 +4641,42 @@ export class TileFlattenManager {
     return isLegacyFlattenedTile;
   }
 
+  _hasRestorableFlattenMetadata(metadata) {
+    return !!(metadata && typeof metadata === 'object' && Array.isArray(metadata.tiles) && metadata.tiles.length);
+  }
+
+  _cloneFlattenMetadataEntry(entry) {
+    const data = this._deepClone(entry?.data);
+    if (!data || typeof data !== 'object') return null;
+    if (!data.flags || typeof data.flags !== 'object') data.flags = {};
+
+    const storedFaFlags = entry?.faFlags && typeof entry.faFlags === 'object'
+      ? this._deepClone(entry.faFlags)
+      : null;
+    const fallbackFaFlags = data.flags[MODULE_ID] && typeof data.flags[MODULE_ID] === 'object'
+      ? this._deepClone(data.flags[MODULE_ID])
+      : null;
+    const hasStoredFaFlags = storedFaFlags && Object.keys(storedFaFlags).length > 0;
+    const faFlags = hasStoredFaFlags ? storedFaFlags : (fallbackFaFlags || storedFaFlags);
+    if (faFlags && typeof faFlags === 'object') {
+      data.flags[MODULE_ID] = faFlags;
+    }
+
+    return {
+      id: entry?.id || data?._id || data?.id || null,
+      data
+    };
+  }
+
+  _applyFlattenOffsetToTileData(data, offset = null) {
+    if (!data || typeof data !== 'object') return;
+    const offsetX = Number.isFinite(offset?.x) ? Number(offset.x) : 0;
+    const offsetY = Number.isFinite(offset?.y) ? Number(offset.y) : 0;
+    if (!offsetX && !offsetY) return;
+    data.x = (Number(data.x) || 0) + offsetX;
+    data.y = (Number(data.y) || 0) + offsetY;
+  }
+
   _prepareDeconstructionPayload(metadata, offset = null, { forceLegacyTilePositionMigration = false } = {}) {
     const entries = Array.isArray(metadata?.tiles) ? metadata.tiles : [];
     const payloads = [];
@@ -4621,40 +4687,36 @@ export class TileFlattenManager {
     const offsetY = Number.isFinite(offset?.y) ? Number(offset.y) : 0;
     for (const entry of entries) {
       try {
-        const data = this._deepClone(entry?.data);
-        if (!data || typeof data !== 'object') continue;
+        const cloned = this._cloneFlattenMetadataEntry(entry);
+        if (!cloned) continue;
+        const data = cloned.data;
+        this._applyFlattenOffsetToTileData(data, offset);
         delete data._id;
         delete data._stats;
-        if (!data.flags || typeof data.flags !== 'object') data.flags = {};
-        const storedFaFlags = entry?.faFlags && typeof entry.faFlags === 'object'
-          ? this._deepClone(entry.faFlags)
-          : null;
-        const fallbackFaFlags = data.flags[MODULE_ID] && typeof data.flags[MODULE_ID] === 'object'
-          ? this._deepClone(data.flags[MODULE_ID])
-          : null;
-        const hasStoredFaFlags = storedFaFlags && Object.keys(storedFaFlags).length > 0;
-        const faFlags = hasStoredFaFlags ? storedFaFlags : (fallbackFaFlags || storedFaFlags);
-        if (faFlags && typeof faFlags === 'object') {
-          data.flags[MODULE_ID] = faFlags;
-        }
-        const flattenedMeta = data.flags[MODULE_ID]?.flattened;
-        const shouldPreserveNestedFlattened = flattenedMeta && typeof flattenedMeta === 'object';
-        if (shouldPreserveNestedFlattened) {
-          preservedNestedFlattened += 1;
-        } else if (data.flags[MODULE_ID] && data.flags[MODULE_ID].flattened) {
-          delete data.flags[MODULE_ID].flattened;
+        const faFlags = data.flags?.[MODULE_ID];
+        if (faFlags && Object.prototype.hasOwnProperty.call(faFlags, 'flattened')) {
+          const flattenedMeta = faFlags.flattened;
+          if (this._hasRestorableFlattenMetadata(flattenedMeta)) {
+            preservedNestedFlattened += 1;
+          } else {
+            if (flattenedMeta && typeof flattenedMeta === 'object') {
+              Logger.warn('TileFlatten.deconstruct.invalidNestedFlattenedFlag', {
+                tileId: cloned.id || data?.id || null,
+                originalTileCount: flattenedMeta?.originalTileCount ?? null,
+                hasTiles: Array.isArray(flattenedMeta?.tiles),
+                tileCount: Array.isArray(flattenedMeta?.tiles) ? flattenedMeta.tiles.length : null
+              });
+            }
+            delete faFlags.flattened;
+          }
         }
         if (migrateLegacyTilePositionForV14(data, { force: forceLegacyTilePositionMigration })) {
           migratedLegacyPositions += 1;
         }
-        if (offsetX || offsetY) {
-          data.x = (Number(data.x) || 0) + offsetX;
-          data.y = (Number(data.y) || 0) + offsetY;
-        }
         const building = data.flags?.[MODULE_ID]?.building;
         payloads.push(normalizeTileCreatePayloadForV14(data, { levelPolicy: LEVEL_POLICY_PRESERVE }));
         restoredEntries.push({
-          id: entry?.id || null,
+          id: cloned.id || null,
           wallGroupId: building?.meta?.wallGroupId || building?.wall?.wallGroupId || null
         });
       } catch (error) {
@@ -4670,7 +4732,7 @@ export class TileFlattenManager {
       offsetX,
       offsetY
     });
-    return { payloads, restoredEntries };
+    return { payloads, restoredEntries, preservedNestedFlattened };
   }
 
   _readRestoredTileFaFlag(doc, key) {
@@ -5308,8 +5370,12 @@ export class TileFlattenManager {
     return rollback;
   }
 
+  _countDeconstructRestoreTiles(metadata) {
+    return Number(metadata?.originalTileCount ?? metadata?.tiles?.length ?? 0) || 0;
+  }
+
   async _confirmDeconstruct(tileDoc, metadata) {
-    const tileCount = Number(metadata?.originalTileCount ?? metadata?.tiles?.length ?? 0) || 0;
+    const tileCount = this._countDeconstructRestoreTiles(metadata);
     const message = tileCount
       ? `This will delete the flattened tile and restore ${tileCount} original tile${tileCount === 1 ? '' : 's'}. Continue?`
       : 'This will delete the flattened tile and restore the saved tiles. Continue?';
@@ -5415,7 +5481,20 @@ export class TileFlattenManager {
     const source = uploadContext?.source || 'data';
     const baseDir = uploadContext?.baseDir || '';
     const bucketOptions = uploadContext?.bucketOptions || {};
-    const result = await FP.browse(source, baseDir, { ...bucketOptions });
+    let result = null;
+    try {
+      result = await FP.browse(source, baseDir, { ...bucketOptions });
+    } catch (error) {
+      if (this._isMissingOutputFolderBrowseError(error, source, baseDir)) {
+        Logger.debug?.('TileFlatten.overwriteCheck.missingFolderClearFromError', {
+          source,
+          baseDir,
+          error: String(error?.message || error)
+        });
+        return [];
+      }
+      throw error;
+    }
     const existing = [];
     const seen = new Set();
 
@@ -5432,6 +5511,16 @@ export class TileFlattenManager {
 
     existing.sort((a, b) => String(a.filename || '').localeCompare(String(b.filename || '')));
     return existing;
+  }
+
+  _isMissingOutputFolderBrowseError(error, source, target) {
+    if (String(source || 'data').toLowerCase() !== 'data') return false;
+    if (!String(target || '').trim()) return false;
+
+    const message = String(error?.message || error || '');
+    if (!message) return false;
+    if (/permission|not permitted|not allowed|FILES_BROWSE/i.test(message)) return false;
+    return /does not exist|not found|ENOENT|no such file or directory/i.test(message);
   }
 
   async _confirmOverwriteOutputs(uploadContext, filenames, options = {}) {
@@ -5670,11 +5759,17 @@ export class TileFlattenManager {
     } catch (_) {}
     if (!path) path = `${baseDir}/${filename}`;
 
-    if (source === 's3' && !/^https?:\/\//i.test(path) && /^https?:\/\//i.test(String(assetsSetting || ''))) {
-      const baseUrl = String(assetsSetting || '').trim().endsWith('/') ? String(assetsSetting || '').trim() : `${String(assetsSetting || '').trim()}/`;
-      const rel = baseTarget && baseDir.startsWith(`${baseTarget}/`) ? baseDir.slice(baseTarget.length + 1) : (baseDir === baseTarget ? '' : baseDir);
-      const relPath = [rel, filename].filter(Boolean).join('/');
-      path = `${baseUrl}${relPath.replace(/^\/+/, '')}`;
+    if (source === 's3' && !/^https?:\/\//i.test(path)) {
+      const objectKey = this._resolveS3UploadedObjectKey(path, uploadContext, filename);
+      const s3Url = this._buildS3ObjectUrl(uploadContext, objectKey);
+      if (s3Url) {
+        path = s3Url;
+      } else if (/^https?:\/\//i.test(String(assetsSetting || ''))) {
+        const baseUrl = String(assetsSetting || '').trim().endsWith('/') ? String(assetsSetting || '').trim() : `${String(assetsSetting || '').trim()}/`;
+        const rel = baseTarget && baseDir.startsWith(`${baseTarget}/`) ? baseDir.slice(baseTarget.length + 1) : (baseDir === baseTarget ? '' : baseDir);
+        const relPath = [rel, filename].filter(Boolean).join('/');
+        path = `${baseUrl}${relPath.replace(/^\/+/, '')}`;
+      }
     }
     if (source === 'forgevtt') {
       path = forgeIntegration.optimizeCacheURL(path);
@@ -5685,6 +5780,116 @@ export class TileFlattenManager {
 
   _predictWebPUploadPath(uploadContext, filename) {
     return this._resolveSavedWebPPath(null, uploadContext || {}, filename);
+  }
+
+  _buildS3ObjectUrl(uploadContext, key) {
+    const cleanBucket = String(uploadContext?.bucketOptions?.bucket || '').trim();
+    const cleanKey = this._normalizeS3ObjectKey(key);
+    if (!cleanBucket || !cleanKey) return '';
+
+    const s3 = game?.data?.files?.s3 ?? {};
+    const forcePathStyle = Boolean(s3.forcePathStyle || s3.pathStyle || s3.usePathStyle);
+    const endpointCandidate = s3.endpoint || s3.url || s3.publicUrl || s3.publicURL || '';
+
+    let endpointUrl = null;
+    try {
+      if (endpointCandidate instanceof URL) endpointUrl = endpointCandidate;
+      else if (typeof endpointCandidate === 'string' && endpointCandidate.trim()) {
+        const raw = endpointCandidate.trim();
+        endpointUrl = new URL(raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw}`);
+      } else if (endpointCandidate && typeof endpointCandidate === 'object') {
+        const protocol = String(endpointCandidate.protocol || 'https:');
+        const host = String(endpointCandidate.host || endpointCandidate.hostname || '').trim();
+        if (host) endpointUrl = new URL(`${protocol.endsWith(':') ? protocol : `${protocol}:`}//${host}`);
+      }
+    } catch (_) {
+      endpointUrl = null;
+    }
+
+    if (endpointUrl) {
+      if (forcePathStyle) {
+        return new URL(cleanKey, this._ensureTrailingSlash(`${endpointUrl.origin.replace(/\/+$/, '')}/${cleanBucket}`)).href;
+      }
+      const host = endpointUrl.hostname;
+      const withBucketHost = host.startsWith(`${cleanBucket}.`) ? host : `${cleanBucket}.${host}`;
+      const origin = `${endpointUrl.protocol}//${withBucketHost}${endpointUrl.port ? `:${endpointUrl.port}` : ''}`;
+      return new URL(cleanKey, this._ensureTrailingSlash(origin)).href;
+    }
+
+    const region = s3.region || s3.awsRegion || s3.awsDefaultRegion || '';
+    const host = region ? `${cleanBucket}.s3.${region}.amazonaws.com` : `${cleanBucket}.s3.amazonaws.com`;
+    return new URL(cleanKey, `https://${host}/`).href;
+  }
+
+  _ensureTrailingSlash(value) {
+    const normalized = String(value ?? '').trim();
+    if (!normalized) return '';
+    return normalized.endsWith('/') ? normalized : `${normalized}/`;
+  }
+
+  _normalizeS3ObjectKey(value) {
+    let raw = String(value ?? '').trim();
+    if (!raw) return '';
+    raw = raw.split(/[?#]/, 1)[0] || '';
+    try { raw = decodeURI(raw); } catch (_) {}
+    return raw.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/{2,}/g, '/');
+  }
+
+  _resolveS3ObjectKey(value, uploadContext = null) {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '';
+
+    try {
+      const resolved = forgeIntegration.resolveFilePickerContext(raw);
+      if (resolved?.source === 's3') {
+        const target = this._normalizeS3ObjectKey(resolved.target);
+        if (target) return target;
+      }
+    } catch (_) {}
+
+    if (/^https?:\/\//i.test(raw)) {
+      try {
+        const url = new URL(raw);
+        let key = this._normalizeS3ObjectKey(url.pathname);
+        const bucket = String(uploadContext?.bucketOptions?.bucket || '').trim().toLowerCase();
+        if (bucket) {
+          const parts = key.split('/').filter(Boolean);
+          if (parts[0]?.toLowerCase() === bucket) key = parts.slice(1).join('/');
+        }
+        return key;
+      } catch (_) {}
+    }
+
+    if (/^s3:/i.test(raw)) {
+      let key = raw.replace(/^s3:\/?/i, '');
+      const bucket = String(uploadContext?.bucketOptions?.bucket || '').trim().toLowerCase();
+      if (bucket) {
+        const parts = key.split('/').filter(Boolean);
+        if (parts[0]?.toLowerCase() === bucket) key = parts.slice(1).join('/');
+      }
+      return this._normalizeS3ObjectKey(key);
+    }
+
+    return this._normalizeS3ObjectKey(raw);
+  }
+
+  _resolveS3UploadedObjectKey(path, uploadContext, filename) {
+    const key = this._resolveS3ObjectKey(path, uploadContext);
+    const baseKey = this._resolveS3ObjectKey(uploadContext?.baseDir || '', uploadContext);
+    if (!key) return [baseKey, filename].filter(Boolean).join('/');
+    if (baseKey && !key.includes('/')) return `${baseKey}/${key}`;
+    return key;
+  }
+
+  _s3UploadPathsMatch(expectedPath, actualPath, uploadContext = null) {
+    if ((uploadContext?.source || '') !== 's3') return false;
+    return this._storageObjectKeysMatch(expectedPath, actualPath, uploadContext);
+  }
+
+  _storageObjectKeysMatch(leftPath, rightPath, uploadContext = null) {
+    const leftKey = this._resolveS3ObjectKey(leftPath, uploadContext);
+    const rightKey = this._resolveS3ObjectKey(rightPath, uploadContext);
+    return !!(leftKey && rightKey && leftKey === rightKey);
   }
 
   _normalizeUploadPathForComparison(value) {
@@ -5699,18 +5904,20 @@ export class TileFlattenManager {
     return raw.replace(/^\/+/, '').replace(/\/{2,}/g, '/');
   }
 
-  _assertSavedWebPPath(expectedPath, actualPath, filename) {
+  _recordSavedWebPPathMismatch(expectedPath, actualPath, filename, uploadContext = null) {
     if (!expectedPath) return;
     const expected = this._normalizeUploadPathForComparison(expectedPath);
     const actual = this._normalizeUploadPathForComparison(actualPath);
     if (expected === actual) return;
+    if (this._s3UploadPathsMatch(expectedPath, actualPath, uploadContext)) return;
 
-    Logger.error('TileFlatten.saveWebP.pathMismatch', {
+    Logger.warn('TileFlatten.saveWebP.pathMismatch', {
       filename,
       expectedPath,
-      actualPath
+      actualPath,
+      source: uploadContext?.source || 'data',
+      usingActualPath: true
     });
-    throw new Error(`Uploaded WebP path mismatch for ${filename}; expected "${expectedPath}" but Foundry returned "${actualPath}". Cannot trust embedded flatten metadata.`);
   }
 
   async _saveAsWebP(canvasEl, quality, options = {}) {
@@ -5736,7 +5943,7 @@ export class TileFlattenManager {
     const uploadResult = await FP.upload(source, baseDir, file, { ...bucketOptions }, { notify: true, filename });
 
     const path = this._resolveSavedWebPPath(uploadResult, uploadContext, filename);
-    this._assertSavedWebPPath(options.expectedPath || '', path, filename);
+    this._recordSavedWebPPathMismatch(options.expectedPath || '', path, filename, uploadContext);
 
     // Wait for Foundry to process the uploaded file before using it
     // This prevents "Invalid Asset" errors when immediately creating tiles
@@ -5777,14 +5984,36 @@ export class TileFlattenManager {
     };
   }
 
+  _replaceFlattenMetadataGeneratedPath(metadata, previousPath, nextPath) {
+    const previous = String(previousPath || '').trim();
+    const next = String(nextPath || '').trim();
+    if (!metadata || !previous || !next || previous === next) return;
+
+    const matches = (candidate) => this._normalizeUploadPathForComparison(candidate) === this._normalizeUploadPathForComparison(previous);
+    if (matches(metadata.filePath)) metadata.filePath = next;
+    if (metadata.embeddedMetadata && matches(metadata.embeddedMetadata.primaryFilePath)) {
+      metadata.embeddedMetadata.primaryFilePath = next;
+    }
+    if (Array.isArray(metadata.chunks)) {
+      for (const chunk of metadata.chunks) {
+        if (matches(chunk?.src)) chunk.src = next;
+      }
+    }
+  }
+
   async _saveCapturedFlattenWebP(record, uploadContext, metadata) {
+    const expectedPath = String(record?.src || '').trim();
     const path = await this._saveWebPBlob(record?.blob, {
       uploadContext,
       filename: record?.filename,
-      expectedPath: record?.src,
+      expectedPath,
       flattenMetadata: metadata
     });
     if (!path) throw new Error(`Failed to save flattened WebP ${record?.filename || ''}`.trim());
+    if (record && path !== expectedPath) {
+      record.src = path;
+      this._replaceFlattenMetadataGeneratedPath(metadata, expectedPath, path);
+    }
     return path;
   }
 
@@ -5818,19 +6047,31 @@ export class TileFlattenManager {
     const tileData = [];
 
     const list = Array.isArray(tiles) ? tiles : [];
+    let preservedNestedFlattened = 0;
     for (let i = 0; i < list.length; i += 1) {
       const doc = list[i];
       if (!doc) continue;
       try {
         const data = doc.toObject(false);
+        const faFlags = data?.flags?.[MODULE_ID] ? this._deepClone(data.flags[MODULE_ID]) : {};
+        if (this._hasRestorableFlattenMetadata(faFlags?.flattened || data?.flags?.[MODULE_ID]?.flattened)) {
+          preservedNestedFlattened += 1;
+        }
         tileData.push({
           id: doc.id,
           data,
-          faFlags: data?.flags?.['fa-nexus'] ? this._deepClone(data.flags['fa-nexus']) : {}
+          faFlags
         });
       } catch (error) {
         Logger.debug?.('TileFlatten.metadata.toObject.failed', { error: String(error?.message || error) });
       }
+    }
+    if (preservedNestedFlattened) {
+      Logger.debug?.('TileFlatten.metadata.preservedNestedFlattenedSources', {
+        sourceTiles: tileData.length,
+        metadataTiles: tileData.length,
+        preservedNestedFlattened
+      });
     }
 
     const normalizedInsets = this._normalizePaddingInsets(paddingInsets)

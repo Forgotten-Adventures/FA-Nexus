@@ -167,6 +167,38 @@ export function invalidateWarmCloudAssetCache(reason = 'unknown') {
   Logger.info('AssetsWarmup.invalidate', { reason });
 }
 
+function cancelWarmCloudAssetBackgroundWork(reason = 'unknown') {
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  const active = cache.status === 'scheduled' || cache.status === 'syncing' || cache.status === 'loading';
+  clearWarmCloudAssetTimer();
+  if (!active) return;
+  invalidateWarmCloudAssetCache(reason);
+}
+
+function seedWarmCloudAssetCache({ latest, items, reason = 'foreground-load' } = {}) {
+  const expectedLatest = String(latest || '').trim();
+  if (!expectedLatest || !Array.isArray(items)) return;
+  const cache = SHARED_ASSET_CLOUD_WARM_CACHE;
+  clearWarmCloudAssetTimer();
+  cache.generation += 1;
+  const controller = cache.abortController;
+  cache.abortController = null;
+  cache.loadPromise = null;
+  cache.items = items;
+  cache.latest = expectedLatest;
+  cache.error = null;
+  cache.mode = 'idle';
+  cache.status = 'ready';
+  if (controller) {
+    try { controller.abort(`seed:${reason}`); } catch (_) {}
+  }
+  Logger.info('AssetsWarmup.cache.seeded', {
+    reason,
+    latest: expectedLatest,
+    count: items.length
+  });
+}
+
 function normalizeCloudAssetRecord(record) {
   if (!record) return null;
   const file_path = String(record.file_path || '').trim();
@@ -1386,6 +1418,7 @@ async function fetchCloudAssets(tab, onProgress, signal) {
     }
   }
 
+  cancelWarmCloudAssetBackgroundWork('foreground-cloud-sync');
   Logger.info('AssetsTab.cloud.sync', { mode: tab._mode, kind, hadCachedIndex });
   try {
     await svc.sync(kind, {
@@ -1418,7 +1451,7 @@ async function fetchCloudAssets(tab, onProgress, signal) {
       signal,
       priority: 'interactive',
       expectedLatest: latest,
-      createIfMissing: true,
+      createIfMissing: false,
       service: svc
     }) : null;
     if (Array.isArray(warmItems)) {
@@ -1470,6 +1503,8 @@ async function fetchCloudAssets(tab, onProgress, signal) {
     out.push(rec);
     if (signal?.aborted) throw abortError();
   }
+
+  seedWarmCloudAssetCache({ latest, items: out, reason: 'foreground-cloud-list' });
 
   return {
     items: out,

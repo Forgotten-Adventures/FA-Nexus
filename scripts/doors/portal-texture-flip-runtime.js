@@ -162,6 +162,27 @@ function getNativeDoorMeshes(doc) {
   return wall?.doorMeshes ? Array.from(wall.doorMeshes).filter(Boolean) : [];
 }
 
+function getDocumentLevelIds(doc) {
+  const levels = doc?.levels;
+  if (levels?.size) return Array.from(levels).map((id) => String(id)).filter(Boolean);
+  const sourceLevels = doc?._source?.levels || doc?.data?.levels || null;
+  return Array.isArray(sourceLevels) ? sourceLevels.map((id) => String(id)).filter(Boolean) : [];
+}
+
+function shouldSyncNativeDoorMeshes(doc) {
+  if (!doc?.id) return false;
+  const scene = canvas?.scene || null;
+  const levelIds = getDocumentLevelIds(doc);
+  if (!scene?.levels || !levelIds.length) return true;
+  if (doc?.viewed === true) return true;
+  Logger.debug?.('PortalTextureFlip.nativeMeshes.skippedInactiveLevel', {
+    wallId: doc.id,
+    viewedLevelId: scene?._view || null,
+    wallLevelIds: levelIds
+  });
+  return false;
+}
+
 function hasAnimatedPortal(doc) {
   const portal = getPortalFlags(doc);
   if (!portal) return false;
@@ -171,8 +192,10 @@ function hasAnimatedPortal(doc) {
 
 async function syncNativeDoorMeshesWithRetry(doc, { reason = 'unknown' } = {}) {
   if (!doc?.id || !hasAnimatedPortal(doc)) return false;
+  if (!shouldSyncNativeDoorMeshes(doc)) return false;
   for (let attempt = 0; attempt < SYNC_RETRY_ATTEMPTS; attempt += 1) {
     if (!canvas?.ready) return false;
+    if (!shouldSyncNativeDoorMeshes(doc)) return false;
     const meshes = getNativeDoorMeshes(doc);
     if (meshes.length) {
       return syncPortalTextureFlipForDocument(doc, meshes, { reason });
@@ -208,6 +231,7 @@ function scheduleNativeDoorMeshSync(doc, reason) {
 function syncWallPlaceable(wall, reason) {
   const doc = wall?.document || wall;
   if (!doc?.id || !getPortalFlags(doc)) return;
+  if (!shouldSyncNativeDoorMeshes(doc)) return;
   const meshes = wall?.doorMeshes ? Array.from(wall.doorMeshes).filter(Boolean) : [];
   if (meshes.length) {
     syncPortalTextureFlipForDocument(doc, meshes, { reason });

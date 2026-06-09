@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.3] - 2026-06-09
+
+### Added
+- **Premium Feature Access Disclaimer:**
+    - Added a premium feature disclaimer above the Texture Painting, Paths, and Building Tool grids for unauthenticated users, clarifying the Adventurer tier requirement and Patreon connection step.
+
+### Fixed
+- **Token Eye Level:**
+    - The overwrite eye-level setting now uses a point 0.5 units below the top of the token cube instead of the exact cube top, avoiding ceiling-boundary line-of-sight edge cases.
+
+- **Token Placement:**
+    - Detached FA Nexus windows can now place uncached cloud tokens without handing Foundry the raw catalog path.
+    - Cloud token previews and color-variant placement now wait for the resolved local or CDN image path instead of falling back to non-image folder data.
+
+- **Cloud Asset Catalog:**
+    - Clearing or reindexing the cloud asset cache now invalidates the shared asset catalog and warm cache, so asset grids refresh without stale cloud entries.
+    - Foreground cloud asset loads now cancel stale background warmup work and seed the warm cache from the loaded records.
+
+- **Exploration Image Canvas Crash:**
+    - Hiding the viewed v14 level background now preserves Foundry's required background slot with a transparent texture, preventing fog/exploration visibility overlays from crashing canvas draw with `baseTexture` errors. [Issue #50](https://github.com/Forgotten-Adventures/FA-Nexus/issues/50)
+
+- **Building Doors & Portals:**
+    - Portal texture flips no longer try to sync native door meshes for inactive v14 levels.
+    - Animated door and window proxies now use correct sort value, preventing bleeding over higher level backgrounds.
+
+- **Layer Manager:**
+    - Renamed v14 tiles now show their saved Tile Config name in the Layer Manager even when Foundry stores it on the tile source data, fixing flattened tiles and Door Frame layers falling back to generated filenames or asset names.
+
+- **Flatten & Scene Export:**
+    - Flatten/export output checks now treat missing generated data folders as empty folders with an overwrite-safety warning, instead of preventing the export.
+    - Fixed some overly-strict metadata coupling that could prevent flattening in certain situations.
+    - Fixed some noisy debug logs.
+    - S3 flatten output paths now resolve through the configured bucket and endpoint, and saved flatten metadata is updated with the path Foundry actually returns.
+
 ## [0.5.2] - 2026-05-22
 
 ### Added

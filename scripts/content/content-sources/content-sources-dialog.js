@@ -841,6 +841,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
       const { CloudDB } = await import('../cloud-db.js');
       const db = new CloudDB(config.db);
       await db.clear(config.store);
+      await this._afterCloudIndexCleared?.(config);
       this._cloudCacheMeta = { ...this._cloudCacheMeta, count: 0, latest: null };
       if (this._cloudContext) {
         this._cloudContext.cacheCount = 0;

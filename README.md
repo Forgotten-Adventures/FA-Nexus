@@ -39,7 +39,7 @@ FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featur
 - **Random Color on Placement:** Randomize colors of selected Token(s) on drop.
 - **Place Token As:** Choose an existing actor from your world or compendium to place token as that actor.
 - **Level-aware placement:** Token placement targets the currently viewed v14 scene level and uses that level's bottom elevation for new token drops.
-- **Eye Level Height:** Token Config includes an FA Nexus eye-level field, plus a module setting for a higher default eye level to avoid midpoint line-of-sight edge cases between elevations.
+- **Eye Level Height:** Token Config includes an FA Nexus eye-level field, plus a module setting for a higher default eye level 0.5 units below the token cube top to avoid midpoint and ceiling-boundary line-of-sight edge cases between elevations.
 - **Hit point presets:** Use the actor default, roll a formula, apply a percentage, add a ±variance, or enter a custom value—even per placement session.
 - **Grid savvy:** Snap to grid, rotate, mirror, or randomize facing before every drop.
 - **Super Wildcards:** Combine the systems above for "super" wildcard placement. For example, multi-select NPCs, enable "Random Color on Placement", choose a "Commoner" statblock as "Place Token As", enable random rotation/flip, and start placing. Each click can drop a random NPC with random color and random rotation.
@@ -136,7 +136,7 @@ Single placement preview:
 - **Live bounds preview:** See output bounds while adjusting the flatten region.
 - **Padding adjust:** Add or trim padding and watch the bounds update live.
 - **Persistent settings:** Options like PPI and quality are remembered.
-- **Smart deconstruct:** Moved flattened tiles deconstruct in their new position, and nested flattened metadata is preserved.
+- **Smart deconstruct:** Moved flattened tiles deconstruct in their new position, and source flattened tiles keep their own deconstruct data so they can be deconstructed separately later.
 - **Chunking:** Large flattened tiles are split automatically and stitched at runtime for better performance.
 - **Level export:** Export or flatten the current viewed level, or run every scene level in sequence. Split output uses background, middle, and foreground band suffixes.
 

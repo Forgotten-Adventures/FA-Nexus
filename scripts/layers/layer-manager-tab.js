@@ -36,7 +36,10 @@ import {
 } from '../canvas/tile-selection-context.js';
 import { getFaNexusTileCapabilities } from '../canvas/tile-capabilities.js';
 import { readDocumentHsbc } from '../core/hsbc.js';
-import { clearStandardTileMask } from '../textures/texture-render.js';
+import {
+  clearStandardTileMask,
+  getTransparentTextureSrc
+} from '../textures/texture-render.js';
 import {
   applySceneElevationGroupMetadataLocally,
   cloneElevationGroupMetadata,
@@ -1243,6 +1246,10 @@ function isLevelTextureMarkerHidden(level = null, kind = 'background') {
   return !!readFaFlag(level, getLevelTextureHiddenFlagKey(kind));
 }
 
+function shouldPreserveHiddenLevelTextureForCanvas(texture, kind = 'background') {
+  return kind === 'background' && !!texture?.level?.isView;
+}
+
 function ensureSceneLevelTextureVisibilityPatch() {
   const SceneDocument = CONFIG?.Scene?.documentClass || foundry?.documents?.Scene || globalThis.Scene;
   const prototype = SceneDocument?.prototype;
@@ -1266,10 +1273,20 @@ function ensureSceneLevelTextureVisibilityPatch() {
     value: function faNexusConfigureLevelTextures(...args) {
       const textures = original.apply(this, args);
       if (!Array.isArray(textures) || !textures.length) return textures;
-      return textures.filter((texture) => {
+      const visibleTextures = [];
+      for (const texture of textures) {
         const kind = texture?.isBackground ? 'background' : 'foreground';
-        return !isLevelTextureMarkerHidden(texture?.level || null, kind);
-      });
+        if (!isLevelTextureMarkerHidden(texture?.level || null, kind)) {
+          visibleTextures.push(texture);
+          continue;
+        }
+        if (!shouldPreserveHiddenLevelTextureForCanvas(texture, kind)) continue;
+        visibleTextures.push({
+          ...texture,
+          src: getTransparentTextureSrc()
+        });
+      }
+      return visibleTextures;
     }
   });
   Object.defineProperty(prototype, '_faNexusLevelTextureVisibilityPatched', {
@@ -2090,6 +2107,8 @@ function ensureLayerHiddenHooks() {
 
 function computeTileName(tile, index) {
   const doc = tile?.document;
+  const sourceName = String(doc?._source?.name ?? '').trim();
+  if (sourceName) return sourceName;
   const documentName = String(doc?.name ?? '').trim();
   if (documentName) return documentName;
   const explicitName = readFaFlag(doc, 'name');

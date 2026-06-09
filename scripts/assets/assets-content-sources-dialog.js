@@ -79,6 +79,20 @@ export class FaNexusAssetsFolderSelectionDialog extends BaseContentSourcesDialog
     };
   }
 
+  async _invalidateCloudAssetCatalog(reason) {
+    const {
+      invalidateSharedAssetCatalog,
+      invalidateWarmCloudAssetCache
+    } = await import('./assets-tab-controller.js');
+    invalidateWarmCloudAssetCache(reason);
+    invalidateSharedAssetCatalog(reason);
+  }
+
+  async _afterCloudIndexCleared(config) {
+    if (config?.store !== 'assets') return;
+    await this._invalidateCloudAssetCatalog('cloud-index-cleared');
+  }
+
   async _handleIndexFolder(folder, button) {
     // Handle cloud indexing specially
     const cloudConfig = this._getCloudConfig();
@@ -137,6 +151,7 @@ export class FaNexusAssetsFolderSelectionDialog extends BaseContentSourcesDialog
       }
 
       this._renderIndexState(folder, { status: 'done', count: finalCount, finishedAt: Date.now(), error: null });
+      await this._invalidateCloudAssetCatalog('cloud-indexed');
       this._markCacheDirty();
       this._captureScrollPosition();
       this._requestRender({ immediate: true, preserveScroll: true });

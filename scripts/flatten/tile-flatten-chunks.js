@@ -224,19 +224,22 @@ export async function applyFlattenedChunks(tile) {
   try {
     if (!tile || tile.destroyed) return;
     const doc = tile.document;
+    const meta = resolveFlattenedMeta(doc);
+    const chunks = resolveChunkEntriesFromMeta(meta);
     const standardMask = doc?.getFlag?.(MODULE_ID, 'standardTileMask')
       || doc?.flags?.[MODULE_ID]?.standardTileMask
       || doc?._source?.flags?.[MODULE_ID]?.standardTileMask
       || null;
     if (standardMask) {
-      cleanupFlattenedChunks(tile);
-      Logger.info?.('TileFlatten.applyChunks.skippedForStandardMask', {
-        tileId: doc?.id || null
-      });
+      const hadOverlay = tileHasFlattenChunkOverlay(tile);
+      if (hadOverlay) cleanupFlattenedChunks(tile);
+      if (chunks.length || hadOverlay) {
+        Logger.trace?.('flatten-chunks', 'TileFlatten.applyChunks.skippedForStandardMask', {
+          tileId: doc?.id || null
+        });
+      }
       return;
     }
-    const meta = resolveFlattenedMeta(doc);
-    const chunks = resolveChunkEntriesFromMeta(meta);
     if (!chunks.length) {
       if (meta) await repairFlattenedTileTexture(doc, meta, tile);
       cleanupFlattenedChunks(tile);

@@ -608,6 +608,10 @@ export class AssetShadowManager {
         layer.tiles.delete(tileId);
         this._tileIndex.delete(tileId);
         this._suspendedTiles.set(tileId, { doc, layerKey });
+        if (!layer.tiles.size) {
+          this._destroyLayer(layerKey);
+          return true;
+        }
         this._scheduleRebuild(layerKey, true);
         return true;
       } catch (e) {

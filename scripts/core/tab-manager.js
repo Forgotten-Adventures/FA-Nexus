@@ -175,6 +175,8 @@ export class TabManager {
     // Update active tab
     this._activeTab = safeId;
     this._activeTabObj = this._tabs[safeId] || null;
+    try { this.app._syncPremiumDisclaimer?.(); }
+    catch (error) { this._logLifecycleFailure('TabSwitch.premiumDisclaimerSyncFailed', error, { tab: safeId }); }
 
     // Save to settings
     this.saveActiveTabToSettings(safeId);

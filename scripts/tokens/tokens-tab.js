@@ -1788,6 +1788,7 @@ export class TokensTab extends GridBrowseTab {
       item._variantRecord = it;
       item.setAttribute('data-filename', it.filename || '');
       item.setAttribute('data-path', it.path || '');
+      if (it.file_path) item.setAttribute('data-file-path', it.file_path);
       item.setAttribute('data-url', it.file_path || '');
       item.setAttribute('data-source', it.source || 'local');
       item.setAttribute('data-file-size', it.file_size || '');

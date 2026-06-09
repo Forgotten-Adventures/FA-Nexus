@@ -694,7 +694,7 @@ export function registerFaNexusSettings() {
     default: true,
     config: true,
     restricted: true,
-    hint: 'When enabled, Eye Level Height will use the top of the token\'s cube for vision and visibility tests instead of Foundry\'s default mid-height.',
+    hint: 'When enabled, Eye Level Height will use 0.5 units below the top of the token\'s cube for vision and visibility tests instead of Foundry\'s default mid-height.',
     onChange: (value) => {
       try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'overwriteEyeLevel', value }); } catch (_) { }
       try { Hooks.callAll('fa-nexus-overwrite-eye-level-changed', { enabled: !!value }); } catch (_) { }

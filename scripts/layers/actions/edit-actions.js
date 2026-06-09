@@ -131,7 +131,7 @@ export async function commitRename({
   }
 
   const nextValue = String(inputEl?.value ?? renameDraft ?? '').trim();
-  const currentValue = String(doc?.name ?? '').trim();
+  const currentValue = String(doc?._source?.name ?? doc?.name ?? '').trim();
   const legacyValue = String(readFlag?.(doc, 'name') || '').trim();
   applyStatePatch(setRenameState, { renameDraft: nextValue });
   try { setRenameSubmitting?.(true); } catch (_) {}

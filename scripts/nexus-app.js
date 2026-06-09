@@ -33,6 +33,8 @@ import {
   preserveCurrentTileSelectionForNexus
 } from './canvas/tile-selection-context.js';
 
+const PREMIUM_DISCLAIMER_TABS = new Set(['textures', 'paths', 'buildings']);
+
 function logAppLifecycleFailure(scope, error, details = {}) {
   Logger.warn(scope, { ...details, error });
 }
@@ -199,6 +201,7 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
               getAuthService: () => this._getAuthService()
             });
             this._setPatreonHeaderVisibility(!this.minimized);
+            this._syncPremiumDisclaimer();
           } catch (err) { Logger.warn('Auth header refresh failed', err); }
         };
         Hooks.on('updateSetting', this._authSettingHook);
@@ -206,6 +209,7 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     } catch (error) {
       logAppLifecycleFailure('App.authHeader.hookInstallFailed', error);
     }
+    this._syncPremiumDisclaimer();
   }
 
   _onAttach(fromDocument, toDocument) {
@@ -359,6 +363,29 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
       if (header) header.hidden = !visible;
     } catch (error) {
       logAppLifecycleFailure('App.authHeader.visibilityFailed', error, { visible: !!visible });
+    }
+  }
+
+  _hasPremiumAuth() {
+    try {
+      const auth = game?.settings?.get?.('fa-nexus', 'patreon_auth_data');
+      return !!(auth && auth.authenticated && auth.state);
+    } catch (error) {
+      logAppLifecycleFailure('App.premiumAuth.readFailed', error);
+      return false;
+    }
+  }
+
+  _syncPremiumDisclaimer() {
+    try {
+      const notice = this.element?.querySelector('.fa-nexus-premium-disclaimer');
+      if (!notice) return;
+      const activeTab = this._tabManager?.getActiveTabId?.() || null;
+      const visible = PREMIUM_DISCLAIMER_TABS.has(activeTab) && !this._hasPremiumAuth();
+      notice.hidden = !visible;
+      notice.setAttribute('aria-hidden', visible ? 'false' : 'true');
+    } catch (error) {
+      logAppLifecycleFailure('App.premiumDisclaimer.syncFailed', error);
     }
   }
 

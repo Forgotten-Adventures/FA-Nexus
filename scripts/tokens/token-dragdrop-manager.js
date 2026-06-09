@@ -209,7 +209,9 @@ export class TokenDragDropManager {
       })();
       card._ensureLocalPromise = p;
       await Promise.race([p, new Promise(r => setTimeout(r, 10))]); // yield quickly; don't block mousedown
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn('TokenDrag.cloudprep.failed', { error: String(error?.message || error) });
+    }
   }
 
   async _createQueuedPreview(card, cursorX, cursorY) {
@@ -319,21 +321,65 @@ export class TokenDragDropManager {
     return { gridWidth, gridHeight, scale };
   }
 
+  static _looksLikeImagePath(path) {
+    if (!path) return false;
+    let normalized = String(path).trim();
+    if (!normalized) return false;
+    try {
+      const base = globalThis?.location?.origin || 'http://localhost';
+      const parsed = new URL(normalized, base);
+      normalized = parsed.pathname || normalized;
+    } catch (_) {}
+    return /\.(webp|png|jpg|jpeg|gif|svg)$/i.test(normalized);
+  }
+
+  static _isAbsoluteHttpUrl(path) {
+    return /^https?:\/\//i.test(String(path || '').trim());
+  }
+
+  static _getResolvedCardImagePath(card) {
+    if (!card) return '';
+    const source = (card.getAttribute?.('data-source') || '').toLowerCase();
+    const isCloud = source === 'cloud';
+    const isCached = card.getAttribute?.('data-cached') === 'true';
+    const resolved = card._resolvedLocalPath || '';
+    if (TokenDragDropManager._looksLikeImagePath(resolved)) return resolved;
+
+    const urlAttr = card.getAttribute?.('data-url') || '';
+    if (TokenDragDropManager._looksLikeImagePath(urlAttr)) {
+      if (!isCloud || isCached || TokenDragDropManager._isAbsoluteHttpUrl(urlAttr)) return urlAttr;
+    }
+
+    const pathAttr = card.getAttribute?.('data-path') || '';
+    if (!isCloud && TokenDragDropManager._looksLikeImagePath(pathAttr)) return pathAttr;
+    return '';
+  }
+
+  static async _resolveCardImagePath(card, { waitForDownload = true } = {}) {
+    const ready = TokenDragDropManager._getResolvedCardImagePath(card);
+    if (ready) return ready;
+    const promise = waitForDownload ? card?._ensureLocalPromise : null;
+    if (!promise) return '';
+    const resolved = await promise;
+    if (resolved && TokenDragDropManager._looksLikeImagePath(resolved)) {
+      try {
+        card._resolvedLocalPath = resolved;
+        card.setAttribute?.('data-url', resolved);
+      } catch (_) {}
+      return resolved;
+    }
+    return TokenDragDropManager._getResolvedCardImagePath(card);
+  }
+
   static async _loadPreviewImageForCard(card, img, loadingDiv) {
     try {
-      const looksLikeFile = (p) => /\.(webp|png|jpg|jpeg|gif|svg)$/i.test(String(p || ''));
-      let localPath = card._resolvedLocalPath || '';
-      if (!localPath) {
-        const urlAttr = card.getAttribute('data-url') || '';
-        const pathAttr = card.getAttribute('data-path') || '';
-        localPath = looksLikeFile(urlAttr) ? urlAttr : (looksLikeFile(pathAttr) ? pathAttr : (urlAttr || pathAttr));
-      }
-      if (card._ensureLocalPromise) {
-        try { localPath = await card._ensureLocalPromise; } catch (_) {}
-      }
+      const source = (card?.getAttribute?.('data-source') || '').toLowerCase();
+      const isCloud = source === 'cloud';
+      const looksLikeFile = TokenDragDropManager._looksLikeImagePath;
+      let localPath = await TokenDragDropManager._resolveCardImagePath(card, { waitForDownload: true });
       try {
         const filename = card.getAttribute('data-filename') || '';
-        if ((!localPath || !looksLikeFile(localPath)) && filename) {
+        if (!isCloud && (!localPath || !looksLikeFile(localPath)) && filename) {
           const base = card.getAttribute('data-path') || card.getAttribute('data-url') || '';
           if (base) {
             const sep = base.endsWith('/') ? '' : '/';
@@ -347,6 +393,7 @@ export class TokenDragDropManager {
         img.src = localPath;
         Logger.info('TokenDrag.preview.src', { src: img.src, card });
       } else {
+        if (isCloud) throw new Error('Cloud token image is not downloaded or resolved');
         const thumb = card.querySelector('img');
         if (thumb && thumb.src) img.src = thumb.src;
         Logger.warn('TokenDrag.preview.no-src', { card });
@@ -598,18 +645,21 @@ export class TokenDragDropManager {
         const scaleAttr = card.getAttribute('data-scale') || '1x';
         const scale = typeof scaleAttr === 'string' && scaleAttr.endsWith('x') ? Number(scaleAttr.replace('x','')) : Number(scaleAttr) || 1;
 
-        // Prefer resolved local path, then file-like data-url, then file-like data-path
-        const looksFile = (p) => /\.(webp|png|jpg|jpeg|gif|svg)$/i.test(String(p||''));
-        let localPath = card._resolvedLocalPath || '';
+        let localPath = '';
+        try {
+          localPath = await TokenDragDropManager._resolveCardImagePath(card, { waitForDownload: true });
+        } catch (error) {
+          Logger.warn('TokenDrag.queued.resolveImage.failed', { error: String(error?.message || error), card });
+          ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
+          this._cleanupQueuedDrag();
+          return;
+        }
         if (!localPath) {
-          const urlAttr = card.getAttribute('data-url') || '';
-          const pathAttr = card.getAttribute('data-path') || '';
-          localPath = looksFile(urlAttr) ? urlAttr : (looksFile(pathAttr) ? pathAttr : (urlAttr || pathAttr));
+          Logger.warn('TokenDrag.queued.resolveImage.missing', { filename, card });
+          ui.notifications?.warn?.('Token image is not available yet.');
+          this._cleanupQueuedDrag();
+          return;
         }
-        if (card._ensureLocalPromise) {
-          try { localPath = await card._ensureLocalPromise; } catch (_) {}
-        }
-        if (!localPath) { this._cleanupQueuedDrag(); return; }
 
         // Build drag data (include origin source/tier from card attributes)
         const originSource = card.getAttribute('data-source') || '';
