@@ -1,7 +1,7 @@
 # FA Nexus
 
 ![Foundry VTT v14](https://img.shields.io/badge/Foundry%20VTT-v14-green)
-![Version](https://img.shields.io/badge/version-0.5.x-orange)
+![Version](https://img.shields.io/badge/version-0.6.x-orange)
 ![Status](https://img.shields.io/badge/status-Beta-yellow)
 
 FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featured mapmaking capabilities* and *advanced token management inside* Foundry VTT as well as other QoL improvements.
@@ -15,15 +15,20 @@ FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featur
 - **Layer Manager** - Right sidebar tab with a list of all tiles within a scene, right under the 'Scenes' button. Supports v14 level-aware groups, visibility/lock toggles, selection sync, drag-and-drop ordering, and `F2` inline rename for tile labels.
 - Custom Tokens & Assets support - Bring your own content to FA Nexus interface & Tools.
 - **Flatten & Scene Export** - Merge tiles or export scenes for the current viewed level or all scene levels, with background/middle/foreground split support, custom output names, and selectable save folders.
+- **Scene Groups** - Group Tiles, Walls, Lights, Sounds, and Regions, then move, rotate, and scale them together on the canvas.
+- **Prefabs (Experimental)** - Save Scene Groups to a local Prefab library shared by every world, place them in any Scene and on any Level, and exchange them as files.
 - Smart Search, Folders, and Bookmarks
 - Pixel Perfect tiles selection
 
-### Premium content & Features - [Patreon Adventurer tier ($7) or higher](https://www.patreon.com/forgottenadventures/membership)
-- **Content unlocks** - All Token Color variants, Premium Tokens, Assets, Paths & Textures 
+### Premium content - [Patreon Premium tier or higher](https://www.patreon.com/forgottenadventures/membership)
+- **Content unlocks** - All Token Color variants, Premium Tokens, and Premium Assets
+
+### Pro tools - [Patreon Pro tier](https://www.patreon.com/forgottenadventures/membership)
+Pro includes everything in Premium, plus:
 - **Texture painting** - Brush and fill tools with height-map masking and blend modes for rapid terrain blending.
 - **Tile Masking** - Mask compatible tiles through the premium Texture Painting editor, clear masks from Tile Config or Layer Manager, and remove parts of a tile image directly in Foundry.
 - **Paths** - Place or freehand draw curved paths with optional Foundry Walls & Drop Shadow support.
-- **Building tool** - Draw outer and inner walls, place doors and windows, then assemble structures with automatic shadows, Foundry walls, composite building tiles, and generated Regions.
+- **Building tool** - Draw outer and inner walls, place doors, windows, openings, and secret doors, fill each room, and commit a Building with its Foundry Walls, doors, and Region. A committed Building can be moved, rotated, scaled, and reopened for editing.
 
 
 
@@ -39,7 +44,6 @@ FA Nexus is the all-in-one hub for Forgotten Adventures—bringing *fully featur
 - **Random Color on Placement:** Randomize colors of selected Token(s) on drop.
 - **Place Token As:** Choose an existing actor from your world or compendium to place token as that actor.
 - **Level-aware placement:** Token placement targets the currently viewed v14 scene level and uses that level's bottom elevation for new token drops.
-- **Eye Level Height:** Token Config includes an FA Nexus eye-level field, plus a module setting for a higher default eye level 0.5 units below the token cube top to avoid midpoint and ceiling-boundary line-of-sight edge cases between elevations.
 - **Hit point presets:** Use the actor default, roll a formula, apply a percentage, add a ±variance, or enter a custom value—even per placement session.
 - **Grid savvy:** Snap to grid, rotate, mirror, or randomize facing before every drop.
 - **Super Wildcards:** Combine the systems above for "super" wildcard placement. For example, multi-select NPCs, enable "Random Color on Placement", choose a "Commoner" statblock as "Place Token As", enable random rotation/flip, and start placing. Each click can drop a random NPC with random color and random rotation.
@@ -64,7 +68,7 @@ Single placement preview:
 
 ---
 
-## Texture Painting *(Adventurer tier $7+)*
+## Texture Painting *(Pro tier)*
 - **Height-map masking:** Paint only the raised or recessed parts of a texture with a live preview window.
 - **Tile Masking:** Use the premium Texture Painting editor to mask compatible tiles.
 - **Blend modes:** Paint texture layers as Normal, Overlay, Soft Light, Multiply, Screen, or Add to blend dirt, moss, water, scorch marks, highlights, color passes, and similar details into the scene underneath.
@@ -81,20 +85,24 @@ Single placement preview:
 
 ---
 
-## Building Tool *(Adventurer tier $7+)*
-- **Rapid structure creation:** Construct building footprints with rectangle, ellipse, and polygon shapes (with arcs support) and inner walls that auto-generate Foundry walls.
-- **Composite output:** Building commits combine walls, portal frames, static windows, fills, and sill art into foreground/background composite tiles instead of leaving every generated element as its own tile.
-- **Generated Regions:** Building commits create Foundry Regions from generated outer walls when region geometry is available, with predefined Define Surface and Suppress Weather behaviors.
-- **Portals:** Place textured doors, windows and gaps on any wall segment. The tool automatically cuts openings, creates appropriate Foundry walls, and adds textures. Doors and windows can even be animated.
-- **Texture per surface:** Assign different textures to exterior walls, interior walls, and floor independently.
-- **Per-segment editing:** In `Edit Shapes`, left click selects the whole shape, right click selects an individual wall segment for per-segment texture, transform, color, and shadow edits.
-- **Automatic shadows:** Structures inherit the same elevation-based shadow system as regular assets for consistent depth.
+## Building Tool *(Pro tier)*
+The Building Tool works on the Building that is on the canvas: open, edit, cancel, and commit it again after it has been moved, rotated, or scaled. The preview shows exactly what Commit writes, its Foundry Walls and doors included.
+- **Workspaces:** Tool Options are organized into Outer Walls, Inner Walls, Portals, Fill Textures, and Edit Geometry.
+- **Outer shapes:** Draw a Rectangle, Ellipse, or Polygon (Shift+click for curved sides) and add it to or subtract it from the Building. Staged placement lets a shape be moved, resized, rotated, or point-edited before it is accepted, and Room Construction keeps the walls between rooms.
+- **Inner walls and dividers:** Draw poly-lines or smooth splines; split, join, and convert segments between straight and curved. Sticky Joints keep connected walls together while one is reshaped.
+- **Fill per room:** Each enclosed room can take its own texture, scale, rotation, offset, opacity, and color, or follow the Building's Fill.
+- **Portals:** Doors, Windows with sill, glass, and frame, framed Openings, and Seamless Secret Doors that look like the wall they are cut from. A portal can be converted to another kind, fitted to its artwork's width, and given its own behavior, sound, timing, and initial state.
+- **Wall behavior:** Solid, Terrain, Invisible, and Ethereal presets or a custom combination, for the whole Building, one wall path, or single segments.
+- **Edit Geometry:** Move vertices and curve handles of the committed shape, with the session's own Undo and Redo.
+- **Clean output:** Walls, Fill, and Sills are committed as named Tiles (for example "Ground Floor - Building 1 - Walls"). A committed Building renders and works for every user without the premium editor.
+- **Leaving with unsaved changes:** Closing FA Nexus or opening another tab asks Commit, Discard, or Continue Editing.
+- **Buildings from 0.5.3:** They open in the new editor and stay untouched until a change is committed, which upgrades them.
 
-[Building tool swcs v2.1 - Made with Clipchamp.webm](https://github.com/user-attachments/assets/1032ccf8-575f-4b30-967d-b0f8367bf47f)
+[Building_Tool_Preview](https://github.com/user-attachments/assets/d256ad1c-c5d4-468d-90f4-40c6fc1127bf)
 
 ---
 
-## Path Placement *(Adventurer tier $7+)*
+## Path Placement *(Pro tier)*
 - **Multi-path sessions:** Draw and edit multiple paths at different elevations before committing.
 - **Draw modes:** Point-and-click curves or freehand drawing with simplification; double-click ends a path, Close Loop is a toggle.
 - **Foundry walls toggle:** Spawn Foundry walls along the path centerline.
@@ -117,6 +125,7 @@ Single placement preview:
 - **Search and chip filters:** Filter by type/status, use `OR` and `NOT`, or prefix a term with `-` to exclude results like `-scatter`.
 - **Visibility, lock, and bulk actions:** Toggle visibility/lock per group or row, and bulk lock/delete selected layers.
 - **Inline rename:** Press `F2` to rename a row. This stores a display-only tile name and falls back to the computed label when cleared.
+- **Folders:** Organize dense stacks into Folders inside an elevation group without changing Elevation; Folders can be nested, hidden, locked, flattened, or promoted to their own elevation.
 - **Nested elevation groups:** Collapse groups, create nested subgroups, give groups custom names, and move whole groups to a new elevation.
 - **Drag-and-drop reordering:** Reorder layers between elevation groups directly from the manager.
 - **Selection controls:** Canvas selection syncs with Layer Manager, all elevations are selectable by default, and `Skip Filtered` limits selection to currently visible search/filter matches.
@@ -127,7 +136,28 @@ Single placement preview:
 
 ---
 
+## Scene Groups
+- **Live groups:** Group selected Tiles, Walls, Lights, Sounds, and Regions in the Scene Groups window. Groups can be renamed, nested, collapsed, hidden, locked, ungrouped, or deleted, and every member still works as a normal Foundry object.
+- **Group transforms:** Move, rotate, and uniformly scale a selected group on the canvas with live previews, snapping, adjustable pivots, and one Undo step.
+- **Copy, paste, duplicate:** Copies are staged for placement, also across Levels and Scenes.
+- **Optional:** "Enable Scene Groups" in the module settings switches them off. Groups already in a Scene are kept, and copy and paste of Buildings and Paths keeps working.
+
+---
+
+## Prefabs (Experimental)
+Prefabs are experimental: how they are saved and placed may change in a later version. "Enable Prefabs (Experimental)" in the module settings switches them off. They need Scene Groups.
+
+- **Local Prefab library:** Save one or more Scene Groups as a Prefab by dragging them into the Prefabs tab or with "Save as Prefab…". The library is shared by every world of the installation.
+- **Stays editable:** Buildings, Paths, Textures, and Scatter inside a placed Prefab can still be edited with Nexus Edit.
+- **Staged placement:** Move, resize, rotate, and mirror a Prefab before Accept, with grid snapping and a choice between its pixel size and the Scene's grid. Accept is one Undo step; Cancel writes nothing.
+- **Anywhere:** Place Prefabs in Scenes with another grid size and on another Level, and exchange them with Export Prefab and Import Prefab.
+
+[SceneGroupsPrefabs_Preview](https://github.com/user-attachments/assets/dde5debe-41fc-4c08-a6e4-a93744250043)
+
+---
+
 ## Flatten & Scene Export
+- **Gameplay stays live:** Flatten turns the selection into one picture per depth band (ground, middle, foreground). Its Walls, doors, windows, Lights, Sounds, and Regions keep working, and Deconstruct brings back the original layers, Buildings and Paths still editable.
 - **Layer Manager access:** The Flatten button lives at the bottom of the Layer Manager, and flattening is also available from the Tile HUD or Layer Manager right-click context menu.
 - **Output name:** Set a custom base name before flattening or exporting.
 - **Output folder:** Choose where generated files are uploaded; flatten and export remember separate last-used folders.
@@ -153,7 +183,7 @@ Single placement preview:
 ## Smart Search, Folders, and Bookmarks
 - **Weighted matching:** Nexus boosts likely hits so `fir` gives you fir trees before fireballs.
 - **Exact and negative terms:** Wrap a term in quotes to match exactly like `"orc"`, or prefix with `-` to hide unwanted results. Combine statements with parentheses for more complex filters.
-- **Docked folder filters:** See and filter by our Folder Structure. Pick inclusion and exclusion folders with multi-select.
+- **Docked folder filters:** Browse folders in every content tab, including Building wall paths and fill textures. Turn off **Include subfolders** to show only files directly inside the selected folder; folder counts follow the selected mode. Ctrl+Click combines folders, and Alt+Click excludes a folder and its subfolders. The mode stays with each tab's folder selection and saved bookmarks.
 - **Bookmark anything:** Save your favorite combinations of search terms and folder filters for Tokens, Assets, Textures, or Paths. Bookmarks show in a toolbar, overflow gracefully, and can be dragged to reorder.
 - **Search memory:** Each tab remembers its last query and folder state, so hopping between views doesn’t wipe your work.
 
@@ -164,7 +194,7 @@ Single placement preview:
 ## Quality of Life & Performance
 - **Restyled tool panels:** Collapsible sections remember their state, controls are denser and clearer, and each active tool includes contextual help.
 - **Unified undo/redo:** `Ctrl+Z` / `Ctrl+Y` across Paths, Textures, Building, and Scatter sessions.
-- **Session guardrails:** Auto-commit on tab change or app close, `Esc` cancel with confirmation, and explicit Commit/Undo/Redo/Cancel buttons in tool panels.
+- **Session guardrails:** Leaving an editor never drops work silently. Texture and Path sessions are saved when you switch tabs or close the window, and the Building Tool asks whether to Commit, Discard, or Continue Editing. `Esc` or Cancel asks before discarding in every editor, and tool panels have explicit Commit/Undo/Redo/Cancel buttons.
 - **Precise controls:** Slider values are remembered, right-click resets to default, numeric inputs stay in sync, and randomization ranges use explicit `Min` / `Max` controls.
 - **Overhead-aware FA tiles:** Paths, masked textures, buildings, scatter tiles, and chunked flatten tiles can participate in Foundry's native overhead occlusion when marked `Overhead`.
 - **FA Nexus Tile Config tab:** Tile Config exposes Parent Level, HSBC, mask clearing, and shadow settings for supported tiles.
@@ -182,7 +212,7 @@ Single placement preview:
 2. Click **Install Module**.
 3. Paste the FA Nexus manifest URL:
    ```
-   https://raw.githubusercontent.com/Forgotten-Adventures/FA-Nexus/main/module.json
+   https://github.com/Forgotten-Adventures/FA-Nexus/releases/latest/download/module.json
    ```
 4. Click **Install**, then enable **FA Nexus** in your world.
 
@@ -196,15 +226,17 @@ Single placement preview:
 5. Click an item, or multi-select several, and start placing.
 6. Visit **Module Settings -> FA Nexus** to toggle pixel-perfect tile selection, elevation behavior, cache paths, shadow quality, generated cleanup, and more.
 
-Premium supporter? Authenticate with Patreon inside the app to unlock texture painting, path editing, the building tool, and premium catalog entries.
+Patreon supporter? Connect Patreon inside the app. Premium unlocks the premium Tokens, Assets, and Token Color variants; Pro also unlocks Texture Painting, Paths, and the Building Tool.
 
 ---
 
 ## Requirements & Compatibility
-- **Foundry VTT:** v14 only. The 0.5.x release line is not backwards compatible with Foundry v13.
+- **Foundry VTT:** v14 only. FA Nexus 0.5 and later do not run on Foundry v13.
 - **Token system mappings:** Updated actor type mappings include Call of Cthulhu 7th Edition, Cyberpunk RED, Alien RPG, Forbidden Lands, Starfinder, World of Darkness 5th Edition/VTM5e, and Daggerheart.
 - **Internet connection:** Needed for cloud content and Patreon validation.
-- **Patreon Adventurer tier ($7+):** Required for premium textures, paths, building tools, and locked assets.
+- **Patreon Premium tier or higher:** Required for premium Tokens and Assets.
+- **Patreon Pro tier:** Required for the Pro tools: Texture Painting, Tile Masking, Paths, and the Building Tool.
+- **The Forge:** FA Nexus works on The Forge, but mapmaking there is slow. Every asset Nexus places, and every Flatten picture, Texture mask, and Prefab it makes, is uploaded to your Forge Assets Library, and those uploads take a long time. We recommend building maps in a local Foundry installation and moving the finished world to The Forge. If you build on The Forge, turn on **Use Direct URLs for Free Cloud Content** in the module settings: free assets then load from the FA cloud without being uploaded. Premium assets and generated files are still uploaded.
 
 ---
 

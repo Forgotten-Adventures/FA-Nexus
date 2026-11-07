@@ -1,14 +1,22 @@
+import { onFoundryBoot } from '../core/foundry-boot-hooks.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { resolveCanvasTilePlaceable } from '../canvas/tile-targets.js';
 import { applyTileHsbcToMesh } from './texture-blend-runtime.js';
 import { ensureMeshTransparent } from './texture-runtime-core.js';
 import {
   applyMaskedTilingToTile,
   applyStandardTileMaskToTile,
+  syncStandardMaskNativeTransformPreview,
   rehydrateAllMaskedTiles,
   rehydrateAllStandardTileMasks,
   cancelGlobalRehydrate,
   clearMaskedOverlaysOnDelete
 } from './texture-mask-runtime.js';
+import {
+  CUSTOM_TILE_RENDER_PHASES,
+  registerCustomTileRenderLifecycle,
+  scheduleCustomTileRenderApply
+} from '../canvas/custom-tile-render-scheduler.js';
 
 export { rehydrateAllMaskedTiles, rehydrateAllStandardTileMasks };
 
@@ -18,6 +26,9 @@ const PATCHED_TILE_DRAW_SYMBOL = Symbol.for('fa-nexus.maskedTiles.tileDrawPrehid
 const ORIGINAL_TILE_DRAW_KEY = '_faNexusOriginalMaskedTileDraw';
 const MASKED_TILING_ORIGINAL_TEXTURE_KEY = 'faNexusMaskedTilingOriginalTexture';
 const STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY = 'faNexusStandardMaskOriginalTexture';
+const STANDARD_MASK_NATIVE_PREVIEW_PATCH = Symbol.for('fa-nexus.standard-mask-native-preview');
+const DISPLAY_TRANSFORM_PREVIEW_SLOT = Symbol.for('fa-nexus.scene-group-display-transform-preview');
+const SCENE_GROUP_OVERLAY_DRAG_MARKER = Symbol.for('fa-nexus.scene-group-overlay-drag-active');
 
 function isEditingTile(tile) {
   try {
@@ -220,6 +231,36 @@ function installMaskedTileDrawPrehidePatch() {
   }
 }
 
+function installStandardMaskNativePreviewPatch() {
+  const controlsPrototype = globalThis?.canvas?.tiles?.placeables
+    ?.find?.((tile) => tile?.controls?.constructor?.prototype?._updateDragPreview)
+    ?.controls?.constructor?.prototype
+    || null;
+  if (!controlsPrototype || typeof controlsPrototype._updateDragPreview !== 'function') return false;
+  if (controlsPrototype[STANDARD_MASK_NATIVE_PREVIEW_PATCH]) return true;
+  const original = controlsPrototype._updateDragPreview;
+  controlsPrototype._updateDragPreview = function faNexusStandardMaskNativePreview(event) {
+    const result = original.call(this, event);
+    const sourceDocument = this?.object?.document || this?.document || null;
+    const flags = sourceDocument?.getFlag?.('fa-nexus', 'standardTileMask')
+      || sourceDocument?._source?.flags?.['fa-nexus']?.standardTileMask
+      || null;
+    const preview = event?.interactionData?.preview || null;
+    if (flags && preview) {
+      syncStandardMaskNativeTransformPreview(preview);
+      globalThis.requestAnimationFrame?.(() => {
+        if (!preview.destroyed) syncStandardMaskNativeTransformPreview(preview);
+      });
+    }
+    return result;
+  };
+  Object.defineProperty(controlsPrototype, STANDARD_MASK_NATIVE_PREVIEW_PATCH, {
+    value: true,
+    configurable: false
+  });
+  return true;
+}
+
 function isMaskRenderRelevantTileUpdate(changes) {
   try {
     if (!changes || typeof changes !== 'object') return false;
@@ -305,7 +346,16 @@ function buildMaskRefreshSignature(tile, targets) {
 async function runMaskRefresh(tile, reason = 'unknown') {
   try {
     if (!tile || tile.destroyed || !tile.document) return true;
-    if (!tile.isPreview && !tile.document?.scene) return true;
+    // Scene Group previews keep the existing mask geometry attached to the
+    // Tile mesh and transform that mesh natively. Rebuilding from a transient
+    // preview document here can finish after a one-event pointer flick and
+    // counter-scale the fill away from the other Building members. The
+    // committed update hooks refresh it once the authoritative size exists.
+    if (globalThis[SCENE_GROUP_OVERLAY_DRAG_MARKER]
+      || tile[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return true;
+    const tileDocId = tile.document.id || tile.document._id || null;
+    const activeSceneDoc = tileDocId ? globalThis.canvas?.scene?.tiles?.get?.(tileDocId) === tile.document : false;
+    if (!tile.isPreview && !(tile.document?.scene || tile.document?.parent || activeSceneDoc)) return false;
     const targets = getMaskRefreshTargets(tile);
     if (targets.hasMaskedTilingFlag && targets.hasStandardTileMaskFlag) {
       Logger.error('MaskedTiles.runMaskRefresh.conflictingModes', {
@@ -365,6 +415,7 @@ async function runMaskRefresh(tile, reason = 'unknown') {
 function scheduleMaskRefresh(tile, options = {}) {
   try {
     if (!tile || tile.destroyed || !hasMaskedPresentation(tile)) return;
+    if (tile[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return;
     const reason = String(options?.reason || 'unknown');
     const followupDelay = Math.max(60, Number(options?.followupDelay) || 120);
     const followupDelays = normalizeFollowupDelays(options, followupDelay);
@@ -418,13 +469,40 @@ function scheduleMaskRefresh(tile, options = {}) {
       }
     };
 
-    void Promise.resolve(runMaskRefresh(tile, `${reason}:sync`)).then((success) => {
+    return Promise.resolve(runMaskRefresh(tile, `${reason}:sync`)).then((success) => {
       const current = REFRESH_STATE.get(tile);
       if (!current || current.seq !== seq || tile.destroyed) return;
       if (success) current.lastSignature = buildMaskRefreshSignature(tile, getMaskRefreshTargets(tile));
       scheduleFollowups(forceFollowups || !success);
     });
   } catch (_) {}
+}
+
+function scheduleDocumentMaskRefresh(doc, options = {}) {
+  const reason = String(options?.reason || 'tile-change');
+  const forceFollowups = !!options?.forceFollowups;
+  const followupDelays = forceFollowups ? [80, 250, 700] : undefined;
+  const apply = () => scheduleCustomTileRenderApply(doc, {
+    reason,
+    shouldApplyDocument: documentHasMaskFlags,
+    hasOverlay: hasMaskedPresentation,
+    applyTile: (tile) => scheduleMaskRefresh(tile, {
+      reason,
+      forceFollowups,
+      followupDelays
+    }),
+    retryDelays: [0, 16, 60, 140, 300, 700, 1200],
+    logger: Logger,
+    logCode: 'MaskedTiles.apply',
+    logLevel: 'warn',
+    refreshLogLevel: 'warn'
+  });
+  apply();
+  if (forceFollowups) {
+    for (const delay of followupDelays) {
+      try { setTimeout(apply, delay); } catch (_) {}
+    }
+  }
 }
 
 function refreshMaskedTilesForLayer(reason = 'activateCanvasLayer') {
@@ -442,8 +520,22 @@ function refreshMaskedTilesForLayer(reason = 'activateCanvasLayer') {
 
 try {
   installMaskedTileDrawPrehidePatch();
+  installStandardMaskNativePreviewPatch();
+  registerCustomTileRenderLifecycle({
+    id: 'masked-tiles',
+    hooks: ['drawTile', 'refreshTile', 'controlTile', 'hoverTile'],
+    phase: CUSTOM_TILE_RENDER_PHASES.MASK,
+    callback: (tile, context) => scheduleMaskRefresh(tile, { reason: context.reason }),
+    logCode: 'MaskedTiles.lifecycle.failed',
+    logLevel: 'error'
+  });
   Hooks.on('canvasReady', () => {
     try { installMaskedTileDrawPrehidePatch(); } catch (_) {}
+    try { installStandardMaskNativePreviewPatch(); } catch (error) {
+      Logger.error?.('MaskedTiles.standardMaskNativePreviewPatch.failed', {
+        error: String(error?.message || error)
+      });
+    }
     try { rehydrateAllMaskedTiles({ attempts: 6, interval: 250 }); } catch (_) {}
     try {
       for (const tile of Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : []) {
@@ -451,26 +543,20 @@ try {
       }
     } catch (_) {}
   });
-  Hooks.once('ready', () => {
+  onFoundryBoot('ready', () => {
     if (!installMaskedTileDrawPrehidePatch()) {
       Logger.error?.('MaskedTiles.tileDrawPrehidePatch.unavailable', {
         reason: 'Tile.prototype._draw missing during ready'
       });
     }
+    installStandardMaskNativePreviewPatch();
   });
   Hooks.on('createTile', (doc) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
-      if (tile) {
-        scheduleMaskRefresh(tile, {
-          reason: 'createTile',
-          forceFollowups: documentHasMaskFlags(doc),
-          followupDelays: [80, 250, 700]
-        });
-      }
-      if (documentHasMaskFlags(doc)) {
-        rehydrateAllMaskedTiles({ attempts: 4, interval: 250 });
-      }
+      scheduleDocumentMaskRefresh(doc, {
+        reason: 'createTile',
+        forceFollowups: documentHasMaskFlags(doc)
+      });
     } catch (error) {
       Logger.error('MaskedTiles.createTile.failed', {
         tileId: doc?.id || null,
@@ -478,45 +564,23 @@ try {
       });
     }
   });
-  Hooks.on('drawTile', (tile) => {
-    scheduleMaskRefresh(tile, { reason: 'drawTile' });
-  });
-  Hooks.on('refreshTile', (tile) => {
-    scheduleMaskRefresh(tile, { reason: 'refreshTile' });
-  });
-  Hooks.on('controlTile', (tile, controlled) => {
-    scheduleMaskRefresh(tile, { reason: `controlTile:${controlled ? 'on' : 'off'}` });
-  });
-  Hooks.on('hoverTile', (tile, hovered) => {
-    scheduleMaskRefresh(tile, { reason: `hoverTile:${hovered ? 'on' : 'off'}` });
-  });
   Hooks.on('activateCanvasLayer', (layer) => {
     const layerName = layer?.options?.name || layer?.name || 'unknown';
     refreshMaskedTilesForLayer(`activateCanvasLayer:${layerName}`);
   });
   Hooks.on('updateTile', async (doc, changes = {}) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
-      if (tile) {
-        const forceFollowups = isMaskRenderRelevantTileUpdate(changes);
-        if (forceFollowups) {
-          Logger.debug?.('MaskedTiles.updateTile.forceFollowups', {
-            tileId: doc?.id || null,
-            changeKeys: changes && typeof changes === 'object' ? Object.keys(changes) : []
-          });
-        }
-        scheduleMaskRefresh(tile, {
-          reason: 'updateTile',
-          forceFollowups,
-          followupDelays: forceFollowups ? [80, 250, 700] : undefined
+      const forceFollowups = isMaskRenderRelevantTileUpdate(changes);
+      if (forceFollowups) {
+        Logger.debug?.('MaskedTiles.updateTile.forceFollowups', {
+          tileId: doc?.id || null,
+          changeKeys: changes && typeof changes === 'object' ? Object.keys(changes) : []
         });
-        rehydrateAllMaskedTiles({
-          attempts: forceFollowups ? 4 : 2,
-          interval: forceFollowups ? 250 : 200
-        });
-      } else if (documentHasMaskFlags(doc)) {
-        rehydrateAllMaskedTiles({ attempts: 4, interval: 250 });
       }
+      scheduleDocumentMaskRefresh(doc, {
+        reason: 'updateTile',
+        forceFollowups
+      });
     } catch (error) {
       Logger.error('MaskedTiles.updateTile.failed', {
         tileId: doc?.id || null,
@@ -526,7 +590,7 @@ try {
   });
   Hooks.on('deleteTile', (doc) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
+      const tile = resolveCanvasTilePlaceable(doc);
       if (tile) {
         cancelRefreshFollowups(tile);
         REFRESH_STATE.delete(tile);

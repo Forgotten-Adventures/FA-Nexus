@@ -42,3 +42,20 @@ export {
   roundValue,
   scheduleMaskedTileRetry
 } from './texture-mask-runtime.js';
+
+export {
+  applyMaskedTilingRepeatTransform,
+  deriveMaskedTilingResizeCommit,
+  mergeMaskedTilingRepeatTransform,
+  resolveMaskedTilingRepeatTransform,
+  scaleMaskedTilingRepeatTransform
+} from './masked-tiling-resize-contract.js';
+
+export {
+  rebaseTextureEditorPhase,
+  refitTextureEditorTilePose,
+  resolveMaskedTilingEditorBaseShift,
+  resolveTextureEditorTileTransform,
+  tileLocalPointToWorld,
+  worldPointToTileLocal
+} from './texture-editor-tile-transform.js';

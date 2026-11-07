@@ -1,0 +1,45 @@
+/* ===== Sticky Placement Mode ===== */
+.fa-nexus-app.placement-sticky {
+  cursor: crosshair !important;
+}
+
+.fa-nexus-app.placement-sticky .fa-nexus-header {
+  background: linear-gradient(135deg, rgba(255, 193, 7, 0.1), rgba(255, 152, 0, 0.1));
+  border-bottom-color: rgba(255, 193, 7, 0.3);
+}
+
+.fa-nexus-app.placement-sticky .fa-nexus-title::after {
+  content: " (Placement Mode)";
+  color: #ffc107;
+  font-size: 0.8em;
+  font-weight: 400;
+}
+
+.fa-nexus-app.placement-sticky .fa-nexus-tabs {
+  background: linear-gradient(135deg, rgba(255, 193, 7, 0.05), rgba(255, 152, 0, 0.05));
+}
+
+.fa-nexus-app.placement-sticky .fa-nexus-tab.active {
+  background: linear-gradient(135deg, rgba(255, 193, 7, 0.15), rgba(255, 152, 0, 0.15));
+  border-color: rgba(255, 193, 7, 0.4);
+}
+
+.fa-nexus-app.placement-frozen .fa-nexus-header {
+  box-shadow: inset 0 -2px 0 rgba(3, 169, 244, 0.4);
+}
+
+.fa-nexus-app.placement-frozen .fa-nexus-title::before {
+  content: "Preview Frozen";
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 8px;
+  padding: 2px 6px;
+  font-size: 0.7em;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #03a9f4;
+  border: 1px solid rgba(3, 169, 244, 0.5);
+  border-radius: 999px;
+}

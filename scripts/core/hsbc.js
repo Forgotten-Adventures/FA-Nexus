@@ -1,4 +1,5 @@
 import { resolveTilePlaceable } from '../canvas/tile-targets.js';
+import { NexusLogger as Logger } from './nexus-logger.js';
 
 const HUE_MIN = -180;
 const HUE_MAX = 180;
@@ -13,6 +14,8 @@ const OFFSET_MAX = DISPLAY_SCALE;
 const FILTER_STATE_KEY = Symbol('faNexusHsbcFilterState');
 const MANAGED_FILTER_KEY = Symbol('faNexusManagedHsbcFilter');
 const HOOKS_INSTALLED_KEY = '__faNexusHsbcHooksInstalled';
+const HSBC_HOOK_LOG_THROTTLE_MS = 2000;
+const hsbcHookFailureLogTimes = new Map();
 
 export const HSBC_DEFAULTS = Object.freeze({
   hue: 0,
@@ -209,6 +212,71 @@ export function isNeutralHsbc(value) {
     && Math.abs(normalized.saturation - HSBC_DEFAULTS.saturation) < EPSILON
     && Math.abs(normalized.brightness - HSBC_DEFAULTS.brightness) < EPSILON
     && Math.abs(normalized.contrast - HSBC_DEFAULTS.contrast) < EPSILON;
+}
+
+/**
+ * Apply the same unpremultiplied HSV adjustment as HSBC_FRAGMENT_SRC to an
+ * ImageData-compatible RGBA buffer. Alpha is preserved for visible pixels;
+ * fully transparent pixels are cleared like the shader.
+ */
+export function applyHsbcToImageData(imageData, value) {
+  const data = imageData?.data;
+  if (!data || typeof data.length !== 'number' || data.length % 4 !== 0) {
+    throw new TypeError('HSBC ImageData requires a complete RGBA pixel buffer.');
+  }
+  const hsbc = normalizeHsbc(value);
+  const hueOffset = hsbc.hue / 360;
+  const clampUnit = (channel) => Math.min(1, Math.max(0, channel));
+
+  for (let index = 0; index < data.length; index += 4) {
+    const alpha = data[index + 3];
+    if (alpha <= 0) {
+      data[index] = 0;
+      data[index + 1] = 0;
+      data[index + 2] = 0;
+      continue;
+    }
+
+    const red = data[index] / 255;
+    const green = data[index + 1] / 255;
+    const blue = data[index + 2] / 255;
+    const maximum = Math.max(red, green, blue);
+    const minimum = Math.min(red, green, blue);
+    const delta = maximum - minimum;
+    let hue = 0;
+    if (delta > 0) {
+      if (maximum === red) hue = ((green - blue) / delta) / 6;
+      else if (maximum === green) hue = ((blue - red) / delta + 2) / 6;
+      else hue = ((red - green) / delta + 4) / 6;
+    }
+    hue = hue - Math.floor(hue);
+    const saturation = maximum > 0 ? delta / maximum : 0;
+    const adjustedHue = hue + hueOffset - Math.floor(hue + hueOffset);
+    const adjustedSaturation = clampUnit(saturation * hsbc.saturation);
+
+    const sector = adjustedHue * 6;
+    const wholeSector = Math.floor(sector);
+    const fraction = sector - wholeSector;
+    const low = maximum * (1 - adjustedSaturation);
+    const descending = maximum * (1 - adjustedSaturation * fraction);
+    const ascending = maximum * (1 - adjustedSaturation * (1 - fraction));
+    let adjustedRgb;
+    switch (wholeSector % 6) {
+      case 0: adjustedRgb = [maximum, ascending, low]; break;
+      case 1: adjustedRgb = [descending, maximum, low]; break;
+      case 2: adjustedRgb = [low, maximum, ascending]; break;
+      case 3: adjustedRgb = [low, descending, maximum]; break;
+      case 4: adjustedRgb = [ascending, low, maximum]; break;
+      default: adjustedRgb = [maximum, low, descending]; break;
+    }
+
+    for (let channel = 0; channel < 3; channel += 1) {
+      const brightened = adjustedRgb[channel] * hsbc.brightness;
+      const contrasted = ((brightened - 0.5) * hsbc.contrast) + 0.5;
+      data[index + channel] = Math.round(clampUnit(contrasted) * 255);
+    }
+  }
+  return imageData;
 }
 
 export function readDocumentHsbc(doc, options = {}) {
@@ -469,7 +537,8 @@ export function applyTileHsbc(tileOrDoc) {
     });
     applyHsbcToDisplayObject(mesh, hsbc, { slot: 'tile-mesh' });
     return true;
-  } catch (_) {
+  } catch (error) {
+    warnTileHsbcHookFailure('applyTileHsbc', 'applyTileHsbc', error, tileOrDoc);
     return false;
   }
 }
@@ -479,7 +548,8 @@ export function clearTileHsbc(tileOrDoc) {
     const tile = resolveTilePlaceable(tileOrDoc);
     clearHsbcFromDisplayObject(tile?.mesh, { slot: 'tile-mesh' });
     return true;
-  } catch (_) {
+  } catch (error) {
+    warnTileHsbcHookFailure('clearTileHsbc', 'clearTileHsbc', error, tileOrDoc);
     return false;
   }
 }
@@ -491,39 +561,64 @@ export function rehydrateAllTileHsbc() {
   } catch (_) {}
 }
 
+function resolveTileHsbcHookIds(tileOrDoc) {
+  const tile = tileOrDoc?.document ? tileOrDoc : tileOrDoc?.object || null;
+  const doc = tileOrDoc?.document || tileOrDoc || null;
+  return {
+    tileId: tile?.id || null,
+    docId: doc?.id || null
+  };
+}
+
+function warnTileHsbcHookFailure(hook, action, error, tileOrDoc = null) {
+  const now = Date.now();
+  const last = hsbcHookFailureLogTimes.get(hook) || 0;
+  if (now - last < HSBC_HOOK_LOG_THROTTLE_MS) return;
+  hsbcHookFailureLogTimes.set(hook, now);
+  Logger.warn('HSBC.tileHook.failed', {
+    hook,
+    action,
+    ...resolveTileHsbcHookIds(tileOrDoc),
+    error: String(error?.message || error)
+  });
+}
+
 function installTileHsbcHooks() {
   if (globalThis?.[HOOKS_INSTALLED_KEY]) return;
   try {
     globalThis[HOOKS_INSTALLED_KEY] = true;
-  } catch (_) {
+  } catch (error) {
+    warnTileHsbcHookFailure('installTileHsbcHooks', 'markInstalled', error);
     return;
   }
   try {
     Hooks.on('canvasReady', () => {
-      try { rehydrateAllTileHsbc(); } catch (_) {}
+      try { rehydrateAllTileHsbc(); } catch (error) { warnTileHsbcHookFailure('canvasReady', 'rehydrateAllTileHsbc', error); }
     });
     Hooks.on('drawTile', (tile) => {
-      try { applyTileHsbc(tile); } catch (_) {}
+      try { applyTileHsbc(tile); } catch (error) { warnTileHsbcHookFailure('drawTile', 'applyTileHsbc', error, tile); }
     });
     Hooks.on('refreshTile', (tile) => {
-      try { applyTileHsbc(tile); } catch (_) {}
+      try { applyTileHsbc(tile); } catch (error) { warnTileHsbcHookFailure('refreshTile', 'applyTileHsbc', error, tile); }
     });
     Hooks.on('controlTile', (tile) => {
-      try { applyTileHsbc(tile); } catch (_) {}
+      try { applyTileHsbc(tile); } catch (error) { warnTileHsbcHookFailure('controlTile', 'applyTileHsbc', error, tile); }
     });
     Hooks.on('hoverTile', (tile) => {
-      try { applyTileHsbc(tile); } catch (_) {}
+      try { applyTileHsbc(tile); } catch (error) { warnTileHsbcHookFailure('hoverTile', 'applyTileHsbc', error, tile); }
     });
     Hooks.on('createTile', (doc) => {
-      try { applyTileHsbc(doc); } catch (_) {}
+      try { applyTileHsbc(doc); } catch (error) { warnTileHsbcHookFailure('createTile', 'applyTileHsbc', error, doc); }
     });
     Hooks.on('updateTile', (doc) => {
-      try { applyTileHsbc(doc); } catch (_) {}
+      try { applyTileHsbc(doc); } catch (error) { warnTileHsbcHookFailure('updateTile', 'applyTileHsbc', error, doc); }
     });
     Hooks.on('deleteTile', (doc) => {
-      try { clearTileHsbc(doc); } catch (_) {}
+      try { clearTileHsbc(doc); } catch (error) { warnTileHsbcHookFailure('deleteTile', 'clearTileHsbc', error, doc); }
     });
-  } catch (_) {}
+  } catch (error) {
+    warnTileHsbcHookFailure('installTileHsbcHooks', 'registerHooks', error);
+  }
 }
 
 installTileHsbcHooks();

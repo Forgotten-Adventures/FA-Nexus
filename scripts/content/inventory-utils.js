@@ -17,6 +17,31 @@ const TOKEN_CREATURE_TYPES = [
   'Dragonborn','Tiefling','Orc','Goblin','Kobold','Gnoll','Hobgoblin'
 ];
 
+function normalizeLocalPath(path = '') {
+  return String(path || '').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/+|\/+$/g, '');
+}
+
+function dirnamePosix(value = '') {
+  const normalized = normalizeLocalPath(value);
+  const index = normalized.lastIndexOf('/');
+  return index >= 0 ? normalized.slice(0, index) : '';
+}
+
+function extname(value = '') {
+  const match = String(value || '').match(/(\.[^/.]+)$/);
+  return match ? match[1].toLowerCase() : '';
+}
+
+function sourceForFilename(filename = '') {
+  const ext = extname(filename) || '.webp';
+  return {
+    format: ext.replace(/^\./, '') || 'webp',
+    ext,
+    size: 0,
+    mtime: new Date().toISOString()
+  };
+}
+
 /**
  * Parse grid size and scale from a token filename.
  * Supports size keywords (Gargantuan/Huge/Large) and `scaleNN` suffix.
@@ -211,39 +236,44 @@ function parseTokenDisplayName(filename = '') {
  */
 export function normalizeTokenInventoryRecord(record) {
   if (!record || typeof record !== 'object') return record;
-  const filePath = String(record.file_path || record.path || '');
-  const filename = String(record.filename || filePath.split('/').pop() || '');
-  const parsedSize = parseTokenSize(filename);
-  const parsedDisplay = parseTokenDisplayName(filename);
-  const resolveGridDimension = (raw, parsed) => {
-    const value = Number(raw);
-    const parsedValue = Number(parsed);
-    if (Number.isFinite(parsedValue) && parsedValue > 1 && (!Number.isFinite(value) || value <= 1)) return parsedValue;
-    if (Number.isFinite(value) && value > 0) return value;
-    if (Number.isFinite(parsedValue) && parsedValue > 0) return parsedValue;
-    return 1;
-  };
-  const gridWidth = resolveGridDimension(record.grid_width, parsedSize.gridWidth);
-  const gridHeight = resolveGridDimension(record.grid_height, parsedSize.gridHeight);
-  const derivedSize = getCreatureSizeFromGridDimensions(gridWidth, gridHeight);
-  const existingSize = String(record.size || '').trim();
-  const existingCreatureType = String(record.creature_type || '').trim();
-  const existingDisplayName = String(record.display_name || '').trim();
-  const filenameDisplayName = filename ? deriveDisplayName(filename) : '';
-  const next = { ...record };
-
-  if (filename && !next.filename) next.filename = filename;
-  next.grid_width = gridWidth;
-  next.grid_height = gridHeight;
-  if (!next.scale && Number.isFinite(parsedSize.scale)) next.scale = `${parsedSize.scale}x`;
-  if (parsedDisplay.size) next.size = parsedDisplay.size;
-  else if (!existingSize || (existingSize === 'Medium' && derivedSize !== 'Medium')) next.size = derivedSize;
-  if (parsedDisplay.creatureType) next.creature_type = parsedDisplay.creatureType;
-  else if (!existingCreatureType) next.creature_type = 'Humanoid';
-  if (parsedDisplay.displayName && (!existingDisplayName || existingDisplayName === filenameDisplayName)) {
-    next.display_name = parsedDisplay.displayName;
+  if (Number(record.schema_version) === 2 && record.id && Array.isArray(record.grid)) {
+    return {
+      ...record,
+      kind: 'token',
+      scale: Number.isFinite(Number(record.scale)) ? Number(record.scale) : 1,
+      color: record.color && typeof record.color === 'object'
+        ? record.color
+        : { variant: null, main: false, group: record.name || record.id }
+    };
   }
 
+  const filePath = String(record.file_path || record.path || '');
+  const filename = String(record.filename || filePath.split('/').pop() || '');
+  const next = localToTokenInventoryRecord({ path: filePath, url: record.url || filePath, filename }, record.tier || null);
+  next.source = String(record.source || 'local').toLowerCase() === 'cloud' ? 'cloud' : 'local';
+  if (record.cachedLocalPath) next.cachedLocalPath = record.cachedLocalPath;
+  if (record.thumbnail_url) next.thumbnail_url = record.thumbnail_url;
+  if (record.enhanced_thumbnail) next.enhanced_thumbnail = !!record.enhanced_thumbnail;
+  if (record.original_thumbnail) next.original_thumbnail = record.original_thumbnail;
+  if (record.cloud_tier) next.cloud_tier = record.cloud_tier;
+  return next;
+}
+
+export function normalizeAssetInventoryRecord(record) {
+  if (!record || typeof record !== 'object') return record;
+  if (Number(record.schema_version) === 2 && record.id && Array.isArray(record.grid)) {
+    return { ...record, kind: 'asset' };
+  }
+  const filePath = String(record.file_path || record.path || record.url || '');
+  const filename = String(record.filename || filePath.split('/').pop() || '');
+  const next = localToAssetInventoryRecord({ path: filePath, url: record.url || filePath, filename });
+  next.source = String(record.source || 'local').toLowerCase() === 'cloud' ? 'cloud' : 'local';
+  if (record.tier) next.tier = record.tier;
+  if (record.cachedLocalPath) next.cachedLocalPath = record.cachedLocalPath;
+  if (record.thumbnail_url) next.thumbnail_url = record.thumbnail_url;
+  if (record.enhanced_thumbnail) next.enhanced_thumbnail = !!record.enhanced_thumbnail;
+  if (record.original_thumbnail) next.original_thumbnail = record.original_thumbnail;
+  if (record.cloud_tier) next.cloud_tier = record.cloud_tier;
   return next;
 }
 
@@ -255,7 +285,8 @@ export function normalizeTokenInventoryRecord(record) {
  */
 export function localToTokenInventoryRecord(localItem, tier = null) {
   const filename = localItem.filename || '';
-  const path = localItem.path || localItem.url || '';
+  const path = normalizeLocalPath(localItem.path || localItem.url || '');
+  const id = path ? path.replace(/\.[^/.]+$/, '') : filename.replace(/\.[^/.]+$/, '');
   const { gridWidth, gridHeight, scale } = parseTokenSize(filename);
   const { baseNameWithoutVariant, colorVariant, isMainColorVariant, hasColorVariant } = detectColorVariant(filename);
   const parsed = parseTokenDisplayName(filename);
@@ -263,35 +294,25 @@ export function localToTokenInventoryRecord(localItem, tier = null) {
   const size = parsed.size || getCreatureSizeFromGridDimensions(gridWidth, gridHeight);
   const creatureType = parsed.creatureType || 'Humanoid';
 
-  // Rough pixel estimation (same idea as reference script)
-  const isGarg = /gargantuan/i.test(filename) || size.toLowerCase() === 'gargantuan';
-  const basePx = isGarg ? 200 : 400;
-  const width = Math.round(gridWidth * basePx * scale);
-  const height = Math.round(gridHeight * basePx * scale);
-
   return {
-    type: 'token',
+    schema_version: 2,
+    id,
+    kind: 'token',
     source: 'local',
-    tier: tier,
-    file_path: path,
-    path: path.split('/').slice(0, -1).join('/'),
-    filename,
-    display_name: displayName,
+    tier: tier || null,
+    folder: dirnamePosix(id),
+    name: displayName,
+    grid: [gridWidth, gridHeight],
     variant: parsed.variant || '',
     size,
     creature_type: creatureType,
-    grid_width: gridWidth,
-    grid_height: gridHeight,
-    scale: scale+'x',
-    width,
-    height,
-    color_variant: colorVariant,
-    is_main_color_variant: isMainColorVariant,
-    has_color_variant: hasColorVariant,
-    base_name_no_variant: baseNameWithoutVariant,
-    file_size: 0,
-    content_type: filename.toLowerCase().endsWith('.webp') ? 'image/webp' : (filename.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg'),
-    last_modified: new Date().toISOString(),
+    scale,
+    color: {
+      variant: colorVariant,
+      main: isMainColorVariant,
+      group: baseNameWithoutVariant
+    },
+    selected_source: sourceForFilename(filename),
     tags: [displayName.toLowerCase()]
   };
 }
@@ -324,35 +345,24 @@ function parseAssetGrid(filename = '') {
  */
 export function localToAssetInventoryRecord(localItem) {
   const filename = localItem.filename || '';
-  const path = localItem.path || localItem.url || '';
+  const path = normalizeLocalPath(localItem.path || localItem.url || '');
+  const id = path ? path.replace(/\.[^/.]+$/, '') : filename.replace(/\.[^/.]+$/, '');
   const { gridWidth, gridHeight } = parseAssetGrid(filename);
   const displayName = deriveDisplayName(filename.replace(/\.[^/.]+$/, ''));
-  const basePx = 200;
-  const width = Math.round(gridWidth * basePx);
-  const height = Math.round(gridHeight * basePx);
-  const contentType = (() => {
-    const f = filename.toLowerCase();
-    if (f.endsWith('.webp')) return 'image/webp';
-    if (f.endsWith('.png')) return 'image/png';
-    if (f.endsWith('.jpg') || f.endsWith('.jpeg')) return 'image/jpeg';
-    if (f.endsWith('.webm')) return 'video/webm';
-    if (f.endsWith('.mp4')) return 'video/mp4';
-    return 'application/octet-stream';
-  })();
+  const lower = path.toLowerCase();
+  const assetClass = lower.includes('/textures/') || lower.includes('/texture_overlays/') ? 'texture'
+    : (filename.toLowerCase().includes('path') || /(^|[\/\-_])paths?(?=[\/\-_]|$)/.test(lower) ? 'path' : 'asset');
   return {
-    type: 'asset',
+    schema_version: 2,
+    id,
+    kind: 'asset',
+    asset_class: assetClass,
     source: 'local',
-    file_path: path,
-    path: path.split('/').slice(0, -1).join('/'),
-    filename,
-    display_name: displayName,
-    grid_width: gridWidth,
-    grid_height: gridHeight,
-    width,
-    height,
-    file_size: 0,
-    content_type: contentType,
-    last_modified: new Date().toISOString(),
+    tier: null,
+    folder: dirnamePosix(id),
+    name: displayName,
+    grid: [gridWidth, gridHeight],
+    selected_source: sourceForFilename(filename),
     tags: [displayName.toLowerCase()]
   };
 }

@@ -1,28 +1,38 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { resolveFlattenedChunkEntries, resolveFlattenedChunkContainerTransform } from './flatten-chunk-layout.js';
 import {
   attachCustomTileOverhead,
-  detachCustomTileOverhead,
-  invalidateCustomTileOverhead
+  detachCustomTileOverhead
 } from '../canvas/custom-tile-overhead.js';
 import { createDisplayProxyFactory } from '../canvas/display-object-proxy.js';
 import {
   encodeTexturePath,
-  ensureMeshTransparent,
   ensureTileMesh,
   getTransparentTextureSrc,
   loadTexture,
+  prepareCustomTileRendererMesh,
   restoreMeshTexture
 } from '../textures/texture-runtime-core.js';
 import {
   collectTileDocuments,
   collectTilePlaceables,
-  mapTilePlaceablesById
+  mapTilePlaceablesById,
+  resolveTilePlaceable
 } from '../canvas/tile-targets.js';
+import {
+  requestCustomTileRenderRefresh,
+  registerCustomTileRenderLifecycle,
+  scheduleCustomTileRenderApply
+} from '../canvas/custom-tile-render-scheduler.js';
 
 const MODULE_ID = 'fa-nexus';
 const REPAIR_ATTEMPTS = new Map();
 const REPAIR_COOLDOWN_MS = 10000;
-const FLATTEN_CHUNK_APPLY_RETRY_DELAYS = [0, 16, 60, 140, 300];
+
+function forgetRepairAttemptForTile(target) {
+  const id = target?.document?.id || target?.id || target?._id || null;
+  if (id) REPAIR_ATTEMPTS.delete(id);
+}
 
 function normalizeSrc(value) {
   const trimmed = String(value || '').trim();
@@ -112,54 +122,18 @@ function resolveFlattenedMeta(doc) {
   return null;
 }
 
-function resolveChunkEntriesFromMeta(meta) {
-  const chunks = Array.isArray(meta?.chunks) ? meta.chunks : [];
-  if (!chunks.length) return [];
-  const normalized = [];
-  for (const chunk of chunks) {
-    const src = String(chunk?.src || '').trim();
-    if (!src) continue;
-    const width = Number(chunk?.width) || 0;
-    const height = Number(chunk?.height) || 0;
-    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) continue;
-    normalized.push({
-      src,
-      x: Number(chunk?.x) || 0,
-      y: Number(chunk?.y) || 0,
-      width,
-      height
-    });
-  }
-  return normalized;
-}
-
-function resolveChunkEntries(doc) {
-  const meta = resolveFlattenedMeta(doc);
-  return resolveChunkEntriesFromMeta(meta);
-}
-
 function buildRenderKey(chunks) {
   if (!chunks?.length) return '';
   return chunks.map((chunk) => `${chunk.src}|${chunk.x}|${chunk.y}|${chunk.width}|${chunk.height}`).join(';');
 }
 
 function requestFlattenedChunkRefresh(tile, reason = 'flatten-refresh') {
-  const refresh = () => {
-    try {
-      if (!canvas?.ready || !tile || tile.destroyed) return;
-      try { tile.renderFlags?.set?.({ refreshState: true }); } catch (_) {}
-      try { canvas?.tiles?.setAllRenderFlags?.({ refreshState: true }); } catch (_) {}
-    } catch (error) {
-      Logger.debug?.('TileFlatten.chunkRefresh.failed', {
-        tileId: tile?.document?.id || null,
-        reason,
-        error: String(error?.message || error)
-      });
-    }
-  };
-  refresh();
-  try { requestAnimationFrame(() => refresh()); } catch (_) {}
-  try { setTimeout(refresh, 80); } catch (_) {}
+  requestCustomTileRenderRefresh(tile, {
+    reason,
+    logger: Logger,
+    logCode: 'TileFlatten.chunkRefresh.failed',
+    logLevel: 'debug'
+  });
 }
 
 function tileHasFlattenChunkOverlay(tile) {
@@ -167,65 +141,94 @@ function tileHasFlattenChunkOverlay(tile) {
 }
 
 function scheduleFlattenedChunkApply(doc, reason = 'tile-change') {
-  const id = doc?.id || doc?._id || '';
-  if (!id) return;
-  const initialTile = resolveFlattenChunkPlaceable(doc);
-  if (!resolveFlattenedMeta(doc) && !tileHasFlattenChunkOverlay(initialTile)) return;
-  const run = (attempt = 0) => {
+  scheduleCustomTileRenderApply(doc, {
+    reason,
+    shouldApplyDocument: resolveFlattenedMeta,
+    hasOverlay: tileHasFlattenChunkOverlay,
+    applyTile: applyFlattenedChunks,
+    afterApply: (tile) => scheduleFlattenedChunkTransformSettle(tile, reason),
+    logger: Logger,
+    logCode: 'TileFlatten.chunkApply',
+    logLevel: 'debug',
+    refreshLogLevel: 'debug'
+  });
+}
+
+function scheduleFlattenedChunkTransformSettle(tile, reason) {
+  const syncLatest = () => {
     try {
-      const tile = resolveFlattenChunkPlaceable(doc);
-      if (tile && !tile.destroyed) {
-        Promise.resolve(applyFlattenedChunks(tile))
-          .then(() => requestFlattenedChunkRefresh(tile, reason))
-          .catch((error) => Logger.debug?.('TileFlatten.chunkApply.scheduledFailed', {
-            tileId: id,
-            reason,
-            attempt,
-            error: String(error?.message || error)
-          }));
-        return;
-      }
-      const nextDelay = FLATTEN_CHUNK_APPLY_RETRY_DELAYS[attempt + 1];
-      if (Number.isFinite(nextDelay)) setTimeout(() => run(attempt + 1), nextDelay);
+      if (!tile || tile.destroyed || !tile.mesh || tile.mesh.destroyed) return;
+      const container = tile.faNexusFlattenChunkContainer
+        || tile.mesh.faNexusFlattenChunkContainer
+        || null;
+      if (!container || container.destroyed || !resolveFlattenedMeta(tile.document)) return;
+      syncFlattenContainerTransform(container, tile.mesh, tile.document);
     } catch (error) {
-      Logger.debug?.('TileFlatten.chunkApply.scheduleFailed', {
-        tileId: id,
+      Logger.error('TileFlatten.chunkTransformSettle.failed', {
+        tileId: tile?.document?.id || tile?.id || null,
         reason,
-        attempt,
-        error: String(error?.message || error)
+        error: String(error?.stack || error?.message || error)
       });
     }
   };
-  run(0);
+  requestAnimationFrame(() => requestAnimationFrame(syncLatest));
+  setTimeout(syncLatest, 120);
 }
 
-function syncFlattenContainerTransform(container, mesh, doc) {
+export function syncFlattenContainerTransform(container, mesh, doc, previewScale = null) {
   if (!container || container.destroyed || !mesh || mesh.destroyed) return;
+  if (container[Symbol.for('fa-nexus.scene-group-display-transform-preview')]) return;
   const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
   const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
-  const rawSx = Number(mesh?.scale?.x ?? 1) || 1;
-  const rawSy = Number(mesh?.scale?.y ?? 1) || 1;
-  const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
-  const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
-  const anchorX = Number(doc?.texture?.anchorX);
-  const anchorY = Number(doc?.texture?.anchorY);
-  const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
-  const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
   try {
-    container.scale?.set?.(1 / sx, 1 / sy);
-    container.position?.set?.(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
+    const transform = resolveFlattenedChunkContainerTransform(mesh, doc, previewScale);
+    container.scale?.set?.(transform.scaleX, transform.scaleY);
+    container.position?.set?.(transform.x, transform.y);
   } catch (_) {
     try { container.scale?.set?.(1, 1); } catch (_) {}
     container.position?.set?.(-docWidth / 2, -docHeight / 2);
   }
 }
 
+export function isFlattenChunkTargetLive(tile, mesh, container, build) {
+  if (!tile || tile.destroyed || !mesh || mesh.destroyed || tile.mesh !== mesh) return false;
+  if (build && tile._faNexusFlattenChunkBuild !== build) return false;
+  if (!container) return true;
+  if (container.destroyed) return false;
+  return tile.faNexusFlattenChunkContainer === container || mesh.faNexusFlattenChunkContainer === container;
+}
+
+export function isFlattenChunkBuildReusable(tile, mesh, container, build, renderKey) {
+  return Boolean(
+    build
+      && build.key === renderKey
+      && build.mesh === mesh
+      && build.container === container
+      && build.promise
+      && isFlattenChunkTargetLive(tile, mesh, container, build)
+  );
+}
+
+function ensureFlattenChunkContainerParent(container, mesh) {
+  if (!container || !mesh || container.destroyed || mesh.destroyed || container.parent === mesh) return false;
+  try { container.parent?.removeChild?.(container); } catch (_) {}
+  mesh.addChild(container);
+  return container.parent === mesh;
+}
+
+export function destroyFlattenChunkSprites(sprites) {
+  for (const sprite of sprites || []) {
+    try { sprite.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
+  }
+}
+
 export async function applyFlattenedChunks(tile) {
   try {
     if (!tile || tile.destroyed) return;
+    if (tile[Symbol.for('fa-nexus.scene-group-display-transform-preview')]) return;
     const doc = tile.document;
     const meta = resolveFlattenedMeta(doc);
-    const chunks = resolveChunkEntriesFromMeta(meta);
+    const chunks = resolveFlattenedChunkEntries(meta);
     const standardMask = doc?.getFlag?.(MODULE_ID, 'standardTileMask')
       || doc?.flags?.[MODULE_ID]?.standardTileMask
       || doc?._source?.flags?.[MODULE_ID]?.standardTileMask
@@ -246,10 +249,10 @@ export async function applyFlattenedChunks(tile) {
       return;
     }
 
-    const mesh = await ensureTileMesh(tile);
-    if (!mesh || mesh.destroyed) return;
-
-    ensureMeshTransparent(mesh, 'faNexusFlattenOriginalTexture');
+    const mesh = await prepareCustomTileRendererMesh(tile, {
+      originalTextureSlotKey: 'faNexusFlattenOriginalTexture'
+    });
+    if (!isFlattenChunkTargetLive(tile, mesh)) return;
 
     let container = tile.faNexusFlattenChunkContainer || mesh.faNexusFlattenChunkContainer;
     const renderKey = buildRenderKey(chunks);
@@ -262,8 +265,8 @@ export async function applyFlattenedChunks(tile) {
       mesh.addChild(container);
       mesh.faNexusFlattenChunkContainer = container;
       tile.faNexusFlattenChunkContainer = container;
-    } else if (!container.parent) {
-      mesh.addChild(container);
+    } else if (container.parent !== mesh) {
+      ensureFlattenChunkContainerParent(container, mesh);
       mesh.faNexusFlattenChunkContainer = container;
       tile.faNexusFlattenChunkContainer = container;
     }
@@ -279,21 +282,21 @@ export async function applyFlattenedChunks(tile) {
         kind: 'flatten',
         contentContainer: container,
         proxyFactory: createDisplayProxyFactory(container),
+        refreshReason: 'flatten-refresh',
         syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
           syncFlattenContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
         }
       });
-      invalidateCustomTileOverhead(tile, 'flatten-refresh');
       requestFlattenedChunkRefresh(tile, 'flatten-reuse');
       return;
     }
 
     const existingBuild = tile._faNexusFlattenChunkBuild;
-    if (existingBuild && existingBuild.key === renderKey) {
+    if (isFlattenChunkBuildReusable(tile, mesh, container, existingBuild, renderKey)) {
       return existingBuild.promise;
     }
 
-    const build = { key: renderKey, promise: null };
+    const build = { key: renderKey, mesh, container, promise: null };
     tile._faNexusFlattenChunkBuild = build;
     build.promise = (async () => {
       const loadJobs = chunks.map(async (chunk) => {
@@ -310,7 +313,8 @@ export async function applyFlattenedChunks(tile) {
       });
       const results = await Promise.all(loadJobs);
 
-      if (tile._faNexusFlattenChunkBuild !== build) {
+      if (!isFlattenChunkTargetLive(tile, mesh, container, build)
+        || tile[Symbol.for('fa-nexus.scene-group-display-transform-preview')]) {
         return;
       }
 
@@ -326,34 +330,33 @@ export async function applyFlattenedChunks(tile) {
         nextSprites.push(sprite);
       }
 
-      if (tile._faNexusFlattenChunkBuild !== build) {
-        for (const sprite of nextSprites) {
-          try { sprite.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
-        }
+      if (!isFlattenChunkTargetLive(tile, mesh, container, build)) {
+        destroyFlattenChunkSprites(nextSprites);
         return;
       }
 
       const prevChildren = container.children?.slice() || [];
       container.removeChildren();
-      for (const child of prevChildren) {
-        try { child.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
-      }
+      destroyFlattenChunkSprites(prevChildren);
       for (const sprite of nextSprites) {
         container.addChild(sprite);
       }
 
       container.faNexusFlattenChunkRenderKey = renderKey;
+      // Release the held scale at the same instant the new chunk geometry lands.
+      delete container[Symbol.for('fa-nexus.scene-group-display-transform-preview')];
+      syncFlattenContainerTransform(container, mesh, doc);
       mesh.faNexusFlattenChunkContainer = container;
       tile.faNexusFlattenChunkContainer = container;
       attachCustomTileOverhead(tile, {
         kind: 'flatten',
         contentContainer: container,
         proxyFactory: createDisplayProxyFactory(container),
+        refreshReason: 'flatten-refresh',
         syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
           syncFlattenContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
         }
       });
-      invalidateCustomTileOverhead(tile, 'flatten-refresh');
       requestFlattenedChunkRefresh(tile, 'flatten-build');
     })();
 
@@ -408,18 +411,14 @@ export async function rehydrateAllFlattenedChunks() {
   } catch (_) {}
 }
 
-function resolveFlattenChunkPlaceable(doc) {
-  const id = doc?.id || doc?._id;
-  if (!id) return null;
-  return mapTilePlaceablesById(collectTilePlaceables()).get(id) || null;
-}
-
 try {
+  registerCustomTileRenderLifecycle({
+    id: 'flatten-chunks',
+    callback: applyFlattenedChunks,
+    logCode: 'TileFlatten.lifecycle.failed'
+  });
   Hooks.on('canvasReady', () => {
     try { rehydrateAllFlattenedChunks(); } catch (_) {}
-  });
-  Hooks.on('drawTile', (tile) => {
-    try { applyFlattenedChunks(tile); } catch (_) {}
   });
   Hooks.on('createTile', (doc) => {
     try {
@@ -433,9 +432,17 @@ try {
   });
   Hooks.on('deleteTile', (doc) => {
     try {
-      const tile = resolveFlattenChunkPlaceable(doc);
+      if (!resolveFlattenedMeta(doc)) return;
+      forgetRepairAttemptForTile(doc);
+      const tile = resolveTilePlaceable(doc);
       if (tile) cleanupFlattenedChunks(tile);
-      try { setTimeout(() => rehydrateAllFlattenedChunks(), 80); } catch (_) {}
     } catch (_) {}
+  });
+  Hooks.on('destroyTile', (tile) => {
+    forgetRepairAttemptForTile(tile);
+    cleanupFlattenedChunks(tile);
+  });
+  Hooks.on('canvasTearDown', () => {
+    REPAIR_ATTEMPTS.clear();
   });
 } catch (_) {}

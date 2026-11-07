@@ -1,17 +1,20 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { isKeyEventForTextEntry } from '../core/keyboard-text-entry.js';
+import { waitForNativeTileTransformTransactions } from '../canvas/native-tile-transform-transactions.js';
 import {
   resolveTileDocument
 } from '../premium/session-host/editing-targets.js';
 import { resolvePremiumFeatureDelegate } from '../premium/session-host/delegate-bootstrap.js';
+import { getPremiumRuntimeAdapter } from '../premium/session-host/premium-runtime-adapter.js';
+import { callRequiredDelegateMethod } from '../premium/session-host/delegate-methods.js';
+import { callRequiredPreviewPlacementAdapterMethod } from '../premium/session-host/preview-placement-adapter.js';
 import {
   buildHostedSessionContextDetails,
-  getCurrentSceneId,
-  isHostedSessionSceneCurrent,
   isApplicationHostReady
 } from '../premium/session-host/host-context.js';
 import {
-  cancelToolWindowMonitor,
-  startHostedToolWindowMonitor
+  beginHostedToolWindowMonitor,
+  cancelHostedToolWindowMonitor
 } from '../premium/session-host/tool-window-monitor.js';
 import {
   beginEditingTileTracking,
@@ -21,63 +24,61 @@ import {
   handleSessionLaunchFailure as handleHostedSessionLaunchFailure,
   hasHostedSessionChanges,
   runHostedSessionLaunch,
-  stopSessionWithFinalize,
-  stopOrphanedSession as stopHostedOrphanedSession
+  syncHostedPreviewLaunchState,
+  stopSessionWithFinalize
 } from '../premium/session-host/session-lifecycle.js';
+import {
+  handleInactiveHostedSceneSessionStop,
+  isHostedSceneSessionHostReady,
+  snapshotHostedSessionScene,
+  stopOrphanedHostedSceneSession
+} from '../premium/session-host/scene-session-guard.js';
 import {
   handleEntitlementRevalidationFailure,
   scheduleEntitlementRevalidation
 } from '../premium/session-host/entitlement-revalidation.js';
 import {
+  notifyHostedPreviewLayerChangeIfNeeded,
   syncHostedToolOptions
 } from '../premium/session-host/tool-options-sync.js';
 import { createSubtoolPreferenceBridge } from '../premium/session-host/subtool-preference-bridge.js';
 import { applyPathTile, cleanupPathOverlay } from './path-tiles.js';
-import { toolOptionsController } from '../core/tool-options-controller.js';
+import { toolOptionsController } from '../core/tool-options/tool-options-controller.js';
 import {
   createNormalizedToolOptionsDescriptor,
   TOOL_OPTIONS_RENDERER_MODE
-} from '../core/tool-options-descriptor.js';
+} from '../core/tool-options/tool-options-descriptor.js';
+import {
+  addDeclarativeActionRowControl,
+  addDeclarativeAxisTogglePairControl,
+  addDeclarativeHintControl,
+  addDeclarativeRangeControl,
+  addDeclarativeRangePairControl,
+  addDeclarativeToggleControl,
+  addDeclarativeToggleListControl
+} from '../core/tool-options/tool-options-control-builders.js';
 import { createShortcut, createStandardEditorShortcuts, mergeShortcutLists } from '../core/editor-shortcuts.js';
 import { buildHsbcToolOptionsControls } from '../core/hsbc.js';
 import { requestSelectionFilterRefresh } from '../canvas/selection-filter-refresh.js';
-import { resolvePlacementAnchorTile } from '../canvas/elevation-band-utils.js';
-import { resolvePlacementSortAtElevation } from '../canvas/canvas-interaction-controller.js';
+import { getCurrentViewedLevelIds, resolvePlacementAnchorTile } from '../canvas/elevation-band-utils.js';
+import { PathGeneratedWallOwnership } from './path-generated-wall-ownership.js';
+import {
+  PATH_WALL_BEHAVIORS,
+  PATH_WALL_BEHAVIOR_OFF_TOOLTIP,
+  PATH_WALL_BEHAVIOR_TOOLTIPS,
+  normalizePathWallBehavior
+} from './path-wall-behavior.js';
 
 const MODULE_ID = 'fa-nexus';
 const PATH_SUBTOOL_SETTING_KEY = 'pathToolActiveSubtool';
 const PATH_ACTIVE_SUBTOOL_IDS = new Set(['curve', 'draw', 'edit-shapes']);
 const PATH_PERSISTED_SUBTOOL_IDS = new Set(['curve', 'draw']);
 const EDITING_TILES_KEY = '__faNexusPathEditingTiles';
-const PATH_MIN_SPLITTABLE_POINTS = 3;
-const PREVIEW_LAYER_HOOK = 'fa-nexus-preview-layers-changed';
-
-function clonePathControlPoint(point = {}) {
-  return {
-    x: Number(point?.x) || 0,
-    y: Number(point?.y) || 0,
-    widthLeft: Number.isFinite(point?.widthLeft) ? Number(point.widthLeft) : 1,
-    widthRight: Number.isFinite(point?.widthRight) ? Number(point.widthRight) : 1
-  };
-}
-
-function clonePathShadowPoint(point = {}) {
-  return {
-    x: Number(point?.x) || 0,
-    y: Number(point?.y) || 0,
-    widthLeft: Number.isFinite(point?.widthLeft) ? Number(point.widthLeft) : 1,
-    widthRight: Number.isFinite(point?.widthRight) ? Number(point.widthRight) : 1,
-    offset: Number.isFinite(point?.offset) ? Number(point.offset) : 0,
-    _anchorX: Number.isFinite(point?._anchorX) ? Number(point._anchorX) : undefined,
-    _anchorY: Number.isFinite(point?._anchorY) ? Number(point._anchorY) : undefined,
-    _anchorSegment: Number.isFinite(point?._anchorSegment) ? Number(point._anchorSegment) : undefined,
-    _anchorT: Number.isFinite(point?._anchorT) ? Number(point._anchorT) : undefined
-  };
-}
 
 export class PathManagerV2 {
   constructor(app) {
     this._app = app;
+    this.premiumRuntimeAdapter = getPremiumRuntimeAdapter(app);
     this._delegate = null;
     this._loading = null;
     this._entitlementProbe = null;
@@ -85,13 +86,15 @@ export class PathManagerV2 {
     this._sessionSceneId = null;
     this._hostUnavailableReason = 'host-context-unavailable';
     this._pendingLaunchPlacementAnchorTileId = undefined;
+    this._generatedWallOwnership = new PathGeneratedWallOwnership();
     this._subtoolPreferenceBridge = createSubtoolPreferenceBridge({
       moduleId: MODULE_ID,
       settingKey: PATH_SUBTOOL_SETTING_KEY,
       activeSubtoolIds: PATH_ACTIVE_SUBTOOL_IDS,
       persistedSubtoolIds: PATH_PERSISTED_SUBTOOL_IDS,
       getDelegate: () => this._delegate,
-      requestSubtoolToggle: (id, enabled) => toolOptionsController?.requestCustomToggle?.(id, enabled)
+      requestSubtoolToggle: (id, enabled) => toolOptionsController?.requestCustomToggle?.(id, enabled),
+      loggerPrefix: 'PathManagerV2'
     });
     this._editingTileId = null;
     this._sessionShortcutKeydownHandler = null;
@@ -128,8 +131,7 @@ export class PathManagerV2 {
       },
       missingMessage: 'Premium path editor v2 bundle missing PathManagerV2 implementation',
       loadedLogName: 'PathEditorV2.bundle.loaded',
-      loadedHookName: 'fa-nexus-path-editor-v2-loaded',
-      fallbackVersion: '0.0.15'
+      loadedHookName: 'fa-nexus-path-editor-v2-loaded'
     });
     try {
       return await this._loading;
@@ -143,18 +145,27 @@ export class PathManagerV2 {
     const wasActive = !!delegate?.isActive;
     if (!wasActive) this._clearEditingTile();
     return runHostedSessionLaunch({
+      awaitLaunch: true,
       beforeLaunch: () => {
         this._captureLaunchPlacementAnchorTileId();
         this._snapshotSessionScene(null, 'start');
         this._cancelPlacementSessions();
         this._refreshDelegateToolDefaults();
       },
-      launchSession: () => delegate.start?.(...args),
+      launchSession: () => callRequiredDelegateMethod({
+        delegate,
+        methodName: 'start',
+        args,
+        loggerPrefix: 'PathManagerV2',
+        logScope: 'sessionLaunch',
+        bundleLabel: 'path editor'
+      }),
       afterLaunch: () => {
-        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-        this._applyPendingLaunchPlacementAnchorTileId();
-        this._syncDelegatePreviewRenderSort();
-        this._applyCurrentPreviewLayerOrdering();
+        syncHostedPreviewLaunchState({
+          applyLaunchPlacementAnchorTileId: () => this._applyPendingLaunchPlacementAnchorTileId(),
+          syncPreviewRenderSort: () => this._syncDelegatePreviewRenderSort(),
+          applyCurrentPreviewLayerOrdering: () => this._applyCurrentPreviewLayerOrdering()
+        });
         this._syncToolOptionsState({
           suppressSubtoolPersistence: true,
           suppressToolDefaultsPersistence: true
@@ -170,11 +181,12 @@ export class PathManagerV2 {
   }
 
   async editTile(targetTile, options = {}) {
+    const doc = resolveTileDocument(targetTile);
+    await waitForNativeTileTransformTransactions(doc);
     const delegate = await this._ensureDelegate();
     if (!delegate || typeof delegate.editTile !== 'function') {
       throw new Error('Installed path editor bundle does not support editing existing tiles.');
     }
-    const doc = resolveTileDocument(targetTile);
     if (doc) this._markEditingTile(doc);
     return runHostedSessionLaunch({
       beforeLaunch: () => {
@@ -184,9 +196,10 @@ export class PathManagerV2 {
       },
       launchSession: () => delegate.editTile(targetTile, options),
       afterLaunch: () => {
-        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-        this._syncDelegatePreviewRenderSort();
-        this._applyCurrentPreviewLayerOrdering();
+        syncHostedPreviewLaunchState({
+          syncPreviewRenderSort: () => this._syncDelegatePreviewRenderSort(),
+          applyCurrentPreviewLayerOrdering: () => this._applyCurrentPreviewLayerOrdering()
+        });
         this._syncToolOptionsState({
           suppressSubtoolPersistence: true,
           suppressToolDefaultsPersistence: true
@@ -224,54 +237,38 @@ export class PathManagerV2 {
   }
 
   _snapshotSessionScene(target = null, phase = 'start') {
-    const doc = resolveTileDocument(target);
-    const sceneId = String(doc?.parent?.id || getCurrentSceneId() || '').trim();
-    this._sessionSceneId = sceneId || null;
-    if (!sceneId) {
-      Logger.warn?.('PathManagerV2.session.sceneIdMissing', { phase });
-    }
-    return this._sessionSceneId;
+    return snapshotHostedSessionScene(this, {
+      target,
+      phase,
+      loggerPrefix: 'PathManagerV2'
+    });
   }
 
   _isSessionHostReady() {
-    if (!this._isEditorHostReady()) {
-      this._hostUnavailableReason = 'host-context-unavailable';
-      return false;
-    }
-    if (!isHostedSessionSceneCurrent(this._sessionSceneId)) {
-      this._hostUnavailableReason = 'scene-changed-during-editor-session';
-      return false;
-    }
-    this._hostUnavailableReason = 'host-context-unavailable';
-    return true;
+    return isHostedSceneSessionHostReady(this, {
+      app: this._app,
+      isEditorHostReady: () => this._isEditorHostReady()
+    });
   }
 
   _handleInactiveMonitorStop() {
-    if (this._sessionSceneId && !isHostedSessionSceneCurrent(this._sessionSceneId)) {
-      Logger.warn?.('PathManagerV2.session.sceneChangedInactive', {
-        reason: 'scene-changed-during-editor-session',
-        sessionSceneId: this._sessionSceneId || null,
-        currentSceneId: getCurrentSceneId() || null,
+    return handleInactiveHostedSceneSessionStop(this, {
+      loggerPrefix: 'PathManagerV2',
+      details: {
         editingTileId: this._editingTileId || null
-      });
-    }
-    this._sessionSceneId = null;
+      }
+    });
   }
 
   _stopOrphanedSession({ reason = 'host-context-unavailable' } = {}) {
-    return stopHostedOrphanedSession({
+    return stopOrphanedHostedSceneSession(this, {
       reason,
       loggerPrefix: 'PathManagerV2',
-      details: buildHostedSessionContextDetails({
-        app: this._app,
-        delegate: this._delegate,
-        includeAppState: true,
+      app: this._app,
+      delegate: this._delegate,
+      contextDetails: {
         editingTileId: this._editingTileId || null,
-        extra: {
-          sessionSceneId: this._sessionSceneId || null,
-          currentSceneId: getCurrentSceneId() || null
-        }
-      }),
+      },
       cancelToolWindowMonitor: () => this._cancelToolWindowMonitor(),
       stopSession: ({ reason: stopReason }) => this.stop({ reason: stopReason }),
       onFallbackCleanup: () => {
@@ -304,21 +301,34 @@ export class PathManagerV2 {
     const keyLower = keyName.toLowerCase();
     if (keyLower !== 'x' || event?.repeat) return;
     if (event?.altKey || event?.ctrlKey || event?.metaKey) return;
-    const delegate = this._delegate;
-    if (!delegate?.isActive) return;
-    if (typeof delegate?._shouldIgnoreKeyEvent === 'function' && delegate._shouldIgnoreKeyEvent(event, keyName)) return;
-    const applied = this._splitHoveredPath();
+    // An "x" typed into a search or name box is text, also while the pointer rests on a path.
+    if (isKeyEventForTextEntry(event)) return;
+    if (!this._delegate?.isActive) return;
+    const applied = this._callRequiredPathEditingDelegateMethod('splitHoveredPath', [{
+      keyEvent: event
+    }]);
     if (!applied) {
-      Logger.debug?.('PathManagerV2.pathSplit.shortcutIgnored', {
-        activePathId: delegate?._activePathId || null,
-        editShapesMode: !!delegate?._editShapesMode,
-        hasPointerWorld: !!delegate?._lastPointerWorld
-      });
+      Logger.debug?.('PathManagerV2.pathSplit.shortcutIgnored');
       return;
     }
+    this._syncToolOptionsState({
+      suppressSubtoolPersistence: true,
+      suppressToolDefaultsPersistence: true
+    });
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation?.();
+  }
+
+  _callRequiredPathEditingDelegateMethod(methodName, args = []) {
+    return callRequiredDelegateMethod({
+      delegate: this._delegate,
+      methodName,
+      args,
+      loggerPrefix: 'PathManagerV2',
+      logScope: 'pathEditing',
+      bundleLabel: 'path editor'
+    });
   }
 
   stop(...args) {
@@ -329,7 +339,14 @@ export class PathManagerV2 {
         this._removeSessionShortcutListener();
       },
       persistToolDefaults: () => this._persistDelegateToolDefaults(),
-      stopSession: (delegate) => delegate.stop?.(...args),
+      stopSession: (delegate) => callRequiredDelegateMethod({
+        delegate,
+        methodName: 'stop',
+        args,
+        loggerPrefix: 'PathManagerV2',
+        logScope: 'sessionStop',
+        bundleLabel: 'path editor'
+      }),
       finalize: () => {
         this._sessionSceneId = null;
         this._clearEditingTile();
@@ -347,12 +364,26 @@ export class PathManagerV2 {
 
   async savePath(...args) {
     const delegate = await this._ensureDelegate();
-    return delegate.savePath?.(...args);
+    return callRequiredDelegateMethod({
+      delegate,
+      methodName: 'savePath',
+      args,
+      loggerPrefix: 'PathManagerV2',
+      logScope: 'persistence',
+      bundleLabel: 'path editor'
+    });
   }
 
   async save(...args) {
     const delegate = await this._ensureDelegate();
-    return delegate.save?.(...args);
+    return callRequiredDelegateMethod({
+      delegate,
+      methodName: 'save',
+      args,
+      loggerPrefix: 'PathManagerV2',
+      logScope: 'persistence',
+      bundleLabel: 'path editor'
+    });
   }
 
   _scheduleEntitlementProbe() {
@@ -369,11 +400,7 @@ export class PathManagerV2 {
       featureId: 'path.edit.v2',
       loggerPrefix: 'PathManagerV2',
       clearReason: 'path-revalidate-failed',
-      warningMessage: 'Authentication expired - premium path editing v2 has been disabled. Please reconnect Patreon.',
-      stopSession: () => this.stop?.(),
-      resetState: () => {
-        this._delegate = null;
-      }
+      editorLabel: 'Path Editor session'
     });
   }
 
@@ -399,14 +426,11 @@ export class PathManagerV2 {
   }
 
   _beginToolWindowMonitor(toolId, delegate) {
-    this._cancelToolWindowMonitor();
-    if (!delegate) return;
-    this._toolMonitor = startHostedToolWindowMonitor({
+    beginHostedToolWindowMonitor(this, {
       delegate,
       toolId,
       isHostReady: () => this._isSessionHostReady(),
       clearEditingTile: () => this._clearEditingTile(),
-      cancelMonitor: () => this._cancelToolWindowMonitor(),
       stopOrphanedSession: (details) => this._stopOrphanedSession({
         ...details,
         reason: this._hostUnavailableReason || details?.reason
@@ -417,9 +441,6 @@ export class PathManagerV2 {
           reason: 'path-editor-v2-monitor-stop',
           source: 'path-manager-v2'
         });
-      },
-      assignMonitorToken: (nextToken) => {
-        this._toolMonitor = nextToken;
       },
       syncToolOptions: () => {
         this._syncToolOptionsState({
@@ -433,7 +454,7 @@ export class PathManagerV2 {
   }
 
   _cancelToolWindowMonitor() {
-    this._toolMonitor = cancelToolWindowMonitor(this._toolMonitor);
+    cancelHostedToolWindowMonitor(this);
   }
 
   _markEditingTile(doc) {
@@ -449,7 +470,7 @@ export class PathManagerV2 {
   }
 
   _clearEditingTile(target = null) {
-    endEditingTileWithRefresh(this, {
+    return endEditingTileWithRefresh(this, {
       target,
       sharedSetKey: EDITING_TILES_KEY,
       loggerPrefix: 'PathManagerV2',
@@ -462,6 +483,14 @@ export class PathManagerV2 {
     });
   }
 
+  async reconcileGeneratedPathWalls({ tileIds = [] } = {}) {
+    return await this._generatedWallOwnership.reconcileTileIds({
+      scene: canvas?.scene,
+      user: game?.user,
+      tileIds
+    });
+  }
+
   _buildToolOptionsState() {
     const baseHints = [
       'LMB adds control points;',
@@ -471,18 +500,30 @@ export class PathManagerV2 {
       'X splits the hovered open path at the hovered non-endpoint.',
       'Double-click ends the current path.',
       'Ctrl/Cmd+Wheel adjusts scale;',
-      'Alt+Wheel, Alt+[ / ], or Alt+Up / Down change elevation (default 0.01, Shift 0.1, Ctrl/Cmd 0.001).',
+      'Alt+Wheel, Alt+[ / ], or Alt+Up / Down change elevation (0.001; add Shift for 0.1).',
+      'Ctrl/Cmd+Alt+Wheel moves the preview one layer through the current depth level.',
       'Press Ctrl/Cmd+S to commit; tap S toggles grid snap and S + wheel changes subgrid density; ESC cancels.'
     ];
     let delegateState = {};
     let handlers = {};
-    try {
-      const descriptor = this._delegate?.getToolOptionsDescriptor?.();
-      if (descriptor) {
-        if (descriptor.state && typeof descriptor.state === 'object') delegateState = descriptor.state;
-        if (descriptor.handlers && typeof descriptor.handlers === 'object') handlers = descriptor.handlers;
+    const delegate = this._delegate;
+    if (delegate) {
+      const descriptor = callRequiredDelegateMethod({
+        delegate,
+        methodName: 'getToolOptionsDescriptor',
+        loggerPrefix: 'PathManagerV2',
+        logScope: 'toolOptionsDescriptor',
+        bundleLabel: 'path editor'
+      });
+      if (!descriptor || typeof descriptor !== 'object') {
+        Logger.error?.('PathManagerV2.toolOptionsDescriptor.invalidDescriptor', {
+          descriptorType: typeof descriptor
+        });
+        throw new Error('Path editor bundle returned invalid tool-options descriptor.');
       }
-    } catch (_) {}
+      if (descriptor.state && typeof descriptor.state === 'object') delegateState = descriptor.state;
+      if (descriptor.handlers && typeof descriptor.handlers === 'object') handlers = descriptor.handlers;
+    }
     const mergedHints = [...baseHints];
     if (Array.isArray(delegateState?.hints)) {
       for (const hint of delegateState.hints) {
@@ -494,17 +535,49 @@ export class PathManagerV2 {
   }
 
   _notifyPreviewLayerChangeIfNeeded(descriptor = null, { force = false, source = 'path-preview' } = {}) {
+    const hostState = this._getPreviewLayerHostState();
     const previewState = {
-      active: !!this._delegate?.isActive,
-      elevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : null,
-      sort: Number.isFinite(this._delegate?._previewSort) ? Number(this._delegate._previewSort) : null,
-      activePathId: this._delegate?._activePathId || null,
+      active: !!hostState?.active,
+      elevation: Number.isFinite(hostState?.elevation) ? Number(hostState.elevation) : null,
+      sort: Number.isFinite(hostState?.sort) ? Number(hostState.sort) : null,
+      activePathId: hostState?.activePathId || null,
       mode: descriptor?.descriptor?.activeMode || null
     };
-    const signature = JSON.stringify(previewState);
-    if (!force && signature === this._lastPreviewLayerSignature) return;
-    this._lastPreviewLayerSignature = signature;
-    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source, previewState }); } catch (_) {}
+    notifyHostedPreviewLayerChangeIfNeeded({
+      previewState,
+      source,
+      force,
+      lastSignature: this._lastPreviewLayerSignature,
+      setLastSignature: (signature) => { this._lastPreviewLayerSignature = signature; },
+      loggerPrefix: 'PathManagerV2'
+    });
+  }
+
+  async prepareEditingTileExit() {
+    const result = this._clearEditingTile();
+    if (result?.refreshPromise) await result.refreshPromise;
+    return {
+      tileId: result?.tileId || null,
+      refreshed: !!result?.refreshPromise
+    };
+  }
+
+  _callRequiredPreviewPlacementDelegateMethod(methodName, args = []) {
+    return callRequiredPreviewPlacementAdapterMethod({
+      delegate: this._delegate,
+      adapterKind: 'path',
+      methodName,
+      args,
+      loggerPrefix: 'PathManagerV2',
+      bundleLabel: 'path editor'
+    });
+  }
+
+  _getPreviewLayerHostState() {
+    if (!this._delegate) {
+      return { active: false, elevation: null, sort: null, activePathId: null };
+    }
+    return this._callRequiredPreviewPlacementDelegateMethod('getPreviewLayerHostState');
   }
 
   _captureLaunchPlacementAnchorTileId(controlledTiles = canvas?.tiles?.controlled) {
@@ -524,149 +597,36 @@ export class PathManagerV2 {
     const anchorTileId = this._pendingLaunchPlacementAnchorTileId || null;
     this._pendingLaunchPlacementAnchorTileId = undefined;
     if (!this._delegate) return anchorTileId;
-    try { this._delegate._placementSortAnchorTileId = anchorTileId; } catch (_) {}
-    try { this._delegate._placementSortBeforeAnchor = false; } catch (_) {}
+    this._callRequiredPreviewPlacementDelegateMethod('applyLaunchPlacementAnchorTileId', [anchorTileId]);
     Logger.debug?.('PathManagerV2.sortAnchor.launchApply', { anchorTileId });
     return anchorTileId;
   }
 
   _syncDelegatePreviewRenderSort() {
-    const delegate = this._delegate;
-    if (!delegate) return null;
-    const currentSort = Number(delegate?._previewSort ?? 0);
-    if (this._editingTileId) {
-      const resolvedSort = Number.isFinite(currentSort) ? currentSort : 0;
-      try { delegate._previewRenderSort = resolvedSort; } catch (_) {}
-      return resolvedSort;
-    }
-    const elevation = Number(delegate?._previewElevation ?? 0);
-    const normalizedElevation = Number.isFinite(elevation) ? elevation : 0;
-    const resolved = resolvePlacementSortAtElevation(normalizedElevation, {
-      anchorTileId: delegate?._placementSortAnchorTileId,
-      sortBefore: delegate?._placementSortBeforeAnchor === true,
-      scene: canvas?.scene,
-      count: 1
-    });
-    const placementSort = Number(resolved?.sort ?? currentSort);
-    if (Number.isFinite(placementSort) && Number.isFinite(currentSort) && Math.abs(placementSort - currentSort) > 0.000001) {
-      Logger.warn?.('PathManagerV2.previewSort.delegateMismatch', {
-        delegateSort: currentSort,
-        resolvedSort: placementSort,
-        elevation: normalizedElevation,
-        anchorTileId: delegate?._placementSortAnchorTileId || null
-      });
-      try { delegate._previewSort = placementSort; } catch (_) {}
-    }
-    const renderSort = Number(resolved?.previewSort ?? placementSort);
-    const nextRenderSort = Number.isFinite(renderSort)
-      ? renderSort
-      : (Number.isFinite(placementSort) ? placementSort : 0);
-    try { delegate._previewRenderSort = nextRenderSort; } catch (_) {}
-    const key = normalizedElevation.toFixed(3);
-    const group = delegate?._previewGroups?.get?.(key) || null;
-    if (group) {
-      try { group.placementSort = Number.isFinite(placementSort) ? placementSort : currentSort; } catch (_) {}
-      try { group.sort = nextRenderSort; } catch (_) {}
-    }
-    return nextRenderSort;
+    if (!this._delegate) return null;
+    return this._callRequiredPreviewPlacementDelegateMethod('syncPreviewRenderSort', [{
+      editingTileId: this._editingTileId || null
+    }]);
   }
 
   _applyPathPreviewPlacementMetadata() {
-    const delegate = this._delegate;
-    if (!delegate) return;
-    const placementSort = Number.isFinite(Number(delegate?._previewSort)) ? Number(delegate._previewSort) : 0;
-    const renderSort = Number.isFinite(Number(delegate?._previewRenderSort)) ? Number(delegate._previewRenderSort) : placementSort;
-    const applyMetadata = (container, finalSort, previewSort) => {
-      if (!container || container.destroyed) return;
-      try { container.faNexusPlacementSort = finalSort; } catch (_) {}
-      try { container.faNexusPreviewSort = previewSort; } catch (_) {}
-    };
-    applyMetadata(delegate._layer, placementSort, renderSort);
-    if (!delegate._previewGroups?.size) return;
-    for (const group of delegate._previewGroups.values()) {
-      const groupPlacementSort = Number.isFinite(Number(group?.placementSort))
-        ? Number(group.placementSort)
-        : placementSort;
-      const groupRenderSort = Number.isFinite(Number(group?.sort)) ? Number(group.sort) : groupPlacementSort;
-      applyMetadata(group?.container, groupPlacementSort, groupRenderSort);
-    }
+    if (!this._delegate) return false;
+    return this._callRequiredPreviewPlacementDelegateMethod('applyPathPreviewPlacementMetadata');
   }
 
   _applyCurrentPreviewLayerOrdering() {
-    const placementSort = Number(this._delegate?._previewSort ?? 0);
-    const renderSort = Number(this._delegate?._previewRenderSort ?? this._syncDelegatePreviewRenderSort() ?? placementSort);
-    try { this._delegate?._syncElevationGroupOrdering?.(); } catch (_) {}
-    try { this._delegate?._applyPreviewLayerOrdering?.(Number.isFinite(renderSort) ? renderSort : placementSort); } catch (_) {}
-    this._applyPathPreviewPlacementMetadata();
+    if (!this._delegate) return false;
+    return this._callRequiredPreviewPlacementDelegateMethod('applyCurrentPreviewLayerOrdering');
   }
 
-  _normalizePreviewGroupKey({ previewKey = null, previewId = null, elevation = null } = {}) {
-    const explicit = String(previewKey || '').trim();
-    if (explicit) return explicit;
-    const id = String(previewId || '').trim();
-    if (id.startsWith('path-preview-')) return id.slice('path-preview-'.length);
-    const numeric = Number(elevation);
-    return Number.isFinite(numeric) ? numeric.toFixed(3) : '';
-  }
-
-  _getPathEntryElevation(entry, fallback = this._delegate?._previewElevation) {
-    const delegate = this._delegate;
-    try {
-      if (typeof delegate?._getEntryElevation === 'function') {
-        const resolved = Number(delegate._getEntryElevation(entry, fallback));
-        if (Number.isFinite(resolved)) return resolved;
-      }
-    } catch (_) {}
-    const direct = Number(entry?.elevation);
-    if (Number.isFinite(direct)) return direct;
-    const fallbackNumber = Number(fallback);
-    return Number.isFinite(fallbackNumber) ? fallbackNumber : 0;
-  }
-
-  _applyPathPreviewGroupPlacement({
-    previewKey = null,
-    previewId = null,
-    elevation = null,
-    sort = undefined,
-    previewSort = undefined
-  } = {}) {
-    const delegate = this._delegate;
-    if (!delegate?.isActive) return false;
-    const sourceKey = this._normalizePreviewGroupKey({ previewKey, previewId, elevation });
-    const targetElevation = Number(elevation);
-    const targetKey = Number.isFinite(targetElevation) ? targetElevation.toFixed(3) : sourceKey;
-    const nextSort = Number(sort);
-    let changed = false;
-
-    if (sourceKey && targetKey && sourceKey !== targetKey && Array.isArray(delegate._sessionPaths)) {
-      for (const entry of delegate._sessionPaths) {
-        const entryKey = this._getPathEntryElevation(entry).toFixed(3);
-        if (entryKey !== sourceKey) continue;
-        entry.elevation = targetElevation;
-        changed = true;
-      }
-      if (Number(delegate._previewElevation).toFixed(3) === sourceKey) {
-        delegate._previewElevation = targetElevation;
-        changed = true;
-      }
-      if (changed) {
-        try { delegate._syncSessionMeshOrder?.({ includeActive: true }); } catch (_) {}
-      }
-    }
-
-    if (Number.isFinite(nextSort)) {
-      const nextPreviewSort = Number.isFinite(Number(previewSort)) ? Number(previewSort) : nextSort;
-      const group = delegate._previewGroups?.get?.(targetKey)
-        || delegate._previewGroups?.get?.(sourceKey)
-        || null;
-      if (group && (Number(group.placementSort) !== nextSort || Number(group.sort) !== nextPreviewSort)) {
-        group.placementSort = nextSort;
-        group.sort = nextPreviewSort;
-        changed = true;
-      }
-    }
-
-    return changed;
+  /**
+   * A Path belongs to the Level it is drawn on: its Foundry Walls are created
+   * there. Its preview is not moved to an Elevation of another Level.
+   */
+  canApplyLayerManagerPreviewLevel({ placementLevelId = undefined } = {}) {
+    const targetLevelId = String(placementLevelId || '').trim();
+    if (!targetLevelId) return true;
+    return getCurrentViewedLevelIds(canvas?.scene).includes(targetLevelId);
   }
 
   applyLayerManagerPreviewPlacement({
@@ -678,61 +638,17 @@ export class PathManagerV2 {
     anchorTileId = undefined,
     sortBefore = undefined
   } = {}) {
-    if (!this._delegate?.isActive) return false;
-    const { handlers } = this._buildToolOptionsState();
-    let changed = false;
-
-    if (anchorTileId !== undefined) {
-      const nextAnchorTileId = String(anchorTileId || '').trim() || null;
-      if (String(this._delegate?._placementSortAnchorTileId || '').trim() !== String(nextAnchorTileId || '').trim()) {
-        try { this._delegate._placementSortAnchorTileId = nextAnchorTileId; } catch (_) {}
-        changed = true;
-      }
-    }
-
-    if (sortBefore !== undefined) {
-      const nextSortBefore = sortBefore === true;
-      if (this._delegate?._placementSortBeforeAnchor !== nextSortBefore) {
-        try { this._delegate._placementSortBeforeAnchor = nextSortBefore; } catch (_) {}
-        changed = true;
-      }
-    }
-
-    if (Number.isFinite(Number(elevation))) {
-      const nextElevation = Number(elevation);
-      if (Number(this._delegate?._previewElevation) !== nextElevation) {
-        if (typeof handlers?.setElevation === 'function') handlers.setElevation(nextElevation, true);
-        else this._delegate._previewElevation = nextElevation;
-        changed = true;
-      }
-    }
-
-    if (sort !== undefined && Number.isFinite(Number(sort))) {
-      const nextSort = Number(sort);
-      if (Number(this._delegate?._previewSort) !== nextSort) {
-        try { this._delegate._previewSort = nextSort; } catch (_) {}
-        changed = true;
-      }
-      const nextPreviewSort = previewSort !== undefined && Number.isFinite(Number(previewSort))
-        ? Number(previewSort)
-        : nextSort;
-      if (Number(this._delegate?._previewRenderSort) !== nextPreviewSort) {
-        try { this._delegate._previewRenderSort = nextPreviewSort; } catch (_) {}
-        changed = true;
-      }
-    }
-
-    changed = this._applyPathPreviewGroupPlacement({
-      previewId,
-      previewKey,
+    if (!this._delegate) return false;
+    const changed = !!this._callRequiredPreviewPlacementDelegateMethod('applyLayerManagerPreviewPlacement', [{
       elevation,
       sort,
-      previewSort
-    }) || changed;
-
+      previewSort,
+      previewId,
+      previewKey,
+      anchorTileId,
+      sortBefore
+    }]);
     if (!changed) return false;
-    this._applyCurrentPreviewLayerOrdering();
-    try { this._delegate?._refreshCursorPreview?.(); } catch (_) {}
     this._syncToolOptionsState({
       suppressRender: false,
       suppressSubtoolPersistence: true,
@@ -747,50 +663,13 @@ export class PathManagerV2 {
     previewKey = null,
     elevation = null
   } = {}) {
-    const delegate = this._delegate;
-    if (!delegate?.isActive) return false;
-    const sourceKey = this._normalizePreviewGroupKey({ previewKey, previewId, elevation });
-    const targetElevation = Number(elevation);
-    const targetKey = sourceKey || (Number.isFinite(targetElevation) ? targetElevation.toFixed(3) : '');
-    let activatedEditShapes = false;
-    if (!delegate._editShapesMode && typeof delegate._setSubtoolMode === 'function') {
-      activatedEditShapes = !!delegate._setSubtoolMode('edit-shapes');
-      if (!activatedEditShapes) {
-        Logger.warn('PathManagerV2.previewSelect.editShapesUnavailable', {
-          previewId,
-          previewKey,
-          elevation: Number.isFinite(targetElevation) ? targetElevation : null
-        });
-        return false;
-      }
-    }
-
-    const entries = Array.isArray(delegate._sessionPaths) ? delegate._sessionPaths : [];
-    const matching = entries.filter((entry) => this._getPathEntryElevation(entry).toFixed(3) === targetKey);
-    const activeEntry = matching.find((entry) => entry?.id && entry.id === delegate._activePathId) || null;
-    const targetEntry = activeEntry || matching[matching.length - 1] || null;
-    if (!targetEntry?.id) {
-      Logger.warn('PathManagerV2.previewSelect.pathMissing', {
-        previewId,
-        previewKey,
-        elevation: Number.isFinite(targetElevation) ? targetElevation : null,
-        targetKey,
-        editShapesMode: !!delegate._editShapesMode,
-        activatedEditShapes
-      });
-      return false;
-    }
-
-    const selected = typeof delegate._selectSessionPath === 'function'
-      ? !!delegate._selectSessionPath(targetEntry.id)
-      : false;
+    if (!this._delegate) return false;
+    const selected = !!this._callRequiredPreviewPlacementDelegateMethod('selectLayerManagerPreview', [{
+      previewId,
+      previewKey,
+      elevation
+    }]);
     if (!selected) {
-      Logger.warn('PathManagerV2.previewSelect.failed', {
-        previewId,
-        previewKey,
-        pathId: targetEntry.id,
-        targetKey
-      });
       return false;
     }
     this._syncToolOptionsState({
@@ -802,157 +681,9 @@ export class PathManagerV2 {
     return true;
   }
 
-  _resolveHoveredSplitTarget() {
-    const delegate = this._delegate;
-    if (!delegate?.isActive || !delegate?._editShapesMode) return null;
-    if (delegate?._dragState) return null;
-    if (typeof delegate?._isShadowEditing === 'function' && delegate._isShadowEditing()) return null;
-    const pointerWorld = delegate?._lastPointerWorld;
-    if (!pointerWorld || !Number.isFinite(pointerWorld.x) || !Number.isFinite(pointerWorld.y)) return null;
-    if (typeof delegate?._selectSessionPathAtPoint === 'function') {
-      const picked = !!delegate._selectSessionPathAtPoint(pointerWorld.x, pointerWorld.y);
-      if (!picked) return null;
-    }
-    if (!delegate?._activePathId || delegate?._isClosed) return null;
-    const points = Array.isArray(delegate?._points) ? delegate._points : [];
-    if (points.length < PATH_MIN_SPLITTABLE_POINTS) return null;
-    const splitIndex = typeof delegate?._findNearestPointIndex === 'function'
-      ? delegate._findNearestPointIndex(pointerWorld.x, pointerWorld.y, 30, points)
-      : -1;
-    if (!Number.isInteger(splitIndex) || splitIndex <= 0 || splitIndex >= (points.length - 1)) return null;
-    return {
-      activePathId: delegate._activePathId || null,
-      pointerWorld: { x: pointerWorld.x, y: pointerWorld.y },
-      splitIndex
-    };
-  }
-
-  _splitHoveredPath() {
-    const target = this._resolveHoveredSplitTarget();
-    if (!target) return false;
-    const applied = this._splitPathAtIndex(target.splitIndex, { sourcePathId: target.activePathId });
-    if (!applied) return false;
-    try { this._delegate?._refreshCursorPreview?.(); } catch (_) {}
-    this._syncToolOptionsState({
-      suppressSubtoolPersistence: true,
-      suppressToolDefaultsPersistence: true
-    });
-    return true;
-  }
-
-  _splitPathAtIndex(splitIndex, { sourcePathId = null } = {}) {
-    const delegate = this._delegate;
-    if (!delegate?.isActive) return false;
-    const numericSplitIndex = Number(splitIndex);
-    const snapshot = delegate?._captureHistorySnapshot?.();
-    if (!snapshot || !Array.isArray(snapshot.sessionPaths)) {
-      Logger.error?.('PathManagerV2.pathSplit.snapshotMissing', {
-        splitIndex: numericSplitIndex,
-        activePathId: delegate?._activePathId || null
-      });
-      return false;
-    }
-    const resolvedSourcePathId = sourcePathId || snapshot.activePathId || delegate?._activePathId || null;
-    const sourceIndex = snapshot.sessionPaths.findIndex((entry) => entry?.id === resolvedSourcePathId);
-    if (sourceIndex < 0) {
-      Logger.error?.('PathManagerV2.pathSplit.pathMissing', {
-        splitIndex: numericSplitIndex,
-        activePathId: resolvedSourcePathId
-      });
-      return false;
-    }
-    const sourceEntry = snapshot.sessionPaths[sourceIndex];
-    const sourcePoints = Array.isArray(sourceEntry?.controlPoints)
-      ? sourceEntry.controlPoints.map(clonePathControlPoint)
-      : [];
-    if (sourceEntry?.closed || sourcePoints.length < PATH_MIN_SPLITTABLE_POINTS) {
-      Logger.error?.('PathManagerV2.pathSplit.invalidSource', {
-        splitIndex: numericSplitIndex,
-        activePathId: resolvedSourcePathId,
-        closed: !!sourceEntry?.closed,
-        pointCount: sourcePoints.length
-      });
-      return false;
-    }
-    if (!Number.isInteger(numericSplitIndex) || numericSplitIndex <= 0 || numericSplitIndex >= (sourcePoints.length - 1)) {
-      Logger.error?.('PathManagerV2.pathSplit.invalidIndex', {
-        splitIndex: numericSplitIndex,
-        activePathId: resolvedSourcePathId,
-        pointCount: sourcePoints.length
-      });
-      return false;
-    }
-
-    const sourceShadowPoints = Array.isArray(sourceEntry?.shadowPoints)
-      ? sourceEntry.shadowPoints.map(clonePathShadowPoint)
-      : [];
-    const hasManualShadowSplit = sourceShadowPoints.length === sourcePoints.length;
-    let pathIdCounter = Number.isFinite(snapshot.pathIdCounter) ? snapshot.pathIdCounter : 0;
-    const nextPathId = () => `path_${++pathIdCounter}`;
-    const now = Date.now();
-    const buildSplitEntry = (controlPoints, shadowPoints) => {
-      const entry = typeof delegate?._cloneSessionPathEntry === 'function'
-        ? delegate._cloneSessionPathEntry(sourceEntry)
-        : { ...sourceEntry };
-      entry.id = nextPathId();
-      entry.controlPoints = controlPoints.map(clonePathControlPoint);
-      entry.closed = false;
-      entry.wallGroupId = null;
-      entry.wallIds = [];
-      entry.createdAt = now;
-      if (hasManualShadowSplit) {
-        entry.shadowPoints = shadowPoints.map(clonePathShadowPoint);
-      } else {
-        entry.shadowPoints = [];
-        if (entry.shadow?.manual) {
-          entry.shadow = {
-            ...entry.shadow,
-            manual: false,
-            editMode: false
-          };
-        }
-      }
-      return entry;
-    };
-
-    const leadingEntry = buildSplitEntry(
-      sourcePoints.slice(0, numericSplitIndex + 1),
-      sourceShadowPoints.slice(0, numericSplitIndex + 1)
-    );
-    const trailingEntry = buildSplitEntry(
-      sourcePoints.slice(numericSplitIndex),
-      sourceShadowPoints.slice(numericSplitIndex)
-    );
-
-    snapshot.sessionPaths.splice(sourceIndex, 1, leadingEntry, trailingEntry);
-    snapshot.activeSnapshot = null;
-    snapshot.activePathId = trailingEntry.id;
-    snapshot.lastPlacedPathId = trailingEntry.id;
-    snapshot.pathIdCounter = pathIdCounter;
-
-    const restored = delegate?._restoreHistorySnapshot?.(snapshot);
-    if (!restored) {
-      Logger.error?.('PathManagerV2.pathSplit.restoreFailed', {
-        splitIndex: numericSplitIndex,
-        sourcePathId: resolvedSourcePathId,
-        leadingPathId: leadingEntry.id,
-        trailingPathId: trailingEntry.id
-      });
-      return false;
-    }
-    delegate?._recordHistorySnapshot?.();
-    Logger.info?.('PathManagerV2.pathSplit.applied', {
-      splitIndex: numericSplitIndex,
-      sourcePathId: resolvedSourcePathId,
-      leadingPathId: leadingEntry.id,
-      trailingPathId: trailingEntry.id,
-      sourcePointCount: sourcePoints.length
-    });
-    return true;
-  }
-
   _buildToolOptionsDescriptor() {
     const { state: legacyState, handlers } = this._buildToolOptionsState();
+    const hostState = this._getPreviewLayerHostState();
     const activeSubtool = this._extractActiveSubtoolId(legacyState) || null;
     const { controls, sections } = this._buildDeclarativeToolOptionsConfig(legacyState);
     const shortcuts = mergeShortcutLists(
@@ -986,7 +717,12 @@ export class PathManagerV2 {
         createShortcut('adjust-elevation-wheel', {
           binding: 'Alt+Wheel',
           label: 'Elevation Wheel',
-          description: 'Adjust tile elevation by 0.01; add Shift for 0.1 or Ctrl/Cmd for 0.001.'
+          description: 'Adjust tile elevation by 0.001; add Shift for 0.1.'
+        }),
+        createShortcut('adjust-layer-order-wheel', {
+          binding: 'Ctrl/Cmd+Alt+Wheel',
+          label: 'Layer Order',
+          description: 'Move the preview one layer up or down within the current depth level.'
         }),
         createShortcut('adjust-elevation-keys', {
           binding: 'Alt+[ / ] or Alt+Up / Down',
@@ -1003,8 +739,8 @@ export class PathManagerV2 {
         activeMode: activeSubtool,
         activeSubtool,
         dirty: this.hasSessionChanges(),
-        selectionSummary: this._delegate?._activePathId
-          ? `Editing path ${this._delegate._activePathId}`
+        selectionSummary: hostState?.activePathId
+          ? `Editing path ${hostState.activePathId}`
           : (activeSubtool || null),
         helpTopicId: 'path-editor-v2'
       },
@@ -1019,9 +755,9 @@ export class PathManagerV2 {
         dirty: this.hasSessionChanges()
       },
       renderState: {
-        previewElevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : 0,
-        editShapesMode: !!this._delegate?._editShapesMode,
-        activePathId: this._delegate?._activePathId || null
+        previewElevation: Number.isFinite(hostState?.elevation) ? Number(hostState.elevation) : 0,
+        editShapesMode: !!hostState?.editShapesMode,
+        activePathId: hostState?.activePathId || null
       },
       persistedState: {
         documentFlags: ['flags.fa-nexus.pathV2', 'flags.fa-nexus.pathsV2', 'flags.fa-nexus.hsbc'],
@@ -1081,128 +817,18 @@ export class PathManagerV2 {
   _buildDeclarativeToolOptionsConfig(legacyState = {}) {
     const controls = {};
     const sections = [];
-    const addHintControl = ({ id, text } = {}) => {
-      if (!id || typeof text !== 'string' || !text.trim().length) return null;
-      controls[id] = {
-        id,
-        type: 'hint',
-        text: text.trim()
-      };
-      return id;
-    };
-    const addRangeControl = ({
-      id,
-      label,
-      state,
-      handlerId,
-      handlerArg,
-      headerToggle = null,
-      compact = false,
-      ariaLabel = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'range',
-        label,
-        compact,
-        ariaLabel,
-        handlerId,
-        handlerArg,
-        headerToggle: headerToggle && typeof headerToggle === 'object' ? { ...headerToggle } : null,
-        min: state.min,
-        max: state.max,
-        step: state.step,
-        value: state.value,
-        display: state.display,
-        defaultValue: state.defaultValue,
-        disabled: !!state.disabled,
-        hint: typeof state.hint === 'string' ? state.hint : '',
-        tooltip: typeof state.tooltip === 'string' ? state.tooltip : '',
-        inputOnly: !!state.inputOnly
-      };
-      return id;
-    };
-    const addRangePairControl = ({
-      id,
-      label,
-      state,
-      handlerId,
-      ariaLabelX = '',
-      ariaLabelY = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'range-pair',
-        label,
-        handlerId,
-        hint: typeof state.hint === 'string' ? state.hint : '',
-        items: [
-          {
-            id: 'x',
-            label: 'X',
-            ariaLabel: ariaLabelX,
-            handlerArg: 'x',
-            ...(state.x && typeof state.x === 'object' ? state.x : {})
-          },
-          {
-            id: 'y',
-            label: 'Y',
-            ariaLabel: ariaLabelY,
-            handlerArg: 'y',
-            ...(state.y && typeof state.y === 'object' ? state.y : {})
-          }
-        ]
-      };
-      return id;
-    };
-    const addToggleControl = ({
-      id,
-      label,
-      value = false,
-      disabled = false,
-      tooltip = '',
-      hint = '',
-      handlerId = '',
-      handlerArg
-    } = {}) => {
-      if (!id) return null;
-      controls[id] = {
-        id,
-        type: 'toggle',
-        label,
-        value: !!value,
-        disabled: !!disabled,
-        tooltip,
-        hint,
-        handlerId,
-        handlerArg
-      };
-      return id;
-    };
-    const addAxisTogglePairControl = ({
-      id,
-      label,
-      state,
-      horizontalHandlerId,
-      verticalHandlerId,
-      horizontalRandomHandlerId = '',
-      verticalRandomHandlerId = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'axis-toggle-pair',
-        label,
-        state,
-        horizontalHandlerId,
-        verticalHandlerId,
-        horizontalRandomHandlerId,
-        verticalRandomHandlerId
-      };
-      return id;
-    };
+    const addHintControl = (config) => addDeclarativeHintControl(controls, config);
+    const addRangeControl = (config) => addDeclarativeRangeControl(controls, config, {
+      includeHandlerArg: true,
+      includeHeaderToggle: true
+    });
+    const addRangePairControl = (config) => addDeclarativeRangePairControl(controls, config);
+    const addToggleControl = (config) => addDeclarativeToggleControl(controls, config, {
+      includeHandlerArg: true
+    });
+    const addAxisTogglePairControl = (config) => addDeclarativeAxisTogglePairControl(controls, config);
+    const addToggleListControl = (config) => addDeclarativeToggleListControl(controls, config);
+    const addActionRowControl = (config) => addDeclarativeActionRowControl(controls, config);
 
     const modeSectionControlIds = [];
     const modeOptions = Array.isArray(legacyState?.subtoolToggles)
@@ -1222,12 +848,33 @@ export class PathManagerV2 {
       : [];
     const subtoolOptions = customToggleList.filter((toggle) => String(toggle?.group || '') === 'subtool-option');
     if (subtoolOptions.length) {
-      controls['path-mode-options'] = {
+      modeSectionControlIds.push(addToggleListControl({
         id: 'path-mode-options',
-        type: 'toggle-list',
         items: subtoolOptions
+      }));
+    }
+
+    // What the Foundry Walls of the path block: the presets the walls of a Building have. Always laid out, and
+    // greyed out while "Foundry Walls" is off, so the panel keeps its shape when the toggle or the selected
+    // path changes (values are synced in place; a new control would need a new layout).
+    const wallBehavior = legacyState?.wallBehavior;
+    if (wallBehavior && typeof wallBehavior === 'object') {
+      const chosen = normalizePathWallBehavior(wallBehavior.value);
+      const wallsOn = !!wallBehavior.available;
+      controls['path-wall-behavior'] = {
+        id: 'path-wall-behavior',
+        type: 'segmented',
+        variant: 'construction-mode',
+        handlerId: 'setWallBehavior',
+        options: PATH_WALL_BEHAVIORS.map((name) => ({
+          id: name,
+          label: name,
+          enabled: name === chosen,
+          disabled: !wallsOn || !!wallBehavior.disabled,
+          tooltip: wallsOn ? PATH_WALL_BEHAVIOR_TOOLTIPS[name] : PATH_WALL_BEHAVIOR_OFF_TOOLTIP
+        }))
       };
-      modeSectionControlIds.push('path-mode-options');
+      modeSectionControlIds.push('path-wall-behavior');
     }
 
     if (modeSectionControlIds.length) {
@@ -1479,17 +1126,15 @@ export class PathManagerV2 {
       ? legacyState.editorActions.filter((action) => action && typeof action === 'object')
       : [];
     if (editorActions.length) {
-      controls['path-session-actions'] = {
-        id: 'path-session-actions',
-        type: 'action-row',
-        actions: editorActions
-      };
       sections.push({
         id: 'session',
         label: 'Session',
         region: 'footer',
         collapsible: false,
-        controls: ['path-session-actions']
+        controls: [addActionRowControl({
+          id: 'path-session-actions',
+          actions: editorActions
+        })]
       });
     }
 

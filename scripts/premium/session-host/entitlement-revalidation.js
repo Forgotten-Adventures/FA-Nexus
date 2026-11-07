@@ -2,7 +2,7 @@ import { NexusLogger as Logger } from '../../core/nexus-logger.js';
 import { premiumFeatureBroker } from '../premium-feature-broker.js';
 import { premiumEntitlementsService } from '../premium-entitlements-service.js';
 import { ensurePremiumFeaturesRegistered } from '../premium-feature-registry.js';
-import { hasPremiumAuth, isPremiumAuthFailure } from './auth-state.js';
+import { hasPremiumAuth, isPremiumAuthFailure, isProTierRefusal } from './auth-state.js';
 
 function stringifyError(error) {
   return String(error?.message || error);
@@ -28,7 +28,13 @@ export function scheduleEntitlementRevalidation(owner, {
   })();
 
   owner._entitlementProbe = probe;
-  probe.catch(() => {});
+  probe.catch((error) => {
+    Logger.error?.('PremiumSessionHost.entitlement.revalidationFailed', {
+      featureId,
+      reason: revalidateReason,
+      error: stringifyError(error)
+    });
+  });
   return probe;
 }
 
@@ -37,18 +43,9 @@ export async function handleEntitlementRevalidationFailure({
   featureId,
   loggerPrefix = 'PremiumSessionHost',
   clearReason = 'premium-revalidate-failed',
-  warningMessage = 'Authentication expired - premium editing has been disabled. Please reconnect Patreon.',
-  stopSession = null,
-  resetState = null
+  editorLabel = 'Pro editor',
+  warningMessage = `Authentication expired. Your current ${editorLabel} remains open; reconnect Patreon before starting another Pro tool.`
 } = {}) {
-  try {
-    await Promise.resolve(stopSession?.());
-  } catch (_) {}
-
-  try {
-    await Promise.resolve(resetState?.());
-  } catch (_) {}
-
   if (!hasPremiumAuth()) {
     Logger.info?.(`${loggerPrefix}.entitlement.skipDisconnect`, {
       code: error?.code || error?.name,
@@ -58,12 +55,18 @@ export async function handleEntitlementRevalidationFailure({
   }
 
   if (isPremiumAuthFailure(error)) {
-    try { premiumEntitlementsService?.clear?.({ reason: clearReason }); } catch (_) {}
-    try { game?.settings?.set?.('fa-nexus', 'patreon_auth_data', null); } catch (_) {}
+    await Promise.resolve(premiumEntitlementsService.clear({ reason: clearReason }));
+    await Promise.resolve(game?.settings?.set?.('fa-nexus', 'patreon_auth_data', null));
     ui?.notifications?.warn?.(`🔐 ${warningMessage}`);
-  } else {
-    ui?.notifications?.error?.(`Unable to confirm premium access: ${stringifyError(error)}`);
+    Hooks?.callAll?.('fa-nexus-premium-auth-lost', { featureId, error });
+    return;
   }
-
-  try { Hooks?.callAll?.('fa-nexus-premium-auth-lost', { featureId, error }); } catch (_) {}
+  // A member whose tier no longer includes the Pro tools stays signed in: Premium content still works. The failed
+  // refresh already emptied the entitlements, so the next Pro tool start is refused.
+  if (isProTierRefusal(error)) {
+    Logger.info?.(`${loggerPrefix}.entitlement.proTierRefused`, { featureId, code: error?.code || error?.name });
+    ui?.notifications?.warn?.(`Your Patreon tier no longer includes the Pro tools. Your current ${editorLabel} remains open; the Pro tier is needed to start another.`);
+    return;
+  }
+  ui?.notifications?.error?.(`Unable to confirm Pro tool access: ${stringifyError(error)}`);
 }

@@ -1,16 +1,77 @@
+import './core/foundry-boot-hooks.js';
 import { FaNexusTokensFolderSelectionDialog } from "./tokens/tokens-content-sources-dialog.js";
 import { FaNexusAssetsFolderSelectionDialog } from "./assets/assets-content-sources-dialog.js";
 import { GeneratedCleanupDialog } from "./cleanup/generated-cleanup-dialog.js";
 import { configurePremiumRuntime } from "./premium/premium-runtime-config.js";
-import { installFoundryTextureLoaderCachePatch } from "./core/foundry-texture-loader-patch.js";
 import { DEFAULT_SHADOW_QUALITY, SHADOW_QUALITY_CHOICES } from "./assets/shadow-quality.js";
-
-installFoundryTextureLoaderCachePatch();
+import { NexusLogger as Logger } from "./core/nexus-logger.js";
+import { NEW_LAYER_LEVELS_ALL, NEW_LAYER_LEVELS_CHOICES, NEW_LAYER_LEVELS_SETTING } from "./canvas/new-layer-levels.js";
+import { getContentKindDescriptor } from "./content/content-kind-descriptors.js";
+import { getFlattenOutputDefaultFolder } from './flatten/flatten-output-paths.js';
+import { writeFeatureAreaBootstrapValue } from "./core/feature-areas.js";
+import { NATIVE_ADJUSTMENTS } from "./core/native-adjustments.js";
+import {
+  SCENE_GROUP_MEMBER_SELECTION_DEFAULT,
+  SCENE_GROUP_MEMBER_SELECTION_SETTING,
+  normalizeSceneGroupMemberSelectionMode
+} from "./composition/scene-group-member-selection.js";
 
 let _cloudDownloadFolderPickerHookInstalled = false;
 
+const SETTINGS_SECTIONS = Object.freeze([
+  Object.freeze({ id: 'features', label: 'Feature Areas', keys: Object.freeze(['tokensEnabled', 'mapmakingEnabled', 'sceneGroupsEnabled', 'prefabsEnabled']) }),
+  Object.freeze({ id: 'tokens', label: 'Tokens', keys: Object.freeze([
+    'folderSelectionMenu', 'cloudDownloadDirTokens', 'actorCreationFolder'
+  ]) }),
+  Object.freeze({ id: 'mapmaking', label: 'Mapmaking', keys: Object.freeze([
+    'assetFolderSelectionMenu', 'cloudDownloadDirAssets', NEW_LAYER_LEVELS_SETTING, 'assetDropShadow',
+    'assetDropShadowQuality', 'generatedCleanupMenu'
+  ]) }),
+  // What changes how Foundry itself behaves or draws, each with its own switch
+  // (docs/architecture/native-foundry-adjustments.md).
+  Object.freeze({ id: 'foundry', label: 'Changes to Foundry behaviour', keys: Object.freeze([
+    'tokenElevationOffset', 'crossLevelDoorSightGating', 'tilePixelSelection',
+    ...Object.values(NATIVE_ADJUSTMENTS).map((adjustment) => adjustment.setting)
+  ]) }),
+  Object.freeze({ id: 'general', label: 'General', keys: Object.freeze(['floatingLauncher', 'useDirectCloudUrls']) }),
+  Object.freeze({ id: 'troubleshooting', label: 'Troubleshooting', keys: Object.freeze(['debugLogging']) })
+]);
+
+const CLOUD_DOWNLOAD_FOLDER_SETTING_DEFINITIONS = Object.freeze([
+  Object.freeze({ descriptor: getContentKindDescriptor('tokens'), name: 'Cloud Download Folder (Tokens)' }),
+  Object.freeze({ descriptor: getContentKindDescriptor('assets'), name: 'Cloud Download Folder (Assets)' })
+]);
+
 function isDebugLoggingEnabled() {
   try { return game?.settings?.get?.('fa-nexus', 'debugLogging') === true; } catch (_) { return false; }
+}
+
+function stringifyError(error) {
+  return String(error?.message || error);
+}
+
+function notifySettingsHook(moduleId, hookName, payload, details = {}) {
+  try {
+    Hooks.callAll(hookName, payload);
+  } catch (error) {
+    Logger.error?.('Settings.hook.failed', {
+      moduleId,
+      hookName,
+      ...details,
+      error: stringifyError(error)
+    });
+  }
+}
+
+function notifySettingChange(moduleId, key, value) {
+  notifySettingsHook(moduleId, 'updateSetting', { namespace: moduleId, key, value }, { key });
+}
+
+function logSettingsSetupFailure(action, error) {
+  Logger.error?.('Settings.setup.failed', {
+    action,
+    error: stringifyError(error)
+  });
 }
 
 function cleanFolderPath(value) {
@@ -95,8 +156,9 @@ function installCloudDownloadFolderPickerHook() {
   Hooks.on('renderSettingsConfig', (_app, html) => {
     const root = html?.nodeType ? html : (html?.[0] || null);
     if (!root) return;
-    const targets = ['cloudDownloadDirTokens', 'cloudDownloadDirAssets'];
-    for (const key of targets) {
+    groupFaNexusSettings(root);
+    for (const { descriptor } of CLOUD_DOWNLOAD_FOLDER_SETTING_DEFINITIONS) {
+      const key = descriptor.downloadDirSetting;
       const settingName = `fa-nexus.${key}`;
       const pickerElement = root.querySelector(`file-picker[name="${settingName}"]`);
       if (!pickerElement) continue;
@@ -136,6 +198,45 @@ function installCloudDownloadFolderPickerHook() {
   });
 }
 
+function groupFaNexusSettings(root) {
+  const category = root.querySelector?.('[data-category="fa-nexus"]');
+  if (!category || category.dataset.faNexusGrouped === '1') return;
+  const groups = Array.from(category.querySelectorAll(':scope > .form-group'));
+  if (!groups.length) return;
+
+  const byKey = new Map(groups.map((group) => {
+    const control = group.querySelector('[name^="fa-nexus."], button[data-key]');
+    const fullKey = control?.getAttribute('name') || control?.dataset?.key || '';
+    return [String(fullKey).replace(/^fa-nexus\./, ''), group];
+  }));
+
+  const claimed = new Set();
+  for (const section of SETTINGS_SECTIONS) {
+    const sectionGroups = section.keys.map((key) => byKey.get(key)).filter(Boolean);
+    if (!sectionGroups.length) continue;
+    const fieldset = document.createElement('fieldset');
+    fieldset.className = 'fa-nexus-settings-section';
+    fieldset.dataset.section = section.id;
+    const legend = document.createElement('legend');
+    legend.textContent = section.label;
+    fieldset.append(legend, ...sectionGroups);
+    category.append(fieldset);
+    sectionGroups.forEach((group) => claimed.add(group));
+  }
+
+  const remaining = groups.filter((group) => !claimed.has(group));
+  if (remaining.length) {
+    const fieldset = document.createElement('fieldset');
+    fieldset.className = 'fa-nexus-settings-section';
+    fieldset.dataset.section = 'advanced';
+    const legend = document.createElement('legend');
+    legend.textContent = 'Advanced';
+    fieldset.append(legend, ...remaining);
+    category.append(fieldset);
+  }
+  category.dataset.faNexusGrouped = '1';
+}
+
 /**
  * Register FA Nexus game settings and auxiliary management menus.
  * Includes client-side UI state, local folder configuration, cache managers,
@@ -150,6 +251,51 @@ export function registerFaNexusSettings() {
   // Operates in background; toggled by in-app checkbox
   client('mainColorOnly', { name: 'Show Main Color Only', type: Boolean, default: true, config: false });
 
+  world('tokensEnabled', {
+    name: 'Enable Tokens',
+    hint: 'Show the Tokens browser and enable Nexus token placement tools. Disable for a mapmaking-only setup.',
+    type: Boolean,
+    default: true,
+    config: true,
+    restricted: true,
+    requiresReload: true,
+    onChange: (value) => writeFeatureAreaBootstrapValue('tokens', value)
+  });
+  world('mapmakingEnabled', {
+    name: 'Enable Mapmaking',
+    hint: 'Show Assets, Textures, Paths, Building Tool, Prefabs and the Layer Manager, and load what draws the layers made with them. Switched off, FA Nexus loads none of it: a map made with these tools is not drawn as it was saved until this is switched on again (the Scene itself is not changed). Disable for a token-only setup.',
+    type: Boolean,
+    default: true,
+    config: true,
+    restricted: true,
+    requiresReload: true,
+    onChange: (value) => writeFeatureAreaBootstrapValue('mapmaking', value)
+  });
+  world('sceneGroupsEnabled', {
+    name: 'Enable Scene Groups',
+    hint: "Show the Scene Groups window, its button and the Scene Member Selection Mode in the Layer Manager and in Foundry's Placeables tabs. Switched off, every layer is selected on its own on the canvas and Prefabs are off too; groups already in a Scene are kept and come back when this is switched on again. Copy and paste of Buildings and Paths keeps working.",
+    type: Boolean,
+    default: true,
+    config: true,
+    restricted: true,
+    requiresReload: true,
+    onChange: (value) => writeFeatureAreaBootstrapValue('sceneGroups', value)
+  });
+  world('prefabsEnabled', {
+    name: 'Enable Prefabs (Experimental)',
+    hint: 'Show the Prefabs tab and the Prefab actions of the Scene Groups window. Prefabs are experimental. They need Scene Groups.',
+    type: Boolean,
+    default: true,
+    config: true,
+    restricted: true,
+    requiresReload: true,
+    onChange: (value) => writeFeatureAreaBootstrapValue('prefabs', value)
+  });
+  writeFeatureAreaBootstrapValue('tokens', game.settings.get(MODULE_ID, 'tokensEnabled'));
+  writeFeatureAreaBootstrapValue('mapmaking', game.settings.get(MODULE_ID, 'mapmakingEnabled'));
+  writeFeatureAreaBootstrapValue('sceneGroups', game.settings.get(MODULE_ID, 'sceneGroupsEnabled'));
+  writeFeatureAreaBootstrapValue('prefabs', game.settings.get(MODULE_ID, 'prefabsEnabled'));
+
   // Enable verbose debug logging to console
   world('debugLogging', { name: 'Enable Debug Logging', type: Boolean, default: false, config: true, restricted: true, hint: 'If enabled, FA Nexus will log detailed debug information to the browser console to help troubleshoot issues.' });
 
@@ -162,7 +308,7 @@ export function registerFaNexusSettings() {
     restricted: true,
     hint: 'When enabled, the Nexus launcher button floats freely and can be dragged anywhere on screen instead of being docked above the players list.',
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'floatingLauncher', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'floatingLauncher', value);
     }
   });
   client('launcherPosition', { name: 'Launcher Position', type: Object, default: { left: null, top: null }, config: false });
@@ -172,10 +318,12 @@ export function registerFaNexusSettings() {
   client('thumbWidthAssets', { name: 'Asset Thumbnail Width', type: Number, default: 108, config: false });
   client('thumbWidthTextures', { name: 'Texture Thumbnail Width', type: Number, default: 108, config: false });
   client('thumbWidthPaths', { name: 'Path Thumbnail Width', type: Number, default: 108, config: false });
+  client('thumbWidthPrefabs', { name: 'Prefab Thumbnail Width', type: Number, default: 128, config: false });
   client('thumbWidthBuildingTextures', { name: 'Building Fill Texture Thumbnail Width', type: Number, default: 108, config: false });
   client('gridSortModes', { name: 'Grid Sort Modes', type: Object, default: {}, config: false });
   client('solidTextureColor', { name: 'Solid Texture Color', type: String, default: '#808080', config: false });
   client('windowPos', { name: 'Window Position', type: Object, default: {}, config: false });
+  client('sceneGroupViewState', { name: 'Scene Groups Folder State', type: Object, default: {}, config: false });
   client('toolOptionsWindowPos', { name: 'Tool Options Window Position', type: Object, default: {}, config: false });
   client('toolOptionsShortcuts', { name: 'Tool Options Shortcuts Collapse State', type: Object, default: {}, config: false });
   client('toolOptionsSections', { name: 'Tool Options Section Collapse State', type: Object, default: {}, config: false });
@@ -186,6 +334,12 @@ export function registerFaNexusSettings() {
   client('buildingPortalWindowDefaults', { name: 'Building Portal Window Defaults', type: Object, default: {}, config: false });
   client('buildingToolDefaults', { name: 'Building Tool Defaults', type: Object, default: {}, config: false });
   client('buildingToolActiveSubtool', { name: 'Building Tool Active Subtool', type: String, default: '', config: false });
+  client('buildingInnerWallNextStackMode', {
+    name: 'Building Inner Wall Next Path Stack Mode',
+    type: String,
+    default: 'below',
+    config: false
+  });
   client('pathToolDefaults', { name: 'Path Tool Defaults', type: Object, default: {}, config: false });
   client('pathToolActiveSubtool', { name: 'Path Tool Active Subtool', type: String, default: '', config: false });
   client('flattenOptions', {
@@ -199,8 +353,8 @@ export function registerFaNexusSettings() {
       exportSplitLayers: false,
       exportChunked: false,
       exportAction: 'flatten',
-      flattenOutputFolder: 'fa-nexus-assets/__generated/flattened',
-      exportOutputFolder: 'fa-nexus-assets/exports'
+      flattenOutputFolder: getFlattenOutputDefaultFolder('flatten'),
+      exportOutputFolder: getFlattenOutputDefaultFolder('export')
     },
     config: false
   });
@@ -222,30 +376,59 @@ export function registerFaNexusSettings() {
   client('layerManagerSkipLocked', { name: 'Layer Manager Skip Locked', type: Boolean, default: true, config: false });
   client('layerManagerSkipHidden', { name: 'Layer Manager Skip Hidden', type: Boolean, default: true, config: false });
   client('layerManagerSkipFiltered', { name: 'Layer Manager Skip Filtered', type: Boolean, default: true, config: false });
-  client('layerManagerIgnoreForeground', { name: 'Layer Manager All Layers', type: Boolean, default: true, config: false });
+  client(SCENE_GROUP_MEMBER_SELECTION_SETTING, {
+    name: 'Scene Member Selection Mode',
+    type: String,
+    default: SCENE_GROUP_MEMBER_SELECTION_DEFAULT,
+    config: false,
+    onChange: (value) => {
+      notifySettingChange(
+        MODULE_ID,
+        SCENE_GROUP_MEMBER_SELECTION_SETTING,
+        normalizeSceneGroupMemberSelectionMode(value)
+      );
+    }
+  });
   client('layerManagerCollapsedState', {
     name: 'Layer Manager Collapsed State',
     type: String,
     default: '{}',
     config: false,
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'layerManagerCollapsedState', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'layerManagerCollapsedState', value);
     }
+  });
+  world(NEW_LAYER_LEVELS_SETTING, {
+    name: 'New layers appear on',
+    hint: 'Which Levels a layer made with the Nexus tools belongs to. "Every Level" shows it from every storey, so an upper window shows the ground below; use a surface Region to hide what must not be seen. "Only their own Level" shows it on the Level it is made on and nowhere else. Layers that exist are not changed; change one in its Tile sheet.',
+    type: String,
+    choices: NEW_LAYER_LEVELS_CHOICES,
+    default: NEW_LAYER_LEVELS_ALL,
+    config: true,
+    restricted: true
   });
   world('layerManagerNestedGrouping', {
     name: 'Layer Manager Nested Elevation Groups',
     type: Boolean,
-    default: true,
-    config: true,
+    default: false,
+    config: false,
     restricted: true,
-    hint: 'Group layer elevations into nested upward buckets in the Layer Manager so fractional elevations can be organized as subgroups.',
+    hint: 'Retained for existing worlds; elevation groups are now displayed as flat Elevations.',
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'layerManagerNestedGrouping', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'layerManagerNestedGrouping', value);
     }
   });
   // Cloud download directories (separate per kind)
-  world('cloudDownloadDirTokens', { name: 'Cloud Download Folder (Tokens)', type: String, filePicker: 'folder', default: 'fa-nexus-tokens', config: true, restricted: true });
-  world('cloudDownloadDirAssets', { name: 'Cloud Download Folder (Assets)', type: String, filePicker: 'folder', default: 'fa-nexus-assets', config: true, restricted: true });
+  for (const { descriptor, name } of CLOUD_DOWNLOAD_FOLDER_SETTING_DEFINITIONS) {
+    world(descriptor.downloadDirSetting, {
+      name,
+      type: String,
+      filePicker: 'folder',
+      default: descriptor.downloadDirDefault,
+      config: true,
+      restricted: true
+    });
+  }
   // Use direct URLs for free cloud content instead of downloading/caching locally
   world('useDirectCloudUrls', {
     name: 'Use Direct URLs for Free Cloud Content',
@@ -257,31 +440,30 @@ export function registerFaNexusSettings() {
   });
   client('cloudTokensEnabled', {
     name: 'Enable Cloud Tokens', type: Boolean, default: true, config: false, onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'cloudTokensEnabled', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'cloudTokensEnabled', value);
     }
   });
   client('cloudAssetsEnabled', {
     name: 'Enable Cloud Assets', type: Boolean, default: true, config: false, onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'cloudAssetsEnabled', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'cloudAssetsEnabled', value);
     }
   });
 
   // Multi-folder selection (JSON string array of {path,label,enabled,customLabel})
   client('tokenFolders', {
     name: 'Token Folders', type: String, default: '[]', config: false, onChange: (value) => {
-      try {
-        // Client-scope settings do not emit the core update hook; mirror it so UIs can react
-        Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'tokenFolders', value });
-      } catch (_) { }
+      // Client-scope settings do not emit the core update hook; mirror it so UIs can react
+      notifySettingChange(MODULE_ID, 'tokenFolders', value);
     }
   });
   client('assetFolders', {
     name: 'Asset Folders', type: String, default: '[]', config: false, onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'assetFolders', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'assetFolders', value);
     }
   });
   client('hideLocked', { name: 'Hide Locked Items', type: Boolean, default: false, config: false });
   client('gridSnap', { name: 'Snap to Grid', type: Boolean, default: true, config: false });
+  client('wallSnap', { name: 'Snap to Walls', type: Boolean, default: true, config: false });
   client('gridSnapSubdivisions', {
     name: 'Grid Snap Subdivisions',
     type: Number,
@@ -375,7 +557,7 @@ export function registerFaNexusSettings() {
     restricted: true,
     hint: 'Enable drop shadows for assets placed via FA Nexus. Individual placements can still toggle shadows while this is enabled.',
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'assetDropShadow', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'assetDropShadow', value);
     }
   });
   world('assetDropShadowQuality', {
@@ -387,11 +569,11 @@ export function registerFaNexusSettings() {
     config: true,
     restricted: true,
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'assetDropShadowQuality', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'assetDropShadowQuality', value);
     }
   });
   const notifyShadowSetting = (key) => (value) => {
-    try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key, value }); } catch (_) { }
+    notifySettingChange(MODULE_ID, key, value);
   };
   client('assetDropShadowAlpha', {
     name: 'Asset Shadow Opacity',
@@ -510,12 +692,6 @@ export function registerFaNexusSettings() {
     default: 120,
     config: false
   });
-  client('assetPlacementScaleRandomStrength', {
-    name: 'Asset Placement Scale Random Strength',
-    type: Number,
-    default: 15,
-    config: false
-  });
   client('assetPlacementRotation', {
     name: 'Asset Placement Rotation',
     type: Number,
@@ -538,12 +714,6 @@ export function registerFaNexusSettings() {
     name: 'Asset Placement Rotation Random Max',
     type: Number,
     default: 359,
-    config: false
-  });
-  client('assetPlacementRotationRandomStrength', {
-    name: 'Asset Placement Rotation Random Strength',
-    type: Number,
-    default: 45,
     config: false
   });
   client('assetPlacementFlipHorizontal', {
@@ -673,7 +843,7 @@ export function registerFaNexusSettings() {
     default: true,
     config: false,
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'pathMergeOnCommit', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'pathMergeOnCommit', value);
     }
   });
   world('tokenElevationOffset', {
@@ -684,20 +854,20 @@ export function registerFaNexusSettings() {
     restricted: true,
     hint: 'Keeps tiles within the first 1 unit of elevation under tokens without changing the token elevation. Example: on a level that starts at 10, tiles placed from 10.000 to 10.999 stay under tokens at 10',
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'tokenElevationOffset', value }); } catch (_) { }
-      try { Hooks.callAll('fa-nexus-token-elevation-offset-changed', { enabled: !!value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'tokenElevationOffset', value);
+      notifySettingsHook(MODULE_ID, 'fa-nexus-token-elevation-offset-changed', { enabled: !!value }, { key: 'tokenElevationOffset' });
     }
   });
-  world('overwriteEyeLevel', {
-    name: 'Overwrite Token Eye Level',
+  world('crossLevelDoorSightGating', {
+    name: 'Cross-Level Door Proxies (Experimental)',
     type: Boolean,
     default: true,
     config: true,
     restricted: true,
-    hint: 'When enabled, Eye Level Height will use 0.5 units below the top of the token\'s cube for vision and visibility tests instead of Foundry\'s default mid-height.',
+    hint: 'Render animated door meshes from other levels when they should be visible through openings. Disable to use Foundry default door rendering without FA Nexus proxy meshes.',
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'overwriteEyeLevel', value }); } catch (_) { }
-      try { Hooks.callAll('fa-nexus-overwrite-eye-level-changed', { enabled: !!value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'crossLevelDoorSightGating', value);
+      notifySettingsHook(MODULE_ID, 'fa-nexus-cross-level-door-proxies-changed', { enabled: !!value }, { key: 'crossLevelDoorSightGating' });
     }
   });
   world('tilePixelSelection', {
@@ -708,19 +878,34 @@ export function registerFaNexusSettings() {
     restricted: true,
     hint: 'Use pixel alpha sampling so tile interactions only trigger on visible pixels. Disable if you prefer the default Foundry hit areas or encounter compatibility issues.',
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'tilePixelSelection', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'tilePixelSelection', value);
     }
   });
+  for (const adjustment of Object.values(NATIVE_ADJUSTMENTS)) {
+    world(adjustment.setting, {
+      name: adjustment.name,
+      hint: adjustment.hint,
+      type: Boolean,
+      default: true,
+      config: true,
+      restricted: true,
+      requiresReload: adjustment.requiresReload,
+      onChange: (value) => {
+        notifySettingChange(MODULE_ID, adjustment.setting, value);
+      }
+    });
+  }
   configurePremiumRuntime({ moduleId: MODULE_ID, registerWorldSetting: world });
   // Patreon auth data (stored client-side; updated by OAuth flow)
   client('patreon_auth_data', {
     name: 'Patreon Auth Data', type: Object, default: null, config: false, onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'patreon_auth_data', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'patreon_auth_data', value);
     }
   });
 
   // Bookmarks per tab (array of bookmark objects)
   client('bookmarks', { name: 'Bookmarks', type: Object, default: {}, config: false });
+  client('collectionBrowser', { name: 'Collection browser state', type: Object, default: {}, config: false });
 
   // Local Token Folders (settings menu opens the dialog)
   menu('folderSelectionMenu', {
@@ -759,7 +944,7 @@ export function registerFaNexusSettings() {
     default: '[]',
     config: false,
     onChange: (value) => {
-      try { Hooks.callAll('updateSetting', { namespace: MODULE_ID, key: 'placeAsExcludedPacks', value }); } catch (_) { }
+      notifySettingChange(MODULE_ID, 'placeAsExcludedPacks', value);
     }
   });
 
@@ -768,9 +953,19 @@ export function registerFaNexusSettings() {
 // loads after the init hook has already fired (robustness for load order).
 try {
   if (globalThis.game?.settings) registerFaNexusSettings();
-} catch (e) { }
-try { if (globalThis.Hooks) installCloudDownloadFolderPickerHook(); } catch (_) { }
-Hooks.once('init', () => {
-  try { registerFaNexusSettings(); } catch (e) { }
-  try { installCloudDownloadFolderPickerHook(); } catch (_) { }
-});
+} catch (error) {
+  logSettingsSetupFailure('register-immediate', error);
+}
+try {
+  if (globalThis.Hooks) installCloudDownloadFolderPickerHook();
+} catch (error) {
+  logSettingsSetupFailure('install-folder-picker-immediate', error);
+}
+try {
+  Hooks.once('init', () => {
+    try { registerFaNexusSettings(); } catch (error) { logSettingsSetupFailure('register-init', error); }
+    try { installCloudDownloadFolderPickerHook(); } catch (error) { logSettingsSetupFailure('install-folder-picker-init', error); }
+  });
+} catch (error) {
+  logSettingsSetupFailure('register-init-hook', error);
+}

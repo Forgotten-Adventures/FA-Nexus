@@ -40,6 +40,27 @@ export async function runHostedSessionLaunch({
   }
 }
 
+export function syncHostedPreviewLaunchState({
+  applyLaunchPlacementAnchorTileId = null,
+  syncPreviewRenderSort = null,
+  applyCurrentPreviewLayerOrdering = null,
+  loggerPrefix = 'PremiumSessionHost'
+} = {}) {
+  try {
+    canvas?.tiles?.releaseAll?.();
+  } catch (error) {
+    Logger.warn?.(`${loggerPrefix}.previewLaunch.releaseAllFailed`, {
+      error: stringifyError(error)
+    });
+  }
+  applyLaunchPlacementAnchorTileId?.();
+  syncPreviewRenderSort?.();
+  applyCurrentPreviewLayerOrdering?.();
+  globalThis.Hooks?.callAll?.('fa-nexus-preview-layers-changed', {
+    source: 'premium-preview-launch-sync'
+  });
+}
+
 export function stopSessionWithFinalize({
   delegate = null,
   beforeStop = null,
@@ -75,31 +96,51 @@ export function stopSessionWithFinalize({
 }
 
 export function hasHostedSessionChanges(delegate, {
-  fallbackWhenActive = true
+  loggerPrefix = 'PremiumSessionHost'
 } = {}) {
   if (!delegate?.isActive) return false;
   try {
     if (typeof delegate?.hasSessionChanges === 'function') {
       return !!delegate.hasSessionChanges();
     }
-  } catch (_) {}
-  return !!fallbackWhenActive;
+  } catch (error) {
+    Logger.warn?.(`${loggerPrefix}.session.hasChangesFailed`, {
+      error: stringifyError(error)
+    });
+  }
+  return false;
+}
+
+export function hasHostedSessionUnresolvedTransientState(delegate, {
+  loggerPrefix = 'PremiumSessionHost'
+} = {}) {
+  if (!delegate?.isActive) return false;
+  try {
+    if (typeof delegate?.hasUnresolvedTransientState === 'function') {
+      return !!delegate.hasUnresolvedTransientState();
+    }
+  } catch (error) {
+    Logger.warn?.(`${loggerPrefix}.session.hasUnresolvedTransientStateFailed`, {
+      error: stringifyError(error)
+    });
+  }
+  return false;
 }
 
 export function canCommitHostedSession(delegate, {
-  fallback = null
+  loggerPrefix = 'PremiumSessionHost'
 } = {}) {
   if (!delegate?.isActive) return false;
   try {
     if (typeof delegate?.canCommitSession === 'function') {
       return !!delegate.canCommitSession();
     }
-    if (typeof delegate?._canCommitSession === 'function') {
-      return !!delegate._canCommitSession();
-    }
-  } catch (_) {}
-  if (typeof fallback === 'function') return !!fallback(delegate);
-  return hasHostedSessionChanges(delegate);
+  } catch (error) {
+    Logger.warn?.(`${loggerPrefix}.session.canCommitFailed`, {
+      error: stringifyError(error)
+    });
+  }
+  return false;
 }
 
 export async function handleSessionLaunchFailure({
@@ -111,7 +152,10 @@ export async function handleSessionLaunchFailure({
   stopSession = null,
   onFallbackCleanup = null
 } = {}) {
-  Logger.error?.(`${loggerPrefix}.session.launchFailed`, {
+  // A refusal the user can act on is not a fault: no login or tier (the entitlement codes) or a 0.5.3 Building the
+  // editor declined to open (its error carries the preflight result).
+  const refused = !!error?.preflight || ['STATE_MISSING', 'PRO_TIER_REQUIRED', 'ENTITLEMENT_REQUIRED'].includes(String(error?.code || '').toUpperCase());
+  Logger[refused ? 'warn' : 'error']?.(`${loggerPrefix}.session.launchFailed`, {
     phase,
     error: stringifyError(error),
     ...(details && typeof details === 'object' ? details : {})

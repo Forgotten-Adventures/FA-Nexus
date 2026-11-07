@@ -2,6 +2,7 @@ import { normalizeFolderPath, normalizePathLower } from './path-utils.js';
 
 export function resolveFolderPathFromRecord(item) {
   if (!item) return '';
+  if (typeof item.folder === 'string' && item.folder) return item.folder;
   const filePath = String(item.file_path || '');
   const inferredFilename = filePath ? filePath.split('/').pop() : '';
   const filename = String(item.filename || inferredFilename || '');
@@ -25,7 +26,7 @@ export function getFolderPathInfo(item, { hydrate = false } = {}) {
       lower: item._faFolderLower
     };
   }
-  const normalized = normalizeFolderPath(typeof item.path === 'string' ? item.path : resolveFolderPathFromRecord(item));
+  const normalized = normalizeFolderPath(typeof item.folder === 'string' ? item.folder : (typeof item.path === 'string' ? item.path : resolveFolderPathFromRecord(item)));
   const lower = normalizePathLower(normalized);
   item._faFolderNormalized = normalized;
   item._faFolderLower = lower;

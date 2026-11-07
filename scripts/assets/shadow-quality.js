@@ -1,3 +1,5 @@
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
+
 const MODULE_ID = 'fa-nexus';
 
 export const DEFAULT_SHADOW_QUALITY = 'high';
@@ -54,9 +56,15 @@ export function getShadowQualityConfig(value, { fallback = DEFAULT_SHADOW_QUALIT
 
 export function readShadowQualityConfig({ moduleId = MODULE_ID, fallback = DEFAULT_SHADOW_QUALITY } = {}) {
   try {
-    const value = game?.settings?.get?.(moduleId, 'assetDropShadowQuality');
+    const settings = globalThis?.game?.settings;
+    if (!settings || typeof settings.get !== 'function') return getShadowQualityConfig(fallback);
+    const value = settings.get(moduleId, 'assetDropShadowQuality');
     return getShadowQualityConfig(value, { fallback });
-  } catch (_) {
+  } catch (error) {
+    Logger.warn('ShadowQuality.read.failed', {
+      moduleId,
+      error: String(error?.message || error)
+    });
     return getShadowQualityConfig(fallback);
   }
 }

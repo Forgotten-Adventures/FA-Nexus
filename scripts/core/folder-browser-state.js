@@ -1,5 +1,6 @@
 import {
   normalizeFolderSelection,
+  cloneFolderSelection,
   enforceFolderSelectionAvailability,
   mergeFolderSelectionExcludes,
   folderSelectionKey,
@@ -18,17 +19,21 @@ function createAllFolderSelection() {
 
 function logFolderBrowserFailure(logger, event, error, details = {}) {
   const target = logger || Logger;
+  const payload = {
+    ...details,
+    error: String(error?.message || error)
+  };
   try {
-    target.warn?.(event, {
-      ...details,
-      error
-    });
+    if (typeof target.error === 'function') target.error(event, payload);
+    else target.warn?.(event, payload);
   } catch (_) {
-    Logger.warn(event, {
-      ...details,
-      error
-    });
+    Logger.error(event, payload);
   }
+}
+
+function throwFolderBrowserFailure(logger, event, error, details = {}) {
+  logFolderBrowserFailure(logger, event, error, details);
+  throw error;
 }
 
 export function createEmptyFolderBrowserStats(version = 0) {
@@ -67,7 +72,9 @@ export function applyFolderBrowserSelectionChange({
   logger = null,
   loggerLabel = '',
   enabled = true,
+  getSelection = null,
   setSelection = null,
+  restoreSelection = null,
   beforeSync = null,
   afterSync = null
 } = {}) {
@@ -81,18 +88,36 @@ export function applyFolderBrowserSelectionChange({
     loggerLabel
   });
   const normalizedTabId = String(tabId || '').trim();
+  const canSnapshotSelection = typeof getSelection === 'function';
+  const previousSelection = canSnapshotSelection ? cloneFolderSelection(getSelection()) : undefined;
+  let selectionApplied = false;
+
+  const rollbackSelection = () => {
+    if (!selectionApplied || !canSnapshotSelection) return;
+    const rollback = typeof restoreSelection === 'function' ? restoreSelection : setSelection;
+    if (typeof rollback !== 'function') return;
+    try {
+      rollback(previousSelection ? cloneFolderSelection(previousSelection) : previousSelection);
+    } catch (rollbackError) {
+      logFolderBrowserFailure(logger, 'FolderBrowser.selection.rollbackFailed', rollbackError, { tabId: normalizedTabId });
+    }
+  };
 
   try { setSelection?.(normalized); } catch (error) {
-    logFolderBrowserFailure(logger, 'FolderBrowser.selection.setFailed', error, { tabId: normalizedTabId });
+    throwFolderBrowserFailure(logger, 'FolderBrowser.selection.setFailed', error, { tabId: normalizedTabId });
   }
+  selectionApplied = typeof setSelection === 'function';
   try { beforeSync?.(normalized); } catch (error) {
-    logFolderBrowserFailure(logger, 'FolderBrowser.selection.beforeSyncFailed', error, { tabId: normalizedTabId });
+    rollbackSelection();
+    throwFolderBrowserFailure(logger, 'FolderBrowser.selection.beforeSyncFailed', error, { tabId: normalizedTabId });
   }
   try { app?.updateFolderFilterSelection?.(normalizedTabId, normalized); } catch (error) {
-    logFolderBrowserFailure(logger, 'FolderBrowser.selection.filterSyncFailed', error, { tabId: normalizedTabId });
+    rollbackSelection();
+    throwFolderBrowserFailure(logger, 'FolderBrowser.selection.filterSyncFailed', error, { tabId: normalizedTabId });
   }
   try { afterSync?.(normalized); } catch (error) {
-    logFolderBrowserFailure(logger, 'FolderBrowser.selection.afterSyncFailed', error, { tabId: normalizedTabId });
+    rollbackSelection();
+    throwFolderBrowserFailure(logger, 'FolderBrowser.selection.afterSyncFailed', error, { tabId: normalizedTabId });
   }
 
   return normalized;

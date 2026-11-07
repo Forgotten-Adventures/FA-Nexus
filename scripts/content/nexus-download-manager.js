@@ -1,6 +1,6 @@
 // NexusDownloadManager — manages downloading cloud files to local Foundry storage
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { forgeIntegration } from '../core/forge-integration.js';
+import { forgeIntegration } from '../storage/forge-integration.js';
 import {
   requireFilePickerMethod,
   wrapOperationalError
@@ -13,6 +13,10 @@ import {
   stripPathQueryAndHash
 } from '../storage/path-utils.js';
 import { ProgressEmitter } from './nexus-content-service.js';
+import { getContentKindDescriptor } from './content-kind-descriptors.js';
+import { contentFilename, contentFolder, contentPath } from './cloud-inventory-v2.js';
+import { preserveDownloadDirectoryDefaults } from '../storage/download-directory-defaults.js';
+import { ensureNestedFilePickerDirectory } from '../storage/file-picker-directory.js';
 
 // Import retry utility
 async function retryWithBackoff(fn, {
@@ -20,6 +24,7 @@ async function retryWithBackoff(fn, {
   initialDelay = 1000,
   maxDelay = 30000,
   onRetry,
+  shouldRetry,
   signal
 } = {}) {
   let lastError;
@@ -35,6 +40,10 @@ async function retryWithBackoff(fn, {
       lastError = error;
 
       if (error?.name === 'AbortError' || signal?.aborted) {
+        throw error;
+      }
+
+      if (typeof shouldRetry === 'function' && !shouldRetry(error)) {
         throw error;
       }
 
@@ -69,6 +78,34 @@ async function retryWithBackoff(fn, {
   throw lastError;
 }
 
+function createDownloadHttpError({ kind, filename, status, statusText }) {
+  const statusCode = Number(status) || 0;
+  const cleanFilename = String(filename || 'file').trim() || 'file';
+  const isMissing = statusCode === 404;
+  const message = isMissing
+    ? `Cloud file is listed in the manifest but is missing from R2: ${cleanFilename} (404)`
+    : `Download failed ${statusCode || String(status || '').trim() || 'HTTP error'}`;
+  const error = new Error(message);
+  error.name = 'FaNexusDownloadError';
+  error.code = isMissing ? 'FA_NEXUS_CLOUD_FILE_MISSING' : 'FA_NEXUS_DOWNLOAD_HTTP_ERROR';
+  error.kind = kind;
+  error.filename = cleanFilename;
+  error.status = statusCode;
+  error.statusText = String(statusText || '');
+  error.retryable = !isMissing;
+  error.faNexusCloudFileMissing = isMissing;
+  error.userMessage = message;
+  return error;
+}
+
+function isCloudFileMissingError(error) {
+  return !!error && (
+    error.faNexusCloudFileMissing === true ||
+    error.code === 'FA_NEXUS_CLOUD_FILE_MISSING' ||
+    Number(error.status) === 404
+  );
+}
+
 /**
  * NexusDownloadManager
  * Manages downloading cloud files into Foundry's local storage and tracks a simple
@@ -98,6 +135,12 @@ export class NexusDownloadManager {
     if (this._initialized) return true;
     try {
       await forgeIntegration.initialize();
+      await preserveDownloadDirectoryDefaults({ settings: game.settings, isGM: game.user.isGM,
+        browseRoot: () => {
+          const context = forgeIntegration.resolveFilePickerContext('');
+          return foundry.applications.apps.FilePicker.implementation.browse(context.source, context.target || '', context.options || {});
+        }
+      });
       Logger.info('DownloadManager.init:start');
       const tokensStorage = this._getStorage('tokens');
       const assetsStorage = this._getStorage('assets');
@@ -140,9 +183,34 @@ export class NexusDownloadManager {
    * @private
    */
   _getDir(kind) {
-    const def = kind === 'tokens' ? 'fa-nexus-tokens' : 'fa-nexus-assets';
-    const key = kind === 'tokens' ? 'cloudDownloadDirTokens' : 'cloudDownloadDirAssets';
-    try { return game.settings.get('fa-nexus', key) || def; } catch (_) { return def; }
+    const descriptor = getContentKindDescriptor(kind);
+    const settings = globalThis?.game?.settings;
+    if (!settings || typeof settings.get !== 'function') return descriptor.downloadDirDefault;
+    try {
+      return settings.get('fa-nexus', descriptor.downloadDirSetting) || descriptor.downloadDirDefault;
+    } catch (error) {
+      Logger.warn('DownloadManager.dirSetting.read.failed', {
+        kind,
+        key: descriptor.downloadDirSetting,
+        error: String(error?.message || error)
+      });
+      return descriptor.downloadDirDefault;
+    }
+  }
+
+  _readUseDirectCloudUrls({ kind = '', item = null } = {}) {
+    const settings = globalThis?.game?.settings;
+    if (!settings || typeof settings.get !== 'function') return false;
+    try {
+      return settings.get('fa-nexus', 'useDirectCloudUrls') === true;
+    } catch (error) {
+      Logger.warn('DownloadManager.directUrlSetting.read.failed', {
+        kind,
+        filename: contentFilename(item),
+        error: String(error?.message || error)
+      });
+      return false;
+    }
   }
 
   _getStorage(kind) {
@@ -184,7 +252,7 @@ export class NexusDownloadManager {
         kind: context?.kind || '',
         userMessage: `FA Nexus could not create the download directory "${dir}" because the Foundry FilePicker runtime is unavailable.`
       });
-      await FilePickerImpl.createDirectory(source, dir, options);
+      await ensureNestedFilePickerDirectory(dir, { source, options, filePicker: FilePickerImpl });
     }
   }
 
@@ -423,6 +491,7 @@ export class NexusDownloadManager {
    * @returns {string|null}
    */
   getLocalPath(kind, item) {
+    getContentKindDescriptor(kind);
     for (const key of this._candidateInventoryKeys(kind, item)) {
       const hit = this._inventory.get(key);
       if (hit) return forgeIntegration.optimizeCacheURL(hit);
@@ -441,6 +510,7 @@ export class NexusDownloadManager {
    */
   async ensureLocal(kind, item, url, options = {}) {
     if (!item || !url) throw new Error('ensureLocal requires item and url');
+    getContentKindDescriptor(kind);
 
     // If useDirectCloudUrls setting is enabled and item is free tier, return URL directly without downloading
     // Treat empty/missing tier as 'free' since that's the default
@@ -448,21 +518,19 @@ export class NexusDownloadManager {
     const isFree = tierLower === 'free' || tierLower === '';
     const forceDownload = options?.forceDownload === true;
     if (isFree && !forceDownload) {
-      try {
-        const useDirectUrls = game?.settings?.get?.('fa-nexus', 'useDirectCloudUrls') === true;
-        if (useDirectUrls) {
-          Logger.info('DownloadManager.ensureLocal:directUrl', { kind, filename: item.filename, tier: item.tier, url });
-          return url;
-        }
-      } catch (_) { /* setting not available, fall through to normal download */ }
+      const useDirectUrls = this._readUseDirectCloudUrls({ kind, item });
+      if (useDirectUrls) {
+        Logger.info('DownloadManager.ensureLocal:directUrl', { kind, filename: contentFilename(item), tier: item.tier, url });
+        return url;
+      }
     }
 
     const initialized = await this.initialize();
     if (!initialized) throw this._initializationError || new Error('Download manager initialization failed');
-    const filename = String(item.filename || '').trim();
+    const filename = contentFilename(item);
     if (!filename) throw new Error('Missing filename');
     let existing = null;
-    for (const key of this._candidateInventoryKeys(kind, { filename, path: item?.file_path || item?.path })) {
+    for (const key of this._candidateInventoryKeys(kind, item)) {
       existing = this._inventory.get(key);
       if (existing) break;
     }
@@ -526,13 +594,21 @@ export class NexusDownloadManager {
         async () => {
           this.progressEmitter.emit('download:fetch', { kind, filename, url });
           const resp = await fetch(url);
-          if (!resp.ok) throw new Error(`Download failed ${resp.status}`);
+          if (!resp.ok) {
+            throw createDownloadHttpError({
+              kind,
+              filename,
+              status: resp.status,
+              statusText: resp.statusText
+            });
+          }
           return resp.blob();
         },
         {
           maxRetries: 3,
           initialDelay: 1500,
           maxDelay: 20000,
+          shouldRetry: (error) => !isCloudFileMissingError(error),
           onRetry: ({ attempt, maxRetries, delay }) => {
             this.progressEmitter.emit('download:retry', { kind, filename, attempt, maxRetries, delay });
             Logger.info('DownloadManager.download.retry', { kind, filename, attempt, maxRetries, delay });
@@ -556,6 +632,16 @@ export class NexusDownloadManager {
       this.progressEmitter.emit('download:upload', { kind, filename, targetDir });
       const uploadResult = await FilePickerImpl.upload(storage.source, targetDir, file, { ...storage.options }, { notify: false, filename });
 
+      if (!this._extractUploadPath(uploadResult)) {
+        const error = new Error(`Foundry did not store the downloaded ${kind} file "${filename}".`);
+        error.name = 'FaNexusStorageError';
+        error.code = 'FA_NEXUS_STORAGE_WRITE_FAILED';
+        error.kind = kind;
+        error.filename = filename;
+        error.userMessage = `FA Nexus could not store "${filename}" in Foundry file storage.`;
+        throw error;
+      }
+
       const path = this._resolveStoredFilePath(storage, targetDir, filename, uploadResult);
       this._registerInventoryEntry(kind, [filename, relSanitized], path);
       Logger.info('DownloadManager.download:done', { path });
@@ -563,8 +649,17 @@ export class NexusDownloadManager {
       return forgeIntegration.optimizeCacheURL(path);
     } catch (error) {
       const errorMsg = String(error?.message || error);
-      Logger.error('DownloadManager.download:error', { kind, filename, error: errorMsg });
-      this.progressEmitter.emit('download:error', { kind, filename, error: errorMsg });
+      const payload = {
+        kind,
+        filename,
+        error: errorMsg,
+        code: error?.code || null,
+        status: Number(error?.status) || null,
+        retryable: error?.retryable !== false
+      };
+      const log = isCloudFileMissingError(error) ? Logger.warn.bind(Logger) : Logger.error.bind(Logger);
+      log('DownloadManager.download:error', payload);
+      this.progressEmitter.emit('download:error', payload);
       throw error;
     }
   }
@@ -577,10 +672,11 @@ export class NexusDownloadManager {
    * @returns {Promise<string|null>} Local path if present, else null
    */
   async probeLocal(kind, item) {
+    getContentKindDescriptor(kind);
     try {
       const initialized = await this.initialize();
       if (!initialized) throw this._initializationError || new Error('Download manager initialization failed');
-      const filename = String(item?.filename || '').trim();
+      const filename = contentFilename(item);
       if (!filename) return null;
       // Quick inventory lookup first
       for (const key of this._candidateInventoryKeys(kind, item || { filename })) {
@@ -624,9 +720,9 @@ export class NexusDownloadManager {
         code: 'LOCAL_PROBE_FAILED',
         source: 'DownloadManager.probeLocal',
         operation: 'probe-local-download-cache',
-        folder: String(item?.path || item?.file_path || ''),
+        folder: String(contentFolder(item) || contentPath(item) || ''),
         kind,
-        userMessage: `FA Nexus could not probe the local ${kind} cache for "${item?.filename || 'unknown file'}".`
+        userMessage: `FA Nexus could not probe the local ${kind} cache for "${contentFilename(item) || 'unknown file'}".`
       });
     }
   }
@@ -654,9 +750,9 @@ export class NexusDownloadManager {
   _candidateKeysForItem(item) {
     const names = new Set();
     if (!item) return [];
-    const filename = item?.filename != null ? String(item.filename).trim() : '';
-    const rawFilePath = String(item?.file_path || '').trim();
-    const rawPath = String(item?.path || '').trim();
+    const filename = contentFilename(item);
+    const rawFilePath = contentPath(item);
+    const rawPath = contentFolder(item);
     const usePathFallback = rawPath && (!rawFilePath || rawFilePath === filename);
     const relSource = usePathFallback ? { path: rawPath, filename } : item;
     const relRaw = this._normalizeRelativePathFromItem(relSource, filename);
@@ -666,7 +762,7 @@ export class NexusDownloadManager {
     // Avoid filename-only fallback when a directory-qualified path is present.
     if (filename && (!hasDir || !rel)) names.add(filename);
     if (!filename && !rel) {
-      const fp = item?.file_path || item?.path;
+      const fp = contentPath(item) || contentFolder(item);
       if (fp) {
         const tail = String(fp).split('/').pop();
         if (tail) names.add(tail);
@@ -703,10 +799,10 @@ export class NexusDownloadManager {
     }
   }
 
-  /** Convert item.path or item.file_path into a clean relative path with filename */
+  /** Convert v2 content path into a clean relative path with filename */
   _normalizeRelativePathFromItem(item, fallbackFilename) {
-    const fromItem = String(item?.file_path || item?.path || '').trim();
-    const filename = normalizeRelativeStoragePath(item?.filename || fallbackFilename || '');
+    const fromItem = contentPath(item);
+    const filename = normalizeRelativeStoragePath(contentFilename(item) || fallbackFilename || '');
     if (!fromItem) return filename;
     const sanitized = this._sanitizeRelativePath(fromItem);
     if (!sanitized) return filename;

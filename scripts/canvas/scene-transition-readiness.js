@@ -1,4 +1,6 @@
+import { onFoundryBoot } from '../core/foundry-boot-hooks.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { isNativeAdjustmentEnabled } from '../core/native-adjustments.js';
 import { applyTileHsbcToMesh } from '../textures/texture-blend-runtime.js';
 import {
   applyMaskedTilingToTile,
@@ -7,11 +9,13 @@ import {
 import { applyFlattenedChunks } from '../flatten/tile-flatten-chunks.js';
 import { applyPathTile } from '../paths/path-tiles.js';
 import { applyAssetScatterTile } from '../assets/asset-scatter-geometry.js';
+import { AssetShadowManager } from '../assets/asset-shadow-manager.js';
 import {
   applyBuildingTile,
   applyDoorFrameTile,
   applyBuildingCompositeTile
 } from '../buildings/building-tiles.js';
+import { DoorShadowManager } from '../portals/door-shadow-manager.js';
 import { flushAllCustomTileOverheads } from './custom-tile-overhead.js';
 
 const MODULE_ID = 'fa-nexus';
@@ -24,9 +28,13 @@ const ORIGINAL_CANVAS_DRAW_KEY = '_faNexusOriginalCanvasDraw';
 const ORIGINAL_CAPTURE_CURRENT_KEY = '_faNexusOriginalCaptureCurrentScene';
 const ORIGINAL_TRANSITION_RESET_KEY = '_faNexusOriginalTransitionReset';
 const JOB_TIMEOUT_MS = 8000;
+const STANDARD_MASK_JOB_PHASE = 1;
+const INTERNAL_READINESS_TRANSITION_TYPES = new Set(['scene-draw', 'scene-draw-refresh', 'level-switch']);
 
 let preparePromise = null;
 let levelDrawHoldSeq = 0;
+let sceneDrawRefreshPromise = null;
+let sceneDrawRefreshInProgress = false;
 
 function nowMs() {
   try { return globalThis.performance?.now?.() ?? Date.now(); }
@@ -45,18 +53,6 @@ function normalizeId(value) {
   } catch (_) {
     return '';
   }
-}
-
-function publishReadinessState(patch = {}) {
-  try {
-    const current = globalThis.faNexus?.sceneTransitionReadiness || {};
-    globalThis.faNexus = Object.assign(globalThis.faNexus || {}, {
-      sceneTransitionReadiness: {
-        ...current,
-        ...patch
-      }
-    });
-  } catch (_) {}
 }
 
 function readFaFlags(doc) {
@@ -148,8 +144,9 @@ async function withTimeout(job, label, tile) {
   }
 }
 
-function pushTileJob(jobs, tile, renderer, fn) {
+function pushTileJob(jobs, tile, renderer, fn, phase = null) {
   jobs.push({
+    phase,
     renderer,
     tile,
     run: () => withTimeout(fn, renderer, tile)
@@ -165,7 +162,7 @@ function collectTileJobs(tile) {
     pushTileJob(jobs, tile, 'maskedTiling', () => applyMaskedTilingToTile(tile));
   }
   if (readFaFlag(doc, 'standardTileMask')) {
-    pushTileJob(jobs, tile, 'standardTileMask', () => applyStandardTileMaskToTile(tile));
+    pushTileJob(jobs, tile, 'standardTileMask', () => applyStandardTileMaskToTile(tile), STANDARD_MASK_JOB_PHASE);
   }
   if (hasFlattenedChunks(doc)) {
     pushTileJob(jobs, tile, 'flattenedChunks', () => applyFlattenedChunks(tile));
@@ -182,7 +179,9 @@ function collectTileJobs(tile) {
   if (readFaFlag(doc, 'buildingDoorFrame')) {
     pushTileJob(jobs, tile, 'buildingDoorFrame', () => applyDoorFrameTile(tile));
   }
-  if (readFaFlag(doc, 'buildingComposite')) {
+  // The managed sills Tile is the current-state replacement for the legacy sill composite and
+  // rehydrates through the same parts renderer, so it must rehydrate on the same transitions.
+  if (readFaFlag(doc, 'buildingComposite') || readFaFlag(doc, 'buildingSills')) {
     pushTileJob(jobs, tile, 'buildingComposite', () => applyBuildingCompositeTile(tile));
   }
   if (hasHsbc(doc)) {
@@ -190,6 +189,103 @@ function collectTileJobs(tile) {
   }
 
   return jobs;
+}
+
+async function runTileJobs(jobs) {
+  const settled = [];
+  // ponytail: two phases are enough; standard masks need custom source containers first.
+  for (const phaseJobs of [
+    jobs.filter((job) => job.phase !== STANDARD_MASK_JOB_PHASE),
+    jobs.filter((job) => job.phase === STANDARD_MASK_JOB_PHASE)
+  ]) {
+    if (!phaseJobs.length) continue;
+    const phaseSettled = await Promise.allSettled(phaseJobs.map((job) => job.run()));
+    for (let i = 0; i < phaseSettled.length; i += 1) {
+      settled.push({ job: phaseJobs[i], result: phaseSettled[i] });
+    }
+  }
+  return settled;
+}
+
+async function prepareShadowRenderersForSceneTransition({ transitionType = null } = {}) {
+  if (!shouldPrepareShadowsForTransitionCapture(transitionType)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'not-transition-capture',
+      transitionType
+    };
+  }
+
+  const jobs = [];
+  const assetShadowManager = getAssetShadowManagerForTransitionCapture();
+  if (assetShadowManager && typeof assetShadowManager.prepareForSceneTransitionCapture === 'function') {
+    jobs.push({
+      renderer: 'assetShadow',
+      run: () => withTimeout(
+        () => assetShadowManager.prepareForSceneTransitionCapture({ transitionType }),
+        'assetShadow',
+        null
+      )
+    });
+  }
+  const doorShadowManager = getDoorShadowManagerForTransitionCapture();
+  if (doorShadowManager && typeof doorShadowManager.prepareForSceneTransitionCapture === 'function') {
+    jobs.push({
+      renderer: 'doorShadow',
+      run: () => withTimeout(
+        () => doorShadowManager.prepareForSceneTransitionCapture({ transitionType }),
+        'doorShadow',
+        null
+      )
+    });
+  }
+
+  if (!jobs.length) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'shadow-renderers-missing',
+      transitionType
+    };
+  }
+
+  const settled = await Promise.allSettled(jobs.map((job) => job.run()));
+  const failures = [];
+  const results = [];
+  for (let i = 0; i < settled.length; i += 1) {
+    const job = jobs[i];
+    const result = settled[i];
+    if (result.status === 'rejected') {
+      failures.push({
+        renderer: job.renderer,
+        error: String(result.reason?.message || result.reason || 'unknown error')
+      });
+      continue;
+    }
+    results.push({
+      renderer: job.renderer,
+      result: result.value || null
+    });
+    if (result.value?.ok === false) {
+      failures.push({
+        renderer: job.renderer,
+        failures: result.value.failures || []
+      });
+    }
+  }
+
+  const summary = {
+    ok: failures.length === 0,
+    skipped: false,
+    transitionType,
+    jobCount: jobs.length,
+    results,
+    failures
+  };
+  if (failures.length) Logger.error?.('SceneTransitionReadiness.shadowPrepare.failed', summary);
+  else Logger.debug?.('SceneTransitionReadiness.shadowPrepare.done', summary);
+  return summary;
 }
 
 function waitForNextFrame() {
@@ -207,6 +303,39 @@ function waitForNextFrame() {
 function shouldExpectSceneTransitions() {
   try { return !!globalThis.CONFIG?.Canvas?.sceneTransitions; }
   catch (_) { return false; }
+}
+
+function shouldPrepareShadowsForTransitionCapture(transitionType) {
+  const type = String(transitionType || '').trim();
+  return !!type && !INTERNAL_READINESS_TRANSITION_TYPES.has(type);
+}
+
+function getAssetShadowManagerForTransitionCapture() {
+  const existing = AssetShadowManager.peek?.();
+  if (existing) return existing;
+  try {
+    if (globalThis.game?.settings?.get?.(MODULE_ID, 'assetDropShadow')) {
+      return AssetShadowManager.getInstance?.();
+    }
+  } catch (error) {
+    Logger.error?.('SceneTransitionReadiness.assetShadowManager.resolveFailed', {
+      error: String(error?.message || error)
+    });
+  }
+  return null;
+}
+
+function getDoorShadowManagerForTransitionCapture() {
+  const existing = DoorShadowManager.peek?.();
+  if (existing) return existing;
+  try {
+    return DoorShadowManager.getInstance?.() || null;
+  } catch (error) {
+    Logger.error?.('SceneTransitionReadiness.doorShadowManager.resolveFailed', {
+      error: String(error?.message || error)
+    });
+  }
+  return null;
 }
 
 function hasExplicitTransition(viewOptions) {
@@ -229,10 +358,12 @@ function getNextDrawScene(canvasRef, sceneArg) {
   }
 }
 
-function getLevelDrawReadinessDetails(canvasRef, sceneArg) {
+// Scene#view passes its view options (the target Level among them) as Canvas#draw's second argument from Foundry
+// 14.370; earlier v14 builds set the public canvas._viewOptions instead and call Canvas#draw with the Scene only.
+function getLevelDrawReadinessDetails(canvasRef, sceneArg, viewOptions) {
   try {
     if (!canvasRef?.initialized || !canvasRef?.scene) return null;
-    const viewOptions = canvasRef?._viewOptions || {};
+    viewOptions ??= canvasRef._viewOptions ?? {};
     if (!Object.prototype.hasOwnProperty.call(viewOptions, 'level')) return null;
     if (hasExplicitTransition(viewOptions)) return null;
 
@@ -349,6 +480,142 @@ async function prepareCustomTileRenderersForLevelDraw(canvasRef, details, holdSt
   }
 }
 
+async function prepareCustomTileRenderersForSceneDraw(canvasRef, sceneArg = null) {
+  const drawScene = canvasRef?.scene || sceneArg || null;
+  try {
+    const transitionType = sceneDrawRefreshInProgress ? 'scene-draw-refresh' : 'scene-draw';
+    const summary = await prepareCustomTileRenderersForSceneTransition({
+      transitionType
+    });
+    scheduleSceneDrawRefresh(canvasRef, summary);
+    return summary;
+  } catch (error) {
+    Logger.error?.('SceneTransitionReadiness.sceneDraw.prepare.crashed', {
+      sceneId: drawScene?.id || null,
+      sceneName: drawScene?.name || null,
+      error: String(error?.message || error)
+    });
+    return null;
+  }
+}
+
+function getSceneDrawRefreshDetails(canvasRef, summary) {
+  const scene = canvasRef?.scene || null;
+  const level = canvasRef?.level || null;
+  return {
+    sceneId: scene?.id || summary?.sceneId || null,
+    sceneName: scene?.name || summary?.sceneName || null,
+    levelId: level?.id || null,
+    levelName: level?.name || null,
+    jobCount: Number(summary?.jobCount) || 0
+  };
+}
+
+function releasePendingTileVideosBeforeSceneRedraw(canvasRef) {
+  try {
+    const pending = globalThis.game?.video?.pending;
+    const tiles = canvasRef?.tiles?.placeables;
+    if (!pending || typeof pending[Symbol.iterator] !== 'function' || typeof pending.delete !== 'function') return 0;
+    if (!Array.isArray(tiles) || !tiles.length) return 0;
+    const tileVideos = new Set(tiles.map((tile) => tile?.sourceElement).filter((source) => source?.tagName === 'VIDEO'));
+    if (!tileVideos.size) return 0;
+    let removed = 0;
+    for (const entry of Array.from(pending)) {
+      if (!tileVideos.has(entry?.[0])) continue;
+      if (pending.delete(entry)) removed += 1;
+    }
+    if (removed) {
+      Logger.debug?.('SceneTransitionReadiness.sceneDraw.pendingTileVideosReleased', {
+        removed,
+        remaining: Number(pending.size) || 0
+      });
+    }
+    return removed;
+  } catch (error) {
+    Logger.error?.('SceneTransitionReadiness.sceneDraw.pendingTileVideoRelease.failed', {
+      error: String(error?.message || error)
+    });
+    return 0;
+  }
+}
+
+function pruneStalePendingVideosAfterSceneDraw() {
+  try {
+    const pending = globalThis.game?.video?.pending;
+    if (!pending || typeof pending[Symbol.iterator] !== 'function' || typeof pending.delete !== 'function') return 0;
+    let removed = 0;
+    for (const entry of Array.from(pending)) {
+      const video = entry?.[0];
+      const isDestroyedSource = video?.readyState === 0
+        && video?.networkState === 3
+        && !Number.isFinite(video?.duration);
+      if (!isDestroyedSource) continue;
+      if (pending.delete(entry)) removed += 1;
+    }
+    if (removed) {
+      Logger.debug?.('SceneTransitionReadiness.sceneDraw.staleVideosPruned', {
+        removed,
+        remaining: Number(pending.size) || 0
+      });
+    }
+    return removed;
+  } catch (error) {
+    Logger.error?.('SceneTransitionReadiness.sceneDraw.staleVideoPrune.failed', {
+      error: String(error?.message || error)
+    });
+    return 0;
+  }
+}
+
+function scheduleSceneDrawRefresh(canvasRef, summary) {
+  if (sceneDrawRefreshInProgress || sceneDrawRefreshPromise) return false;
+  if (summary?.transitionType !== 'scene-draw' || !summary?.jobCount) return false;
+  if (!canvasRef?.ready || canvasRef?.loading || !canvasRef?.scene || !canvasRef?.level) return false;
+
+  const details = getSceneDrawRefreshDetails(canvasRef, summary);
+  sceneDrawRefreshPromise = (async () => {
+    Logger.debug?.('SceneTransitionReadiness.sceneDraw.redraw.scheduled', details);
+    await waitForNextFrame();
+
+    const currentCanvas = getCanvas();
+    if (
+      !currentCanvas?.ready
+      || currentCanvas.loading
+      || currentCanvas.scene?.id !== details.sceneId
+      || currentCanvas.level?.id !== details.levelId
+    ) {
+      Logger.debug?.('SceneTransitionReadiness.sceneDraw.redraw.skipped', {
+        ...details,
+        currentSceneId: currentCanvas?.scene?.id || null,
+        currentLevelId: currentCanvas?.level?.id || null,
+        canvasReady: !!currentCanvas?.ready,
+        canvasLoading: !!currentCanvas?.loading
+      });
+      return null;
+    }
+
+    sceneDrawRefreshInProgress = true;
+    Logger.debug?.('SceneTransitionReadiness.sceneDraw.redraw.start', details);
+    releasePendingTileVideosBeforeSceneRedraw(currentCanvas);
+    await currentCanvas.draw(currentCanvas.scene, { level: details.levelId });
+    pruneStalePendingVideosAfterSceneDraw();
+    Logger.debug?.('SceneTransitionReadiness.sceneDraw.redraw.done', details);
+    return true;
+  })().catch((error) => {
+    Logger.error?.('SceneTransitionReadiness.sceneDraw.redraw.failed', {
+      ...details,
+      error: String(error?.message || error)
+    });
+    return null;
+  }).finally(() => {
+    sceneDrawRefreshInProgress = false;
+    sceneDrawRefreshPromise = null;
+  });
+
+  return true;
+}
+
+
 async function prepareCustomTileRenderersForSceneTransition({ transitionType = null } = {}) {
   if (preparePromise) return preparePromise;
 
@@ -360,7 +627,6 @@ async function prepareCustomTileRenderersForSceneTransition({ transitionType = n
         skipped: true,
         reason: 'canvas-not-ready'
       };
-      publishReadinessState({ lastSummary: summary });
       return summary;
     }
 
@@ -370,16 +636,19 @@ async function prepareCustomTileRenderersForSceneTransition({ transitionType = n
     const jobs = tiles.flatMap((tile) => collectTileJobs(tile));
     if (!jobs.length) {
       const overhead = flushAllCustomTileOverheads('scene-transition-precapture:no-jobs');
+      const shadow = await prepareShadowRenderersForSceneTransition({ transitionType });
+      if (!shadow?.skipped) await waitForNextFrame();
       const summary = {
-        ok: true,
+        ok: shadow?.ok !== false,
         sceneId,
         sceneName,
         transitionType,
         tileCount: tiles.length,
         jobCount: 0,
-        overhead
+        overhead,
+        shadow
       };
-      publishReadinessState({ lastSummary: summary });
+      if (shadow?.ok === false) Logger.error?.('SceneTransitionReadiness.prepare.failed', summary);
       return summary;
     }
 
@@ -392,24 +661,26 @@ async function prepareCustomTileRenderersForSceneTransition({ transitionType = n
       jobCount: jobs.length
     });
 
-    const settled = await Promise.allSettled(jobs.map((job) => job.run()));
+    const settled = await runTileJobs(jobs);
     await waitForNextFrame();
     const overhead = flushAllCustomTileOverheads('scene-transition-precapture');
+    const shadow = await prepareShadowRenderersForSceneTransition({ transitionType });
+    if (!shadow?.skipped) await waitForNextFrame();
 
     const failures = [];
-    for (let i = 0; i < settled.length; i += 1) {
-      const result = settled[i];
+    for (const entry of settled) {
+      const { job, result } = entry;
       if (result.status !== 'rejected') continue;
       failures.push({
-        renderer: jobs[i]?.renderer || 'unknown',
-        tileId: jobs[i]?.tile?.document?.id || jobs[i]?.tile?.id || null,
+        renderer: job?.renderer || 'unknown',
+        tileId: job?.tile?.document?.id || job?.tile?.id || null,
         error: String(result.reason?.message || result.reason || 'unknown error')
       });
     }
 
     const elapsedMs = Math.round(nowMs() - started);
     const summary = {
-      ok: failures.length === 0,
+      ok: failures.length === 0 && shadow?.ok !== false,
       sceneId,
       sceneName,
       transitionType,
@@ -417,12 +688,12 @@ async function prepareCustomTileRenderersForSceneTransition({ transitionType = n
       jobCount: jobs.length,
       failures,
       overhead,
+      shadow,
       elapsedMs
     };
 
-    if (failures.length) Logger.error?.('SceneTransitionReadiness.prepare.failed', summary);
+    if (failures.length || shadow?.ok === false) Logger.error?.('SceneTransitionReadiness.prepare.failed', summary);
     else Logger.debug?.('SceneTransitionReadiness.prepare.done', summary);
-    publishReadinessState({ lastSummary: summary });
     return summary;
   })().finally(() => {
     preparePromise = null;
@@ -445,26 +716,23 @@ function patchTransitionCapture() {
     const original = prototype._captureNextScene;
     prototype[ORIGINAL_CAPTURE_KEY] = original;
     prototype._captureNextScene = async function faNexusCaptureNextSceneWithReadiness(options = {}) {
+      if (!isNativeAdjustmentEnabled('sceneDraw')) return original.call(this, options);
+      const transitionType = options?.transitionType || this?.defaultTransitionType || null;
       try {
         await prepareCustomTileRenderersForSceneTransition({
-          transitionType: options?.transitionType || null
+          transitionType
         });
       } catch (error) {
         Logger.error?.('SceneTransitionReadiness.prepare.crashed', {
           sceneId: getCanvas()?.scene?.id || null,
           sceneName: getCanvas()?.scene?.name || null,
-          transitionType: options?.transitionType || null,
+          transitionType,
           error: String(error?.message || error)
         });
       }
       return original.call(this, options);
     };
     prototype[PATCHED_CAPTURE_SYMBOL] = true;
-
-    publishReadinessState({
-      prepare: prepareCustomTileRenderersForSceneTransition,
-      patched: true
-    });
 
     Logger.debug?.('SceneTransitionReadiness.patch.installed');
     return true;
@@ -515,7 +783,6 @@ function patchTransitionHoldForLevelReadiness() {
     };
 
     prototype[PATCHED_TRANSITION_HOLD_SYMBOL] = true;
-    publishReadinessState({ transitionHoldPatched: true });
     Logger.debug?.('SceneTransitionReadiness.transitionHoldPatch.installed');
     return true;
   } catch (error) {
@@ -538,12 +805,18 @@ function patchCanvasDrawForLevelReadiness() {
 
     const original = prototype.draw;
     prototype[ORIGINAL_CANVAS_DRAW_KEY] = original;
-    prototype.draw = async function faNexusDrawWithLevelReadiness(sceneArg) {
-      const levelDetails = getLevelDrawReadinessDetails(this, sceneArg);
+    prototype.draw = async function faNexusDrawWithLevelReadiness(...args) {
+      // Every argument goes through to Foundry: dropping the view options draws the Level already in view.
+      // Switched off in the settings: Foundry's own draw, once, with no transition hold (the hold of the two
+      // transition wrappers is only ever begun here).
+      if (!isNativeAdjustmentEnabled('sceneDraw')) return original.apply(this, args);
+      const [sceneArg, viewOptions] = args;
+      const levelDetails = getLevelDrawReadinessDetails(this, sceneArg, viewOptions);
       const holdState = levelDetails ? beginLevelDrawTransitionHold(this, levelDetails) : null;
       try {
-        const result = await original.call(this, sceneArg);
+        const result = await original.apply(this, args);
         if (levelDetails) await prepareCustomTileRenderersForLevelDraw(this, levelDetails, holdState);
+        else await prepareCustomTileRenderersForSceneDraw(this, sceneArg);
         return result;
       } catch (error) {
         releaseLevelDrawTransitionHold(this, holdState, 'canvas-draw-error');
@@ -551,12 +824,6 @@ function patchCanvasDrawForLevelReadiness() {
       }
     };
     prototype[PATCHED_CANVAS_DRAW_SYMBOL] = true;
-
-    publishReadinessState({
-      prepare: prepareCustomTileRenderersForSceneTransition,
-      prepareLevelDraw: prepareCustomTileRenderersForLevelDraw,
-      canvasDrawPatched: true
-    });
 
     Logger.debug?.('SceneTransitionReadiness.canvasDrawPatch.installed');
     return true;
@@ -589,7 +856,7 @@ try {
       });
     }
   });
-  Hooks.once('ready', () => {
+  onFoundryBoot('ready', () => {
     if (!patchTransitionCapture()) {
       const details = { reason: 'TransitionContainer._captureNextScene missing during ready' };
       if (shouldExpectSceneTransitions()) Logger.error?.('SceneTransitionReadiness.patch.unavailable', details);

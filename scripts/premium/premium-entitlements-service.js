@@ -12,6 +12,18 @@ function getModuleVersion() {
   }
 }
 
+function normalizeNonEmptyString(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function normalizeSha256Hash(value) {
+  const normalized = normalizeNonEmptyString(value);
+  if (!normalized || !/^[a-fA-F0-9]{64}$/.test(normalized)) return null;
+  return normalized.toLowerCase();
+}
+
 export class PremiumGateError extends Error {
   constructor(code, message, details) {
     super(message || code || 'Premium gate error');
@@ -54,6 +66,7 @@ export class PremiumEntitlementsService {
     this._inflight = null;
     this._refreshSequence = 0;
     this._activeRefreshId = 0;
+    this._proTierRefusal = null;
     this._settingsHook = null;
     this._installSettingsHook();
   }
@@ -77,7 +90,15 @@ export class PremiumEntitlementsService {
     };
   }
 
+  /** The remembered PRO_TIER_REQUIRED refusal for the current Patreon state, or null. */
+  get proTierRefusal() {
+    const refusal = this._proTierRefusal;
+    if (!refusal) return null;
+    return refusal.state === this._resolvePatreonState() ? refusal.error : null;
+  }
+
   async refresh({ signal, force = false, bundle } = {}) {
+    if (!force && this.proTierRefusal && !(await getPremiumEntitlementSnapshotOverride())) throw this.proTierRefusal;
     if (this._inflight && !force) return this._inflight;
     const requestId = ++this._refreshSequence;
     this._activeRefreshId = requestId;
@@ -121,8 +142,14 @@ export class PremiumEntitlementsService {
       const payload = await this._safeJson(res);
       if (!res.ok || !payload?.success) {
         const code = payload?.error || `HTTP_${res.status}`;
-        throw new PremiumGateError(code, payload?.message || 'Premium entitlement request failed', payload);
+        const error = new PremiumGateError(code, payload?.message || 'Premium entitlement request failed', { ...(payload || {}), status: res.status });
+        error.status = res.status;
+        // A tier without the Pro tools is remembered for this Patreon state, so the next tool click answers
+        // without asking the server again. Reconnecting (a new state) or a forced revalidation asks again.
+        if (code === 'PRO_TIER_REQUIRED') this._proTierRefusal = { state, error };
+        throw error;
       }
+      this._proTierRefusal = null;
 
       const entitlements = this._normalizeEntitlements(payload);
       const bundles = this._normalizeBundles(payload);
@@ -157,7 +184,13 @@ export class PremiumEntitlementsService {
         });
         return this.snapshot();
       }
-      this._applyRefreshState({ status: 'error' }, requestId);
+      this._applyRefreshState({
+        status: 'error',
+        entitlements: Object.create(null),
+        sessionToken: null,
+        expiresAt: null,
+        bundles: new Map()
+      }, requestId);
       throw err;
     }
   }
@@ -168,13 +201,17 @@ export class PremiumEntitlementsService {
   }
 
   _normalizeEntitlements(payload) {
+    const entitlements = payload?.entitlements;
+    if (!entitlements || typeof entitlements !== 'object' || Array.isArray(entitlements)) {
+      throw new PremiumGateError(
+        'ENTITLEMENTS_MALFORMED',
+        'Premium entitlement response is missing a valid entitlements map.',
+        { fieldType: Array.isArray(entitlements) ? 'array' : typeof entitlements }
+      );
+    }
     const output = Object.create(null);
-    if (payload?.entitlements && typeof payload.entitlements === 'object') {
-      for (const [key, value] of Object.entries(payload.entitlements)) {
-        output[String(key)] = !!value;
-      }
-    } else if (payload?.success) {
-      output['premium.all'] = true;
+    for (const [key, value] of Object.entries(entitlements)) {
+      output[String(key)] = !!value;
     }
     return output;
   }
@@ -186,11 +223,24 @@ export class PremiumEntitlementsService {
       if (!item) continue;
       const id = String(item.id || '').trim();
       if (!id) continue;
+      const downloadUrl = normalizeNonEmptyString(item.download_url) || normalizeNonEmptyString(item.url);
+      const rawHash = normalizeNonEmptyString(item.sha256) || normalizeNonEmptyString(item.hash);
+      const hash = normalizeSha256Hash(rawHash);
+      const missing = [];
+      if (!downloadUrl) missing.push('download_url/url');
+      if (!rawHash) missing.push('sha256/hash');
+      if (rawHash && !hash) missing.push('valid sha256/hash');
+      if (missing.length) {
+        throw new PremiumGateError(
+          'BUNDLE_DESCRIPTOR_MALFORMED',
+          `Premium bundle descriptor for ${id} is missing ${missing.join(' and ')}.`,
+          { bundleId: id, missing, fieldNames: Object.keys(item) }
+        );
+      }
       result.set(id, {
         id,
-        downloadUrl: item.download_url || item.url || null,
-        signature: item.signature || null,
-        hash: item.hash || null,
+        downloadUrl,
+        hash,
         fileVersion: item.file_version || null,
         version: item.version || null,
         minModule: item.min_module || null,

@@ -126,9 +126,28 @@ export class PlacementPrefetchQueue {
     try {
       const value = this._getItemKey(item);
       return String(value || '').toLowerCase();
-    } catch (_) {
+    } catch (error) {
+      this._log('key.failed', {
+        error: String(error?.message || error),
+        ...PlacementPrefetchQueue._safeItemLogContext(item)
+      }, 'warn');
       return '';
     }
+  }
+
+  static _safeItemLogContext(item) {
+    const read = (field) => {
+      try {
+        const value = item?.[field];
+        return value == null ? null : String(value);
+      } catch (_) {
+        return null;
+      }
+    };
+    return {
+      filename: read('filename'),
+      path: read('file_path') || read('path')
+    };
   }
 
   _log(event, payload = {}, level = 'info') {

@@ -1,13 +1,13 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import {
   applyHsbcToDisplayObject,
+  clearHsbcFromDisplayObject,
   readDocumentHsbc
 } from '../core/hsbc.js';
 import { cloneDisplayObjectForProxy } from '../canvas/display-object-proxy.js';
 import {
   attachCustomTileOverhead,
-  detachCustomTileOverhead,
-  invalidateCustomTileOverhead
+  detachCustomTileOverhead
 } from '../canvas/custom-tile-overhead.js';
 import { resolveTileId } from '../canvas/tile-targets.js';
 import {
@@ -18,11 +18,10 @@ import {
 import {
   encodeTexturePath,
   ensureMeshTransparent,
-  ensureTileMesh,
   getFlattenedChunkEntries,
   getMaxTextureSize,
-  getSharedTexture,
   loadTexture,
+  prepareCustomTileRendererMesh,
   restoreMeshTexture
 } from './texture-runtime-core.js';
 import { applyMaskedTextureBlendMode } from './texture-blend-runtime.js';
@@ -32,25 +31,23 @@ import {
   resolveStandardMaskCustomBaseSources,
   syncStandardMaskCustomSourceSuppression
 } from './standard-mask-custom-base.js';
+import { buildArcSamplePoints } from './texture-arc-geometry.js';
+import {
+  applyMaskedTilingRepeatTransform,
+  deriveMaskedTilingTransformPreview,
+  resolveMaskedTilingBaseGridScale
+} from './masked-tiling-resize-contract.js';
+import {
+  destroyOwnedTextureResources,
+  isTextureCleanupFailure
+} from './texture-owned-resource-cleanup.js';
 
 const TILE_RETRY_TIMERS = new WeakMap();
+const TILE_APPLY_GENERATIONS = new WeakMap();
+const PREVIEW_VISIBILITY_STATES = new WeakMap();
 let REHYDRATE_STATE = null;
 
-const TEXTURE_SCALE_MIN = 0.25;
-const TEXTURE_SCALE_MAX = 3;
-const DEG_TO_RAD = Math.PI / 180;
 const MASK_TYPE_ARRAY = 'array';
-const ARC_SAMPLE_SPACING = 20;
-const ARC_SAMPLE_MIN = 8;
-const ARC_SAMPLE_MAX = 72;
-const ARC_DUPLICATE_EPSILON = 0.5;
-const ARC_CIRCULAR_ALIGNMENT_RATIO = 0.02;
-const ARC_CIRCULAR_ALIGNMENT_MIN = 0.75;
-const ARC_CIRCULAR_ANGLE_EPSILON = Math.PI / 90;
-const ARC_CIRCULAR_DOT_RATIO = 0.001;
-const ARC_CIRCULAR_CENTER_RATIO = 0.45;
-const TAU = Math.PI * 2;
-const RIGHT_ANGLE = Math.PI / 2;
 const EDITING_TILE_SET_KEY = '__faNexusTextureEditingTileIds';
 const SOLID_COLOR_FULL_RE = /^#([0-9a-f]{6})$/i;
 const SOLID_COLOR_SHORT_RE = /^#([0-9a-f]{3})$/i;
@@ -61,6 +58,53 @@ const STANDARD_MASK_OVERHEAD_KIND = 'standard-mask';
 const LEGACY_ORIGINAL_TEXTURE_KEY = 'faNexusOriginalTexture';
 const MASKED_TILING_ORIGINAL_TEXTURE_KEY = 'faNexusMaskedTilingOriginalTexture';
 const STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY = 'faNexusStandardMaskOriginalTexture';
+
+function beginTileApply(tile, kind) {
+  const generations = TILE_APPLY_GENERATIONS.get(tile) || {};
+  const generation = Number(generations[kind] || 0) + 1;
+  generations[kind] = generation;
+  TILE_APPLY_GENERATIONS.set(tile, generations);
+  return Object.freeze({ kind, generation });
+}
+
+function isCurrentTileApply(tile, token) {
+  return Number(TILE_APPLY_GENERATIONS.get(tile)?.[token?.kind] || 0) === Number(token?.generation || 0);
+}
+
+function invalidateTileApply(tile, kind) {
+  if (!tile) return;
+  const generations = TILE_APPLY_GENERATIONS.get(tile) || {};
+  generations[kind] = Number(generations[kind] || 0) + 1;
+  TILE_APPLY_GENERATIONS.set(tile, generations);
+}
+
+export function cancelTileApplies(tile) {
+  if (!tile) return;
+  invalidateTileApply(tile, 'masked-tiling');
+  invalidateTileApply(tile, 'standard-tile-mask');
+}
+
+function suppressPreviewVisibility(tile, token) {
+  if (!tile?.isPreview) return null;
+  const state = PREVIEW_VISIBILITY_STATES.get(tile) || {
+    originalVisible: tile.visible !== false,
+    tokens: new Set()
+  };
+  state.tokens.add(token);
+  PREVIEW_VISIBILITY_STATES.set(tile, state);
+  try { tile.visible = false; } catch (_) {}
+  return token;
+}
+
+function releasePreviewVisibility(tile, token) {
+  if (!tile || !token) return;
+  const state = PREVIEW_VISIBILITY_STATES.get(tile);
+  if (!state) return;
+  state.tokens.delete(token);
+  if (state.tokens.size) return;
+  PREVIEW_VISIBILITY_STATES.delete(tile);
+  try { tile.visible = state.originalVisible; } catch (_) {}
+}
 
 function getEditingTileSet() {
   try {
@@ -127,25 +171,10 @@ export function roundValue(value, places = 3) {
   return Math.round(value * factor) / factor;
 }
 
-function clampTextureScale(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return 1;
-  return Math.min(TEXTURE_SCALE_MAX, Math.max(TEXTURE_SCALE_MIN, numeric));
-}
-
-function normalizeTextureRotation(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return 0;
-  const normalized = ((numeric % 360) + 360) % 360;
-  return normalized * DEG_TO_RAD;
-}
-
 function getBaseGridScale() {
   try {
-    const assetPx = 200;
     const sceneGridSize = Number(canvas?.scene?.grid?.size || 100) || 100;
-    if (!Number.isFinite(sceneGridSize) || sceneGridSize <= 0) return 1;
-    return sceneGridSize / assetPx;
+    return resolveMaskedTilingBaseGridScale(sceneGridSize);
   } catch (_) {
     return 1;
   }
@@ -188,6 +217,14 @@ function createMaskedProxyFactory(container) {
   return () => {
     try {
       const liveContainer = container;
+      if (liveContainer?.faNexusCompositeRegions) {
+        const proxy = new PIXI.Container();
+        copyProxyTransform(liveContainer, proxy);
+        for (const region of liveContainer.faNexusCompositeRegions) {
+          proxy.addChild(createMaskedProxyFactory(region.container)());
+        }
+        return proxy;
+      }
       const liveMask = liveContainer?.faNexusMaskSprite || null;
       if (!liveContainer || liveContainer.destroyed || !liveMask || liveMask.destroyed) {
         return cloneDisplayObjectForProxy(liveContainer);
@@ -201,12 +238,33 @@ function createMaskedProxyFactory(container) {
       if (!proxyMask || proxyMask.destroyed) return proxyContainer;
       try { proxyMask.visible = true; } catch (_) {}
       try { proxyMask.renderable = true; } catch (_) {}
+      if (liveMask.texture?.baseTexture?.faNexusSingleChannelMask) {
+        // One channel has no alpha of its own. Draw white through it, the way
+        // the layer draws its texture through it.
+        const fill = new PIXI.Sprite(PIXI.Texture.WHITE);
+        fill.eventMode = 'none';
+        fill.position.copyFrom(proxyMask.position);
+        fill.width = proxyMask.width;
+        fill.height = proxyMask.height;
+        proxyContainer.addChild(fill, proxyMask);
+        fill.mask = proxyMask;
+        return proxyContainer;
+      }
       proxyContainer.addChild(proxyMask);
       return proxyContainer;
     } catch (_) {
       return cloneDisplayObjectForProxy(container);
     }
   };
+}
+
+// Names what a masked Tile draws, for the silhouette kept by the overhead
+// runtime: this renderer attaches again on every Tile refresh.
+function overheadContentKey(doc, maskKey, maskTex, width, height, extra = []) {
+  const base = maskTex?.baseTexture;
+  const texture = doc?.texture || {};
+  return [maskKey, base?.uid, base?.dirtyId, width, height, doc?.rotation, texture.scaleX, texture.scaleY,
+    texture.anchorX, texture.anchorY, ...extra].join('|');
 }
 
 function shouldUseMaskedTileOverhead(tile) {
@@ -223,9 +281,41 @@ function syncMeshBoundContainerDisplayState(container, mesh, doc) {
   if (!container || container.destroyed) return;
   try { container.visible = mesh?.visible !== false; } catch (_) {}
   try { container.renderable = mesh?.renderable !== false; } catch (_) {}
+  const documentAlpha = Number.isFinite(Number(doc?.alpha))
+    ? clampValue(Number(doc.alpha), 0, 1)
+    : 1;
+  // Keep opacity off every parent shared by the artwork and its mask. Parent
+  // alpha attenuates the mask as well as the texture and squares the result.
+  try { if (mesh && !mesh.destroyed) mesh.alpha = 1; } catch (_) {}
+  try { container.alpha = 1; } catch (_) {}
   try {
-    container.alpha = Number.isFinite(Number(doc?.alpha)) ? clampValue(Number(doc.alpha), 0, 1) : 1;
+    const tiling = container.faNexusTilingSprite;
+    if (tiling && !tiling.destroyed) tiling.alpha = documentAlpha;
   } catch (_) {}
+  try {
+    const baseDisplay = container.faNexusBaseDisplayObject;
+    if (baseDisplay && !baseDisplay.destroyed) baseDisplay.alpha = documentAlpha;
+  } catch (_) {}
+  try {
+    const mask = container.faNexusMaskSprite;
+    if (mask && !mask.destroyed) mask.alpha = 1;
+  } catch (_) {}
+}
+
+function resolveClonedDisplayReference(sourceRoot, clonedRoot, sourceTarget) {
+  if (!sourceRoot || !clonedRoot || !sourceTarget) return null;
+  if (sourceTarget === sourceRoot) return clonedRoot;
+  const path = [];
+  let current = sourceTarget;
+  while (current && current !== sourceRoot) {
+    const parent = current.parent;
+    const index = Array.isArray(parent?.children) ? parent.children.indexOf(current) : -1;
+    if (index < 0) return null;
+    path.unshift(index);
+    current = parent;
+  }
+  if (current !== sourceRoot) return null;
+  return path.reduce((entry, index) => entry?.children?.[index] || null, clonedRoot);
 }
 
 function mirrorMaskedPreviewContainer(tile, {
@@ -272,6 +362,17 @@ function mirrorMaskedPreviewContainer(tile, {
       try { container.faNexusMaskFlagKey = sourceContainer.faNexusMaskFlagKey || null; } catch (_) {}
       try { container.faNexusWidth = sourceContainer.faNexusWidth || null; } catch (_) {}
       try { container.faNexusHeight = sourceContainer.faNexusHeight || null; } catch (_) {}
+      for (const referenceKey of [
+        'faNexusContentContainer',
+        'faNexusBaseDisplayObject',
+        'faNexusBaseSprite',
+        'faNexusMaskSprite',
+        'faNexusTilingSprite'
+      ]) {
+        const sourceReference = sourceContainer?.[referenceKey] || null;
+        const clonedReference = resolveClonedDisplayReference(sourceContainer, container, sourceReference);
+        if (clonedReference) container[referenceKey] = clonedReference;
+      }
       mesh[containerKey] = container;
       tile[containerKey] = container;
       mesh.addChild(container);
@@ -293,12 +394,12 @@ function mirrorMaskedPreviewContainer(tile, {
         contentContainer: container,
         proxyFactory: () => cloneDisplayObjectForProxy(container),
         filterMode: 'container',
+        refreshReason: `${logTag}.previewMirror`,
         syncContent: ({ mesh: currentMesh, entry }) => {
           syncTransform?.(entry?.contentContainer, currentMesh, tile?.document);
           syncMeshBoundContainerDisplayState(entry?.contentContainer, currentMesh, tile?.document);
         }
       });
-      invalidateCustomTileOverhead(tile, `${logTag}.previewMirror`);
     } else {
       detachCustomTileOverhead(tile, { kind: overheadKind });
     }
@@ -326,311 +427,6 @@ function clampValue(value, min, max) {
   return Math.min(max, Math.max(min, numeric));
 }
 
-function pointsEqual(a, b, epsilon = ARC_DUPLICATE_EPSILON) {
-  if (!a || !b) return false;
-  return Math.abs((a.x ?? 0) - (b.x ?? 0)) <= epsilon
-    && Math.abs((a.y ?? 0) - (b.y ?? 0)) <= epsilon;
-}
-
-function distanceBetween(a, b) {
-  if (!a || !b) return 0;
-  const dx = (b.x ?? 0) - (a.x ?? 0);
-  const dy = (b.y ?? 0) - (a.y ?? 0);
-  return Math.hypot(dx, dy);
-}
-
-function segmentSide(a, b, point, epsilon = 1e-4) {
-  if (!a || !b || !point) return 0;
-  const ax = a.x ?? 0;
-  const ay = a.y ?? 0;
-  const bx = b.x ?? 0;
-  const by = b.y ?? 0;
-  const px = point.x ?? 0;
-  const py = point.y ?? 0;
-  const cross = ((bx - ax) * (py - ay)) - ((by - ay) * (px - ax));
-  if (Math.abs(cross) <= epsilon) return 0;
-  return cross > 0 ? 1 : -1;
-}
-
-function sampleQuadraticBezier(start, control, end, segments = ARC_SAMPLE_MIN) {
-  const count = clampValue(Math.trunc(segments), ARC_SAMPLE_MIN, ARC_SAMPLE_MAX);
-  const points = [];
-  if (!start || !control || !end) return points;
-  for (let i = 0; i <= count; i += 1) {
-    const t = i / count;
-    const mt = 1 - t;
-    const x = (mt * mt * (start.x ?? 0))
-      + (2 * mt * t * (control.x ?? 0))
-      + (t * t * (end.x ?? 0));
-    const y = (mt * mt * (start.y ?? 0))
-      + (2 * mt * t * (control.y ?? 0))
-      + (t * t * (end.y ?? 0));
-    points.push({ x, y });
-  }
-  return points;
-}
-
-function dedupeSequentialPoints(points = [], epsilon = ARC_DUPLICATE_EPSILON) {
-  if (!Array.isArray(points) || points.length <= 1) return points;
-  const result = [points[0]];
-  for (let i = 1; i < points.length; i += 1) {
-    const prev = result[result.length - 1];
-    const current = points[i];
-    if (!pointsEqual(prev, current, epsilon)) result.push(current);
-  }
-  return result;
-}
-
-function resolveArcSnapStep() {
-  const grid = Number(canvas?.scene?.grid?.size || 0);
-  if (Number.isFinite(grid) && grid > 0) return grid;
-  return 200;
-}
-
-function getArcSampleCount(distance) {
-  const spacing = Math.max(6, ARC_SAMPLE_SPACING);
-  const estimate = Math.max(ARC_SAMPLE_MIN, Math.ceil(distance / spacing) * 2);
-  return clampValue(estimate, ARC_SAMPLE_MIN, ARC_SAMPLE_MAX);
-}
-
-function isQuarterAxisAligned(vec, tolerance) {
-  if (!vec) return false;
-  const alignedX = Math.abs(vec.x ?? 0) <= tolerance;
-  const alignedY = Math.abs(vec.y ?? 0) <= tolerance;
-  if (alignedX && alignedY) return false;
-  return alignedX || alignedY;
-}
-
-function resolveQuarterCircleCenters(startPoint, endPoint, controlPoint) {
-  if (!startPoint || !endPoint || !controlPoint) return [];
-  if (Math.abs((endPoint.x ?? 0) - (startPoint.x ?? 0)) <= ARC_DUPLICATE_EPSILON) return [];
-  if (Math.abs((endPoint.y ?? 0) - (startPoint.y ?? 0)) <= ARC_DUPLICATE_EPSILON) return [];
-  const snapStep = Math.abs(resolveArcSnapStep()) || 200;
-  const centerTolerance = Math.max(ARC_CIRCULAR_ALIGNMENT_MIN, snapStep * ARC_CIRCULAR_CENTER_RATIO);
-  const candidates = [
-    { x: startPoint.x, y: endPoint.y },
-    { x: endPoint.x, y: startPoint.y }
-  ];
-  const unique = [];
-  for (const candidate of candidates) {
-    if (!Number.isFinite(candidate.x) || !Number.isFinite(candidate.y)) continue;
-    const exists = unique.some((existing) => Math.abs(existing.x - candidate.x) <= ARC_DUPLICATE_EPSILON
-      && Math.abs(existing.y - candidate.y) <= ARC_DUPLICATE_EPSILON);
-    if (!exists) unique.push(candidate);
-  }
-  const centers = [];
-  let hasPreferred = false;
-  unique.forEach((center) => {
-    const distance = distanceBetween(center, controlPoint);
-    const preferred = Number.isFinite(distance) && distance <= centerTolerance;
-    const weight = preferred ? distance : distance + centerTolerance;
-    centers.push({ center, weight, preferred });
-    if (preferred) hasPreferred = true;
-  });
-  if (!hasPreferred) return [];
-  centers.sort((a, b) => (a.weight ?? 0) - (b.weight ?? 0));
-  return centers;
-}
-
-function resolveArcOrientationFromControl(startPoint, endPoint, controlPoint, prevPoint) {
-  const chord = {
-    x: (endPoint?.x ?? 0) - (startPoint?.x ?? 0),
-    y: (endPoint?.y ?? 0) - (startPoint?.y ?? 0)
-  };
-  const controlVec = controlPoint ? {
-    x: (controlPoint.x ?? 0) - (startPoint?.x ?? 0),
-    y: (controlPoint.y ?? 0) - (startPoint?.y ?? 0)
-  } : chord;
-  let cross = (controlVec.x * chord.y) - (controlVec.y * chord.x);
-  if (Math.abs(cross) <= 1e-6 && prevPoint) {
-    const prevVec = {
-      x: (startPoint?.x ?? 0) - (prevPoint?.x ?? 0),
-      y: (startPoint?.y ?? 0) - (prevPoint?.y ?? 0)
-    };
-    cross = (prevVec.x * chord.y) - (prevVec.y * chord.x);
-  }
-  if (Math.abs(cross) <= 1e-6) {
-    return chord.y >= 0 ? 1 : -1;
-  }
-  return cross >= 0 ? 1 : -1;
-}
-
-function buildCircularArcFromCenter(startPoint, endPoint, center, options = {}) {
-  if (!startPoint || !endPoint || !center) return null;
-  const snapStep = Math.abs(resolveArcSnapStep()) || 200;
-  const axisTolerance = Math.max(ARC_CIRCULAR_ALIGNMENT_MIN, snapStep * ARC_CIRCULAR_ALIGNMENT_RATIO);
-  const startVec = {
-    x: (startPoint.x ?? 0) - (center.x ?? 0),
-    y: (startPoint.y ?? 0) - (center.y ?? 0)
-  };
-  const endVec = {
-    x: (endPoint.x ?? 0) - (center.x ?? 0),
-    y: (endPoint.y ?? 0) - (center.y ?? 0)
-  };
-  if (!isQuarterAxisAligned(startVec, axisTolerance)) return null;
-  if (!isQuarterAxisAligned(endVec, axisTolerance)) return null;
-
-  const startRadius = Math.hypot(startVec.x, startVec.y);
-  const endRadius = Math.hypot(endVec.x, endVec.y);
-  if (!Number.isFinite(startRadius) || !Number.isFinite(endRadius)) return null;
-  if (startRadius <= axisTolerance || endRadius <= axisTolerance) return null;
-  if (Math.abs(startRadius - endRadius) > axisTolerance) return null;
-  const radius = (startRadius + endRadius) / 2;
-
-  const dot = (startVec.x * endVec.x) + (startVec.y * endVec.y);
-  const dotTolerance = Math.max(1, radius * radius * ARC_CIRCULAR_DOT_RATIO);
-  if (Math.abs(dot) > dotTolerance) return null;
-  const cross = (startVec.x * endVec.y) - (startVec.y * endVec.x);
-  if (Math.abs(cross) <= dotTolerance) return null;
-  const orientation = cross >= 0 ? 1 : -1;
-
-  let startAngle = Math.atan2(startVec.y, startVec.x);
-  let endAngle = Math.atan2(endVec.y, endVec.x);
-  let delta = endAngle - startAngle;
-  if (orientation > 0 && delta < 0) delta += TAU;
-  if (orientation < 0 && delta > 0) delta -= TAU;
-  const angleDelta = Math.abs(delta);
-  const angleTolerance = Math.max(ARC_CIRCULAR_ANGLE_EPSILON, angleDelta * 0.05);
-  if (Math.abs(angleDelta - RIGHT_ANGLE) > angleTolerance) return null;
-
-  const segments = clampValue(Math.trunc(options?.segments ?? ARC_SAMPLE_MIN), ARC_SAMPLE_MIN, ARC_SAMPLE_MAX);
-  const step = delta / segments;
-  const points = [];
-  for (let i = 0; i <= segments; i += 1) {
-    const theta = startAngle + (step * i);
-    points.push({
-      x: Number(((center.x ?? 0) + (Math.cos(theta) * radius)).toFixed(3)),
-      y: Number(((center.y ?? 0) + (Math.sin(theta) * radius)).toFixed(3))
-    });
-  }
-  const samples = dedupeSequentialPoints(points);
-  if (!samples.length) return null;
-  samples[0] = { x: startPoint.x, y: startPoint.y };
-  samples[samples.length - 1] = { x: endPoint.x, y: endPoint.y };
-  return { points: samples, mode: 'circular', orientation };
-}
-
-function buildCircularArcPoints(startPoint, endPoint, controlPoint, options = {}) {
-  if (!startPoint || !endPoint || !controlPoint) return null;
-  const centers = resolveQuarterCircleCenters(startPoint, endPoint, controlPoint);
-  if (!centers.length) return null;
-  const desiredSide = segmentSide(startPoint, endPoint, options.sourceControlPoint || controlPoint);
-  let fallback = null;
-  for (const candidate of centers) {
-    const arc = buildCircularArcFromCenter(startPoint, endPoint, candidate.center, options);
-    if (!arc) continue;
-    const midSample = arc.points[Math.floor(arc.points.length / 2)] || arc.points[0];
-    const arcSide = segmentSide(startPoint, endPoint, midSample);
-    if (desiredSide && arcSide && desiredSide === arcSide) {
-      return arc;
-    }
-    if (!fallback || candidate.weight < fallback.weight) {
-      fallback = { arc, weight: candidate.weight };
-    }
-  }
-  return fallback?.arc ?? null;
-}
-
-function buildEllipticalArcPoints(startPoint, endPoint, controlPoint, options = {}) {
-  if (!startPoint || !endPoint || !controlPoint) return null;
-
-  const cx = controlPoint.x;
-  const cy = controlPoint.y;
-  const u = { x: startPoint.x - cx, y: startPoint.y - cy };
-  const v = { x: endPoint.x - cx, y: endPoint.y - cy };
-
-  const dot = (u.x * v.x) + (u.y * v.y);
-  const magU = Math.hypot(u.x, u.y);
-  const magV = Math.hypot(v.x, v.y);
-  if (magU < 1 || magV < 1) return null;
-
-  const cosTheta = dot / (magU * magV);
-  if (Math.abs(cosTheta) > 0.02) return null;
-
-  const center = {
-    x: startPoint.x + v.x,
-    y: startPoint.y + v.y
-  };
-
-  const segments = clampValue(Math.trunc(options?.segments ?? ARC_SAMPLE_MIN), ARC_SAMPLE_MIN, ARC_SAMPLE_MAX);
-  const points = [];
-  const axis1 = { x: startPoint.x - center.x, y: startPoint.y - center.y };
-  const axis2 = { x: endPoint.x - center.x, y: endPoint.y - center.y };
-
-  for (let i = 0; i <= segments; i++) {
-    const t = (i / segments) * (Math.PI / 2);
-    const ct = Math.cos(t);
-    const st = Math.sin(t);
-    points.push({
-      x: center.x + axis1.x * ct + axis2.x * st,
-      y: center.y + axis1.y * ct + axis2.y * st
-    });
-  }
-
-  const samples = dedupeSequentialPoints(points);
-  if (!samples.length) return null;
-  samples[0] = { x: startPoint.x, y: startPoint.y };
-  samples[samples.length - 1] = { x: endPoint.x, y: endPoint.y };
-
-  const orientation = resolveArcOrientationFromControl(startPoint, endPoint, controlPoint, options.prevPoint);
-  return { points: samples, mode: 'manual', orientation };
-}
-
-function buildArcSamplePoints(startPoint, endPoint, options = {}) {
-  if (!startPoint || !endPoint) return { points: [], mode: 'line', orientation: 0 };
-  const distance = distanceBetween(startPoint, endPoint);
-  if (distance <= ARC_DUPLICATE_EPSILON) {
-    return {
-      points: [
-        { x: startPoint.x, y: startPoint.y },
-        { x: endPoint.x, y: endPoint.y }
-      ],
-      mode: 'line',
-      orientation: 0
-    };
-  }
-  const segmentCount = getArcSampleCount(distance);
-  if (options.controlPoint) {
-    const circular = buildCircularArcPoints(startPoint, endPoint, options.controlPoint, {
-      prevPoint: options.prevPoint,
-      segments: segmentCount,
-      sourceControlPoint: options.controlPoint
-    });
-    if (circular) return circular;
-
-    const elliptical = buildEllipticalArcPoints(startPoint, endPoint, options.controlPoint, {
-      prevPoint: options.prevPoint,
-      segments: segmentCount
-    });
-    if (elliptical) return elliptical;
-
-    const bezierPoints = dedupeSequentialPoints(sampleQuadraticBezier(
-      startPoint,
-      options.controlPoint,
-      endPoint,
-      segmentCount
-    ));
-    if (bezierPoints.length) {
-      bezierPoints[0] = { x: startPoint.x, y: startPoint.y };
-      bezierPoints[bezierPoints.length - 1] = { x: endPoint.x, y: endPoint.y };
-    }
-    if (!bezierPoints.length) {
-      bezierPoints.push({ x: startPoint.x, y: startPoint.y });
-      bezierPoints.push({ x: endPoint.x, y: endPoint.y });
-    }
-    const orientation = resolveArcOrientationFromControl(startPoint, endPoint, options.controlPoint, options.prevPoint);
-    return { points: bezierPoints, mode: 'manual', orientation };
-  }
-  return {
-    points: [
-      { x: startPoint.x, y: startPoint.y },
-      { x: endPoint.x, y: endPoint.y }
-    ],
-    mode: 'line',
-    orientation: 0
-  };
-}
-
 function expandPolygonVertices(vertices = []) {
   if (!Array.isArray(vertices) || !vertices.length) return [];
   const points = [];
@@ -651,7 +447,7 @@ function expandPolygonVertices(vertices = []) {
       const arcResult = buildArcSamplePoints(
         { x: Number(vertices[i - 1].x ?? 0), y: Number(vertices[i - 1].y ?? 0) },
         point,
-        { controlPoint: { x: controlX, y: controlY }, prevPoint }
+        { controlPoint: { x: controlX, y: controlY }, gridSize: canvas?.scene?.grid?.size, prevPoint }
       );
       const samples = Array.isArray(arcResult?.points) ? arcResult.points : [];
       if (samples.length) {
@@ -695,6 +491,30 @@ function resolveMaskKey(flags) {
     return data?.key || null;
   }
   return flags?.maskSrc || null;
+}
+
+// A mask texture built from shapes belongs to the container that shows it. Whenever that container is destroyed, by a
+// cleanup here or together with the Tile's mesh when the canvas is redrawn, the texture goes with it; without this it
+// stayed in GPU memory after every Level or Scene switch.
+function bindOwnedMaskTexture(container, texture) {
+  if (!container || container.destroyed) return;
+  container.faNexusOwnedMaskTexture = texture || null;
+  if (container.faNexusOwnedMaskTextureBound) return;
+  container.faNexusOwnedMaskTextureBound = true;
+  container.once('destroyed', () => {
+    const owned = container.faNexusOwnedMaskTexture;
+    container.faNexusOwnedMaskTexture = null;
+    if (!owned || owned.destroyed || !owned.baseTexture) return;
+    try { owned.destroy(true); }
+    catch (error) { Logger.warn('TextureRender.ownedMask.destroyFailed', { error: String(error?.message || error) }); }
+  });
+}
+
+// After an apply: a mask built now is owned by its container; a reused mask stays with whoever owns it (this container,
+// when it built it in an earlier apply; the source Tile, when a preview borrows it).
+function syncOwnedMaskTexture(container, maskTex, builtNow) {
+  if (builtNow) bindOwnedMaskTexture(container, maskTex);
+  else if (container?.faNexusOwnedMaskTexture && container.faNexusOwnedMaskTexture !== maskTex) container.faNexusOwnedMaskTexture = null;
 }
 
 function buildMaskTextureFromShapes(shapes, width, height) {
@@ -768,6 +588,102 @@ function buildMaskTextureFromShapes(shapes, width, height) {
   }
 }
 
+// Derived from the same array mask as the rendered texture. Keep it on the
+// mounted mask so selection follows its live preview transform and lifetime.
+function buildMaskHitGeometry(shapes, width, height) {
+  return {
+    width: Math.max(2, Math.ceil(Number(width) || 2)),
+    height: Math.max(2, Math.ceil(Number(height) || 2)),
+    shapes: (shapes || []).filter((source) => source?.type).map((source) => {
+      let shape;
+      if (source.type === 'rectangle') {
+        shape = new PIXI.Rectangle(Number(source.x ?? source.topLeft?.x ?? 0), Number(source.y ?? source.topLeft?.y ?? 0),
+          Math.max(1, Number(source.width ?? source.size?.width ?? 0)), Math.max(1, Number(source.height ?? source.size?.height ?? 0)));
+      } else if (source.type === 'ellipse') {
+        shape = new PIXI.Ellipse(Number(source.x ?? source.center?.x ?? 0), Number(source.y ?? source.center?.y ?? 0),
+          Math.max(0.5, Number(source.radiusX ?? source.radius?.x ?? 0)), Math.max(0.5, Number(source.radiusY ?? source.radius?.y ?? 0)));
+      } else if (source.type === 'polygon') {
+        const vertices = Array.isArray(source.vertices) ? source.vertices : (Array.isArray(source.points) ? source.points : []);
+        shape = new PIXI.Polygon(expandPolygonVertices(vertices).flatMap((point) => [point.x, point.y]));
+      }
+      return { operation: source.operation, shape };
+    })
+  };
+}
+
+const SINGLE_CHANNEL_MASKS = new WeakMap();
+const FULL_COLOUR_MASKS = new Set();
+
+/**
+ * A painted mask holds one value per pixel (white with the value in alpha, or
+ * the older grey on opaque). Uploaded premultiplied, its red channel is that
+ * value, and red is all a sprite mask reads, so the copy drawn here keeps red
+ * alone: a quarter of the GPU memory. The full-colour texture stays in the
+ * loader's cache, off the GPU, for the Texture editor to paint on.
+ */
+function toSingleChannelMaskTexture(texture) {
+  const base = texture?.baseTexture;
+  const source = base?.resource?.source;
+  const renderer = canvas?.app?.renderer;
+  if (!base || !source || renderer?.context?.webGLVersion !== 2) return texture;
+  if (base.alphaMode === PIXI.ALPHA_MODES.NPM) return texture;
+  const image = [globalThis.ImageBitmap, globalThis.HTMLImageElement, globalThis.HTMLCanvasElement]
+    .some((type) => type && source instanceof type);
+  if (!image) return texture;
+  let single = SINGLE_CHANNEL_MASKS.get(base);
+  if (!isTextureUsable(single)) {
+    const singleBase = new PIXI.BaseTexture(source, {
+      format: PIXI.FORMATS.RED,
+      type: PIXI.TYPES.UNSIGNED_BYTE,
+      alphaMode: base.alphaMode,
+      mipmap: base.mipmap,
+      scaleMode: base.scaleMode,
+      wrapMode: base.wrapMode,
+      resolution: base.resolution,
+      anisotropicLevel: base.anisotropicLevel
+    });
+    // The image belongs to the loader's texture; this copy must not close it.
+    if (singleBase.resource && ('ownsImageBitmap' in singleBase.resource)) singleBase.resource.ownsImageBitmap = false;
+    singleBase.faNexusSingleChannelMask = true;
+    singleBase.faNexusFullColourMask = base;
+    single = new PIXI.Texture(singleBase);
+    SINGLE_CHANNEL_MASKS.set(base, single);
+    FULL_COLOUR_MASKS.add(base);
+    base.once('destroyed', () => {
+      FULL_COLOUR_MASKS.delete(base);
+      if (!single.destroyed) single.destroy(true);
+    });
+  }
+  releaseFullColourMaskCopies();
+  return single;
+}
+
+/** The editor uploads a full-colour mask to paint on it. Nothing draws it afterwards. */
+function releaseFullColourMaskCopies() {
+  const contextId = canvas?.app?.renderer?.CONTEXT_UID;
+  for (const full of FULL_COLOUR_MASKS) {
+    if (!full.destroyed && full._glTextures?.[contextId]) full.dispose();
+  }
+}
+
+async function resolveMaskedTilingTextures({ reuse, flags, solidTint, arrayMask, maskData, width, height }) {
+  let baseTex = reuse?.baseTex || null;
+  let maskTex = reuse?.maskTex || null;
+  let ownsMaskTex = false;
+  if (solidTint !== null) baseTex = getSolidColorTexture();
+  if (!baseTex) baseTex = solidTint !== null ? getSolidColorTexture() : await loadTexture(flags.baseSrc);
+  if (!maskTex) {
+    if (arrayMask) {
+      maskTex = buildMaskTextureFromShapes(maskData?.shapes, width, height);
+      ownsMaskTex = !!maskTex;
+      if (!maskTex) throw new Error('Mask shape render failed');
+    } else {
+      maskTex = toSingleChannelMaskTexture(await loadTexture(flags.maskSrc));
+    }
+  }
+  return { baseTex, maskTex, ownsMaskTex };
+}
+
 function buildFlattenedChunkKey(chunks) {
   if (!Array.isArray(chunks) || !chunks.length) return '';
   return chunks.map((chunk) => (
@@ -814,8 +730,8 @@ function syncTileLocalContainerTransform(
     const scaleX = preserveFlipSign ? (1 / sx) : ((Math.sign(rawSx || 1) || 1) / sx);
     const scaleY = preserveFlipSign ? (1 / sy) : ((Math.sign(rawSy || 1) || 1) / sy);
     container.scale.set(scaleX, scaleY);
-    const offsetX = -((Number(width) || 0) * clampValue(Number(anchor?.x), 0, 1, 0.5)) / (sx || 1);
-    const offsetY = -((Number(height) || 0) * clampValue(Number(anchor?.y), 0, 1, 0.5)) / (sy || 1);
+    const offsetX = -((Number(width) || 0) * (preserveFlipSign && rawSx < 0 ? 1-clampValue(Number(anchor?.x), 0, 1, 0.5) : clampValue(Number(anchor?.x), 0, 1, 0.5))) / (sx || 1);
+    const offsetY = -((Number(height) || 0) * (preserveFlipSign && rawSy < 0 ? 1-clampValue(Number(anchor?.y), 0, 1, 0.5) : clampValue(Number(anchor?.y), 0, 1, 0.5))) / (sy || 1);
     container.position.set(offsetX, offsetY);
   } catch (_) {
     try { container.scale.set(1, 1); } catch (_) {}
@@ -827,11 +743,57 @@ function syncTileLocalContainerTransform(
 }
 
 function syncMaskedContainerTransform(container, mesh, width, height, doc) {
-  syncTileLocalContainerTransform(container, mesh, width, height, getTileAnchor(doc), { preserveFlipSign: false });
+  syncTileLocalContainerTransform(container, mesh, width, height, getTileAnchor(doc), { preserveFlipSign: true });
+  // A prepared Tile may be clamped while its semantic mask and native Walls
+  // remain at the stored pose. Convert that displacement through the live mesh
+  // rather than treating it as an authoring move or changing document state.
+  const rawX = doc?._source?.x ?? doc?.x, rawY = doc?._source?.y ?? doc?.y;
+  if (rawX === doc?.x && rawY === doc?.y) return;
+  const stored = mesh.toLocal(new PIXI.Point(rawX, rawY), mesh.parent);
+  const prepared = mesh.toLocal(new PIXI.Point(doc.x, doc.y), mesh.parent);
+  container.position.x += stored.x - prepared.x;
+  container.position.y += stored.y - prepared.y;
 }
 
 function syncStandardMaskContainerTransform(container, mesh, width, height, doc) {
   syncTileLocalContainerTransform(container, mesh, width, height, getTileAnchor(doc), { preserveFlipSign: true });
+}
+
+function syncStandardMaskNativeContainerTransform(container, mesh, document) {
+  if (!container || container.destroyed || !mesh || mesh.destroyed || !document) return false;
+  const width = Math.max(2, Number(document.width) || Number(mesh.width) || 2);
+  const height = Math.max(2, Number(document.height) || Number(mesh.height) || 2);
+  if (container.faNexusBaseKind === 'sprite') {
+    const baseSprite = container.faNexusBaseDisplayObject || container.faNexusBaseSprite || null;
+    if (baseSprite && !baseSprite.destroyed) {
+      baseSprite.position?.set?.(0, 0);
+      baseSprite.width = width;
+      baseSprite.height = height;
+    }
+    const maskSprite = container.faNexusMaskSprite || null;
+    const maskFlags = document.getFlag?.('fa-nexus', STANDARD_TILE_MASK_FLAG)
+      ?? document.flags?.['fa-nexus']?.[STANDARD_TILE_MASK_FLAG]
+      ?? null;
+    if (maskSprite && !maskSprite.destroyed && maskFlags) {
+      const placement = computeMaskPlacement(maskFlags, width, height, maskSprite.texture);
+      maskSprite.position?.set?.(placement.offsetX || 0, placement.offsetY || 0);
+      maskSprite.scale?.set?.(placement.scaleX || 1, placement.scaleY || 1);
+    }
+    container.faNexusWidth = width;
+    container.faNexusHeight = height;
+  }
+  syncStandardMaskContainerTransform(container, mesh, width, height, document);
+  syncMeshBoundContainerDisplayState(container, mesh, document);
+  return true;
+}
+
+export function syncStandardMaskNativeTransformPreview(preview) {
+  const mesh = preview?.mesh || null;
+  const document = preview?.document || null;
+  const container = preview?.faNexusStandardMaskContainer
+    || mesh?.faNexusStandardMaskContainer
+    || null;
+  return syncStandardMaskNativeContainerTransform(container, mesh, document);
 }
 
 export function computeMaskPlacement(flags, tileWidth, tileHeight, maskTex) {
@@ -931,6 +893,58 @@ export function applyBaseTilingOffset(tiling, tile, flags) {
   } catch (_) {}
 }
 
+export function syncMaskedTilingTransformPreview(
+  tile,
+  maskedTiling,
+  { geometryCompensationX = 1, geometryCompensationY = 1 } = {}
+) {
+  if (!maskedTiling || typeof maskedTiling !== 'object') return false;
+  const container = tile?.mesh?.faNexusMaskContainer || tile?.faNexusMaskContainer || null;
+  if (maskedTiling.maskType === 'composite' && container?.faNexusCompositeRegions) {
+    for (const region of maskedTiling.regions.filter((entry) => entry.active)) {
+      const child = container.faNexusCompositeRegions.find((entry) => entry.regionId === region.regionId)?.container;
+      if (!child) throw new Error(`Composite Fill Region ${region.regionId} is not ready.`);
+      syncMaskedTilingTransformPreview({ document: tile.document, mesh: { faNexusMaskContainer: child } }, region.maskedTiling,
+        { geometryCompensationX, geometryCompensationY });
+    }
+    return true;
+  }
+  const tiling = container?.faNexusTilingSprite || null;
+  if (!tile?.document || !container || container.destroyed || !tiling || tiling.destroyed) {
+    throw new Error(
+      `Masked Texture Tile ${tile?.document?.uuid || tile?.document?.id || tile?.id || 'unknown'} `
+        + 'cannot preview its semantic transform because the masked renderer is not ready.'
+    );
+  }
+  applyMaskedTilingRepeatTransform(tiling, maskedTiling, getBaseGridScale());
+  applyBaseTilingOffset(tiling, tile, maskedTiling);
+  const compensationX = Number(geometryCompensationX);
+  const compensationY = Number(geometryCompensationY);
+  if (!(compensationX > 0) || !(compensationY > 0)) {
+    throw new Error('Masked Texture preview geometry compensation requires positive per-axis factors.');
+  }
+  if (compensationX !== 1 || compensationY !== 1) {
+    const Matrix = globalThis.PIXI?.Matrix;
+    const transform = tiling.tileTransform;
+    if (typeof Matrix !== 'function' || typeof transform?.setFromMatrix !== 'function') {
+      throw new Error('Foundry v14 Pixi tileTransform matrix API is unavailable for preview compensation.');
+    }
+    transform.updateLocalTransform?.();
+    const matrix = transform.localTransform;
+    transform.setFromMatrix(new Matrix(
+      matrix.a * compensationX,
+      matrix.b * compensationY,
+      matrix.c * compensationX,
+      matrix.d * compensationY,
+      matrix.tx * compensationX,
+      matrix.ty * compensationY
+    ));
+  }
+  if (typeof tiling._refresh === 'function') tiling._refresh();
+  else tiling.uvMatrix?.update?.();
+  return true;
+}
+
 export function getLiveTileDelta(tile, flags) {
   try {
     if (!tile || !tile.document) return { x: 0, y: 0 };
@@ -960,6 +974,10 @@ export function scheduleMaskedTileRetry(tile, applyFn) {
     const next = (existing.attempts || 0) + 1;
     if (next > 8) {
       retries.delete(tile);
+      Logger.error('TextureRender.scheduleMaskedTileRetry.exhausted', {
+        tileId: tile?.document?.id || tile?.id || null,
+        attempts: existing.attempts || 0
+      });
       return;
     }
     const timeout = setTimeout(() => {
@@ -1007,69 +1025,171 @@ export function clearMaskedTileRetry(tile) {
   } catch (_) {}
 }
 
+function tileDocumentSnapshot(doc) {
+  return {
+    x: Number(doc?.x),
+    y: Number(doc?.y),
+    width: Number(doc?.width),
+    height: Number(doc?.height),
+    rotation: Number(doc?.rotation || 0),
+    texture: {
+      anchorX: Number(doc?.texture?.anchorX ?? 0.5),
+      anchorY: Number(doc?.texture?.anchorY ?? 0.5)
+    }
+  };
+}
+
+export function deriveMaskedTilingPreviewState(tile, maskedTiling) {
+  const sourceDocument = tile?._original?.document || null;
+  const previewDocument = tile?.document || null;
+  if (!maskedTiling || typeof maskedTiling !== 'object') return maskedTiling;
+  if (!tile?.isPreview || !sourceDocument || !previewDocument) return maskedTiling;
+  return deriveMaskedTilingTransformPreview({
+    maskedTiling,
+    originalTile: tileDocumentSnapshot(sourceDocument),
+    finalTile: tileDocumentSnapshot(previewDocument)
+  });
+}
+
+function clearMaskedTilingOverlay(tile, { preserveTexture = false } = {}) {
+  try {
+    const meshRef = tile?.mesh;
+    const cont = meshRef?.faNexusMaskContainer || tile?.faNexusMaskContainer;
+    if (tile) detachCustomTileOverhead(tile, { kind: MASKED_OVERHEAD_KIND });
+    if (cont) {
+      if (cont.faNexusCompositeRegions) destroyCompositeFillResources(cont);
+      try { cont.parent?.removeChild?.(cont); } catch (_) {}
+      try { cont.destroy({ children: true }); } catch (_) {}
+      cont.faNexusTilingSprite = null;
+      cont.faNexusMaskSprite = null;
+      cont.faNexusBaseTexture = null;
+      cont.faNexusMaskTexture = null;
+      cont.faNexusBaseSrc = null;
+      cont.faNexusMaskSrc = null;
+    }
+    if (meshRef) {
+      meshRef.faNexusMaskContainer = null;
+      meshRef.faNexusMaskReady = false;
+      if (!preserveTexture && meshRef[MASKED_TILING_ORIGINAL_TEXTURE_KEY]) {
+        if (meshRef.faNexusStandardMaskContainer || tile?.faNexusStandardMaskContainer) {
+          Logger.debug('TextureRender.maskedTiling.cleanup.restoreBlockedByStandardMask', {
+            tileId: tile?.document?.id || tile?.id || null
+          });
+        } else {
+          restoreMeshTexture(meshRef, MASKED_TILING_ORIGINAL_TEXTURE_KEY);
+        }
+      }
+    }
+    if (tile) tile.faNexusMaskContainer = null;
+  } catch (error) { if (isTextureCleanupFailure(error)) throw error; }
+}
+
+function destroyCompositeFillResources(container) {
+  const textures = [];
+  for (const region of container.faNexusCompositeRegions || []) {
+    const child = region.container;
+    if (child.faNexusTilingSprite) {
+      child.faNexusTilingSprite.mask = null;
+      clearHsbcFromDisplayObject(child.faNexusTilingSprite, { slot: 'masked-tiling' });
+    }
+    if (child.faNexusMaskTexture) textures.push(child.faNexusMaskTexture);
+    child.faNexusMaskTexture = null;
+    child.faNexusOwnedMaskTexture = null;
+  }
+  destroyOwnedTextureResources({ textures, context: 'Composite Fill mask cleanup' });
+}
+
+async function prepareCompositeFillContainer(tile, flags, width, height) {
+  const container = new PIXI.Container();
+  container.eventMode = 'none';
+  container.faNexusCompositeRegions = [];
+  try {
+    for (const region of flags.regions || []) {
+      if (!region.active) continue;
+      const baseSrc = String(region.asset?.src || '').trim();
+      if (!baseSrc) throw new Error(`Composite Fill Region ${region.regionId} has no asset source.`);
+      const projected = { ...region.maskedTiling, baseSrc };
+      const child = new PIXI.Container();
+      child.eventMode = 'none';
+      container.addChild(child);
+      container.faNexusCompositeRegions.push({ regionId: region.regionId, container: child });
+      const resources = await resolveMaskedTilingTextures({ flags: projected, solidTint: null, arrayMask: true,
+        maskData: getMaskShapeData(projected), width, height });
+      child.faNexusMaskTexture = resources.maskTex;
+      if (resources.ownsMaskTex) bindOwnedMaskTexture(child, resources.maskTex);
+      child.faNexusBaseTexture = resources.baseTex;
+      if (!isTextureUsable(resources.baseTex) || !isTextureUsable(resources.maskTex)) throw new Error(`Composite Fill Region ${region.regionId} texture unavailable: ${baseSrc}`);
+      const sprite = new PIXI.TilingSprite(resources.baseTex, width, height);
+      child.addChild(sprite);
+      child.faNexusTilingSprite = sprite;
+      const mask = new PIXI.Sprite(resources.maskTex);
+      child.addChild(mask);
+      child.faNexusMaskSprite = mask;
+      mask.faNexusMaskGeometry = buildMaskHitGeometry(getMaskShapeData(projected)?.shapes, width, height);
+      applyMaskedTilingRepeatTransform(sprite, projected, getBaseGridScale());
+      applyTilingSamplingFix(sprite);
+      applyBaseTilingOffset(sprite, tile, projected);
+      sprite.alpha = Number(region.appearance?.opacity ?? 1);
+      applyHsbcToDisplayObject(sprite, region.appearance?.hsbc, { slot: 'masked-tiling' });
+      const placement = computeMaskPlacement(projected, width, height, resources.maskTex);
+      mask.scale.set(placement.scaleX || 1, placement.scaleY || 1);
+      mask.position.set(placement.offsetX || 0, placement.offsetY || 0);
+      mask.width = width;
+      mask.height = height;
+      sprite.mask = mask;
+      mask.renderable = false;
+    }
+    if (!container.faNexusCompositeRegions.length) throw new Error('Composite Fill requires an active Region.');
+    container.faNexusSourceFingerprint = flags.sourceFingerprint;
+    return container;
+  } catch (error) {
+    try { destroyCompositeFillResources(container); }
+    finally { container.destroy({ children: true }); }
+    throw error;
+  }
+}
+
 export async function applyMaskedTilingToTile(tile) {
+  let compositeRequested = false;
   let hidePreview = false;
-  let wasVisible = null;
+  let previewVisibilityToken = null;
+  let applyToken = null;
   try {
     if (!tile || !tile.document) return;
+    applyToken = beginTileApply(tile, 'masked-tiling');
     const editing = isEditingTile(tile);
-    const flags = tile.document.getFlag('fa-nexus', MASKED_TILING_FLAG);
+    const sourceFlags = tile?._original?.document?.getFlag?.('fa-nexus', MASKED_TILING_FLAG)
+      || tile.document.getFlag('fa-nexus', MASKED_TILING_FLAG);
+    const flags = deriveMaskedTilingPreviewState(tile, sourceFlags);
     const arrayMask = isArrayMask(flags);
+    const compositeMask = flags?.maskType === 'composite';
+    compositeRequested = compositeMask;
     const solidColor = normalizeSolidColor(flags?.baseColor);
     const solidTint = parseSolidColorTint(solidColor);
-    const cleanupOverlay = (options = {}) => {
-      const preserveTexture = !!options.preserveTexture;
-      try {
-        const meshRef = tile?.mesh;
-        const cont = meshRef?.faNexusMaskContainer || tile?.faNexusMaskContainer;
-        if (tile) detachCustomTileOverhead(tile, { kind: MASKED_OVERHEAD_KIND });
-        if (cont) {
-          try { cont.parent?.removeChild?.(cont); } catch (_) {}
-          try { cont.destroy({ children: true }); } catch (_) {}
-          cont.faNexusTilingSprite = null;
-          cont.faNexusMaskSprite = null;
-          cont.faNexusBaseTexture = null;
-          cont.faNexusMaskTexture = null;
-          cont.faNexusBaseSrc = null;
-          cont.faNexusMaskSrc = null;
-        }
-        if (meshRef) {
-          meshRef.faNexusMaskContainer = null;
-          meshRef.faNexusMaskReady = false;
-          if (!preserveTexture && meshRef[MASKED_TILING_ORIGINAL_TEXTURE_KEY]) {
-            if (meshRef.faNexusStandardMaskContainer || tile?.faNexusStandardMaskContainer) {
-              Logger.debug('TextureRender.maskedTiling.cleanup.restoreBlockedByStandardMask', {
-                tileId: tile?.document?.id || tile?.id || null
-              });
-            } else {
-              restoreMeshTexture(meshRef, MASKED_TILING_ORIGINAL_TEXTURE_KEY);
-            }
-          }
-        }
-        if (tile) tile.faNexusMaskContainer = null;
-      } catch (_) {}
-    };
 
     if (editing) {
-      cleanupOverlay({ preserveTexture: true });
+      clearMaskedTilingOverlay(tile, { preserveTexture: true });
       clearMaskedTileRetry(tile);
-      let mesh = tile.mesh;
-      if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
+      const mesh = await prepareCustomTileRendererMesh(tile, {
+        originalTextureSlotKey: MASKED_TILING_ORIGINAL_TEXTURE_KEY
+      });
+      if (!isCurrentTileApply(tile, applyToken)) return;
       if (mesh && !mesh.destroyed) {
-        ensureMeshTransparent(mesh, MASKED_TILING_ORIGINAL_TEXTURE_KEY);
         try { mesh.alpha = 0; } catch (_) {}
       }
       return;
     }
 
-    if (!flags || (!flags.baseSrc && !solidColor) || (!flags.maskSrc && !arrayMask)) {
-      cleanupOverlay();
+    if (!flags || (!flags.baseSrc && !solidColor && !compositeMask) || (!flags.maskSrc && !arrayMask && !compositeMask)) {
+      clearMaskedTilingOverlay(tile);
       clearMaskedTileRetry(tile);
       return;
     }
 
-    let mesh = tile.mesh;
-    if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
+    const mesh = await prepareCustomTileRendererMesh(tile, {
+      originalTextureSlotKey: MASKED_TILING_ORIGINAL_TEXTURE_KEY
+    });
+    if (!isCurrentTileApply(tile, applyToken)) return;
 
     if (!mesh || mesh.destroyed) {
       scheduleMaskedTileRetry(tile, applyMaskedTilingToTile);
@@ -1078,34 +1198,17 @@ export async function applyMaskedTilingToTile(tile) {
 
     clearMaskedTileRetry(tile);
 
-    ensureMeshTransparent(mesh, MASKED_TILING_ORIGINAL_TEXTURE_KEY);
-
-    if (tile?.isPreview) {
-      const originalContainer = tile?._original?.mesh?.faNexusMaskContainer
-        || tile?._original?.faNexusMaskContainer
-        || null;
-      const mirrored = mirrorMaskedPreviewContainer(tile, {
-        sourceContainer: originalContainer,
-        containerKey: 'faNexusMaskContainer',
-        readyKey: 'faNexusMaskReady',
-        slotKey: MASKED_TILING_ORIGINAL_TEXTURE_KEY,
-        overheadKind: MASKED_OVERHEAD_KIND,
-        syncTransform: (containerRef, meshRef, docRef) => {
-          const width = Math.max(2, Number(docRef?.width) || Number(meshRef?.width) || 2);
-          const height = Math.max(2, Number(docRef?.height) || Number(meshRef?.height) || 2);
-          syncMaskedContainerTransform(containerRef, meshRef, width, height, docRef);
-        },
-        logTag: 'TextureRender.applyMaskedTilingToTile.previewMirrorFailed'
-      });
-      if (mirrored) return;
+    if (tile?.isPreview && (
+      mesh.faNexusMaskContainer?.faNexusPreviewMirror
+      || tile.faNexusMaskContainer?.faNexusPreviewMirror
+    )) {
+      clearMaskedTilingOverlay(tile, { preserveTexture: true });
     }
 
     let reuse = getReusableTextures(tile, flags);
+    if (!reuse && tile?.isPreview) reuse = getPreviewSourceTextures(tile, flags);
     hidePreview = (!reuse || !reuse.ready) && tile?.isPreview;
-    wasVisible = hidePreview ? !!tile.visible : null;
-    if (hidePreview && tile.visible) {
-      try { tile.visible = false; } catch (_) {}
-    }
+    if (hidePreview) previewVisibilityToken = suppressPreviewVisibility(tile, applyToken);
 
     const meshWidth = Number(mesh?.width);
     const meshHeight = Number(mesh?.height);
@@ -1113,22 +1216,57 @@ export async function applyMaskedTilingToTile(tile) {
     const docHeight = Number(tile?.document?.height);
     const w = Math.max(2, Number.isFinite(docWidth) && docWidth > 0 ? docWidth : (Number.isFinite(meshWidth) && meshWidth > 0 ? meshWidth : 2));
     const h = Math.max(2, Number.isFinite(docHeight) && docHeight > 0 ? docHeight : (Number.isFinite(meshHeight) && meshHeight > 0 ? meshHeight : 2));
+    if (compositeMask) {
+      const container = await prepareCompositeFillContainer(tile, flags, w, h);
+      if (!isCurrentTileApply(tile, applyToken)) {
+        try { destroyCompositeFillResources(container); }
+        finally { container.destroy({ children: true }); }
+        return;
+      }
+      clearMaskedTilingOverlay(tile, { preserveTexture: true });
+      mesh.faNexusMaskContainer = container;
+      tile.faNexusMaskContainer = container;
+      mesh.addChild(container);
+      syncMaskedContainerTransform(container, mesh, w, h, tile.document);
+      syncMeshBoundContainerDisplayState(container, mesh, tile.document);
+      mesh.faNexusMaskReady = true;
+      if (shouldUseMaskedTileOverhead(tile)) attachCustomTileOverhead(tile, {
+        kind: MASKED_OVERHEAD_KIND, contentContainer: container,
+        proxyFactory: createMaskedProxyFactory(container), filterMode: 'leaf', refreshReason: 'masked-refresh',
+        syncContent: ({ mesh: currentMesh, entry }) => {
+          syncMaskedContainerTransform(entry?.contentContainer, currentMesh, w, h, tile.document);
+          syncMeshBoundContainerDisplayState(entry?.contentContainer, currentMesh, tile.document);
+        }
+      });
+      else detachCustomTileOverhead(tile, { kind: MASKED_OVERHEAD_KIND });
+      return;
+    }
+    if (mesh.faNexusMaskContainer?.faNexusCompositeRegions) clearMaskedTilingOverlay(tile, { preserveTexture: true });
     const maskData = arrayMask ? getMaskShapeData(flags) : null;
 
-    let baseTex = reuse?.baseTex || null;
-    let maskTex = reuse?.maskTex || null;
-    if (solidTint !== null) baseTex = getSolidColorTexture();
+    let baseTex = null;
+    let maskTex = null;
+    let ownsMaskTex = false;
     try {
-      if (!baseTex || !maskTex) {
-        baseTex = solidTint !== null ? getSolidColorTexture() : await loadTexture(flags.baseSrc);
-        if (arrayMask) {
-          maskTex = buildMaskTextureFromShapes(maskData?.shapes, w, h);
-          if (!maskTex) throw new Error('Mask shape render failed');
-        } else {
-          maskTex = await loadTexture(flags.maskSrc);
-        }
+      ({ baseTex, maskTex, ownsMaskTex } = await resolveMaskedTilingTextures({
+        reuse,
+        flags,
+        solidTint,
+        arrayMask,
+        maskData,
+        width: w,
+        height: h
+      }));
+      if (!isCurrentTileApply(tile, applyToken)) {
+        destroyOwnedTextureResources({
+          textures: ownsMaskTex ? [maskTex] : [],
+          context: 'Stale masked-tiling apply cleanup'
+        });
+        return;
       }
     } catch (texErr) {
+      if (isTextureCleanupFailure(texErr)) throw texErr;
+      if (!isCurrentTileApply(tile, applyToken)) return;
       try { Logger.warn('TextureRender.apply.loadFailed', { error: String(texErr?.message || texErr), tileId: tile?.document?.id }); } catch (_) {}
       scheduleMaskedTileRetry(tile, applyMaskedTilingToTile);
       return;
@@ -1172,22 +1310,8 @@ export async function applyMaskedTilingToTile(tile) {
       tiling.height = h;
     } catch (_) {}
 
-    const baseGridScale = getBaseGridScale();
-    const userScale = clampTextureScale(flags?.textureScale);
-    const combinedScale = baseGridScale * userScale;
-    const finalScale = (Number.isFinite(combinedScale) && combinedScale > 0) ? combinedScale : 1;
-    const rotationRad = normalizeTextureRotation(flags?.textureRotation);
-
-    try { tiling.tileScale.set(finalScale, finalScale); }
-    catch (_) { tiling.scale?.set?.(finalScale, finalScale); }
+    applyMaskedTilingRepeatTransform(tiling, flags, getBaseGridScale());
     applyTilingSamplingFix(tiling);
-    try {
-      if (tiling.tileTransform && typeof tiling.tileTransform.rotation === 'number') {
-        tiling.tileTransform.rotation = rotationRad;
-      } else {
-        tiling.rotation = rotationRad;
-      }
-    } catch (_) {}
 
     if (!maskSprite || maskSprite.destroyed) {
       maskSprite = new PIXI.Sprite(maskTex);
@@ -1219,7 +1343,10 @@ export async function applyMaskedTilingToTile(tile) {
 
     container.faNexusMaskSprite = maskSprite;
     container.faNexusTilingSprite = tiling;
+    maskSprite.faNexusMaskGeometry = arrayMask && tile.document.getFlag('fa-nexus', 'buildingFill')?.wallTileId
+      ? buildMaskHitGeometry(maskData?.shapes, w, h) : null;
     container.faNexusMaskTexture = maskTex;
+    syncOwnedMaskTexture(container, maskTex, ownsMaskTex);
     container.faNexusBaseTexture = baseTex;
     container.faNexusMaskSrc = maskKey;
     container.faNexusBaseSrc = flags.baseSrc;
@@ -1252,17 +1379,33 @@ export async function applyMaskedTilingToTile(tile) {
         contentContainer: container,
         proxyFactory: createMaskedProxyFactory(container),
         filterMode: 'leaf',
+        refreshReason: 'masked-refresh',
+        contentKey: overheadContentKey(tile.document, maskKey, maskTex, w, h, [placement.scaleX, placement.scaleY, placement.offsetX, placement.offsetY]),
         syncContent: ({ mesh: currentMesh, entry }) => {
           syncMaskedContainerTransform(entry?.contentContainer, currentMesh, w, h, tile.document);
           syncMeshBoundContainerDisplayState(entry?.contentContainer, currentMesh, tile.document);
         }
       });
-      invalidateCustomTileOverhead(tile, 'masked-refresh');
     } else {
       detachCustomTileOverhead(tile, { kind: MASKED_OVERHEAD_KIND });
     }
   } catch (error) {
+    if (isTextureCleanupFailure(error)) {
+      Logger.error('TextureRender.apply.staleCleanupFailed', {
+        tileId: tile?.document?.id,
+        error: String(error?.message || error),
+        failures: error?.errors?.length || 0
+      });
+      throw error;
+    }
+    if (applyToken && !isCurrentTileApply(tile, applyToken)) return;
     Logger.warn('TextureRender.apply.failed', String(error?.message || error));
+    if (compositeRequested) {
+      clearMaskedTilingOverlay(tile, { preserveTexture: true });
+      if (tile?.mesh) tile.mesh.faNexusMaskReady = false;
+      scheduleMaskedTileRetry(tile, applyMaskedTilingToTile);
+      return;
+    }
     try {
       const cont = tile?.mesh?.faNexusMaskContainer || tile?.faNexusMaskContainer;
       const invalid = cont && (!isTextureUsable(cont.faNexusBaseTexture) || !isTextureUsable(cont.faNexusMaskTexture));
@@ -1271,9 +1414,7 @@ export async function applyMaskedTilingToTile(tile) {
       }
     } catch (_) {}
   } finally {
-    if (hidePreview && wasVisible !== null) {
-      try { tile.visible = wasVisible; } catch (_) {}
-    }
+    if (hidePreview) releasePreviewVisibility(tile, previewVisibilityToken);
   }
 }
 
@@ -1361,27 +1502,18 @@ function ensureSpriteStandardBaseDisplay(content, container, baseTex, width, hei
   return baseSprite;
 }
 
-async function ensureChunkedStandardBaseDisplay(content, container, chunkEntries, chunkKey, tileId = null) {
-  let baseDisplay = container?.faNexusBaseDisplayObject || null;
-  const needsReset = !baseDisplay
-    || baseDisplay.destroyed
-    || container?.faNexusBaseKind !== 'flattened-chunks'
-    || (baseDisplay instanceof PIXI.Sprite);
-  if (needsReset) {
-    destroyStandardBaseDisplay(container, content);
-    baseDisplay = new PIXI.Container();
-    baseDisplay.eventMode = 'none';
-    baseDisplay.sortableChildren = false;
-    content.addChildAt(baseDisplay, 0);
-    container.faNexusBaseDisplayObject = baseDisplay;
-    container.faNexusBaseSprite = null;
-    container.faNexusBaseKind = 'flattened-chunks';
-  } else if (baseDisplay.parent !== content) {
-    content.addChildAt(baseDisplay, 0);
-  }
+function canReuseChunkedStandardBaseDisplay(container, chunkKey) {
+  const baseDisplay = container?.faNexusBaseDisplayObject || null;
+  return !!(
+    baseDisplay
+    && !baseDisplay.destroyed
+    && container?.faNexusBaseKind === 'flattened-chunks'
+    && !(baseDisplay instanceof PIXI.Sprite)
+    && container?.faNexusBaseChunkKey === chunkKey
+  );
+}
 
-  if (container?.faNexusBaseChunkKey === chunkKey) return baseDisplay;
-
+async function prepareChunkedStandardBaseSprites(chunkEntries, tileId = null) {
   const results = await Promise.all(chunkEntries.map(async (chunk) => {
     try {
       const texture = await loadTexture(chunk.src, { attempts: 3, timeout: 6000 });
@@ -1414,6 +1546,39 @@ async function ensureChunkedStandardBaseDisplay(content, container, chunkEntries
       chunks: Array.isArray(chunkEntries) ? chunkEntries.length : 0
     });
     throw new Error('Chunked flattened tile did not produce any standard mask base sprites');
+  }
+  return nextSprites;
+}
+
+function destroyPreparedStandardBaseSprites(sprites) {
+  return destroyOwnedTextureResources({
+    displayObjects: sprites || [],
+    context: 'Prepared Standard Mask base sprite cleanup'
+  });
+}
+
+function ensureChunkedStandardBaseDisplay(content, container, nextSprites, chunkKey, tileId = null) {
+  let baseDisplay = container?.faNexusBaseDisplayObject || null;
+  const needsReset = !baseDisplay
+    || baseDisplay.destroyed
+    || container?.faNexusBaseKind !== 'flattened-chunks'
+    || (baseDisplay instanceof PIXI.Sprite);
+  if (needsReset) {
+    destroyStandardBaseDisplay(container, content);
+    baseDisplay = new PIXI.Container();
+    baseDisplay.eventMode = 'none';
+    baseDisplay.sortableChildren = false;
+    content.addChildAt(baseDisplay, 0);
+    container.faNexusBaseDisplayObject = baseDisplay;
+    container.faNexusBaseSprite = null;
+    container.faNexusBaseKind = 'flattened-chunks';
+  } else if (baseDisplay.parent !== content) {
+    content.addChildAt(baseDisplay, 0);
+  }
+
+  if (container?.faNexusBaseChunkKey === chunkKey) return baseDisplay;
+  if (!Array.isArray(nextSprites) || !nextSprites.length) {
+    throw new Error('Prepared chunk sprites are required before committing a standard mask base');
   }
 
   const prevChildren = baseDisplay.children?.slice() || [];
@@ -1466,11 +1631,39 @@ function ensureCustomStandardBaseDisplay(content, container, tile, customBaseKey
   return baseDisplay;
 }
 
+function ensureStandardMaskBaseDisplay({
+  content,
+  container,
+  tile,
+  baseTex,
+  width,
+  height,
+  isCustomBase,
+  customBaseKey,
+  isChunkedBase,
+  preparedChunkSprites,
+  chunkBaseKey
+}) {
+  if (isCustomBase) {
+    const baseDisplay = ensureCustomStandardBaseDisplay(content, container, tile, customBaseKey);
+    container.faNexusBaseTexture = null;
+    return baseDisplay;
+  }
+  if (isChunkedBase) {
+    const baseDisplay = ensureChunkedStandardBaseDisplay(content, container, preparedChunkSprites, chunkBaseKey, tile?.document?.id || null);
+    container.faNexusBaseTexture = null;
+    return baseDisplay;
+  }
+  const baseSprite = ensureSpriteStandardBaseDisplay(content, container, baseTex, width, height);
+  container.faNexusBaseTexture = baseTex;
+  return baseSprite;
+}
+
 function customStandardBaseNeedsRetry(tile, customBaseKey) {
   const tileId = tile?.document?.id || tile?.id || null;
   const { sources, missing } = resolveStandardMaskCustomBaseSources(tile);
   if (sources.length && !missing.length) return false;
-  Logger.error('TextureRender.standardTileMask.customBaseNotReady', {
+  Logger.debug?.('TextureRender.standardTileMask.customBaseNotReady', {
     tileId,
     customBaseKey,
     sources: sources.map((entry) => entry.kind),
@@ -1528,6 +1721,7 @@ function resolveStandardMaskTarget(target) {
 export async function clearStandardTileMask(target, options = {}) {
   const { doc, tile } = resolveStandardMaskTarget(target);
   if (!doc) throw new Error('Unable to resolve tile document for mask clearing.');
+  invalidateTileApply(tile, 'standard-tile-mask');
   const tileId = doc?.id || tile?.id || null;
   const hadFlag = !!doc?.getFlag?.('fa-nexus', STANDARD_TILE_MASK_FLAG);
   const hadOverlay = !!(tile?.mesh?.faNexusStandardMaskContainer || tile?.faNexusStandardMaskContainer);
@@ -1559,9 +1753,11 @@ export async function clearStandardTileMask(target, options = {}) {
 
 export async function applyStandardTileMaskToTile(tile) {
   let hidePreview = false;
-  let wasVisible = null;
+  let previewVisibilityToken = null;
+  let applyToken = null;
   try {
     if (!tile || !tile.document) return;
+    applyToken = beginTileApply(tile, 'standard-tile-mask');
     const editing = isEditingTile(tile);
     const flags = tile.document.getFlag('fa-nexus', STANDARD_TILE_MASK_FLAG);
     const arrayMask = isArrayMask(flags);
@@ -1575,10 +1771,11 @@ export async function applyStandardTileMaskToTile(tile) {
     if (editing) {
       clearStandardTileMaskOverlay(tile, { preserveTexture: true });
       clearMaskedTileRetry(tile);
-      let mesh = tile.mesh;
-      if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
+      const mesh = await prepareCustomTileRendererMesh(tile, {
+        originalTextureSlotKey: STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY
+      });
+      if (!isCurrentTileApply(tile, applyToken)) return;
       if (mesh && !mesh.destroyed) {
-        ensureMeshTransparent(mesh, STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY);
         try { mesh.alpha = 0; } catch (_) {}
       }
       return;
@@ -1599,14 +1796,15 @@ export async function applyStandardTileMaskToTile(tile) {
       return;
     }
 
-    let mesh = tile.mesh;
-    if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
+    const mesh = await prepareCustomTileRendererMesh(tile, {
+      originalTextureSlotKey: STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY
+    });
+    if (!isCurrentTileApply(tile, applyToken)) return;
     if (!mesh || mesh.destroyed) {
       scheduleMaskedTileRetry(tile, applyStandardTileMaskToTile);
       return;
     }
 
-    ensureMeshTransparent(mesh, STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY);
     if (isCustomBase && customStandardBaseNeedsRetry(tile, customBaseKey)) return;
     clearMaskedTileRetry(tile);
 
@@ -1621,9 +1819,7 @@ export async function applyStandardTileMaskToTile(tile) {
         slotKey: STANDARD_TILE_MASK_ORIGINAL_TEXTURE_KEY,
         overheadKind: STANDARD_MASK_OVERHEAD_KIND,
         syncTransform: (containerRef, meshRef, docRef) => {
-          const width = Math.max(2, Number(docRef?.width) || Number(meshRef?.width) || 2);
-          const height = Math.max(2, Number(docRef?.height) || Number(meshRef?.height) || 2);
-          syncStandardMaskContainerTransform(containerRef, meshRef, width, height, docRef);
+          syncStandardMaskNativeContainerTransform(containerRef, meshRef, docRef);
         },
         logTag: 'TextureRender.applyStandardTileMaskToTile.previewMirrorFailed'
       });
@@ -1641,24 +1837,32 @@ export async function applyStandardTileMaskToTile(tile) {
     const reuse = getReusableStandardMaskTextures(tile, flags, baseSrc);
 
     hidePreview = (!reuse || !reuse.ready) && tile?.isPreview;
-    wasVisible = hidePreview ? !!tile.visible : null;
-    if (hidePreview && tile.visible) {
-      try { tile.visible = false; } catch (_) {}
-    }
+    if (hidePreview) previewVisibilityToken = suppressPreviewVisibility(tile, applyToken);
 
     let baseTex = reuse?.baseTex || null;
     let maskTex = reuse?.maskTex || null;
+    let ownsMaskTex = false;
     try {
-      if (!isChunkedBase && !isCustomBase && !baseTex) baseTex = getSharedTexture(baseSrc);
+      if (!isChunkedBase && !isCustomBase && !baseTex) baseTex = await loadTexture(baseSrc);
       if (!maskTex) {
         if (arrayMask) {
           maskTex = buildMaskTextureFromShapes(maskData?.shapes, w, h);
+          ownsMaskTex = !!maskTex;
           if (!maskTex) throw new Error('Tile mask shape render failed');
         } else {
           maskTex = await loadTexture(flags.maskSrc);
         }
       }
+      if (!isCurrentTileApply(tile, applyToken)) {
+        destroyOwnedTextureResources({
+          textures: ownsMaskTex ? [maskTex] : [],
+          context: 'Stale Standard Mask texture cleanup'
+        });
+        return;
+      }
     } catch (texErr) {
+      if (isTextureCleanupFailure(texErr)) throw texErr;
+      if (!isCurrentTileApply(tile, applyToken)) return;
       Logger.error('TextureRender.applyStandardTileMaskToTile.textureLoadFailed', {
         tileId: tile?.document?.id,
         error: String(texErr?.message || texErr),
@@ -1671,6 +1875,20 @@ export async function applyStandardTileMaskToTile(tile) {
     }
     if (!isChunkedBase && !isCustomBase && !isTextureUsable(baseTex)) throw new Error('Standard tile base texture invalid');
     if (!isTextureUsable(maskTex)) throw new Error('Tile mask texture invalid');
+
+    let preparedChunkSprites = null;
+    const existingContainer = mesh.faNexusStandardMaskContainer || tile.faNexusStandardMaskContainer || null;
+    if (isChunkedBase && !canReuseChunkedStandardBaseDisplay(existingContainer, chunkBaseKey)) {
+      preparedChunkSprites = await prepareChunkedStandardBaseSprites(chunkEntries, tile?.document?.id || null);
+      if (!isCurrentTileApply(tile, applyToken)) {
+        destroyOwnedTextureResources({
+          displayObjects: preparedChunkSprites || [],
+          textures: ownsMaskTex ? [maskTex] : [],
+          context: 'Stale Standard Mask prepared resource cleanup'
+        });
+        return;
+      }
+    }
 
     let container = mesh.faNexusStandardMaskContainer;
     if (!container || container.destroyed) {
@@ -1696,30 +1914,33 @@ export async function applyStandardTileMaskToTile(tile) {
       container.faNexusContentContainer = content;
     }
 
-    let baseDisplay = container.faNexusBaseDisplayObject || container.faNexusBaseSprite || null;
-    let baseSprite = container.faNexusBaseSprite || null;
     let maskSprite = container.faNexusMaskSprite || null;
-    if (isCustomBase) {
-      baseDisplay = ensureCustomStandardBaseDisplay(content, container, tile, customBaseKey);
-      baseSprite = null;
-      container.faNexusBaseTexture = null;
-    } else if (isChunkedBase) {
-      baseDisplay = await ensureChunkedStandardBaseDisplay(content, container, chunkEntries, chunkBaseKey, tile?.document?.id || null);
-      baseSprite = null;
-      container.faNexusBaseTexture = null;
-    } else {
-      baseSprite = ensureSpriteStandardBaseDisplay(content, container, baseTex, w, h);
-      baseDisplay = baseSprite;
-      container.faNexusBaseTexture = baseTex;
-    }
+    const baseDisplay = ensureStandardMaskBaseDisplay({
+      content,
+      container,
+      tile,
+      baseTex,
+      width: w,
+      height: h,
+      isCustomBase,
+      customBaseKey,
+      isChunkedBase,
+      preparedChunkSprites,
+      chunkBaseKey
+    });
 
     if (!maskSprite || maskSprite.destroyed) {
       maskSprite = new PIXI.Sprite(maskTex);
       maskSprite.eventMode = 'none';
       content.addChild(maskSprite);
-      container.faNexusMaskSprite = maskSprite;
     } else if (maskSprite.texture !== maskTex) {
       try { maskSprite.texture = maskTex; } catch (_) {}
+    }
+    container.faNexusMaskSprite = maskSprite;
+    for (const child of Array.from(content.children || [])) {
+      if (!child || child === baseDisplay || child === maskSprite) continue;
+      try { content.removeChild(child); } catch (_) {}
+      try { child.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
     }
     const placement = computeMaskPlacement(flags, w, h, maskTex);
     try {
@@ -1733,6 +1954,7 @@ export async function applyStandardTileMaskToTile(tile) {
     try { if (baseDisplay) baseDisplay.mask = maskSprite; } catch (_) {}
 
     container.faNexusMaskTexture = maskTex;
+    syncOwnedMaskTexture(container, maskTex, ownsMaskTex);
     container.faNexusBaseDisplayObject = baseDisplay;
     container.faNexusMaskSrc = resolveMaskKey(flags);
     container.faNexusBaseSrc = baseSrc;
@@ -1765,16 +1987,25 @@ export async function applyStandardTileMaskToTile(tile) {
         contentContainer: container,
         proxyFactory: () => cloneDisplayObjectForProxy(container),
         filterMode: 'container',
+        refreshReason: 'standard-mask-refresh',
+        contentKey: overheadContentKey(tile.document, container.faNexusMaskSrc, maskTex, w, h, [baseSrc, isCustomBase]),
         syncContent: ({ mesh: currentMesh, entry }) => {
-          syncStandardMaskContainerTransform(entry?.contentContainer, currentMesh, w, h, tile.document);
-          syncMeshBoundContainerDisplayState(entry?.contentContainer, currentMesh, tile.document);
+          syncStandardMaskNativeContainerTransform(entry?.contentContainer, currentMesh, tile.document);
         }
       });
-      invalidateCustomTileOverhead(tile, 'standard-mask-refresh');
     } else {
       detachCustomTileOverhead(tile, { kind: STANDARD_MASK_OVERHEAD_KIND });
     }
   } catch (error) {
+    if (isTextureCleanupFailure(error)) {
+      Logger.error('TextureRender.applyStandardTileMaskToTile.staleCleanupFailed', {
+        tileId: tile?.document?.id,
+        error: String(error?.message || error),
+        failures: error?.errors?.length || 0
+      });
+      throw error;
+    }
+    if (applyToken && !isCurrentTileApply(tile, applyToken)) return;
     Logger.error('TextureRender.applyStandardTileMaskToTile.failed', {
       tileId: tile?.document?.id,
       error: String(error?.message || error)
@@ -1792,9 +2023,7 @@ export async function applyStandardTileMaskToTile(tile) {
       if (invalid) clearStandardTileMaskOverlay(tile);
     } catch (_) {}
   } finally {
-    if (hidePreview && wasVisible !== null) {
-      try { tile.visible = wasVisible; } catch (_) {}
-    }
+    if (hidePreview) releasePreviewVisibility(tile, previewVisibilityToken);
   }
 }
 
@@ -1831,13 +2060,41 @@ function getReusableTextures(tile, flags) {
   }
 }
 
+function getPreviewSourceTextures(tile, flags) {
+  try {
+    const sourceMesh = tile?._original?.mesh || null;
+    const container = sourceMesh?.faNexusMaskContainer || tile?._original?.faNexusMaskContainer || null;
+    if (!container || container.destroyed) return null;
+    const baseTex = container.faNexusBaseTexture || null;
+    if (container.faNexusBaseSrc !== flags?.baseSrc || !isTextureUsable(baseTex)) return null;
+    if (isArrayMask(flags)) {
+      return {
+        baseTex,
+        maskTex: null,
+        ready: sourceMesh?.faNexusMaskReady === true
+      };
+    }
+    const maskTex = container.faNexusMaskTexture || null;
+    if (container.faNexusMaskSrc !== resolveMaskKey(flags) || !isTextureUsable(maskTex)) return null;
+    return {
+      baseTex,
+      maskTex,
+      ready: sourceMesh?.faNexusMaskReady === true
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 export function rehydrateAllMaskedTiles(options = {}) {
   try {
     if (!canvas?.ready) return;
     const state = REHYDRATE_STATE || (REHYDRATE_STATE = {
       remaining: Math.max(1, Number(options?.attempts) || 1),
       interval: Math.max(50, Number(options?.interval) || 200),
-      timer: null
+      timer: null,
+      cancelled: false,
+      tiles: new Set()
     });
 
     const addAttempts = Math.max(0, Number(options?.attempts ?? 0));
@@ -1848,7 +2105,10 @@ export function rehydrateAllMaskedTiles(options = {}) {
     const run = async () => {
       state.timer = null;
       try {
-        if (!canvas || !canvas.ready) { REHYDRATE_STATE = null; return; }
+        if (state.cancelled || !canvas || !canvas.ready) {
+          if (REHYDRATE_STATE === state) REHYDRATE_STATE = null;
+          return;
+        }
         const tiles = Array.isArray(canvas.tiles?.placeables) ? canvas.tiles.placeables : [];
         const jobs = [];
         for (const tile of tiles) {
@@ -1856,13 +2116,14 @@ export function rehydrateAllMaskedTiles(options = {}) {
             const hasMaskedTiling = !!tile?.document?.getFlag?.('fa-nexus', MASKED_TILING_FLAG);
             const hasStandardTileMask = !!tile?.document?.getFlag?.('fa-nexus', STANDARD_TILE_MASK_FLAG);
             if (!hasMaskedTiling && !hasStandardTileMask) continue;
+            state.tiles.add(tile);
             if (hasMaskedTiling) jobs.push(applyMaskedTilingToTile(tile));
             if (hasStandardTileMask) jobs.push(applyStandardTileMaskToTile(tile));
           } catch (_) {}
         }
         if (jobs.length) await Promise.allSettled(jobs);
       } catch (_) {}
-      if (state) {
+      if (!state.cancelled && REHYDRATE_STATE === state) {
         state.remaining = Math.max(0, (state.remaining || 0) - 1);
         if (state.remaining > 0) {
           state.timer = setTimeout(run, state.interval);
@@ -1882,23 +2143,23 @@ export function rehydrateAllStandardTileMasks(options = {}) {
 }
 
 export function cancelGlobalRehydrate() {
-  try {
-    const state = REHYDRATE_STATE;
-    if (!state) return;
-    if (state.timer) {
-      try { clearTimeout(state.timer); } catch (_) {}
-    }
-    REHYDRATE_STATE = null;
-  } catch (_) {}
+  const state = REHYDRATE_STATE;
+  if (!state) return;
+  state.cancelled = true;
+  if (state.timer) clearTimeout(state.timer);
+  for (const tile of state.tiles || []) cancelTileApplies(tile);
+  REHYDRATE_STATE = null;
 }
 
 export function clearMaskedOverlaysOnDelete(tile) {
   try {
     if (!tile) return;
+    cancelTileApplies(tile);
     const mesh = tile.mesh;
     const container = mesh?.faNexusMaskContainer || tile.faNexusMaskContainer;
     detachCustomTileOverhead(tile, { kind: MASKED_OVERHEAD_KIND });
     if (container) {
+      if (container.faNexusCompositeRegions) destroyCompositeFillResources(container);
       try { container.parent?.removeChild?.(container); } catch (_) {}
       try { container.destroy({ children: true }); } catch (_) {}
     }
@@ -1911,7 +2172,7 @@ export function clearMaskedOverlaysOnDelete(tile) {
     }
     if (tile) tile.faNexusMaskContainer = null;
     clearMaskedTileRetry(tile);
-  } catch (_) {}
+  } catch (error) { if (isTextureCleanupFailure(error)) throw error; }
   try {
     clearStandardTileMaskOverlay(tile);
   } catch (_) {}

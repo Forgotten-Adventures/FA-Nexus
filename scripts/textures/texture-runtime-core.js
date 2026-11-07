@@ -1,9 +1,17 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { getOrCreatePixiTexture } from '../core/foundry-texture-loader-patch.js';
+import {
+  getCachedFoundryTexture,
+  loadFoundryTexture
+} from '../core/foundry-texture-cache.js';
 import {
   waitForTileMesh,
   clearTileMeshWaiters as clearSharedTileMeshWaiters
 } from '../canvas/tile-mesh-waiter.js';
+import { getMaxTextureSize } from './texture-render-limits.js';
+import { encodeTexturePath } from './texture-path.js';
+
+export { getMaxTextureSize } from './texture-render-limits.js';
+export { encodeTexturePath } from './texture-path.js';
 
 const SHARED_TEXTURE_CACHE = new Map();
 let TRANSPARENT_TEXTURE = null;
@@ -20,28 +28,6 @@ function isTextureUsable(texture) {
   return true;
 }
 
-export function getMaxTextureSize() {
-  try {
-    const gl = canvas?.app?.renderer?.gl || canvas?.app?.renderer?.context?.gl;
-    if (!gl) return 4096;
-    const val = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const max = Number(val || 4096) || 4096;
-    return Math.max(1024, Math.min(max, 8192));
-  } catch (_) {
-    return 4096;
-  }
-}
-
-export function encodeTexturePath(path) {
-  if (!path) return path;
-  if (/^https?:/i.test(path)) return path;
-  try { return encodeURI(decodeURI(String(path))); }
-  catch (_) {
-    try { return encodeURI(String(path)); }
-    catch { return path; }
-  }
-}
-
 export function getSharedTexture(src) {
   if (!src) return null;
   const encoded = encodeTexturePath(src);
@@ -50,7 +36,8 @@ export function getSharedTexture(src) {
     if (isTextureUsable(cached)) return cached;
     SHARED_TEXTURE_CACHE.delete(encoded);
   }
-  const texture = getOrCreatePixiTexture(encoded);
+  const texture = getCachedFoundryTexture(encoded);
+  if (!texture) throw new Error(`Texture is not loaded in the Foundry cache: ${encoded}`);
   SHARED_TEXTURE_CACHE.set(encoded, texture);
   return texture;
 }
@@ -70,12 +57,18 @@ export function getTransparentTextureSrc() {
 export function getTransparentTexture() {
   try {
     if (!TRANSPARENT_TEXTURE || TRANSPARENT_TEXTURE.destroyed) {
-      const tex = PIXI.Texture.from(TRANSPARENT_SRC);
+      const source = document.createElement('canvas');
+      source.width = 1;
+      source.height = 1;
+      const tex = PIXI.Texture.from(source);
       tex.baseTexture.wrapMode = PIXI.WRAP_MODES.CLAMP;
       TRANSPARENT_TEXTURE = tex;
     }
     return TRANSPARENT_TEXTURE;
-  } catch (_) {
+  } catch (error) {
+    Logger.error('TextureRender.transparentTexture.createFailed', {
+      error: String(error?.message || error)
+    });
     return PIXI.Texture.EMPTY;
   }
 }
@@ -143,6 +136,18 @@ export async function ensureTileMesh(tile, options = {}) {
   });
 }
 
+export async function prepareCustomTileRendererMesh(tile, {
+  originalTextureSlotKey = LEGACY_ORIGINAL_TEXTURE_KEY,
+  meshOptions = {}
+} = {}) {
+  if (!tile || tile.destroyed) return null;
+  let mesh = tile.mesh;
+  if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile, meshOptions);
+  if (!mesh || mesh.destroyed) return null;
+  ensureMeshTransparent(mesh, originalTextureSlotKey);
+  return mesh;
+}
+
 export function clearTileMeshWaiters() {
   clearSharedTileMeshWaiters('TextureRender.clearTileMeshWaiters');
 }
@@ -204,17 +209,24 @@ export async function sleep(ms) {
 
 export async function loadTexture(src, options = {}) {
   if (!src) throw new Error('Missing texture source');
-  const { attempts = 4, timeout = 5000, bustCacheOnRetry = true } = options;
+  const {
+    attempts = 4,
+    timeout = 5000,
+    assetAlias = null,
+    resourceOptions = null
+  } = options;
   const encoded = encodeTexturePath(src);
   let lastError = null;
   for (let attempt = 1; attempt <= Math.max(1, attempts); attempt++) {
     try {
-      const canBust = bustCacheOnRetry && attempt > 1 && !/^data:/i.test(encoded);
-      const key = canBust ? `${encoded}${encoded.includes('?') ? '&' : '?'}v=${Date.now()}` : encoded;
-      const texture = canBust ? getOrCreatePixiTexture(key) : getSharedTexture(encoded);
+      let texture = SHARED_TEXTURE_CACHE.get(encoded);
+      if (!isTextureUsable(texture)) {
+        SHARED_TEXTURE_CACHE.delete(encoded);
+        texture = await loadFoundryTexture(encoded, { assetAlias, resourceOptions });
+      }
       const ok = await waitForBaseTexture(texture?.baseTexture, timeout);
       if (ok) {
-        if (canBust) SHARED_TEXTURE_CACHE.set(encoded, texture);
+        SHARED_TEXTURE_CACHE.set(encoded, texture);
         return texture;
       }
       lastError = new Error('Texture base texture invalid');

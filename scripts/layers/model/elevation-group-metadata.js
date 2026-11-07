@@ -157,7 +157,8 @@ export function applySceneElevationGroupMetadataLocally(scene, metadata) {
   try { assign(targetScene._source); } catch (_) {}
 }
 
-export async function setSceneElevationGroupMetadata(scene, metadata) {
+/** `force` sends the whole value whatever the local Scene holds (see setSceneLayerManagerSections). */
+export async function setSceneElevationGroupMetadata(scene, metadata, { force = false } = {}) {
   const targetScene = scene || canvas?.scene;
   if (!targetScene) throw new Error('No active scene available for elevation group update.');
   if (!targetScene?.canUserModify?.(game.user, 'update')) {
@@ -172,7 +173,9 @@ export async function setSceneElevationGroupMetadata(scene, metadata) {
     storageEntries: serialized.length
   });
   if (!groupKeys.length) {
-    if (typeof targetScene.unsetFlag === 'function') {
+    if (force) {
+      await targetScene.update({ [`flags.${MODULE_ID}.-=${ELEVATION_GROUPS_FLAG}`]: null }, { diff: false });
+    } else if (typeof targetScene.unsetFlag === 'function') {
       await targetScene.unsetFlag(MODULE_ID, ELEVATION_GROUPS_FLAG);
     } else {
       await targetScene.update({ [`flags.${MODULE_ID}.-=${ELEVATION_GROUPS_FLAG}`]: null });
@@ -180,7 +183,9 @@ export async function setSceneElevationGroupMetadata(scene, metadata) {
     applySceneElevationGroupMetadataLocally(targetScene, {});
     return;
   }
-  if (typeof targetScene.setFlag === 'function') {
+  if (force) {
+    await targetScene.update({ flags: { [MODULE_ID]: { [ELEVATION_GROUPS_FLAG]: serialized } } }, { diff: false });
+  } else if (typeof targetScene.setFlag === 'function') {
     await targetScene.setFlag(MODULE_ID, ELEVATION_GROUPS_FLAG, serialized);
   } else {
     await targetScene.update({ [`flags.${MODULE_ID}.${ELEVATION_GROUPS_FLAG}`]: serialized });

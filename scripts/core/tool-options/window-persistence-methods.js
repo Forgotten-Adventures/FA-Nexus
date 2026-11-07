@@ -16,8 +16,19 @@ class ToolOptionsWindowPersistenceMethods {
       if (Number.isFinite(pos.height)) state.height = pos.height;
       if (!Object.keys(state).length) return;
       const maybePromise = settings.set(MODULE_ID, TOOL_WINDOW_SETTING_KEY, state);
-      if (maybePromise?.catch) maybePromise.catch(() => {});
-    } catch (_) {}
+      if (maybePromise?.catch) {
+        maybePromise.catch((error) => {
+          Logger.warn('ToolOptionsWindow.position.persistFailed', {
+            state,
+            error: String(error?.message || error)
+          });
+        });
+      }
+    } catch (error) {
+      Logger.warn('ToolOptionsWindow.position.persistFailed', {
+        error: String(error?.message || error)
+      });
+    }
   }
 
   _handleResizeObserverStart(event) {

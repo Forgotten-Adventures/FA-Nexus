@@ -27,6 +27,12 @@ function shouldCloneDisplayFilter(filter) {
   try {
     if (filter?.constructor?.name === 'CustomTileOverheadFilter') return false
   } catch (_) {}
+  try {
+    if (Object.getOwnPropertySymbols(filter || {})
+      .some((symbol) => String(symbol) === 'Symbol(faNexusManagedHsbcFilter)' && filter[symbol] === true)) {
+      return false
+    }
+  } catch (_) {}
   return true
 }
 
@@ -92,7 +98,13 @@ function cloneMeshShader(mesh) {
   const shader = mesh?.shader || mesh?.material || null
   if (!shader) return null
   if (shader?.program && shader?.uniforms) {
-    return new PIXI.Shader(shader.program, cloneUniformValue(shader.uniforms))
+    const uniforms = cloneUniformValue(shader.uniforms)
+    if (shader.faNexusCustomOverheadMaterial) {
+      // A proxy describes the artwork, independent of current Token occlusion.
+      uniforms.baseAlpha = uniforms.occludedAlpha = 1
+      uniforms.fadeOcclusion = uniforms.radialOcclusion = uniforms.visionOcclusion = uniforms.surfaceOcclusion = 0
+    }
+    return new PIXI.Shader(shader.program, uniforms)
   }
   const texture = resolveMeshTexture(mesh)
   if (texture && PIXI?.MeshMaterial) {
@@ -120,7 +132,18 @@ function cloneDisplayObjectTree(source, map = new Map()) {
     try { clone.tilePosition?.copyFrom?.(source.tilePosition) } catch (_) {}
     try { clone.tileScale?.copyFrom?.(source.tileScale) } catch (_) {}
     try {
-      if (clone.tileTransform && source.tileTransform) clone.tileTransform.rotation = source.tileTransform.rotation
+      source.tileTransform?.updateLocalTransform?.()
+      const matrix = source.tileTransform?.localTransform
+      if (clone.tileTransform?.setFromMatrix && matrix) {
+        clone.tileTransform.setFromMatrix(new PIXI.Matrix(
+          Number(matrix.a),
+          Number(matrix.b),
+          Number(matrix.c),
+          Number(matrix.d),
+          Number(matrix.tx),
+          Number(matrix.ty)
+        ))
+      }
     } catch (_) {}
     try { clone.anchor?.copyFrom?.(source.anchor) } catch (_) {}
   } else if (source instanceof PIXI.Sprite) {

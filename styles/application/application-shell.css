@@ -1,0 +1,1611 @@
+#fa-nexus-app .window-content {
+  padding: 0;
+  display: flex;
+}
+
+.fa-nexus-app {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.fa-nexus-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.1));
+}
+
+.fa-nexus-title {
+  margin: 0;
+  font-size: 16px;
+}
+
+.fa-nexus-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.fa-nexus-placeholder {
+  opacity: 0.75;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.fa-nexus-tabs {
+  display: inline-flex;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 12px 0px;
+  background: var(--fa-nexus-panel-bg, rgba(0, 0, 0, 0.15));
+  position: relative;
+}
+
+.fa-nexus-tabs .fa-nexus-tab {
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  outline: none;
+  box-shadow: none;
+  color: inherit;
+  font-weight: 500;
+  font-size: 0.9em;
+  border-radius: 6px 6px 0 0;
+  position: relative;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+  overflow: hidden;
+  z-index: 1;
+}
+
+.fa-nexus-tabs .fa-nexus-tab::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(135deg,
+      rgba(90, 170, 255, 0.05) 0%,
+      rgba(90, 170, 255, 0.1) 50%,
+      rgba(90, 170, 255, 0.05) 100%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  z-index: -1;
+}
+
+.fa-nexus-tabs .fa-nexus-tab:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.fa-nexus-tabs .fa-nexus-tab:hover::before {
+  opacity: 1;
+}
+
+.fa-nexus-tabs .fa-nexus-tab.active {
+  color: #5aafff;
+  font-weight: 600;
+  transform: translateY(-1px);
+  box-shadow:
+    0 4px 12px rgba(90, 170, 255, 0.2),
+    0 0 0 1px rgba(90, 170, 255, 0.3) inset;
+  position: relative;
+}
+
+.fa-nexus-tabs .fa-nexus-tab.active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 60%;
+  height: 3px;
+  background: linear-gradient(90deg,
+      transparent 0%,
+      #5aafff 20%,
+      #7adeff 50%,
+      #5aafff 80%,
+      transparent 100%);
+  border-radius: 2px 2px 0 0;
+  animation: fa-nexus-tab-pulse 2s ease-in-out infinite;
+}
+
+@keyframes fa-nexus-tab-pulse {
+
+  0%,
+  100% {
+    opacity: 0.8;
+    transform: translateX(-50%) scaleX(1);
+  }
+
+  50% {
+    opacity: 1;
+    transform: translateX(-50%) scaleX(1.1);
+  }
+}
+
+.fa-nexus-tabs .fa-nexus-tab.active::before {
+  opacity: 1;
+  background: linear-gradient(135deg,
+      rgba(90, 170, 255, 0.1) 0%,
+      rgba(90, 170, 255, 0.2) 50%,
+      rgba(90, 170, 255, 0.1) 100%);
+}
+
+.fa-nexus-tabs .fa-nexus-tab:disabled,
+.fa-nexus-tabs .fa-nexus-tab.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  box-shadow: none;
+  transform: none;
+}
+
+.fa-nexus-tabs .fa-nexus-tab:disabled::before,
+.fa-nexus-tabs .fa-nexus-tab.is-disabled::before,
+.fa-nexus-tabs .fa-nexus-tab:disabled::after,
+.fa-nexus-tabs .fa-nexus-tab.is-disabled::after {
+  opacity: 0;
+}
+
+/* Light theme adjustments */
+.fa-theme-light .fa-nexus-tabs {
+  background: var(--fa-nexus-panel-bg, rgba(255, 255, 255, 0.4));
+  border-color: var(--fa-nexus-border, rgba(0, 0, 0, 0.1));
+}
+
+.fa-theme-light .fa-nexus-tabs .fa-nexus-tab.active {
+  color: #2563eb;
+  box-shadow:
+    0 4px 12px rgba(37, 99, 235, 0.15),
+    0 0 0 1px rgba(37, 99, 235, 0.2) inset;
+}
+
+.fa-theme-light .fa-nexus-tabs .fa-nexus-tab.active::after {
+  background: linear-gradient(90deg,
+      transparent 0%,
+      #2563eb 20%,
+      #3b82f6 50%,
+      #2563eb 80%,
+      transparent 100%);
+}
+
+.fa-nexus-search-input .fa-search {
+  font-size: 10px;
+}
+
+.fa-nexus-search-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 6px 3px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.2);
+  max-height: 20px;
+  max-width: 200px;
+  justify-content: space-between;
+  flex: 1 1 auto;
+}
+
+.fa-theme-light .fa-nexus-search-input {
+  border-color: rgba(0, 0, 0, 0.15);
+}
+
+.fa-nexus-search-input input {
+  width: 100%;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: inherit;
+  box-shadow: none;
+  max-height: 20px;
+}
+
+.fa-nexus-search-input .clear-search,
+.fa-nexus-search-input .clear-folders {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  display: none;
+  transition: opacity 0.2s ease;
+}
+
+.fa-nexus-search-input .clear-folders {
+  color: var(--color-button-primary, #007bff);
+  font-size: 10px;
+}
+
+.fa-nexus-search-input.has-text .clear-search,
+.fa-nexus-search-input.has-folder-filter .clear-folders {
+  display: inline-block;
+}
+
+.fa-nexus-search-input .clear-search:focus,
+.fa-nexus-search-input .clear-folders:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.fa-nexus-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  justify-content: space-between;
+}
+
+.fa-nexus-controls-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* ===== FA Nexus Icon Button Base Style ===== */
+.fa-nexus-icon-button {
+  background: none;
+  border: none;
+  color: inherit;
+  border-radius: 4px;
+  width: 32px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+}
+
+.fa-nexus-icon-button:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.fa-nexus-icon-button:hover {
+  box-shadow: 0 0 6px rgba(90, 170, 255, 0.35);
+}
+
+.fa-nexus-icon-button i {
+  transition: transform 0.2s ease;
+}
+
+.fa-theme-light .fa-nexus-icon-button {
+  background: rgba(37, 99, 235, 0.15);
+}
+
+/* ===== Folder Toggle (inherits from icon button) ===== */
+.fa-nexus-controls .fa-nexus-folder-toggle i {
+  transition: transform 0.2s ease;
+}
+
+.fa-nexus-controls .fa-nexus-folder-toggle:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.fa-nexus-controls .fa-nexus-folder-toggle.is-hidden {
+  display: none;
+}
+
+.fa-nexus-controls .fa-nexus-folder-toggle:hover {
+  background: rgba(90, 170, 255, 0.25);
+  box-shadow: 0 0 6px rgba(90, 170, 255, 0.35);
+}
+
+.fa-nexus-controls .fa-nexus-folder-toggle.is-collapsed {
+  background: none;
+  border: none;
+}
+
+.fa-nexus-controls .fa-nexus-folder-toggle.is-filtered i {
+  color: rgba(90, 170, 255, 0.95);
+}
+
+.fa-theme-light .fa-nexus-controls .fa-nexus-folder-toggle {
+  background: rgba(37, 99, 235, 0.15);
+  border-color: rgba(37, 99, 235, 0.3);
+}
+
+.fa-theme-light .fa-nexus-controls .fa-nexus-folder-toggle.is-filtered::after {
+  background: rgba(37, 99, 235, 0.95);
+  box-shadow: 0 0 6px rgba(37, 99, 235, 0.5);
+}
+
+#fa-nexus-app .header-content {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex: 1;
+}
+
+#fa-nexus-app .window-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  white-space: nowrap;
+}
+
+#fa-nexus-app .window-title i {
+  color: #4CAF50;
+  font-size: 1.1em;
+}
+
+/* Custom FA icon styling */
+#fa-nexus-app .custom-fa-icon {
+  width: 30px;
+  height: 30px;
+}
+
+/* Header Patreon auth styling similar to Token Browser */
+#fa-nexus-app .header-patreon-auth {
+  margin-left: auto;
+  pointer-events: auto;
+  position: relative;
+  z-index: 5;
+  display: inline-flex;
+}
+
+#fa-nexus-app .header-patreon-auth .patreon-connect-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.8rem;
+  background: linear-gradient(135deg, #ff424d, #ff6b35);
+  border: none;
+  border-radius: 4px;
+  color: white;
+  font-weight: 500;
+  font-size: 0.9em;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 3px rgba(255, 66, 77, 0.3);
+}
+
+#fa-nexus-app .header-patreon-auth .patreon-connect-button:hover {
+  background: linear-gradient(135deg, #e63946, #f77f00);
+  box-shadow: 0 2px 6px rgba(255, 66, 77, 0.4);
+  transform: translateY(-1px);
+}
+
+#fa-nexus-app .header-patreon-auth .auth-status-display {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  appearance: none;
+  padding: 0.3rem 0.6rem;
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 4px;
+  color: rgb(34, 197, 94);
+  font-family: inherit;
+  font-size: 0.85em;
+  font-weight: 500;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+#fa-nexus-app .auth-status-display[data-disconnect-handler="true"]:hover {
+  background: rgba(34, 197, 94, 0.15);
+  border-color: rgba(34, 197, 94, 0.4);
+  transform: translateY(-1px);
+  transition: all 0.2s ease;
+}
+
+.fa-nexus-controls .thumb-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+}
+
+.fa-nexus-controls .thumb-size input[type="range"] {
+  max-width: 50px;
+}
+
+.fa-nexus-controls .thumb-size input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.8);
+  border: 2px solid rgba(168, 168, 168, 0.6);
+}
+
+.fa-nexus-index-status {
+  font-size: 12px;
+  opacity: 0.85;
+  padding: 2px 4px;
+}
+
+/* Virtualized grid (multi-column cards) */
+
+.fa-nexus-grid {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  margin-left: 8px;
+  min-width: 0;
+}
+
+.fa-nexus-main {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 0;
+  position: relative;
+}
+
+.fa-nexus-grid-stack {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.fa-nexus-premium-disclaimer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 8px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 184, 84, 0.32);
+  border-radius: 6px;
+  background: rgba(255, 184, 84, 0.1);
+  color: rgba(255, 232, 196, 0.94);
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.fa-nexus-premium-disclaimer[hidden] {
+  display: none !important;
+}
+
+.fa-nexus-premium-disclaimer a {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.fa-nexus-premium-disclaimer [hidden] {
+  display: none;
+}
+
+.fa-nexus-premium-disclaimer i {
+  flex: 0 0 auto;
+  color: #ffbd64;
+}
+
+.fa-theme-light .fa-nexus-premium-disclaimer {
+  border-color: rgba(184, 105, 20, 0.3);
+  background: rgba(255, 191, 96, 0.18);
+  color: #5f3a12;
+}
+
+#fa-nexus-folder-window .window-content {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.fa-nexus-folder-window {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.fa-nexus-folder-browser {
+  display: flex;
+  flex-direction: column;
+  background: var(--fa-nexus-panel-bg, rgba(0, 0, 0, 0.25));
+  border-left: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  border-radius: 0;
+  height: 100%;
+}
+
+.fa-theme-light .fa-nexus-folder-browser {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.9));
+}
+
+.fa-nexus-folder-window .fa-nexus-folder-browser {
+  border-left: none;
+  box-shadow: none;
+  padding: 0 3px 3px;
+  overflow: auto;
+}
+
+.fa-nexus-folder-window .fa-nexus-folder-header {
+  padding: 12px 4px 10px;
+}
+
+.fa-nexus-folder-browser.is-hidden {
+  display: none;
+}
+
+.fa-nexus-folder-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px;
+  gap: 8px;
+  border-bottom: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+}
+
+.fa-nexus-folder-header .title {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.fa-nexus-folder-header .actions button {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 0.2s ease;
+}
+
+.fa-nexus-folder-header .actions button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.fa-theme-light .fa-nexus-folder-header .actions button:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.fa-nexus-folder-tree {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.fa-nexus-folder-mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 7px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.fa-nexus-folder-mode input {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.fa-nexus-folder-shortcuts {
+  padding: 2px 0px;
+  border-top: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  font-size: 0.75rem;
+  text-align: center;
+  opacity: 40%;
+}
+
+.fa-nexus-folder-filter-list {
+  list-style: none;
+  margin: 0;
+  padding: 3px 0 3px;
+}
+
+.fa-nexus-folder-node {
+  display: block;
+  color: inherit;
+}
+
+.fa-nexus-folder-node .children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: none;
+  margin-left: 14px;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.fa-theme-light .fa-nexus-folder-node .children {
+  border-left-color: rgba(0, 0, 0, 0.15);
+}
+
+.fa-nexus-folder-node.has-children.is-expanded>.children {
+  display: block;
+}
+
+.fa-nexus-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  border-radius: 4px;
+  height: 1.2rem;
+  transition: background 0.15s ease;
+}
+
+.fa-nexus-folder-row:hover {
+  background: rgba(90, 170, 255, 0.15);
+}
+
+.fa-nexus-folder-row:focus {
+  outline: none;
+}
+
+.fa-theme-light .fa-nexus-folder-row:hover {
+  background: rgba(37, 99, 235, 0.12);
+}
+
+.fa-nexus-folder-node.is-active>.fa-nexus-folder-row {
+  background: rgba(90, 170, 255, 0.25);
+  box-shadow: 0 0 0 1px rgba(90, 170, 255, 0.35) inset;
+}
+
+.fa-theme-light .fa-nexus-folder-node.is-active>.fa-nexus-folder-row {
+  background: rgba(37, 99, 235, 0.18);
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.3) inset;
+}
+
+.fa-nexus-folder-row button {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+.fa-nexus-folder-row button:focus {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
+  outline: none;
+  box-shadow: none;
+}
+
+.fa-nexus-folder-row .toggle {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fa-nexus-folder-row .toggle i {
+  transition: transform 0.2s ease;
+}
+
+.fa-nexus-folder-node.has-children.is-expanded>.fa-nexus-folder-row .toggle i {
+  transform: rotate(90deg);
+}
+
+.fa-nexus-folder-row .toggle-spacer {
+  width: 18px;
+  height: 18px;
+}
+
+.fa-nexus-folder-row .label {
+  flex: 1 1 auto;
+  justify-content: flex-start;
+  text-align: left;
+  font-size: 0.8rem;
+}
+
+.fa-nexus-folder-row .count {
+  opacity: 0.75;
+  font-size: 0.8rem;
+  padding-right: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.fa-nexus-folder-row .count::before {
+  content: '';
+  display: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.fa-theme-light .fa-nexus-folder-row .count::before {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);
+}
+
+.fa-nexus-folder-node.has-active-descendant:not(.is-expanded)>.fa-nexus-folder-row .count::before {
+  display: inline-block;
+  background: rgba(59, 130, 246, 0.9);
+}
+
+.fa-nexus-folder-node.has-excluded-descendant:not(.is-expanded)>.fa-nexus-folder-row .count::before {
+  display: inline-block;
+  background: rgba(249, 115, 22, 0.9);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.fa-theme-light .fa-nexus-folder-node.has-excluded-descendant:not(.is-expanded)>.fa-nexus-folder-row .count::before {
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+.fa-nexus-folder-node.has-active-descendant.has-excluded-descendant:not(.is-expanded)>.fa-nexus-folder-row .count::before {
+  display: inline-block;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.9) 0%, rgba(59, 130, 246, 0.9) 50%, rgba(249, 115, 22, 0.9) 50%, rgba(249, 115, 22, 0.9) 100%);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.fa-theme-light .fa-nexus-folder-node.has-active-descendant.has-excluded-descendant:not(.is-expanded)>.fa-nexus-folder-row .count::before {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);
+}
+
+.fa-nexus-folder-node.is-excluded>.fa-nexus-folder-row {
+  background: rgba(239, 68, 68, 0.22);
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.3) inset;
+  opacity: 0.9;
+}
+
+.fa-theme-light .fa-nexus-folder-node.is-excluded>.fa-nexus-folder-row {
+  background: rgba(248, 113, 113, 0.22);
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.3) inset;
+  opacity: 1;
+}
+
+.fa-nexus-folder-node.is-excluded>.fa-nexus-folder-row .label {
+  text-decoration: line-through;
+}
+
+.fa-nexus-folder-node.is-excluded>.fa-nexus-folder-row .count {
+  opacity: 0.65;
+}
+
+.fa-nexus-folder-node.is-partial>.fa-nexus-folder-row,
+.fa-nexus-folder-node .fa-nexus-folder-row.is-partial {
+  opacity: 0.85;
+}
+
+.fa-nexus-folder-empty {
+  font-size: 0.85rem;
+  opacity: 0.7;
+  padding: 8px 12px 12px;
+}
+
+.fa-nexus-grid-loader {
+  display: grid;
+  place-items: center;
+  flex: 1 1 auto;
+  min-height: 160px;
+}
+
+.fa-nexus-grid-loader .fa-nexus-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--fa-nexus-panel-bg, rgba(0, 0, 0, 0.35));
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  font-size: 13px;
+}
+
+.fa-theme-light .fa-nexus-grid-loader .fa-nexus-loading {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.85));
+}
+
+.fa-nexus-grid-loader .fa-nexus-loading .text {
+  opacity: 0.9;
+}
+
+.fa-nexus-grid .fa-nexus-card {
+  position: absolute;
+  width: 160px;
+  height: 180px;
+  padding: var(--fa-nexus-card-pad, 6px);
+  border-radius: 6px;
+  background: var(--fa-nexus-card-bg, rgba(0, 0, 0, 0.18));
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.08));
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  cursor: grab;
+}
+
+.fa-nexus-grid .fa-nexus-card:active {
+  cursor: grabbing;
+}
+
+.fa-nexus-grid .fa-nexus-card:hover {
+  border-color: rgba(90, 170, 255, 0.35);
+  box-shadow: 0 0 0 1px rgba(90, 170, 255, 0.35) inset, 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-selected {
+  border-color: rgba(90, 170, 255, 0.85);
+  box-shadow: 0 0 0 2px rgba(90, 170, 255, 0.55) inset, 0 4px 14px rgba(0, 0, 0, 0.35);
+  background: var(--fa-nexus-card-bg, rgba(0, 0, 0, 0.18));
+}
+
+.fa-theme-light .fa-nexus-grid .fa-nexus-card.fa-nexus-selected {
+  border-color: rgba(40, 120, 255, 0.85);
+  box-shadow: 0 0 0 2px rgba(40, 120, 255, 0.45) inset, 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-selected::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 10px;
+  height: 6px;
+  border: 2px solid rgba(90, 170, 255, 0.95);
+  border-top-color: transparent;
+  border-left-color: transparent;
+  transform: rotate(45deg);
+  opacity: 0.95;
+}
+
+.fa-theme-light .fa-nexus-grid .fa-nexus-card.fa-nexus-selected::after {
+  border-color: rgba(40, 120, 255, 0.95);
+  border-top-color: transparent;
+  border-left-color: transparent;
+}
+
+.fa-nexus-grid .fa-nexus-card .thumb {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fa-nexus-grid .fa-nexus-card .thumb.fa-nexus-thumb-placeholder {
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 48px 48px;
+  /* Neutral image placeholder icon */
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="%23aaa" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2" ry="2"/><path d="M7 15l3-3 4 4 2-2 3 3"/><circle cx="9" cy="9" r="1.5"/></svg>');
+  opacity: 0.35;
+}
+
+.fa-theme-light .fa-nexus-grid .fa-nexus-card .thumb.fa-nexus-thumb-placeholder {
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="%23555" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2" ry="2"/><path d="M7 15l3-3 4 4 2-2 3 3"/><circle cx="9" cy="9" r="1.5"/></svg>');
+}
+
+.fa-nexus-grid .fa-nexus-card .thumb img,
+.fa-nexus-grid .fa-nexus-card .thumb video {
+  max-width: 110%;
+  max-height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .thumb {
+  background: var(--fa-nexus-solid-color, #808080);
+  overflow: hidden;
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .thumb img {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: cover;
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .fa-nexus-status-icon {
+  display: none;
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .fa-nexus-grid-size-tag {
+  display: none;
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .fa-nexus-solid-color-picker {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(0, 0, 0, 0.5);
+  color: #f5f5f5;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: transform 0.1s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .fa-nexus-solid-color-picker:hover {
+  background: rgba(0, 0, 0, 0.7);
+  border-color: rgba(255, 255, 255, 0.45);
+  transform: translateY(-1px);
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .fa-nexus-solid-color-picker:focus-within {
+  box-shadow: 0 0 0 2px rgba(90, 170, 255, 0.35);
+}
+
+.fa-nexus-grid .fa-nexus-card.fa-nexus-solid-texture .fa-nexus-solid-color-picker input[type="color"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  border: 0;
+  padding: 0;
+}
+
+.fa-nexus-grid .fa-nexus-card .card-footer {
+  padding-top: var(--fa-nexus-footer-pt, 6px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
+}
+
+.fa-nexus-grid .fa-nexus-card .label {
+  opacity: 0.95;
+  font-size: var(--fa-nexus-title-size, 0.8rem);
+  pointer-events: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 95%;
+  text-align: center;
+}
+
+/* Launcher panel above #players */
+.fa-nexus-launcher {
+  position: relative;
+  width: 100px;
+  pointer-events: all;
+  opacity: 0.4;
+  transition: opacity 0.4s linear;
+}
+
+.fa-nexus-launcher:hover {
+  opacity: 1;
+}
+
+.fa-nexus-launch-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  justify-content: center;
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+
+.fa-nexus-launch-btn img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  vertical-align: middle;
+  filter: brightness(1.2);
+}
+
+.theme-light .fa-nexus-launch-btn img {
+  filter: invert(1);
+}
+
+/* Floating launcher mode */
+.fa-nexus-launcher--floating {
+  position: fixed;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--fa-nexus-panel-bg, rgba(0, 0, 0, 0.35));
+  border-radius: 6px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  opacity: 0.7;
+  transition: opacity 0.2s ease, box-shadow 0.2s ease;
+  width: auto;
+}
+
+.fa-nexus-launcher--floating:hover {
+  opacity: 1;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.fa-nexus-launcher--floating .fa-nexus-launch-btn {
+  width: auto;
+  border-radius: 0 6px 6px 0;
+}
+
+.fa-nexus-launcher-drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 4px 6px 6px;
+  cursor: grab;
+  color: rgba(255, 255, 255, 0.5);
+  transition: color 0.15s ease, background 0.15s ease;
+  border-radius: 6px 0 0 6px;
+}
+
+.fa-nexus-launcher-drag-handle:hover {
+  color: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.fa-nexus-launcher--dragging {
+  opacity: 1 !important;
+  cursor: grabbing !important;
+}
+
+.fa-nexus-launcher--dragging .fa-nexus-launcher-drag-handle {
+  cursor: grabbing;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Light theme adjustments for floating launcher */
+.fa-theme-light.fa-nexus-launcher--floating {
+  background: var(--fa-nexus-panel-bg, rgba(255, 255, 255, 0.85));
+  border-color: var(--fa-nexus-border, rgba(0, 0, 0, 0.15));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.fa-theme-light.fa-nexus-launcher--floating:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.fa-theme-light .fa-nexus-launcher-drag-handle {
+  color: rgba(0, 0, 0, 0.4);
+}
+
+.fa-theme-light .fa-nexus-launcher-drag-handle:hover {
+  color: rgba(0, 0, 0, 0.7);
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.fa-theme-light.fa-nexus-launcher--dragging .fa-nexus-launcher-drag-handle {
+  color: rgba(0, 0, 0, 0.8);
+  background: rgba(0, 0, 0, 0.1);
+}
+
+
+/* Theme adapters */
+.fa-theme-dark {
+  --fa-nexus-panel-bg: rgba(0, 0, 0, 0.35);
+  --fa-nexus-btn-bg: rgba(255, 255, 255, 0.08);
+  --fa-nexus-btn-bg-hover: rgba(255, 255, 255, 0.14);
+  --fa-nexus-border: rgba(255, 255, 255, 0.12);
+  --fa-nexus-surface: rgba(0, 0, 0, 0.75);
+  --fa-nexus-card-bg: linear-gradient(120deg, rgba(117, 117, 117, 0.32) 25%, rgba(146, 146, 146, 0.34) 37%, rgba(118, 118, 118, 0.32) 63%);
+}
+
+.fa-theme-light {
+  --fa-nexus-panel-bg: rgba(255, 255, 255, 0.6);
+  --fa-nexus-btn-bg: rgba(0, 0, 0, 0.06);
+  --fa-nexus-btn-bg-hover: rgba(0, 0, 0, 0.14);
+  --fa-nexus-border: rgba(0, 0, 0, 0.15);
+  --fa-nexus-surface: rgba(255, 255, 255, 0.85);
+  --fa-nexus-card-bg: linear-gradient(120deg, rgba(117, 117, 117, 0.32) 25%, rgba(146, 146, 146, 0.34) 37%, rgba(118, 118, 118, 0.32) 63%);
+}
+
+.fa-theme-light #fa-nexus-app .window-content,
+#fa-nexus-app.fa-theme-light .window-content {
+  background: none;
+}
+
+.fa-theme-dark #fa-nexus-app .window-content,
+#fa-nexus-app.fa-theme-dark .window-content {
+  background: transparent;
+}
+
+/* Theme variable definitions */
+
+/* Hover preview */
+.fa-nexus-hover-preview {
+  position: fixed;
+  z-index: 9999;
+  background: rgba(61, 60, 62, 0.606);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  padding: 1rem;
+  max-width: min(600px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+  backdrop-filter: blur(5px);
+  overflow: hidden;
+  opacity: 0;
+}
+
+.fa-nexus-hover-preview.visible {
+  opacity: 1;
+}
+
+.fa-nexus-hover-preview img,
+.fa-nexus-hover-preview video {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 600px;
+  border-radius: 4px;
+  display: block;
+  margin: 0 auto;
+  transition: opacity 0.3s ease;
+}
+
+.fa-nexus-hover-preview video {
+  pointer-events: none;
+}
+
+.fa-nexus-hover-preview .preview-info {
+  margin-top: 0.75rem;
+  text-align: center;
+}
+
+.fa-nexus-hover-preview .preview-filename {
+  font-weight: bold;
+  color: rgb(238, 238, 238);
+  font-size: 0.9em;
+  margin-bottom: 0.25rem;
+  word-break: break-word;
+  line-height: 1.3;
+}
+
+.fa-nexus-hover-preview .preview-path {
+  color: rgb(153, 153, 153);
+  font-size: 0.75em;
+  opacity: 0.8;
+  word-break: break-all;
+  line-height: 1.2;
+}
+
+.fa-nexus-hover-preview .preview-meta {
+  color: rgb(153, 153, 153);
+  font-size: 0.75em;
+  opacity: 0.8;
+  word-break: break-all;
+  line-height: 1.2;
+}
+
+.fa-nexus-footer {
+  padding: 6px 8px;
+  border-top: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+.fa-nexus-footer .actions {
+  display: flex;
+  gap: 6px;
+}
+
+.fa-nexus-footer .fa-nexus-tool-options-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.fa-nexus-footer .fa-nexus-tool-options-button:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(90, 170, 255, 0.38);
+}
+
+.fa-nexus-footer .fa-nexus-tool-options-button:hover {
+  background: rgba(90, 170, 255, 0.14);
+  border-color: rgba(90, 170, 255, 0.35);
+  box-shadow: 0 0 6px rgba(90, 170, 255, 0.22);
+  transform: translateY(-1px);
+}
+
+.fa-theme-light .fa-nexus-footer .fa-nexus-tool-options-button {
+  background: rgba(37, 99, 235, 0.15);
+  border-color: rgba(37, 99, 235, 0.35);
+}
+
+.fa-theme-light .fa-nexus-footer .fa-nexus-tool-options-button:hover {
+  background: rgba(37, 99, 235, 0.25);
+  border-color: rgba(37, 99, 235, 0.45);
+}
+
+.fa-nexus-footer .fa-nexus-tool-options-button i {
+  font-size: 12px;
+}
+
+.fa-nexus-footer .fa-nexus-maincolor-toggle .fa-nexus-checkbox-label,
+.fa-nexus-footer .fa-nexus-randomcolor-toggle .fa-nexus-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fa-nexus-grid-placeholder {
+  --fa-nexus-skeleton-card-width: 120px;
+  --fa-nexus-skeleton-card-height: 140px;
+  --fa-nexus-skeleton-card-gap: 12px;
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: calc(var(--fa-nexus-skeleton-card-gap) / 2);
+  display: none;
+  pointer-events: none;
+  z-index: 2;
+  overflow: hidden;
+  /*background: linear-gradient(180deg, rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0));
+}
+
+.fa-theme-light .fa-nexus-grid-placeholder {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.65), rgba(255, 255, 255, 0)); */
+}
+
+.fa-nexus-grid-placeholder[data-visible="true"] {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--fa-nexus-skeleton-card-width), 1fr));
+  align-content: start;
+  gap: var(--fa-nexus-skeleton-card-gap);
+}
+
+.fa-nexus-grid-placeholder__card {
+  height: var(--fa-nexus-skeleton-card-height);
+  border-radius: 8px;
+  background: linear-gradient(120deg, rgba(117, 117, 117, 0.32) 25%, rgba(146, 146, 146, 0.34) 37%, rgba(118, 118, 118, 0.32) 63%);
+  background-size: 200% 100%;
+  animation: fa-nexus-skeleton-shimmer 1.5s ease-in-out infinite;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  opacity: 0.92;
+}
+
+.fa-theme-light .fa-nexus-grid-placeholder__card {
+  background: linear-gradient(120deg, rgba(117, 117, 117, 0.32) 25%, rgba(146, 146, 146, 0.34) 37%, rgba(118, 118, 118, 0.32) 63%);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.05);
+}
+
+@keyframes fa-nexus-skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+    opacity: 0.78;
+  }
+
+  50% {
+    opacity: 1;
+  }
+
+  100% {
+    background-position: -200% 0;
+    opacity: 0.78;
+  }
+}
+
+/* ===== Bookmarks ===== */
+.fa-nexus-bookmarks {
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.1));
+  background: var(--fa-nexus-panel-bg, rgba(0, 0, 0, 0.05));
+}
+
+.fa-nexus-bookmark-toolbar {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.fa-nexus-bookmark-items {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+  overflow: hidden;
+}
+
+.fa-nexus-bookmark-item {
+  padding: 4px 8px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.2));
+  background: var(--fa-nexus-bg, rgba(0, 0, 0, 0.3));
+  color: var(--fa-nexus-text, inherit);
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.fa-nexus-bookmark-wrapper:hover .fa-nexus-bookmark-item {
+  background: var(--fa-nexus-hover-bg, rgba(255, 255, 255, 0.1));
+  border-color: var(--fa-nexus-hover-border, rgba(255, 255, 255, 0.3));
+}
+
+.fa-nexus-bookmark-wrapper:active .fa-nexus-bookmark-item {
+  background: var(--fa-nexus-active-bg, rgba(255, 255, 255, 0.1));
+}
+
+.fa-nexus-bookmark-overflow {
+  padding: 4px 6px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.2));
+  background: var(--fa-nexus-bg, rgba(0, 0, 0, 0.3));
+  color: var(--fa-nexus-text, inherit);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: opacity 0.15s ease, background 0.2s ease, border-color 0.2s ease;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.fa-nexus-bookmark-overflow:hover {
+  background: var(--fa-nexus-hover-bg, rgba(255, 255, 255, 0.1));
+  border-color: var(--fa-nexus-hover-border, rgba(255, 255, 255, 0.3));
+}
+
+.fa-nexus-bookmark-overflow span {
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--color-button-primary, #007bff);
+  color: white;
+  border-radius: 8px;
+  padding: 1px 4px;
+  min-width: 12px;
+  text-align: center;
+  line-height: 1;
+}
+
+
+
+
+/* ===== Bookmark Dialog ===== */
+
+.fa-nexus-bookmark-dialog .form-group {
+  margin-bottom: 16px;
+}
+
+.fa-nexus-bookmark-dialog .form-group label {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+
+.fa-nexus-bookmark-dialog .form-group input {
+  width: 100%;
+  border: 1px solid var(--color-border-light-2, #c9c7b8);
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.fa-nexus-bookmark-dialog .form-group input:focus {
+  outline: none;
+  border-color: var(--color-border-highlight, #007bff);
+  box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+}
+
+.fa-nexus-bookmark-dialog .bookmark-info {
+  margin-bottom: 5px;
+  padding: 5px 5px;
+  font-size: 13px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.fa-nexus-bookmark-dialog .bookmark-info.bookmark-include {
+  background: rgba(0, 123, 255, 0.1);
+  border-color: rgba(0, 123, 255, 0.3);
+}
+
+.fa-nexus-bookmark-dialog .bookmark-info.bookmark-exclude {
+  background: rgba(220, 53, 69, 0.1);
+  border-color: rgba(220, 53, 69, 0.3);
+}
+
+.fa-nexus-bookmark-dialog .bookmark-info i {
+  margin-right: 8px;
+  width: 14px;
+  text-align: center;
+  color: var(--color-text-dark-secondary, #7a7971);
+}
+
+.fa-nexus-bookmark-dialog .bookmark-info.bookmark-include i {
+  color: rgba(0, 123, 255, 0.8);
+}
+
+.fa-nexus-bookmark-dialog .bookmark-info.bookmark-exclude i {
+  color: rgba(220, 53, 69, 0.8);
+}
+
+.fa-nexus-bookmark-dialog .buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.fa-nexus-bookmark-dialog .buttons button {
+  padding: 6px 12px;
+  border: 1px solid var(--color-border-light-2, #c9c7b8);
+  border-radius: 4px;
+  background: var(--color-bg-1, #ffffff);
+  color: var(--color-text-dark-primary, #191813);
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.fa-nexus-bookmark-dialog .buttons button.save {
+  background: var(--color-button-primary, #007bff);
+  border-color: var(--color-button-primary, #007bff);
+  color: white;
+}
+
+.fa-nexus-bookmark-dialog .buttons button.save:hover {
+  background: var(--color-button-primary-hover, #0056b3);
+  border-color: var(--color-button-primary-hover, #0056b3);
+}
+
+.fa-nexus-bookmark-dialog .buttons button.remove {
+  background: var(--color-button-danger, #dc3545);
+  border-color: var(--color-button-danger, #dc3545);
+  color: white;
+}
+
+.fa-nexus-bookmark-dialog .buttons button.remove:hover {
+  background: var(--color-button-danger-hover, #c82333);
+  border-color: var(--color-button-danger-hover, #c82333);
+}
+
+/* ===== Bookmark Overflow Menu ===== */
+.fa-nexus-bookmark-overflow-menu {
+  background: var(--fa-nexus-bg, rgba(0, 0, 0, 0.9));
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.2));
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  min-width: 160px;
+  max-width: 240px;
+  z-index: 1000;
+}
+
+.fa-nexus-bookmark-overflow-item {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--fa-nexus-text, inherit);
+  text-align: left;
+  cursor: grab;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.fa-nexus-bookmark-overflow-item:hover {
+  background: var(--fa-nexus-hover-bg, rgba(255, 255, 255, 0.1));
+}
+
+.fa-nexus-bookmark-overflow-item:active {
+  cursor: grabbing;
+}
+
+.fa-nexus-bookmark-overflow-item:first-child {
+  border-radius: 3px 3px 0 0;
+}
+
+.fa-nexus-bookmark-overflow-item:last-child {
+  border-radius: 0 0 3px 3px;
+}
+
+.fa-nexus-bookmark-overflow-item:only-child {
+  border-radius: 3px;
+}
+
+.fa-nexus-bookmark-overflow-separator {
+  height: 1px;
+  background: var(--fa-nexus-border, rgba(255, 255, 255, 0.2));
+  margin: 4px 0;
+}
+
+
+/* ===== Bookmark Drag & Drop ===== */
+.fa-nexus-bookmark-wrapper {
+  display: inline-flex;
+  position: relative;
+  cursor: grab;
+}
+
+.fa-nexus-bookmark-wrapper:active {
+  cursor: grabbing;
+}
+
+.fa-nexus-bookmark-wrapper.fa-nexus-bookmark-dragging {
+  opacity: 0.5;
+  transform: rotate(5deg);
+  z-index: 100;
+  pointer-events: none;
+}
+
+.fa-nexus-bookmark-drag-active .fa-nexus-bookmark-wrapper:not(.fa-nexus-bookmark-dragging) {
+  opacity: 1;
+  transform: none;
+}
+
+/* Drop position indicators on bookmark wrappers */
+.fa-nexus-bookmark-wrapper.fa-nexus-bookmark-drop-left::before {
+  content: '';
+  position: absolute;
+  left: -2px;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--color-button-primary, #007bff);
+  border-radius: 2px;
+  box-shadow: 0 0 4px rgba(0, 123, 255, 0.4);
+  z-index: 10;
+}
+
+.fa-nexus-bookmark-wrapper.fa-nexus-bookmark-drop-right::after {
+  content: '';
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--color-button-primary, #007bff);
+  border-radius: 2px;
+  box-shadow: 0 0 4px rgba(0, 123, 255, 0.4);
+  z-index: 10;
+}
+
+/* Disable hover effects during drag */
+.fa-nexus-bookmark-drag-active .fa-nexus-bookmark-wrapper:not(.fa-nexus-bookmark-dragging) .fa-nexus-bookmark-item {
+  pointer-events: none;
+}
+
+.fa-nexus-bookmark-drag-active .fa-nexus-bookmark-wrapper:not(.fa-nexus-bookmark-dragging):hover .fa-nexus-bookmark-item {
+  background: var(--fa-nexus-bg, rgba(0, 0, 0, 0.3)) !important;
+  border-color: var(--fa-nexus-border, rgba(255, 255, 255, 0.2)) !important;
+}
+
+/* Drag preview that follows cursor */
+.fa-nexus-bookmark-drag-preview {
+  padding: 4px 8px;
+  background: var(--fa-nexus-bg, rgba(0, 0, 0, 0.9));
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.3));
+  border-radius: 4px;
+  color: var(--fa-nexus-text, inherit);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  opacity: 0.9;
+  transform: translate(-50%, -50%);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

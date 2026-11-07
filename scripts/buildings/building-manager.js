@@ -1,17 +1,23 @@
+import { appendBuildingV2PortalControls, appendBuildingV2InteriorPathControls, buildingV2WindowBehaviorControls } from './v2/building-v2-tool-options.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { waitForNativeTileTransformTransactions } from '../canvas/native-tile-transform-transactions.js';
 import {
+  resolveTileDocument,
   resolveTileId,
   resolveTilePlaceable
 } from '../premium/session-host/editing-targets.js';
 import { resolvePremiumFeatureDelegate } from '../premium/session-host/delegate-bootstrap.js';
+import { getPremiumRuntimeAdapter } from '../premium/session-host/premium-runtime-adapter.js';
+import { callRequiredDelegateMethod } from '../premium/session-host/delegate-methods.js';
+import { callRequiredPreviewPlacementAdapterMethod } from '../premium/session-host/preview-placement-adapter.js';
 import {
   buildHostedSessionContextDetails,
   canRecoverHostedSessionFromCanvasTeardown,
   isApplicationHostReady
 } from '../premium/session-host/host-context.js';
 import {
-  cancelToolWindowMonitor,
-  startHostedToolWindowMonitor
+  beginHostedToolWindowMonitor,
+  cancelHostedToolWindowMonitor
 } from '../premium/session-host/tool-window-monitor.js';
 import {
   beginEditingTileTracking,
@@ -21,21 +27,43 @@ import {
   canCommitHostedSession,
   handleSessionLaunchFailure as handleHostedSessionLaunchFailure,
   hasHostedSessionChanges,
+  hasHostedSessionUnresolvedTransientState,
   runHostedSessionLaunch,
+  syncHostedPreviewLaunchState,
   stopSessionWithFinalize,
   stopOrphanedSession as stopHostedOrphanedSession
 } from '../premium/session-host/session-lifecycle.js';
+import {
+  askHostedSessionExitQuestion,
+  buildDiscardQuestionText,
+  confirmHostedCancelSession,
+  createHostedCancelSessionState
+} from '../premium/session-host/cancel-session-dialog.js';
 import {
   handleEntitlementRevalidationFailure,
   scheduleEntitlementRevalidation
 } from '../premium/session-host/entitlement-revalidation.js';
 import {
+  notifyHostedPreviewLayerChangeIfNeeded,
   syncHostedToolOptions
 } from '../premium/session-host/tool-options-sync.js';
-import { toolOptionsController } from '../core/tool-options-controller.js';
+import { createSubtoolPreferenceBridge } from '../premium/session-host/subtool-preference-bridge.js';
+import { toolOptionsController } from '../core/tool-options/tool-options-controller.js';
+import { WALL_SNAP_SETTING_KEY } from '../core/tool-options/shared.js';
 import { applyBuildingTile, applyBuildingCompositeTile, applyDoorFrameTile } from './building-tiles.js';
-import { TOOL_OPTIONS_RENDERER_MODE, createNormalizedToolOptionsDescriptor } from '../core/tool-options-descriptor.js';
+import { TOOL_OPTIONS_RENDERER_MODE, createNormalizedToolOptionsDescriptor } from '../core/tool-options/tool-options-descriptor.js';
 import {
+  addDeclarativeActionRowControl,
+  addDeclarativeAxisTogglePairControl,
+  addDeclarativeHintControl,
+  addDeclarativeRangeControl,
+  addDeclarativeRangePairControl,
+  addDeclarativeScalarControl,
+  addDeclarativeSelectControl,
+  addDeclarativeToggleControl
+} from '../core/tool-options/tool-options-control-builders.js';
+import {
+  SHORTCUT_ACTION,
   createShortcut,
   createStandardEditorShortcuts,
   mergeShortcutLists,
@@ -44,34 +72,40 @@ import {
 import { buildHsbcToolOptionsControls } from '../core/hsbc.js';
 import {
   getCurrentLevelBottomElevation,
+  getCurrentLevelElevationRange,
   getCurrentSceneLevel,
-  getGroundBandRenderSort,
   getHighestControlledTileElevation,
-  getTileRenderElevation,
   resolvePlacementAnchorTile
 } from '../canvas/elevation-band-utils.js';
-import {
-  getDefaultTilePlacementLevelId,
-  resolveTileRenderOrder
-} from '../canvas/tile-band-utils.js';
-import { resolvePlacementSortAtElevation } from '../canvas/canvas-interaction-controller.js';
 import { requestSelectionFilterRefresh } from '../canvas/selection-filter-refresh.js';
+import { PREMIUM_RUNTIME_CAPABILITY } from '../premium/session-host/runtime-adapter-factory.js';
 
 const MODULE_ID = 'fa-nexus';
 const BUILDING_SUBTOOL_SETTING_KEY = 'buildingToolActiveSubtool';
 const BUILDING_PERSISTED_SUBTOOL_IDS = new Set(['rectangle', 'ellipse', 'polygon', 'inner-wall']);
+// ADR 0002/0004: Edit Shapes is the sole geometry and structural-segment workspace — there is
+// no Edit Points subtool and no Wall Behavior subtool to switch to.
 const BUILDING_ACTIVE_SUBTOOL_IDS = new Set([
   ...BUILDING_PERSISTED_SUBTOOL_IDS,
-  'edit-points',
-  'edit-shapes'
+  'edit-shapes',
+  'edit-geometry'
 ]);
 const EDITING_TILE_SET_KEY = '__faNexusBuildingEditingTileIds';
 
 const FEATURE_ID = 'building.edit';
 const TOOL_LABEL = 'Building Editor';
+const BUILDING_EDITOR_ARCHITECTURE_V2 = 'building-editor-v2';
+const BUILDING_EDITOR_V2_HOST = Object.freeze({
+  id: 'fa-nexus.building-editor-v2-host',
+  contractVersion: 1
+});
+const BUILDING_EDITOR_V2_RUNTIME_CAPABILITIES = Object.freeze([
+  PREMIUM_RUNTIME_CAPABILITY.BUILDING_V2_GET_RUNTIME_CAPABILITIES,
+  PREMIUM_RUNTIME_CAPABILITY.BUILDING_PORTAL_PICKER_GET_DEPS
+]);
 const CANVAS_REBIND_TIMEOUT_MS = 15000;
 const HOST_CONTEXT_GRACE_MS = 5000;
-const PREVIEW_LAYER_HOOK = 'fa-nexus-preview-layers-changed';
+const CANVAS_REBIND_GUARDS = new WeakMap();
 
 function stringifyError(error) {
   return String(error?.message || error);
@@ -90,6 +124,7 @@ function getDocumentLevelIds(target) {
 export class BuildingManager {
   constructor(app) {
     this._app = app;
+    this.premiumRuntimeAdapter = getPremiumRuntimeAdapter(app);
     this._delegate = null;
     this._loading = null;
     this._entitlementProbe = null;
@@ -97,13 +132,25 @@ export class BuildingManager {
     this._canvasRebindState = null;
     this._portalMode = false;
     this._onToolOptionsChange = null;
-    this._lastPersistedSubtool = null;
-    this._toolDefaultsPersistTimer = null;
     this._editingTileId = null;
     this._forcingMeasurementsEnabled = false;
-    this._hsbcTarget = 'wall';
     this._lastPreviewLayerSignature = null;
     this._pendingLaunchPlacementAnchorTileId = undefined;
+    this._currentBuildingLaunchTail = null;
+    this._applicationClosePending = false;
+    this._applicationClosePromise = null;
+    this._subtoolPreferenceBridge = createSubtoolPreferenceBridge({
+      moduleId: MODULE_ID,
+      settingKey: BUILDING_SUBTOOL_SETTING_KEY,
+      activeSubtoolIds: BUILDING_ACTIVE_SUBTOOL_IDS,
+      persistedSubtoolIds: BUILDING_PERSISTED_SUBTOOL_IDS,
+      getDelegate: () => this._delegate,
+      requestSubtoolToggle: (id, enabled) => {
+        if (this._portalMode) return false;
+        return enabled ? this.setActiveTool(id) : true;
+      },
+      loggerPrefix: 'BuildingManager'
+    });
   }
 
   /**
@@ -125,21 +172,134 @@ export class BuildingManager {
     return !!this._delegate?.isActive;
   }
 
+  get isCurrentBuildingEditSessionActive() {
+    return this.isActive;
+  }
+
   hasSessionChanges() {
     return hasHostedSessionChanges(this._delegate);
   }
 
+  hasUnresolvedTransientState() {
+    return hasHostedSessionUnresolvedTransientState(this._delegate, { loggerPrefix: 'BuildingManager' });
+  }
+
   canCommitSession() {
-    return canCommitHostedSession(this._delegate, {
-      fallback: () => this.hasSessionChanges()
-    });
+    return canCommitHostedSession(this._delegate, { loggerPrefix: 'BuildingManager' });
   }
 
   get version() {
-    return this._delegate?.version || '0.0.14';
+    return this._delegate?.version || null;
   }
 
-  async start(session = {}) {
+  _serializeBuildingLaunch(operation) {
+    if (typeof operation !== 'function') throw new TypeError('Building launch serialization requires an operation.');
+    const prior = this._currentBuildingLaunchTail || Promise.resolve();
+    const run = prior.then(operation, operation);
+    const tail = run.catch(() => {});
+    this._currentBuildingLaunchTail = tail;
+    return run.finally(() => {
+      if (this._currentBuildingLaunchTail === tail) this._currentBuildingLaunchTail = null;
+    });
+  }
+
+  requestApplicationClose({ reason = 'closing FA Nexus' } = {}) {
+    if (this._applicationClosePromise) return this._applicationClosePromise;
+    this._applicationClosePending = true;
+    const run = this._serializeBuildingLaunch(async () => {
+
+      const exit = await this._decideSessionExit({ reason: 'app-close', leaveLabel: String(reason || 'closing FA Nexus') });
+      if (!exit.proceed) return Object.freeze({ kind: exit.kind });
+      return Object.freeze({ kind: exit.kind === 'none' ? 'ready' : `closed-${exit.kind}` });
+    });
+    const pending = run.then((outcome) => {
+      if (['continued', 'blocked'].includes(outcome?.kind)) this._applicationClosePending = false;
+      return outcome;
+    }, (error) => {
+      this._applicationClosePending = false;
+      throw error;
+    }).finally(() => {
+      if (this._applicationClosePromise === pending) this._applicationClosePromise = null;
+    });
+    this._applicationClosePromise = pending;
+    return pending;
+  }
+
+  /**
+   * Leaving the Building editor by opening another Nexus tab. Resolves { proceed, kind }; see _decideSessionExit.
+   */
+  requestSessionExit({ reason = 'tab-switch', leaveLabel = 'opening another tab' } = {}) {
+    if (this._sessionExitPromise) return this._sessionExitPromise;
+    const pending = this._serializeBuildingLaunch(() => this._decideSessionExit({ reason, leaveLabel }))
+      .finally(() => { if (this._sessionExitPromise === pending) this._sessionExitPromise = null; });
+    this._sessionExitPromise = pending;
+    return pending;
+  }
+
+  /**
+   * The one decision behind every way out of a Building session that is not Commit or Cancel (NUX-016, design A2,
+   * Building slice). A Commit in progress or an unfinished step refuses, with a message saying why; a session
+   * without changes ends; one with changes asks Commit / Discard / Continue Editing. A Commit or Discard that
+   * leaves the session open refuses too. Every refusal is shown here, so no caller can leave it unsaid.
+   * Resolves { proceed, kind } with kind 'none', 'ended', 'committed', 'discarded', 'continued' or 'blocked'.
+   */
+  async _decideSessionExit({ reason, leaveLabel }) {
+    const delegate = this._delegate;
+    if (delegate?.architecture !== BUILDING_EDITOR_ARCHITECTURE_V2 || !delegate?.isActive) return { proceed: true, kind: 'none' };
+    const refuse = (message, kind = 'blocked', level = 'warn') => {
+      Logger.info?.('BuildingManager.sessionExit.refused', { reason, kind, message });
+      ui.notifications[level](message);
+      return { proceed: false, kind };
+    };
+    if (delegate.isCommitting) return refuse('The Building is still being committed. Try again when it has finished.');
+    if (hasHostedSessionUnresolvedTransientState(delegate, { loggerPrefix: 'BuildingManager' })) {
+      return refuse('Finish or cancel the step in progress in the Building editor first: a staged shape, a wall being drawn or a pending choice.');
+    }
+    if (!hasHostedSessionChanges(delegate, { loggerPrefix: 'BuildingManager' })) {
+      await Promise.resolve(this.stop({ reason: `${reason}-clean` }));
+      if (this.isActive) return refuse('The Building session could not be ended. Use Cancel in Tool Options.', 'blocked', 'error');
+      return { proceed: true, kind: 'ended' };
+    }
+    const answer = await askHostedSessionExitQuestion({
+      state: this._sessionExitQuestionState ||= {},
+      noun: 'building',
+      leaveLabel,
+      commitUnavailableReason: this.canCommitSession()
+        ? null
+        : 'the Building is not ready to commit. Choose Continue Editing to see why beside the Commit button.'
+    });
+    if (answer === 'continue') return { proceed: false, kind: 'continued' };
+    if (answer === 'discard') {
+      await Promise.resolve(this.stop({ reason: `${reason}-discard` }));
+      if (this.isActive) return refuse('The Building session stays open: its edits could not be discarded.', 'blocked', 'error');
+      return { proceed: true, kind: 'discarded' };
+    }
+    let failure = null;
+    try { await this.commitBuilding(); }
+    catch (error) { failure = error; }
+    if (this.isActive) {
+      const detail = failure ? ` (${String(failure?.message || failure)})` : '';
+      return refuse(`The Building session stays open: its edits could not be committed${detail}.`, 'blocked', 'error');
+    }
+    return { proceed: true, kind: 'committed' };
+  }
+
+  cancelApplicationClose() {
+    if (this._applicationClosePromise) {
+      throw new Error('Cannot cancel FA Nexus application close while its Building exit decision is pending.');
+    }
+    this._applicationClosePending = false;
+  }
+
+  start(session = {}) {
+    if (this._applicationClosePending) {
+      return Promise.reject(new Error('Cannot start a Building workflow while FA Nexus is closing.'));
+    }
+    return this._serializeBuildingLaunch(() => this._startSerialized(session));
+  }
+
+  async _startSerialized(session = {}) {
+
     const startSession = { ...(session || {}) };
     const sceneId = String(canvas?.scene?.id || '').trim();
     if (!Object.prototype.hasOwnProperty.call(startSession, 'sceneId') && sceneId) {
@@ -168,7 +328,22 @@ export class BuildingManager {
       placementLevelId = String(getCurrentSceneLevel(canvas?.scene)?.id || '').trim();
     }
     if (!placementLevels.length && placementLevelId) placementLevels = [placementLevelId];
+    const currentLevelId = String(getCurrentSceneLevel(canvas?.scene)?.id || '').trim();
+    const wallPlacementLevelId = String(startSession.wallPlacementLevelId || currentLevelId || placementLevelId).trim() || null;
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'wallPlacementLevelId') && wallPlacementLevelId) {
+      startSession.wallPlacementLevelId = wallPlacementLevelId;
+    }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'wallPlacementLevels') && wallPlacementLevelId) {
+      startSession.wallPlacementLevels = [wallPlacementLevelId];
+    }
     const fillAnchorElevation = Number.isFinite(selectedElevation) ? selectedElevation : fallbackElevation;
+    const currentLevelRange = getCurrentLevelElevationRange(canvas?.scene);
+    const wallElevation = Number.isFinite(currentLevelRange?.top)
+      ? Number(currentLevelRange.top)
+      : fillAnchorElevation;
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'elevation') && Number.isFinite(wallElevation)) {
+      startSession.elevation = wallElevation;
+    }
     if (!Object.prototype.hasOwnProperty.call(startSession, 'selectedElevation') && Number.isFinite(fillAnchorElevation)) {
       startSession.selectedElevation = fillAnchorElevation;
     }
@@ -191,20 +366,35 @@ export class BuildingManager {
     if (!Object.prototype.hasOwnProperty.call(startSession, 'placementLevelId') && placementLevelId) {
       startSession.placementLevelId = placementLevelId;
     }
+    if (!Object.prototype.hasOwnProperty.call(startSession, 'sceneGridSize')) {
+      const sceneGridSize = Number(canvas?.scene?.grid?.size);
+      if (Number.isFinite(sceneGridSize) && sceneGridSize > 0) startSession.sceneGridSize = sceneGridSize;
+    }
     const delegate = await this._ensureDelegate();
     return runHostedSessionLaunch({
+      awaitLaunch: true,
       beforeLaunch: () => {
         this._clearEditingTile();
-        if (typeof delegate?.setPortalMode === 'function') {
-          delegate.setPortalMode(this._portalMode);
-        }
+        this._callRequiredDelegateCommand('setPortalMode', 'setPortalMode', {
+          args: [this._portalMode],
+          context: { phase: 'start', enabled: this._portalMode },
+          rethrow: true
+        });
       },
-      launchSession: () => delegate.start?.(startSession),
+      launchSession: () => callRequiredDelegateMethod({
+        delegate,
+        methodName: 'start',
+        args: [startSession],
+        loggerPrefix: 'BuildingManager',
+        logScope: 'sessionLaunch',
+        bundleLabel: 'building editor'
+      }),
       afterLaunch: () => {
-        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-        this._applyPendingLaunchPlacementAnchorTileId();
-        this._syncDelegatePreviewRenderSort();
-        this._applyCurrentPreviewLayerOrdering();
+        syncHostedPreviewLaunchState({
+          applyLaunchPlacementAnchorTileId: () => this._applyPendingLaunchPlacementAnchorTileId(),
+          syncPreviewRenderSort: () => this._syncDelegatePreviewRenderSort(),
+          applyCurrentPreviewLayerOrdering: () => this._applyCurrentPreviewLayerOrdering()
+        });
         // Sync tool options state BEFORE activating the tool to ensure the cached
         // state reflects the new session mode (e.g., 'inner' vs 'outer'). Otherwise,
         // activateTool would use stale cached state from the previous session.
@@ -222,7 +412,30 @@ export class BuildingManager {
     });
   }
 
-  async editTile(tileDocument, options = {}) {
+  editTile(tileDocument, options = {}) {
+    if (this._applicationClosePending) {
+      return Promise.reject(new Error('Cannot edit a Building while FA Nexus is closing.'));
+    }
+    return this._serializeBuildingLaunch(() => this._editTileSerialized(tileDocument, options));
+  }
+
+  async _editTileSerialized(tileDocument, options = {}) {
+
+    // Resolve the edit target BEFORE anything dereferences it. A caller may legitimately hand
+    // over a placeable, a document, or a Tile id, and any of those may name a Tile that is no
+    // longer on the Scene (it was committed away, deleted, or the id was recorded in an earlier
+    // session). Without this, the first thing to touch the target is the native-transform
+    // transaction key, which reports the internal "require scene and Tile ids" — a message that
+    // says nothing about the real problem and points the user nowhere.
+    const doc = resolveTileDocument(tileDocument) || null;
+    if (!doc?.id || !doc?.parent?.id) {
+      const requested = String(resolveTileId(tileDocument) || (typeof tileDocument === 'string' ? tileDocument : '') || '').trim();
+      throw new Error(
+        `Building Tile ${requested || '(unidentified)'} is not on this Scene any more, so it cannot be opened for editing.`
+        + ' Select the Building on the canvas and edit it from its Tile HUD.'
+      );
+    }
+    await waitForNativeTileTransformTransactions(doc);
     if (Object.prototype.hasOwnProperty.call(options || {}, 'portalMode')) {
       this._portalMode = !!options.portalMode;
     }
@@ -231,7 +444,6 @@ export class BuildingManager {
     if (!Object.prototype.hasOwnProperty.call(editOptions, 'sceneId') && sceneId) {
       editOptions.sceneId = sceneId;
     }
-    const doc = tileDocument?.document || tileDocument || null;
     const documentLevelIds = getDocumentLevelIds(doc);
     if (!Object.prototype.hasOwnProperty.call(editOptions, 'placementLevels') && documentLevelIds.length) {
       editOptions.placementLevels = documentLevelIds;
@@ -239,23 +451,42 @@ export class BuildingManager {
     if (!Object.prototype.hasOwnProperty.call(editOptions, 'placementLevelId') && documentLevelIds.length === 1) {
       editOptions.placementLevelId = documentLevelIds[0];
     }
+    if (!Object.prototype.hasOwnProperty.call(editOptions, 'fillElevation')) {
+      editOptions.fillElevation = getCurrentLevelBottomElevation(canvas?.scene);
+    }
+    if (!Object.prototype.hasOwnProperty.call(editOptions, 'fillPlacementLevelId')) {
+      editOptions.fillPlacementLevelId = getCurrentSceneLevel(canvas?.scene)?.id || null;
+    }
     const delegate = await this._ensureDelegate();
     if (!delegate || typeof delegate.editTile !== 'function') {
       throw new Error('Installed building editor bundle does not support editing existing tiles.');
     }
-    const tileId = resolveTileId(tileDocument);
+    if (delegate.isActive) {
+      if (hasHostedSessionUnresolvedTransientState(delegate, { loggerPrefix: 'BuildingManager' })) {
+        throw new Error('Apply or cancel the staged Rectangle before editing another Tile.');
+      }
+      if (hasHostedSessionChanges(delegate, { loggerPrefix: 'BuildingManager' })) {
+        throw new Error('Finish or cancel the active Building Editor session before editing another Tile.');
+      }
+      await Promise.resolve(this.stop({ reason: 'edit-reentry' }));
+    }
+    const tileId = resolveTileId(doc);
     return runHostedSessionLaunch({
+      awaitLaunch: true,
       beforeLaunch: () => {
-        this._markEditingTile(tileDocument);
-        if (typeof delegate?.setPortalMode === 'function') {
-          delegate.setPortalMode(this._portalMode);
-        }
+        this._markEditingTile(doc);
+        this._callRequiredDelegateCommand('setPortalMode', 'setPortalMode', {
+          args: [this._portalMode],
+          context: { phase: 'edit', enabled: this._portalMode, tileId },
+          rethrow: true
+        });
       },
-      launchSession: () => delegate.editTile(tileDocument, editOptions),
+      launchSession: () => delegate.editTile(doc, editOptions),
       afterLaunch: () => {
-        try { canvas?.tiles?.releaseAll?.(); } catch (_) {}
-        this._syncDelegatePreviewRenderSort();
-        this._applyCurrentPreviewLayerOrdering();
+        syncHostedPreviewLaunchState({
+          syncPreviewRenderSort: () => this._syncDelegatePreviewRenderSort(),
+          applyCurrentPreviewLayerOrdering: () => this._applyCurrentPreviewLayerOrdering()
+        });
         // Sync tool options state BEFORE activating the tool to ensure the cached
         // state reflects the new session mode. Otherwise, activateTool would use
         // stale cached state from the previous session.
@@ -352,19 +583,23 @@ export class BuildingManager {
 
   setActiveTool(toolId) {
     if (!this._delegate?.isActive) return;
-    const call = this._callOptionalDelegateMethod('setActiveTool', 'setActiveTool', {
+    const call = this._callRequiredDelegateCommand('setActiveTool', 'setActiveTool', {
       args: [toolId],
       context: { toolId }
     });
-    if (call.ok) this._syncToolOptionsState({ suppressRender: false });
+    if (!call.ok) return call.result;
+    this._syncToolOptionsState({ suppressRender: false });
+    return call.result;
   }
 
   setPortalMode(enabled = false) {
     this._portalMode = !!enabled;
-    this._callOptionalDelegateMethod('setPortalMode', 'setPortalMode', {
+    if (!this._delegate) return this._portalMode;
+    const call = this._callRequiredDelegateCommand('setPortalMode', 'setPortalMode', {
       args: [this._portalMode],
       context: { enabled }
     });
+    if (!call.ok) return this._portalMode;
     this._syncToolOptionsState({ suppressRender: false });
     return this._portalMode;
   }
@@ -375,7 +610,47 @@ export class BuildingManager {
     this._syncToolOptionsState({ suppressRender: false });
   }
 
+  canHandlePortalPanelActions() {
+    return !!this._delegate;
+  }
+
+  getPortalPanelState() {
+    if (!this._delegate) return null;
+    const call = this._callRequiredDelegateCommand('getPortalPanelState', 'getPortalPanelState', {
+      missingReturn: null
+    });
+    return call.result;
+  }
+
+  setPortalPanelKind(kind) {
+    const call = this._callRequiredDelegateCommand('setPortalPanelKind', 'setPortalPanelKind', {
+      args: [kind],
+      context: { kind },
+      missingReturn: null
+    });
+    return call.result;
+  }
+
+  clearPortalTexture(pickerType) {
+    const call = this._callRequiredDelegateCommand('clearPortalTexture', 'clearPortalTexture', {
+      args: [pickerType],
+      context: { pickerType },
+      missingReturn: false
+    });
+    return call.result;
+  }
+
+  openPortalTexturePicker(pickerType) {
+    const call = this._callRequiredDelegateCommand('openPortalTexturePicker', 'openPortalTexturePicker', {
+      args: [pickerType],
+      context: { pickerType },
+      missingReturn: false
+    });
+    return call.result;
+  }
+
   stop(...args) {
+    if (this._delegate?.architecture === BUILDING_EDITOR_ARCHITECTURE_V2 && this._delegate.isCommitting) return false;
     return stopSessionWithFinalize({
       delegate: this._delegate,
       beforeStop: () => {
@@ -385,8 +660,15 @@ export class BuildingManager {
       },
       persistToolDefaults: () => this._persistDelegateToolDefaults(),
       stopSession: (delegate) => {
-        const stopFn = delegate?.__faNexusOriginalStop || delegate?.stop;
-        return stopFn?.(...args);
+        const guardedStop = CANVAS_REBIND_GUARDS.get(delegate)?.originalStop || null;
+        return callRequiredDelegateMethod({
+          delegate: guardedStop ? { stop: guardedStop } : delegate,
+          methodName: 'stop',
+          args,
+          loggerPrefix: 'BuildingManager',
+          logScope: 'sessionStop',
+          bundleLabel: 'building editor'
+        });
       },
       finalize: () => {
         try { this._clearEditingTile(); } catch (_) {}
@@ -400,12 +682,15 @@ export class BuildingManager {
   async commitBuilding(options = {}) {
     const delegate = this._delegate;
     if (!delegate?.isActive) return null;
-    if (typeof delegate.commitBuilding !== 'function') {
-      Logger.warn?.('BuildingManager.commitBuilding.methodMissing', { options });
-      return null;
-    }
     try {
-      const result = await delegate.commitBuilding(options);
+      const result = await callRequiredDelegateMethod({
+        delegate,
+        methodName: 'commitBuilding',
+        args: [options],
+        loggerPrefix: 'BuildingManager',
+        logScope: 'sessionCompletion',
+        bundleLabel: 'building editor'
+      });
       if (!delegate?.isActive) {
         this._cancelToolWindowMonitor();
         toolOptionsController.deactivateTool(FEATURE_ID);
@@ -421,46 +706,83 @@ export class BuildingManager {
   async requestCancelSession(options = {}) {
     const delegate = this._delegate;
     if (!delegate?.isActive) return false;
-    if (typeof delegate.requestCancelSession === 'function') {
-      try {
-        const cancelled = await delegate.requestCancelSession(options);
-        if (cancelled && !delegate?.isActive) {
-          this._cancelToolWindowMonitor();
-          toolOptionsController.deactivateTool(FEATURE_ID);
-          this._clearEditingTile();
-        }
-        return cancelled;
-      } catch (error) {
-        Logger.warn?.('BuildingManager.cancel.failed', { error: String(error?.message || error), options });
-        return false;
-      }
-    }
     try {
-      this.stop?.(options);
-      return true;
+      const cancelled = await callRequiredDelegateMethod({
+        delegate,
+        methodName: 'requestCancelSession',
+        args: [{ ...options, confirmDiscard: () => this._confirmDiscardSession(options) }],
+        loggerPrefix: 'BuildingManager',
+        logScope: 'sessionCompletion',
+        bundleLabel: 'building editor'
+      });
+      if (cancelled && !delegate?.isActive) {
+        this._cancelToolWindowMonitor();
+        toolOptionsController.deactivateTool(FEATURE_ID);
+        this._clearEditingTile();
+      }
+      return cancelled;
     } catch (error) {
+      if (typeof delegate?.requestCancelSession !== 'function') throw error;
       Logger.warn?.('BuildingManager.cancel.failed', { error: String(error?.message || error), options });
       return false;
     }
   }
 
+  /**
+   * Asked by the editor before Escape or Cancel discards a session with unsaved changes. A second Escape while
+   * the question is open answers it with Discard, as in the Texture and Path editors.
+   */
+  _confirmDiscardSession({ reason } = {}) {
+    const state = createHostedCancelSessionState(this);
+    return confirmHostedCancelSession({
+      state,
+      force: reason === 'esc' && !!state.promise,
+      ...buildDiscardQuestionText('building'),
+      logger: Logger,
+      loggerPrefix: 'BuildingManager'
+    });
+  }
+
+  _assertDelegateArchitecture(delegate) {
+    const actual = String(delegate?.architecture || '').trim();
+    if (actual !== BUILDING_EDITOR_ARCHITECTURE_V2) {
+      throw new Error(`Building Editor V2 is required, but the premium bundle resolved ${actual || 'an unidentified editor'}. Legacy fallback is disabled.`);
+    }
+    return delegate;
+  }
+
   async _ensureDelegate() {
     if (this._delegate) {
-      this._installDelegatePreviewOrderingGuard(this._delegate);
-      return this._delegate;
+      try {
+        return this._assertDelegateArchitecture(this._delegate);
+      } catch (error) {
+        if (this._delegate?.isActive) throw error;
+        this._delegate = null;
+      }
     }
-    if (this._loading) return this._loading;
+    if (this._loading) {
+      const pending = await this._loading;
+      return this._assertDelegateArchitecture(pending);
+    }
     this._loading = resolvePremiumFeatureDelegate({
       featureId: FEATURE_ID,
       app: this._app,
+      creationApp: null,
       host: this,
       assignDelegate: (instance) => {
         this._delegate = instance;
       },
       missingMessage: 'Premium building editor bundle missing BuildingManager implementation',
+      validateInstance: (instance) => this._assertDelegateArchitecture(instance),
+      attachmentHost: Object.freeze({
+            ...BUILDING_EDITOR_V2_HOST,
+            requestToolOptionsUpdate: (options = {}) => this.requestToolOptionsUpdate(options),
+            prepareEditingTileExit: (options = {}) => this.prepareEditingTileExit(options),
+            restoreEditingTile: (options = {}) => this.restoreEditingTile(options)
+          }),
+      exposedRuntimeCapabilities: BUILDING_EDITOR_V2_RUNTIME_CAPABILITIES,
       loadedLogName: 'BuildingEditor.bundle.loaded',
       loadedHookName: 'fa-nexus-building-editor-loaded',
-      fallbackVersion: '0.0.14',
       afterAttach: (instance) => {
         try { this._installCanvasRebindGuard(instance); }
         catch (error) {
@@ -468,17 +790,12 @@ export class BuildingManager {
             error: String(error?.message || error)
           });
         }
-        try { this._installDelegatePreviewOrderingGuard(instance); }
-        catch (error) {
-          Logger.error?.('BuildingManager.previewOrderingGuard.installFailed', {
-            error: String(error?.message || error)
-          });
-        }
-        try {
-          if (typeof instance.setPortalMode === 'function') {
-            instance.setPortalMode(this._portalMode);
-          }
-        } catch (_) {}
+        this._callRequiredDelegateCommand('setPortalMode', 'setPortalMode', {
+          delegate: instance,
+          args: [this._portalMode],
+          context: { phase: 'afterAttach', enabled: this._portalMode },
+          rethrow: true
+        });
       }
     });
     try {
@@ -539,6 +856,42 @@ export class BuildingManager {
     }
   }
 
+  _callRequiredDelegateCommand(action, methodName, {
+    delegate = this._delegate,
+    args = [],
+    context = {},
+    missingReturn = undefined,
+    rethrow = false
+  } = {}) {
+    const details = context && typeof context === 'object' ? context : {};
+    if (!delegate) {
+      const error = new Error(`Building delegate missing required ${methodName}`);
+      Logger.error?.(`BuildingManager.${action}.delegateMissing`, details);
+      if (rethrow) throw error;
+      return { ok: false, result: missingReturn, error };
+    }
+    const method = delegate?.[methodName];
+    if (typeof method !== 'function') {
+      const error = new Error(`Building delegate missing required ${methodName}`);
+      Logger.error?.(`BuildingManager.${action}.methodMissing`, details);
+      if (rethrow) throw error;
+      return { ok: false, result: missingReturn, error };
+    }
+    try {
+      return {
+        ok: true,
+        result: method.call(delegate, ...(Array.isArray(args) ? args : []))
+      };
+    } catch (error) {
+      Logger.warn?.(`BuildingManager.${action}.failed`, {
+        error: stringifyError(error),
+        ...details
+      });
+      if (rethrow) throw error;
+      return { ok: false, result: missingReturn, error };
+    }
+  }
+
   _scheduleEntitlementProbe() {
     return scheduleEntitlementRevalidation(this, {
       featureId: FEATURE_ID,
@@ -553,36 +906,44 @@ export class BuildingManager {
       featureId: FEATURE_ID,
       loggerPrefix: 'BuildingManager',
       clearReason: 'building-revalidate-failed',
-      warningMessage: 'Authentication expired - premium building editing has been disabled. Please reconnect Patreon.',
-      stopSession: () => this.stop?.(),
-      resetState: () => {
-        this._delegate = null;
-      }
+      editorLabel: 'Building Editor session'
     });
   }
 
   _installCanvasRebindGuard(delegate) {
-    if (!delegate || delegate.__faNexusCanvasRebindGuardInstalled) return;
+    if (!delegate || CANVAS_REBIND_GUARDS.has(delegate)) return;
     const originalStop = typeof delegate.stop === 'function' ? delegate.stop.bind(delegate) : null;
     if (!originalStop) return;
-    Object.defineProperty(delegate, '__faNexusOriginalStop', {
-      configurable: true,
-      enumerable: false,
-      writable: false,
-      value: originalStop
-    });
     delegate.stop = (...args) => {
+      if (delegate.architecture === BUILDING_EDITOR_ARCHITECTURE_V2 && delegate.isCommitting) return false;
       if (this._shouldRecoverFromCanvasTeardown(delegate, args)) {
         return this._handleCanvasTeardownRecovery(delegate);
       }
       this._clearCanvasRebindState({ delegate });
       return originalStop(...args);
     };
-    Object.defineProperty(delegate, '__faNexusCanvasRebindGuardInstalled', {
-      configurable: true,
-      enumerable: false,
-      writable: false,
-      value: true
+    CANVAS_REBIND_GUARDS.set(delegate, { originalStop });
+  }
+
+  _callRequiredCanvasRebindDelegateMethod(delegate, methodName, args = []) {
+    return callRequiredDelegateMethod({
+      delegate,
+      methodName,
+      args,
+      loggerPrefix: 'BuildingManager',
+      logScope: 'canvasRebind',
+      bundleLabel: 'building editor'
+    });
+  }
+
+  _callRequiredPreviewPlacementDelegateMethod(methodName, args = []) {
+    return callRequiredPreviewPlacementAdapterMethod({
+      delegate: this._delegate,
+      adapterKind: 'building',
+      methodName,
+      args,
+      loggerPrefix: 'BuildingManager',
+      bundleLabel: 'building editor'
     });
   }
 
@@ -612,7 +973,8 @@ export class BuildingManager {
     if (existing?.delegate === delegate) return existing.promise;
     this._clearCanvasRebindState({ delegate });
     this._cancelToolWindowMonitor();
-    const expectedSceneId = String(delegate?._session?.sceneId || canvas?.scene?.id || '').trim();
+    const rebindHostState = this._callRequiredCanvasRebindDelegateMethod(delegate, 'getCanvasRebindHostState');
+    const expectedSceneId = String(rebindHostState?.sceneId || canvas?.scene?.id || '').trim();
     Logger.warn?.('BuildingManager.session.canvasTeardownIntercepted', buildHostedSessionContextDetails({
       app: this._app,
       delegate,
@@ -621,9 +983,6 @@ export class BuildingManager {
         expectedSceneId: expectedSceneId || null
       }
     }));
-    try { delegate._removeInteractionHandlers?.(); } catch (_) {}
-    try { delegate._clearDebugPreview?.(); } catch (_) {}
-    try { delegate._destroyOverlayLayer?.(); } catch (_) {}
 
     let resolvePromise;
     const promise = new Promise((resolve) => {
@@ -634,6 +993,14 @@ export class BuildingManager {
       this._clearCanvasRebindState({ delegate });
       resolvePromise?.(value);
       return value;
+    };
+
+    const logStopDelegateRejection = (reason, error) => {
+      Logger.error?.('BuildingManager.session.canvasRebindStopDelegateFailed', {
+        reason,
+        expectedSceneId: expectedSceneId || null,
+        error: stringifyError(error)
+      });
     };
 
     const stopDelegate = async (reason, error = null) => {
@@ -649,7 +1016,7 @@ export class BuildingManager {
           expectedSceneId: expectedSceneId || null
         });
       }
-      const stopFn = delegate?.__faNexusOriginalStop || delegate?.stop;
+      const stopFn = CANVAS_REBIND_GUARDS.get(delegate)?.originalStop || delegate?.stop;
       try {
         await Promise.resolve(stopFn?.({ reason }));
       } catch (stopError) {
@@ -661,6 +1028,12 @@ export class BuildingManager {
       }
       return finish(false);
     };
+
+    try {
+      this._callRequiredCanvasRebindDelegateMethod(delegate, 'prepareCanvasRebindRecovery');
+    } catch (error) {
+      return stopDelegate('canvas-rebind-prepare-failed', error);
+    }
 
     const resume = async () => {
       if (!delegate?.isActive) {
@@ -674,19 +1047,7 @@ export class BuildingManager {
         return stopDelegate('canvas-rebind-host-not-ready');
       }
       try {
-        delegate._installInteractionHandlers?.();
-        delegate._ensureOverlayLayer?.();
-        delegate._updateWallTexturePreview?.();
-        delegate._updateFillTexturePreview?.();
-        delegate._updateShadowPreview?.();
-        delegate._updateDoorFramePreview?.();
-        delegate._updateWindowPreview?.();
-        if (delegate._shapeEditMode) delegate._refreshShapeEditState?.({ immediate: true });
-        if (delegate._gapEditMode) delegate._refreshGapOverlay?.();
-        if (delegate._pointEditMode) {
-          delegate._refreshPointHandles?.();
-          delegate._updateEditOverlayVisibility?.();
-        }
+        this._callRequiredCanvasRebindDelegateMethod(delegate, 'resumeCanvasRebindRecovery');
         this._syncToolOptionsState({
           suppressRender: false,
           suppressSubtoolPersistence: true,
@@ -709,12 +1070,16 @@ export class BuildingManager {
 
     const readyHook = () => {
       Promise.resolve(resume()).catch((error) => {
-        stopDelegate('canvas-rebind-ready-hook-threw', error).catch?.(() => {});
+        stopDelegate('canvas-rebind-ready-hook-threw', error).catch((stopError) => {
+          logStopDelegateRejection('canvas-rebind-ready-hook-threw', stopError);
+        });
       });
     };
 
     const timeoutId = setTimeout(() => {
-      Promise.resolve(stopDelegate('canvas-rebind-timeout')).catch(() => {});
+      Promise.resolve(stopDelegate('canvas-rebind-timeout')).catch((error) => {
+        logStopDelegateRejection('canvas-rebind-timeout', error);
+      });
     }, CANVAS_REBIND_TIMEOUT_MS);
 
     this._canvasRebindState = {
@@ -729,14 +1094,11 @@ export class BuildingManager {
   }
 
   _beginToolWindowMonitor(delegate) {
-    this._cancelToolWindowMonitor();
-    if (!delegate) return;
-    this._toolMonitor = startHostedToolWindowMonitor({
+    beginHostedToolWindowMonitor(this, {
       delegate,
       toolId: FEATURE_ID,
       isHostReady: () => this._isEditorHostReady(),
       clearEditingTile: () => this._clearEditingTile(),
-      cancelMonitor: () => this._cancelToolWindowMonitor(),
       deactivateBeforeCancel: false,
       stopOrphanedSession: (details) => this._stopOrphanedSession(details),
       hostFailureGraceMs: HOST_CONTEXT_GRACE_MS,
@@ -751,9 +1113,6 @@ export class BuildingManager {
           }
         }));
       },
-      assignMonitorToken: (nextToken) => {
-        this._toolMonitor = nextToken;
-      },
       syncToolOptions: () => {
         this._syncToolOptionsState({
           suppressRender: true,
@@ -766,7 +1125,7 @@ export class BuildingManager {
   }
 
   _cancelToolWindowMonitor() {
-    this._toolMonitor = cancelToolWindowMonitor(this._toolMonitor);
+    cancelHostedToolWindowMonitor(this);
   }
 
   _markEditingTile(targetTile) {
@@ -786,19 +1145,66 @@ export class BuildingManager {
   }
 
   _clearEditingTile() {
+    return this._endEditingTileWithRefresh().tileId;
+  }
+
+  _endEditingTileWithRefresh({ deferRefresh = false } = {}) {
     const refreshJobs = [];
     const { tileId, refreshPromise } = endEditingTileWithRefresh(this, {
       sharedSetKey: EDITING_TILE_SET_KEY,
       loggerPrefix: 'BuildingManager',
       collectRefreshJobs: ({ tile }) => {
+        if (deferRefresh) return [];
         refreshJobs.push(Promise.resolve(applyBuildingTile(tile)));
         refreshJobs.push(Promise.resolve(applyBuildingCompositeTile(tile)));
         refreshJobs.push(Promise.resolve(applyDoorFrameTile(tile)));
         return refreshJobs;
       }
     });
-    this._refreshExitedEditTile(tileId, refreshPromise || (refreshJobs.length ? Promise.allSettled(refreshJobs) : null));
-    return tileId;
+    const combinedRefresh = refreshPromise || (refreshJobs.length ? Promise.all(refreshJobs) : null);
+    if (!deferRefresh) this._refreshExitedEditTile(tileId, combinedRefresh);
+    return { tileId, refreshPromise: combinedRefresh };
+  }
+
+  async prepareEditingTileExit({ linkedTileIds = [], deferRefresh = false } = {}) {
+    const result = this._endEditingTileWithRefresh({ deferRefresh });
+    if (result.refreshPromise) await result.refreshPromise;
+    const linkedIds = Array.from(new Set(
+      (Array.isArray(linkedTileIds) ? linkedTileIds : [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean)
+    ));
+    for (const tileId of deferRefresh ? [] : linkedIds) {
+      const tile = resolveTilePlaceable(null, tileId);
+      if (!tile || tile.destroyed) {
+        throw new Error(`Building exit handoff could not resolve linked Tile ${tileId}.`);
+      }
+      await Promise.all([
+        Promise.resolve(applyBuildingTile(tile)),
+        Promise.resolve(applyBuildingCompositeTile(tile)),
+        Promise.resolve(applyDoorFrameTile(tile))
+      ]);
+      try { tile.renderFlags?.set?.({ refreshState: true }); } catch (_) {}
+    }
+    const root = globalThis?.window ?? globalThis;
+    if (typeof root?.requestAnimationFrame === 'function') {
+      await new Promise((resolve) => {
+        root.requestAnimationFrame(() => root.requestAnimationFrame(resolve));
+      });
+    }
+    return {
+      tileId: result.tileId || null,
+      linkedTileIds: linkedIds,
+      refreshed: deferRefresh ? false : (!!result.refreshPromise || linkedIds.length > 0)
+    };
+  }
+
+  restoreEditingTile({ tileId = null } = {}) {
+    const normalizedTileId = String(tileId || '').trim();
+    const document = normalizedTileId ? globalThis.canvas?.scene?.tiles?.get?.(normalizedTileId) : null;
+    if (!document) throw new Error(`Building edit handoff could not restore Tile ${normalizedTileId || '(missing)'}.`);
+    this._markEditingTile(document);
+    return true;
   }
 
   _refreshExitedEditTile(tileId = null, waitFor = null) {
@@ -847,15 +1253,78 @@ export class BuildingManager {
     const baseHints = [];
     let delegateState = {};
     let handlers = {};
-    try {
-      const descriptor = this._delegate?.getToolOptionsDescriptor?.();
-      if (descriptor) {
-        if (descriptor.state && typeof descriptor.state === 'object') delegateState = descriptor.state;
-        if (descriptor.handlers && typeof descriptor.handlers === 'object') handlers = descriptor.handlers;
+    const delegate = this._delegate;
+    if (delegate) {
+      const descriptor = callRequiredDelegateMethod({
+        delegate,
+        methodName: 'getToolOptionsDescriptor',
+        loggerPrefix: 'BuildingManager',
+        logScope: 'toolOptionsDescriptor',
+        bundleLabel: 'building editor'
+      });
+      if (!descriptor || typeof descriptor !== 'object') {
+        Logger.error?.('BuildingManager.toolOptionsDescriptor.invalidDescriptor', {
+          descriptorType: typeof descriptor
+        });
+        throw new Error('Building editor bundle returned invalid tool-options descriptor.');
       }
-    } catch (error) {
-      Logger.warn?.('BuildingManager.toolOptionsState.delegateFailed', { error: stringifyError(error) });
+      if (descriptor.state && typeof descriptor.state === 'object') delegateState = descriptor.state;
+      if (descriptor.handlers && typeof descriptor.handlers === 'object') handlers = descriptor.handlers;
     }
+    const delegateEditorActionHandler = handlers.handleEditorAction;
+    const delegateCustomToggleHandlers = handlers.customToggles && typeof handlers.customToggles === 'object'
+      ? handlers.customToggles
+      : {};
+    const subtoolToggleHandlers = Object.fromEntries(
+      (Array.isArray(delegateState?.subtoolToggles) ? delegateState.subtoolToggles : [])
+        .map((toggle) => String(toggle?.id || '').trim())
+        .filter(Boolean)
+        .map((id) => [id, (enabled) => (enabled ? this.setActiveTool(id) : true)])
+    );
+    handlers = {
+      ...handlers,
+      setWallSnapEnabled: async (enabled) => {
+        await game.settings.set(MODULE_ID, WALL_SNAP_SETTING_KEY, enabled === true);
+        this._syncToolOptionsState({ suppressRender: false, forcePreviewLayerNotify: false });
+        return true;
+      },
+      setBuildingWorkspaceMode: (modeId) => {
+        const id = String(modeId || '').trim();
+        if (id === 'outer-walls') {
+          const activeShape = (delegateState?.subtoolToggles || []).find((toggle) => (
+            toggle?.enabled === true && ['rectangle', 'ellipse', 'polygon'].includes(String(toggle?.id || ''))
+          ));
+          return activeShape ? true : this.setActiveTool('rectangle');
+        }
+        if (id === 'inner-walls') return this.setActiveTool('inner-wall');
+        if (id === 'portals') return this.setActiveTool(id);
+        if (id === 'edit-geometry') return this.setActiveTool('edit-geometry');
+        if (id === 'fill') return this.setActiveTool('fill');
+        return false;
+      },
+      setOuterShapeTool: (shapeId) => {
+        const id = String(shapeId || '').trim();
+        return ['rectangle', 'ellipse', 'polygon'].includes(id) ? this.setActiveTool(id) : false;
+      },
+      customToggles: {
+        ...delegateCustomToggleHandlers,
+        ...subtoolToggleHandlers
+      },
+      handleEditorAction: (actionId) => {
+        const id = String(actionId || '').trim();
+        if (id === 'commit') return this.commitBuilding({ reason: 'button' });
+        if (id === 'cancel') return this.requestCancelSession({ reason: 'button' });
+        if (id === 'undo' || id === 'redo') {
+          return this._callRequiredDelegateCommand(id, id, {
+            context: { source: 'tool-options' },
+            rethrow: true
+          }).result;
+        }
+        return typeof delegateEditorActionHandler === 'function'
+          ? delegateEditorActionHandler(actionId)
+          : false;
+      }
+    };
     const mergedHints = [...baseHints];
     if (Array.isArray(delegateState?.hints)) {
       for (const hint of delegateState.hints) {
@@ -864,39 +1333,12 @@ export class BuildingManager {
     } else if (typeof delegateState?.hints === 'string' && delegateState.hints.trim()) {
       mergedHints.push(delegateState.hints.trim());
     }
-    const state = { ...delegateState, hints: mergedHints };
-    const wallHsbcAvailable = !!state?.pathAppearance?.hsbc?.available;
-    const fillHsbcAvailable = !!state?.fillHsbc?.available;
-    const activeHsbcTarget = fillHsbcAvailable && (!wallHsbcAvailable || this._hsbcTarget === 'fill') ? 'fill' : 'wall';
-    this._hsbcTarget = activeHsbcTarget;
-    state.colorTarget = {
-      available: wallHsbcAvailable || fillHsbcAvailable,
-      value: activeHsbcTarget,
-      options: [
-        {
-          id: 'wall',
-          label: 'Walls',
-          enabled: activeHsbcTarget === 'wall',
-          disabled: !wallHsbcAvailable,
-          tooltip: 'Adjust wall HSBC settings.'
-        },
-        {
-          id: 'fill',
-          label: 'Fill',
-          enabled: activeHsbcTarget === 'fill',
-          disabled: !fillHsbcAvailable,
-          tooltip: fillHsbcAvailable
-            ? 'Adjust fill HSBC settings.'
-            : 'Select a fill texture to enable fill color controls.'
-        }
-      ]
-    };
-    handlers = {
-      ...handlers,
-      setColorTarget: (target) => {
-        this._hsbcTarget = target === 'fill' ? 'fill' : 'wall';
-        this.requestToolOptionsUpdate({ suppressRender: true });
-        return true;
+    const state = {
+      ...delegateState,
+      hints: mergedHints,
+      wallSnap: {
+        available: true,
+        enabled: game.settings.get(MODULE_ID, WALL_SNAP_SETTING_KEY) === true
       }
     };
     return { state, handlers };
@@ -908,176 +1350,31 @@ export class BuildingManager {
         .filter((toggle) => String(toggle?.group || '') === 'placement')
         .map((toggle) => ({ id: String(toggle?.id || ''), enabled: !!toggle?.enabled }))
       : [];
-    const fillElevation = Number(descriptor?.legacyState?.fillElevation?.value ?? NaN);
+    const hostState = this._getPreviewLayerHostState();
+    const fillElevation = Number(descriptor?.legacyState?.fillElevation?.value ?? hostState?.fillElevation ?? NaN);
     const previewState = {
-      active: !!this._delegate?.isActive,
-      elevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : null,
+      active: !!hostState?.active,
+      elevation: Number.isFinite(hostState?.elevation) ? Number(hostState.elevation) : null,
       fillElevation: Number.isFinite(fillElevation) ? fillElevation : null,
-      sort: Number.isFinite(this._delegate?._previewSort) ? Number(this._delegate._previewSort) : null,
+      sort: Number.isFinite(hostState?.sort) ? Number(hostState.sort) : null,
       portalMode: !!this._portalMode,
       placementToggles: customToggles
     };
-    const signature = JSON.stringify(previewState);
-    if (!force && signature === this._lastPreviewLayerSignature) return;
-    this._lastPreviewLayerSignature = signature;
-    try { Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source, previewState }); } catch (_) {}
-  }
-
-  _getLayerManagerPreviewPlacementStore() {
-    const delegate = this._delegate;
-    if (!delegate) return null;
-    if (!delegate.__faNexusLayerManagerPreviewPlacement || typeof delegate.__faNexusLayerManagerPreviewPlacement !== 'object') {
-      try {
-        Object.defineProperty(delegate, '__faNexusLayerManagerPreviewPlacement', {
-          configurable: true,
-          enumerable: false,
-          writable: true,
-          value: {}
-        });
-      } catch (_) {
-        delegate.__faNexusLayerManagerPreviewPlacement = {};
-      }
-    }
-    return delegate.__faNexusLayerManagerPreviewPlacement;
-  }
-
-  _rememberLayerManagerPreviewPlacement({
-    previewKind = 'building-preview',
-    elevation = undefined,
-    sort = undefined,
-    previewSort = undefined,
-    placementLevelId = undefined,
-    anchorTileId = undefined,
-    sortBefore = undefined
-  } = {}) {
-    const delegate = this._delegate;
-    const store = this._getLayerManagerPreviewPlacementStore();
-    if (!delegate || !store) return null;
-    const targetIsFill = previewKind === 'building-fill-preview';
-    const key = targetIsFill ? 'fill' : 'wall';
-    const currentElevation = targetIsFill
-      ? Number(delegate._fillElevation ?? NaN)
-      : Number(delegate._previewElevation ?? NaN);
-    const currentSort = targetIsFill
-      ? Number(delegate._fillPreviewSort ?? NaN)
-      : Number(delegate._previewSort ?? NaN);
-    const currentPreviewSort = targetIsFill
-      ? Number(delegate._fillPreviewRenderSort ?? NaN)
-      : Number(delegate._previewRenderSort ?? NaN);
-    const nextElevation = Number.isFinite(Number(elevation))
-      ? Number(elevation)
-      : currentElevation;
-    const nextSort = Number.isFinite(Number(sort))
-      ? Number(sort)
-      : currentSort;
-    const nextPreviewSort = Number.isFinite(Number(previewSort))
-      ? Number(previewSort)
-      : (Number.isFinite(currentPreviewSort) ? currentPreviewSort : nextSort);
-    if (!Number.isFinite(nextElevation) || !Number.isFinite(nextSort)) return null;
-    store[key] = {
-      previewKind: targetIsFill ? 'building-fill-preview' : 'building-preview',
-      elevation: nextElevation,
-      sort: nextSort,
-      previewSort: Number.isFinite(nextPreviewSort) ? nextPreviewSort : nextSort,
-      placementLevelId: placementLevelId !== undefined
-        ? (String(placementLevelId || '').trim() || null)
-        : (String(delegate?._session?.placementLevelId || '').trim() || null),
-      anchorTileId: anchorTileId !== undefined
-        ? (String(anchorTileId || '').trim() || null)
-        : (String(delegate?._placementSortAnchorTileId || '').trim() || null),
-      sortBefore: sortBefore !== undefined
-        ? sortBefore === true
-        : delegate?._placementSortBeforeAnchor === true
-    };
-    return store[key];
-  }
-
-  _reassertLayerManagerPreviewPlacement(previewKind = 'building-preview', { source = 'building-preview-ordering-guard' } = {}) {
-    const delegate = this._delegate;
-    const store = delegate?.__faNexusLayerManagerPreviewPlacement || null;
-    if (!delegate || !store) return false;
-    const targetIsFill = previewKind === 'building-fill-preview';
-    const key = targetIsFill ? 'fill' : 'wall';
-    const placement = store[key] || null;
-    if (!placement) return false;
-    const currentElevation = targetIsFill
-      ? Number(delegate._fillElevation ?? NaN)
-      : Number(delegate._previewElevation ?? NaN);
-    const storedElevation = Number(placement.elevation);
-    if (!Number.isFinite(currentElevation) || !Number.isFinite(storedElevation) || Math.abs(currentElevation - storedElevation) > 0.0005) {
-      delete store[key];
-      Logger.debug?.('BuildingManager.previewOrderingGuard.cleared', {
-        previewKind: placement.previewKind || previewKind,
-        source,
-        currentElevation: Number.isFinite(currentElevation) ? currentElevation : null,
-        storedElevation: Number.isFinite(storedElevation) ? storedElevation : null
-      });
-      return false;
-    }
-    const nextSort = Number(placement.sort);
-    const nextPreviewSort = Number(placement.previewSort);
-    if (!Number.isFinite(nextSort)) return false;
-    try {
-      if (targetIsFill) {
-        delegate._fillPreviewSort = nextSort;
-        delegate._fillPreviewRenderSort = Number.isFinite(nextPreviewSort) ? nextPreviewSort : nextSort;
-      } else {
-        delegate._previewSort = nextSort;
-        delegate._previewRenderSort = Number.isFinite(nextPreviewSort) ? nextPreviewSort : nextSort;
-      }
-    } catch (_) {}
-    this._applyCurrentPreviewLayerOrdering({
-      fillElevation: targetIsFill ? storedElevation : null,
-      fillSort: targetIsFill ? nextSort : null,
-      ensurePreviewLayer: false,
-      ensureFillLayer: false
+    notifyHostedPreviewLayerChangeIfNeeded({
+      previewState,
+      source,
+      force,
+      lastSignature: this._lastPreviewLayerSignature,
+      setLastSignature: (signature) => { this._lastPreviewLayerSignature = signature; },
+      loggerPrefix: 'BuildingManager'
     });
-    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source });
-    return true;
   }
 
-  _installDelegatePreviewOrderingGuard(delegate) {
-    if (!delegate || delegate.__faNexusPreviewOrderingGuardInstalled) return;
-    const originalPreviewOrdering = typeof delegate._syncPreviewOrdering === 'function'
-      ? delegate._syncPreviewOrdering
-      : null;
-    const originalFillOrdering = typeof delegate._syncFillPreviewLayerOrdering === 'function'
-      ? delegate._syncFillPreviewLayerOrdering
-      : null;
-    if (!originalPreviewOrdering && !originalFillOrdering) return;
-
-    if (originalPreviewOrdering) {
-      const manager = this;
-      delegate._syncPreviewOrdering = function faNexusGuardedSyncPreviewOrdering(...args) {
-        const result = originalPreviewOrdering.apply(this, args);
-        manager._reassertLayerManagerPreviewPlacement('building-preview', {
-          source: 'building-preview-ordering-guard'
-        });
-        return result;
-      };
+  _getPreviewLayerHostState() {
+    if (!this._delegate) {
+      return { active: false, elevation: null, fillElevation: null, sort: null };
     }
-
-    if (originalFillOrdering) {
-      const manager = this;
-      delegate._syncFillPreviewLayerOrdering = function faNexusGuardedSyncFillPreviewLayerOrdering(...args) {
-        const result = originalFillOrdering.apply(this, args);
-        manager._reassertLayerManagerPreviewPlacement('building-fill-preview', {
-          source: 'building-fill-preview-ordering-guard'
-        });
-        return result;
-      };
-    }
-
-    try {
-      Object.defineProperty(delegate, '__faNexusPreviewOrderingGuardInstalled', {
-        configurable: true,
-        enumerable: false,
-        writable: false,
-        value: true
-      });
-    } catch (_) {
-      delegate.__faNexusPreviewOrderingGuardInstalled = true;
-    }
+    return this._callRequiredPreviewPlacementDelegateMethod('getPreviewLayerHostState');
   }
 
   _applyPendingLaunchPlacementAnchorTileId() {
@@ -1085,60 +1382,16 @@ export class BuildingManager {
     const anchorTileId = this._pendingLaunchPlacementAnchorTileId || null;
     this._pendingLaunchPlacementAnchorTileId = undefined;
     if (!this._delegate) return anchorTileId;
-    try { this._delegate._placementSortAnchorTileId = anchorTileId; } catch (_) {}
-    try { this._delegate._placementSortBeforeAnchor = false; } catch (_) {}
-    const session = this._delegate._session && typeof this._delegate._session === 'object'
-      ? this._delegate._session
-      : (this._delegate._session = {});
-    session.placementAnchorTileId = anchorTileId;
+    this._callRequiredPreviewPlacementDelegateMethod('applyLaunchPlacementAnchorTileId', [anchorTileId]);
     Logger.debug?.('BuildingManager.sortAnchor.launchApply', { anchorTileId });
     return anchorTileId;
   }
 
   _syncDelegatePreviewRenderSort() {
-    const delegate = this._delegate;
-    if (!delegate) return null;
-    const currentPlacementSort = Number(delegate?._previewSort ?? 0);
-    if (this._editingTileId) {
-      const resolvedSort = Number.isFinite(currentPlacementSort) ? currentPlacementSort : 0;
-      try { delegate._previewRenderSort = resolvedSort; } catch (_) {}
-      return resolvedSort;
-    }
-    const elevation = Number(delegate?._previewElevation ?? delegate?._fillElevation ?? 0);
-    const resolved = resolvePlacementSortAtElevation(Number.isFinite(elevation) ? elevation : 0, {
-      anchorTileId: delegate?._placementSortAnchorTileId,
-      sortBefore: delegate?._placementSortBeforeAnchor === true,
-      scene: canvas?.scene,
-      count: 1
-    });
-    const placementSort = Number(resolved?.sort ?? currentPlacementSort);
-    if (Number.isFinite(placementSort) && Number.isFinite(currentPlacementSort) && Math.abs(placementSort - currentPlacementSort) > 0.000001) {
-      Logger.debug?.('BuildingManager.previewSort.launchResolved', {
-        previousSort: currentPlacementSort,
-        resolvedSort: placementSort,
-        elevation: Number.isFinite(elevation) ? elevation : 0,
-        anchorTileId: delegate?._placementSortAnchorTileId || null
-      });
-      try { delegate._previewSort = placementSort; } catch (_) {}
-    }
-    const renderSort = Number(resolved?.previewSort ?? placementSort);
-    const nextRenderSort = Number.isFinite(renderSort)
-      ? renderSort
-      : (Number.isFinite(placementSort) ? placementSort : 0);
-    try { delegate._previewRenderSort = nextRenderSort; } catch (_) {}
-    this._rememberLayerManagerPreviewPlacement({
-      previewKind: 'building-preview',
-      elevation,
-      sort: placementSort,
-      previewSort: nextRenderSort,
-      placementLevelId: delegate?._session?.placementLevelId,
-      anchorTileId: delegate?._placementSortAnchorTileId,
-      sortBefore: delegate?._placementSortBeforeAnchor === true
-    });
-    if (Number.isFinite(Number(delegate?._fillPreviewSort)) && !Number.isFinite(Number(delegate?._fillPreviewRenderSort))) {
-      try { delegate._fillPreviewRenderSort = Number(delegate._fillPreviewSort); } catch (_) {}
-    }
-    return nextRenderSort;
+    if (!this._delegate) return null;
+    return this._callRequiredPreviewPlacementDelegateMethod('syncPreviewRenderSort', [{
+      editingTileId: this._editingTileId || null
+    }]);
   }
 
   _applyCurrentPreviewLayerOrdering({
@@ -1147,73 +1400,13 @@ export class BuildingManager {
     ensurePreviewLayer = true,
     ensureFillLayer = true
   } = {}) {
-    const delegate = this._delegate;
-    if (!delegate) return;
-    const applyLayerOrdering = (layer, elevation, sort, renderSortOverride = undefined) => {
-      if (!layer || layer.destroyed) return;
-      const resolvedSort = Number.isFinite(Number(sort)) ? Number(sort) : 0;
-      const resolvedRenderSort = Number.isFinite(Number(renderSortOverride)) ? Number(renderSortOverride) : resolvedSort;
-      const resolvedElevation = Number.isFinite(Number(elevation)) ? Number(elevation) : 0;
-      const placementLevelId = String(delegate?._session?.placementLevelId || getDefaultTilePlacementLevelId() || '').trim() || null;
-      const renderOrder = resolveTileRenderOrder({ elevation: resolvedElevation, sort: resolvedRenderSort }, {
-        elevation: resolvedElevation,
-        sort: resolvedRenderSort,
-        placementLevelId,
-        allowCurrentLevelFallback: true
-      });
-      const renderSort = Number.isFinite(Number(renderOrder?.sort)) ? Number(renderOrder.sort) : resolvedRenderSort;
-      const renderElevation = Number.isFinite(Number(renderOrder?.elevation)) ? Number(renderOrder.elevation) : getTileRenderElevation(resolvedElevation);
-      const zIndex = Number.isFinite(Number(renderOrder?.zIndex)) ? Number(renderOrder.zIndex) : (getGroundBandRenderSort(resolvedElevation, resolvedRenderSort) !== null ? resolvedRenderSort : resolvedRenderSort);
-      const sortLayer = Number.isFinite(Number(renderOrder?.sortLayer)) ? Number(renderOrder.sortLayer) : layer.sortLayer;
-      try { delegate?._applyTileSortLayer?.(layer); } catch (_) {}
-      try { layer.faNexusElevationDoc = resolvedElevation; } catch (_) {}
-      try { layer.faNexusElevation = renderElevation; } catch (_) {}
-      try { layer.faNexusPlacementLevelId = renderOrder?.placementLevelId || placementLevelId || null; } catch (_) {}
-      try { layer.faNexusBandKind = renderOrder?.kind || 'normal'; } catch (_) {}
-      try { layer.elevation = renderElevation; } catch (_) {}
-      try { layer.faNexusSort = renderSort; } catch (_) {}
-      try { layer.faNexusPlacementSort = resolvedSort; } catch (_) {}
-      try { layer.faNexusPreviewSort = resolvedRenderSort; } catch (_) {}
-      try { layer.sort = renderSort; } catch (_) {}
-      try { layer.sortLayer = sortLayer; } catch (_) {}
-      try { layer.zIndex = zIndex; } catch (_) {}
-      const parent = layer.parent;
-      if (!parent) return;
-      try {
-        if ('sortDirty' in parent) parent.sortDirty = true;
-        parent.sortChildren?.();
-      } catch (_) {}
-    };
-
-    const previewRenderSort = Number.isFinite(Number(delegate._previewRenderSort))
-      ? Number(delegate._previewRenderSort)
-      : this._syncDelegatePreviewRenderSort();
-    if ((!delegate._previewLayer || delegate._previewLayer.destroyed) && ensurePreviewLayer) {
-      try { delegate._ensurePreviewLayer?.(delegate._previewElevation); } catch (_) {}
-    }
-    if (delegate._previewLayer && !delegate._previewLayer.destroyed) {
-      applyLayerOrdering(delegate._previewLayer, delegate._previewElevation, delegate._previewSort, previewRenderSort);
-    }
-    const storedFillSort = delegate._fillPreviewSort === null || delegate._fillPreviewSort === undefined
-      ? NaN
-      : Number(delegate._fillPreviewSort);
-    const resolvedFillElevation = Number.isFinite(Number(fillElevation))
-      ? Number(fillElevation)
-      : Number(delegate._fillElevation ?? NaN);
-    const resolvedFillSort = Number.isFinite(Number(fillSort))
-      ? Number(fillSort)
-      : (Number.isFinite(storedFillSort)
-        ? storedFillSort
-        : Number(delegate._previewSort ?? NaN));
-    const resolvedFillRenderSort = Number.isFinite(Number(delegate._fillPreviewRenderSort))
-      ? Number(delegate._fillPreviewRenderSort)
-      : resolvedFillSort;
-    if ((!delegate._fillPreviewLayer || delegate._fillPreviewLayer.destroyed) && ensureFillLayer) {
-      try { delegate._ensureFillPreviewLayer?.(resolvedFillElevation); } catch (_) {}
-    }
-    if (delegate._fillPreviewLayer && !delegate._fillPreviewLayer.destroyed) {
-      applyLayerOrdering(delegate._fillPreviewLayer, resolvedFillElevation, resolvedFillSort, resolvedFillRenderSort);
-    }
+    if (!this._delegate) return false;
+    return this._callRequiredPreviewPlacementDelegateMethod('applyCurrentPreviewLayerOrdering', [{
+      fillElevation,
+      fillSort,
+      ensurePreviewLayer,
+      ensureFillLayer
+    }]);
   }
 
   applyLayerManagerPreviewPlacement({
@@ -1225,137 +1418,17 @@ export class BuildingManager {
     anchorTileId = undefined,
     sortBefore = undefined
   } = {}) {
-    if (!this._delegate?.isActive) return false;
-    const { state, handlers } = this._buildToolOptionsState();
-    let changed = false;
-    const targetIsFill = previewKind === 'building-fill-preview';
-
-    if (placementLevelId !== undefined) {
-      const nextPlacementLevelId = String(placementLevelId || '').trim() || null;
-      const session = this._delegate._session && typeof this._delegate._session === 'object'
-        ? this._delegate._session
-        : (this._delegate._session = {});
-      const currentPlacementLevelId = String(session.placementLevelId || '').trim() || null;
-      if (currentPlacementLevelId !== nextPlacementLevelId) {
-        session.placementLevelId = nextPlacementLevelId;
-        session.placementLevels = nextPlacementLevelId ? [nextPlacementLevelId] : [];
-        changed = true;
-      }
-      for (const layer of [this._delegate._previewLayer, this._delegate._fillPreviewLayer]) {
-        if (!layer || layer.destroyed) continue;
-        try { layer.faNexusPlacementLevelId = nextPlacementLevelId; } catch (_) {}
-      }
-    }
-
-    if (anchorTileId !== undefined) {
-      const nextAnchorTileId = String(anchorTileId || '').trim() || null;
-      if (String(this._delegate._placementSortAnchorTileId || '').trim() !== String(nextAnchorTileId || '').trim()) {
-        this._delegate._placementSortAnchorTileId = nextAnchorTileId;
-        const session = this._delegate._session && typeof this._delegate._session === 'object'
-          ? this._delegate._session
-          : (this._delegate._session = {});
-        session.placementAnchorTileId = nextAnchorTileId;
-        changed = true;
-      }
-    }
-
-    if (sortBefore !== undefined) {
-      const nextSortBefore = sortBefore === true;
-      if (this._delegate?._placementSortBeforeAnchor !== nextSortBefore) {
-        try { this._delegate._placementSortBeforeAnchor = nextSortBefore; } catch (_) {}
-        changed = true;
-      }
-    }
-
-    if (Number.isFinite(Number(elevation))) {
-      const nextElevation = Number(elevation);
-      const currentElevation = targetIsFill
-        ? Number(state?.fillElevation?.value ?? NaN)
-        : Number(this._delegate?._previewElevation ?? NaN);
-      if (!Number.isFinite(currentElevation) || currentElevation !== nextElevation) {
-        const handlerId = targetIsFill ? 'setFillElevation' : 'setElevation';
-        if (typeof handlers?.[handlerId] === 'function') handlers[handlerId](nextElevation, true);
-        else if (!targetIsFill) this._delegate._previewElevation = nextElevation;
-        changed = true;
-      }
-    }
-
-    if (sort !== undefined && Number.isFinite(Number(sort))) {
-      const nextSort = Number(sort);
-      const previousSort = targetIsFill
-        ? Number(this._delegate?._fillPreviewSort ?? NaN)
-        : Number(this._delegate?._previewSort ?? NaN);
-      if (previousSort !== nextSort) {
-        try {
-          if (targetIsFill) this._delegate._fillPreviewSort = nextSort;
-          else this._delegate._previewSort = nextSort;
-        } catch (_) {}
-        changed = true;
-      }
-      const nextPreviewSort = previewSort !== undefined && Number.isFinite(Number(previewSort))
-        ? Number(previewSort)
-        : nextSort;
-      const previousPreviewSort = targetIsFill
-        ? Number(this._delegate?._fillPreviewRenderSort ?? NaN)
-        : Number(this._delegate?._previewRenderSort ?? NaN);
-      if (previousPreviewSort !== nextPreviewSort) {
-        try {
-          if (targetIsFill) this._delegate._fillPreviewRenderSort = nextPreviewSort;
-          else this._delegate._previewRenderSort = nextPreviewSort;
-        } catch (_) {}
-        changed = true;
-      }
-    }
-
-    const requestedPlacementUpdate = (
-      placementLevelId !== undefined
-      || anchorTileId !== undefined
-      || sortBefore !== undefined
-      || Number.isFinite(Number(elevation))
-      || sort !== undefined
-      || previewSort !== undefined
-    );
-    if (!changed && !requestedPlacementUpdate) return false;
-    const resolvedFillElevation = previewKind === 'building-fill-preview' && Number.isFinite(Number(elevation))
-      ? Number(elevation)
-      : Number(state?.fillElevation?.value ?? this._delegate?._fillElevation ?? NaN);
-    const resolvedFillSort = previewKind === 'building-fill-preview' && Number.isFinite(Number(sort))
-      ? Number(this._delegate?._fillPreviewSort ?? sort)
-      : Number(this._delegate?._fillPreviewSort ?? NaN);
-    this._rememberLayerManagerPreviewPlacement({
+    if (!this._delegate) return false;
+    const changed = !!this._callRequiredPreviewPlacementDelegateMethod('applyLayerManagerPreviewPlacement', [{
+      elevation,
+      sort,
+      previewSort,
       previewKind,
-      elevation: targetIsFill
-        ? resolvedFillElevation
-        : Number(this._delegate?._previewElevation ?? elevation ?? NaN),
-      sort: targetIsFill
-        ? resolvedFillSort
-        : Number(this._delegate?._previewSort ?? sort ?? NaN),
-      previewSort: targetIsFill
-        ? Number(this._delegate?._fillPreviewRenderSort ?? previewSort ?? NaN)
-        : Number(this._delegate?._previewRenderSort ?? previewSort ?? NaN),
       placementLevelId,
       anchorTileId,
       sortBefore
-    });
-    this._applyCurrentPreviewLayerOrdering({ fillElevation: resolvedFillElevation, fillSort: resolvedFillSort });
-    try {
-      if (this._delegate?._previewLayer) this._delegate._previewLayer.faNexusPreviewActive = !targetIsFill;
-      if (this._delegate?._fillPreviewLayer) this._delegate._fillPreviewLayer.faNexusPreviewActive = targetIsFill;
-    } catch (_) {}
-    try { this._delegate?._updateWallTexturePreview?.(); } catch (_) {}
-    try { this._delegate?._updateFillTexturePreview?.(); } catch (_) {}
-    try { this._delegate?._updateDoorFramePreview?.(); } catch (_) {}
-    try { this._delegate?._updateWindowPreview?.(); } catch (_) {}
-    this._applyCurrentPreviewLayerOrdering({
-      fillElevation: resolvedFillElevation,
-      fillSort: resolvedFillSort,
-      ensurePreviewLayer: false,
-      ensureFillLayer: false
-    });
-    try {
-      if (this._delegate?._previewLayer) this._delegate._previewLayer.faNexusPreviewActive = !targetIsFill;
-      if (this._delegate?._fillPreviewLayer) this._delegate._fillPreviewLayer.faNexusPreviewActive = targetIsFill;
-    } catch (_) {}
+    }]);
+    if (!changed) return false;
     this._syncToolOptionsState({
       suppressRender: false,
       suppressSubtoolPersistence: true,
@@ -1365,14 +1438,60 @@ export class BuildingManager {
     return true;
   }
 
+  canReindexLayerManagerPreviewSiblings() {
+    return false;
+  }
+
+  canStageLayerManagerPreviewSiblingReindex() {
+    return true;
+  }
+
+  canApplyLayerManagerPreviewLevel({ placementLevelId = undefined } = {}) {
+    return this._callRequiredPreviewPlacementDelegateMethod('canApplyLayerManagerPreviewLevel', [{
+      placementLevelId
+    }]) === true;
+  }
+
+  selectLayerManagerPreview({
+    previewId = null,
+    previewKey = null,
+    previewKind = 'building-preview',
+    elevation = null,
+    sort = undefined,
+    previewSort = undefined,
+    placementLevelId = undefined
+  } = {}) {
+    if (!this._delegate) return false;
+    const selected = !!this._callRequiredPreviewPlacementDelegateMethod('selectLayerManagerPreview', [{
+      previewId,
+      previewKey,
+      previewKind
+    }]);
+    if (!selected) return false;
+    this._syncToolOptionsState({
+      suppressRender: false,
+      suppressSubtoolPersistence: true,
+      suppressToolDefaultsPersistence: true
+    });
+    this._notifyPreviewLayerChangeIfNeeded(null, { force: true, source: 'building-preview-layer-manager-select' });
+    return true;
+  }
+
   _buildToolOptionsDescriptor() {
     const { state: legacyState, handlers } = this._buildToolOptionsState();
     const activeSubtool = this._extractActiveSubtoolId(legacyState) || null;
-    const { controls, sections } = this._buildDeclarativeToolOptionsConfig(legacyState);
-    const basePolarity = this._delegate?._baseOperationPolarity || 'add';
-    const invertHeld = !!this._delegate?._polarityInvertHeld;
+    const { controls, sections } = this._buildDeclarativeToolOptionsConfig(legacyState, handlers);
+    const hostState = this._getToolOptionsHostState();
+    const basePolarity = hostState.basePolarity || 'add';
+    const invertHeld = hostState.polarityInvertHeld === true;
     const shortcuts = mergeShortcutLists(
-      createStandardEditorShortcuts({ includePolarity: !this._portalMode }),
+      createStandardEditorShortcuts({ includePolarity: false }),
+      [
+        createShortcut(SHORTCUT_ACTION.TOGGLE_WALL_SNAP, {
+          label: 'Wall Snap',
+          description: 'Toggle snapping authored points to the current Building Walls.'
+        })
+      ],
       this._portalMode
         ? [
             createShortcut('place-portal', {
@@ -1382,40 +1501,53 @@ export class BuildingManager {
             })
           ]
         : [
+            createShortcut(SHORTCUT_ACTION.TOGGLE_POLARITY, {
+              label: 'Toggle Add/Subtract',
+              description: 'Switch the current construction operation between Add and Subtract.'
+            }),
+            createShortcut(SHORTCUT_ACTION.TEMPORARY_INVERT_POLARITY, {
+              label: 'Temporary Add/Subtract',
+              description: 'Temporarily preview and use the opposite Add/Subtract operation while held.'
+            }),
+            createShortcut('toggle-staged-placement', {
+              binding: 'Shift+E',
+              label: 'Toggle Staged',
+              description: 'Toggle staged placement. Turning it off discards the current staged shape.'
+            }),
             createShortcut('select-segment', {
-              binding: 'Right-Click',
-              label: 'Select Segment',
-              description: 'In Edit Shapes, select a wall segment for per-segment wall overrides.'
+              binding: 'Click / Ctrl/Cmd+Click / Shift+Click',
+              label: 'Select Wall Segments',
+              description: 'In Edit Geometry, select one Segment, toggle one Segment, or toggle its complete Outer loop or Inner Path for shared appearance and Behavior edits.'
             }),
-            createShortcut('multi-select-segments', {
-              binding: 'Ctrl/Cmd+Right-Click',
-              label: 'Add Segment',
-              description: 'In Edit Shapes, add or toggle a wall segment in the current segment selection.'
+            createShortcut('convert-segment', {
+              binding: 'Shift+Right-Click',
+              label: 'Straight / Curve',
+              description: 'In Edit Geometry, toggle the hovered Segment between Straight and the current exact Curve scaffold.'
             }),
-            createShortcut('arc-segment', {
-              binding: 'Shift+Click',
-              label: 'Arc Segment',
-              description: 'Convert the latest or hovered segment into an arc.'
-            }),
-            createShortcut('finish-open-wall', {
-              binding: 'Double-Click',
-              label: 'Finish Open Wall',
-              description: 'Finish an inner-wall polyline without closing it.'
+            createShortcut('finish-polygon', {
+              binding: 'Double-Click / Enter',
+              label: 'Finish Polygon',
+              description: 'Close the current Polygon sketch and resolve it through Direct or Staged placement. While sketching, Shift+Click ends a curved side and the next click sets its bend.'
             }),
             createShortcut('add-vertex', {
-              binding: 'Ctrl+Click',
+              binding: 'Ctrl/Cmd+Right-Click',
               label: 'Add Vertex',
-              description: 'Add a vertex on a segment while editing shapes.'
+              description: 'Insert a vertex on the hovered straight Segment in Edit Geometry or on a staged candidate Segment in Edit Points.'
             }),
             createShortcut('remove-vertex', {
-              binding: 'Alt+Click',
+              binding: 'Alt+Right-Click',
               label: 'Remove Vertex',
-              description: 'Remove a vertex while editing shapes.'
+              description: 'Remove an eligible hovered vertex in Edit Geometry or staged Edit Points. Alt does not change Add/Subtract while staged Edit Points is active.'
             }),
             createShortcut('adjust-elevation-wheel', {
               binding: 'Alt+Wheel',
               label: 'Elevation Wheel',
-              description: 'Adjust wall elevation by 0.01; add Shift for 0.1 or Ctrl/Cmd for 0.001.'
+              description: 'Adjust wall elevation by 0.001; add Shift for 0.1.'
+            }),
+            createShortcut('adjust-layer-order-wheel', {
+              binding: 'Ctrl/Cmd+Alt+Wheel',
+              label: 'Layer Order',
+              description: 'Move the building preview one layer up or down within the current depth level.'
             }),
             createShortcut('adjust-elevation-keys', {
               binding: 'Alt+[ / ] or Alt+Up / Down',
@@ -1453,10 +1585,9 @@ export class BuildingManager {
         dirty: this.hasSessionChanges()
       },
       renderState: {
-        previewElevation: Number.isFinite(this._delegate?._previewElevation) ? Number(this._delegate._previewElevation) : 0,
-        pointEditMode: !!this._delegate?._pointEditMode,
-        shapeEditMode: !!this._delegate?._shapeEditMode,
-        gapEditMode: !!this._delegate?._gapEditMode
+        previewElevation: Number.isFinite(hostState.previewElevation) ? Number(hostState.previewElevation) : 0,
+        shapeEditMode: hostState.shapeEditMode === true,
+        gapEditMode: hostState.gapEditMode === true
       },
       persistedState: {
         documentFlags: ['flags.fa-nexus.building'],
@@ -1465,186 +1596,295 @@ export class BuildingManager {
     });
   }
 
-  _buildDeclarativeToolOptionsConfig(legacyState = {}) {
+  _getToolOptionsHostState() {
+    const delegate = this._delegate;
+    if (!delegate) return {};
+    const state = callRequiredDelegateMethod({
+      delegate,
+      methodName: 'getToolOptionsHostState',
+      loggerPrefix: 'BuildingManager',
+      logScope: 'toolOptionsHostState',
+      bundleLabel: 'building editor'
+    });
+    if (state && typeof state === 'object') return state;
+    Logger.error?.('BuildingManager.toolOptionsHostState.invalidState', {
+      stateType: typeof state
+    });
+    throw new Error('Building editor bundle returned invalid tool-options host state.');
+  }
+
+  _buildDeclarativeToolOptionsConfig(legacyState = {}, handlers = {}) {
     const controls = {};
     const sections = [];
-    const addHintControl = ({ id, text } = {}) => {
-      if (!id || typeof text !== 'string' || !text.trim().length) return null;
-      controls[id] = {
-        id,
-        type: 'hint',
-        text: text.trim()
-      };
-      return id;
-    };
-    const addRangeControl = ({
-      id,
-      label,
-      state,
-      handlerId,
-      headerToggle = null,
-      compact = false,
-      ariaLabel = '',
-      inputOnly = false
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'range',
-        label,
-        headerToggle: headerToggle && typeof headerToggle === 'object' ? { ...headerToggle } : null,
-        compact,
-        ariaLabel,
-        handlerId,
-        min: state.min,
-        max: state.max,
-        step: state.step,
-        value: state.value,
-        display: state.display,
-        defaultValue: state.defaultValue,
-        disabled: !!state.disabled,
-        hint: typeof state.hint === 'string' ? state.hint : '',
-        tooltip: typeof state.tooltip === 'string' ? state.tooltip : '',
-        inputOnly: !!inputOnly || !!state.inputOnly
-      };
-      return id;
-    };
-    const addRangePairControl = ({
-      id,
-      label,
-      state,
-      handlerId,
-      ariaLabelX = '',
-      ariaLabelY = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'range-pair',
-        label,
-        handlerId,
-        hint: typeof state.hint === 'string' ? state.hint : '',
-        items: [
-          {
-            id: 'x',
-            label: 'X',
-            ariaLabel: ariaLabelX,
-            handlerArg: 'x',
-            ...(state.x && typeof state.x === 'object' ? state.x : {})
-          },
-          {
-            id: 'y',
-            label: 'Y',
-            ariaLabel: ariaLabelY,
-            handlerArg: 'y',
-            ...(state.y && typeof state.y === 'object' ? state.y : {})
-          }
-        ]
-      };
-      return id;
-    };
-    const addToggleControl = ({
-      id,
-      label,
-      value = false,
-      disabled = false,
-      tooltip = '',
-      hint = '',
-      handlerId = ''
-    } = {}) => {
-      if (!id) return null;
-      controls[id] = {
-        id,
-        type: 'toggle',
-        label,
-        value: !!value,
-        disabled: !!disabled,
-        tooltip,
-        hint,
-        handlerId
-      };
-      return id;
-    };
-    const addAxisTogglePairControl = ({
-      id,
-      label,
-      state,
-      horizontalHandlerId,
-      verticalHandlerId,
-      horizontalRandomHandlerId = '',
-      verticalRandomHandlerId = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'axis-toggle-pair',
-        label,
-        state,
-        horizontalHandlerId,
-        verticalHandlerId,
-        horizontalRandomHandlerId,
-        verticalRandomHandlerId
-      };
-      return id;
-    };
-    const addActionRowControl = ({
-      id,
-      actions,
-      handlerId = ''
-    } = {}) => {
-      if (!id) return null;
-      const list = Array.isArray(actions)
-        ? actions.filter((action) => action && typeof action === 'object')
-        : [];
-      if (!list.length) return null;
-      controls[id] = {
-        id,
-        type: 'action-row',
-        handlerId,
-        actions: list
-      };
-      return id;
-    };
-    const addScalarRandomizedControl = ({
-      id,
-      label,
-      ariaLabel = '',
-      state,
-      variant = 'scale',
-      handlerId,
-      randomHandlerId = '',
-      strengthHandlerId = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'scalar-randomized',
-        variant,
-        label: typeof state.label === 'string' && state.label.trim().length ? state.label.trim() : label,
-        ariaLabel,
-        state,
-        handlerId,
-        randomHandlerId,
-        strengthHandlerId
-      };
-      return id;
-    };
+    const addHintControl = (config) => addDeclarativeHintControl(controls, config);
+    const addRangeControl = (config) => addDeclarativeRangeControl(controls, config, {
+      includeHeaderToggle: true
+    });
+    const addRangePairControl = (config) => addDeclarativeRangePairControl(controls, config);
+    const addToggleControl = (config) => addDeclarativeToggleControl(controls, config);
+    const addAxisTogglePairControl = (config) => addDeclarativeAxisTogglePairControl(controls, config);
+    const addActionRowControl = (config) => addDeclarativeActionRowControl(controls, config, {
+      includeHandlerId: true
+    });
+    const addScalarControl = (config) => addDeclarativeScalarControl(controls, config);
 
-    const modeOptions = Array.isArray(legacyState?.subtoolToggles)
-      ? legacyState.subtoolToggles.filter((toggle) => toggle && typeof toggle === 'object')
+    const modeOptions = Array.isArray(legacyState?.modeToggles)
+      ? legacyState.modeToggles.filter((toggle) => toggle && typeof toggle === 'object')
       : [];
     if (modeOptions.length) {
-      controls['tool-mode'] = {
-        id: 'tool-mode',
+      controls['building-workspace-mode'] = {
+        id: 'building-workspace-mode',
         type: 'segmented',
+        variant: 'mode-rail',
+        handlerId: 'setBuildingWorkspaceMode',
         options: modeOptions
       };
       sections.push({
-        id: 'mode',
-        label: 'Mode',
+        id: 'building-workspace',
+        label: 'Building Workspace',
         region: 'header',
         collapsible: false,
-        controls: ['tool-mode']
+        controls: ['building-workspace-mode']
+      });
+    }
+
+    const outerModeActive = modeOptions.some((option) => option?.id === 'outer-walls' && option?.enabled === true);
+    const shapeOptions = Array.isArray(legacyState?.subtoolToggles)
+      ? legacyState.subtoolToggles.filter((toggle) => toggle && typeof toggle === 'object')
+      : [];
+    if (outerModeActive && shapeOptions.length) {
+      controls['outer-shape-tool'] = {
+        id: 'outer-shape-tool',
+        type: 'segmented',
+        handlerId: 'setOuterShapeTool',
+        options: shapeOptions
+      };
+      sections.push({
+        id: 'outer-shape',
+        label: 'Shape',
+        region: 'header',
+        collapsible: false,
+        controls: ['outer-shape-tool']
+      });
+    }
+
+    const rectangleConstruction = legacyState?.rectangleConstruction;
+    if (outerModeActive && rectangleConstruction?.available) {
+      const effectiveOperation = rectangleConstruction.operation === 'subtract' ? 'subtract' : 'add';
+      controls['rectangle-construction-mode'] = {
+        id: 'rectangle-construction-mode',
+        type: 'segmented',
+        variant: 'construction-mode',
+        multiple: true,
+        handlerId: 'setRectangleConstructionOption',
+        options: [
+          {
+            id: 'add',
+            label: 'Add',
+            tone: 'add',
+            enabled: effectiveOperation === 'add',
+            disabled: rectangleConstruction.operationDisabled === true,
+            tooltip: 'Add the dragged shape to the Building.'
+          },
+          {
+            id: 'staged',
+            label: 'Staged',
+            tone: 'staged',
+            enabled: rectangleConstruction.staged === true,
+            disabled: rectangleConstruction.stagedDisabled === true,
+            tooltip: 'Keep an adjustable candidate before applying it.'
+          },
+          {
+            id: 'subtract',
+            label: 'Subtract',
+            tone: 'subtract',
+            enabled: effectiveOperation === 'subtract',
+            disabled: rectangleConstruction.operationDisabled === true,
+            tooltip: 'Subtract the dragged shape from the Building.'
+          }
+        ]
+      };
+      sections.push({
+        id: 'rectangle-construction',
+        label: 'Construction',
+        region: 'header',
+        collapsible: false,
+        controls: ['rectangle-construction-mode']
+      });
+      if (typeof handlers.setRoomConstructionEnabled === 'function') {
+        addToggleControl({ id: 'room-construction', label: 'Room Construction',
+          value: rectangleConstruction.roomConstructionEnabled === true,
+          disabled: rectangleConstruction.roomConstructionDisabled === true,
+          tooltip: 'Add preserves room seams; Subtract trims affected Interior Paths to the remaining building. Ordinary construction is unchanged when off.',
+          handlerId: 'setRoomConstructionEnabled' });
+        sections.push({ id: 'room-construction', label: 'Room Construction', region: 'header',
+          collapsible: false, controls: ['room-construction'] });
+        if (rectangleConstruction.roomConstructionEnabled && typeof handlers.setRoomConstructionInnerOnly === 'function') {
+          controls['room-construction-scope'] = { id: 'room-construction-scope', type: 'segmented', variant: 'construction-mode',
+            handlerId: 'setRoomConstructionScope', options: [
+              { id: 'full', label: 'Outer + Inner', enabled: !rectangleConstruction.roomConstructionInnerOnly,
+                disabled: rectangleConstruction.roomConstructionDisabled },
+              { id: 'inner', label: 'Inner Only', enabled: rectangleConstruction.roomConstructionInnerOnly === true,
+                disabled: rectangleConstruction.roomConstructionDisabled,
+                tooltip: 'Add room walls inside the existing outline without expanding it. Subtract still trims the building.' }
+            ] };
+          sections.at(-1).controls.push('room-construction-scope');
+        }
+      }
+    }
+
+    if (legacyState?.stickyJoints?.available && typeof handlers.setStickyJointsEnabled === 'function') {
+      addToggleControl({ id: 'sticky-joints', label: 'Sticky Joints',
+        value: legacyState.stickyJoints.enabled === true,
+        disabled: legacyState.stickyJoints.disabled === true,
+        tooltip: 'Keep touching wall vertices together and keep attached endpoints on their walls during geometry edits. Turn off to separate a joint.',
+        handlerId: 'setStickyJointsEnabled' });
+      sections.push({ id: 'sticky-joints', label: 'Edit Geometry', region: 'header',
+        collapsible: false, controls: ['sticky-joints'] });
+    }
+
+    if (legacyState?.wallSnap?.available) {
+      addToggleControl({
+        id: 'wall-snap',
+        label: 'Walls',
+        value: legacyState.wallSnap.enabled === true,
+        disabled: false,
+        tooltip: 'Snap authored vertices to this Building\'s current Outer and Inner Walls without joining their semantic identities. Shift+S toggles Wall Snap; Grid Snap takes priority while enabled.',
+        handlerId: 'setWallSnapEnabled'
+      });
+      sections.push({
+        id: 'wall-snap',
+        label: 'Snapping',
+        region: 'footer-snap',
+        collapsible: false,
+        controls: ['wall-snap']
+      });
+    }
+
+    const consolidatedPortals = legacyState.portalControlsLayout === 'consolidated';
+    const portalBehaviorControlIds = consolidatedPortals
+      ? buildingV2WindowBehaviorControls(controls, legacyState.windowControls) : [];
+    if (legacyState?.opening?.available && (!consolidatedPortals || legacyState.opening.unresolved)) {
+      const opening = legacyState.opening;
+      sections.push({ id: 'opening-controls', label: `${opening.selected ? 'Selected' : 'Place'} ${opening.kind === 'door' ? 'Door' : 'Opening'}`, collapsible: false,
+        controls: [
+          addHintControl({ id: 'opening-instructions', text: opening.unresolved || (opening.kind === 'door' ? 'Choose Door artwork, then hover a wall and click to place. Drag the center to move or either jamb to resize. Right-click deselects; right-drag pans. Undo/Redo restores complete Door edits.' : 'Hover a wall and click to place a one-grid-wide Opening. Drag its center to move or either jamb to resize. Right-click deselects; right-drag pans without deselecting. Tab cycles overlapping wall targets. Escape clears the active gesture or selection; Escape again cancels the session.') })
+        ].filter(Boolean)
+      });
+    }
+
+    if (legacyState?.doorBehavior?.available) {
+      const door = legacyState.doorBehavior;
+      const addSelect = (id, label, value, options, handlerId) => addDeclarativeSelectControl(controls, {
+        id, label, state: { value, options, disabled: door.disabled }, handlerId
+      });
+      const addToggle = (id, label, value, handlerId) => addToggleControl({
+        id, label, value, disabled: door.disabled, handlerId
+      });
+      const behaviorControls = [
+        addSelect('door-animation', 'Animation', door.animation, door.animations, 'setDoorAnimation'),
+        addSelect('door-direction', 'Open Direction', door.direction, [
+          { value: 1, label: 'Default' }, { value: -1, label: 'Reversed' }
+        ], 'setDoorDirection'),
+        addToggle('door-hinge-flip', 'Flip Hinge', door.directionFlip, 'setDoorHingeFlip'),
+        addToggle('door-double', 'Double Door', door.double, 'setDoorDouble'),
+        !door.inheritsWallTexture && addToggle('door-texture-flip-horizontal', 'Flip Horizontal', door.textureFlip.horizontal, 'setDoorTextureFlipHorizontal'),
+        !door.inheritsWallTexture && addToggle('door-texture-flip-vertical', 'Flip Vertical', door.textureFlip.vertical, 'setDoorTextureFlipVertical')
+      ].filter(Boolean);
+      if (consolidatedPortals) portalBehaviorControlIds.push(...behaviorControls);
+      else sections.push({ id: 'door-behavior', label: 'Door Setup', collapsible: false, controls: behaviorControls });
+    }
+
+    if (legacyState?.portalOptions?.available) {
+      const portal = legacyState.portalOptions;
+      const portalControls = [...portalBehaviorControlIds,
+        addHintControl({ id: 'portal-options-scope', text: `${portal.scopeLabel}: ${portal.summary}` }),
+        addActionRowControl({ id: 'portal-options-actions', handlerId: 'editPortalOptions', actions: [
+          { id: 'custom', label: 'Custom Behavior…', disabled: portal.disabled }
+        ] }),
+        ...(consolidatedPortals ? [addActionRowControl({ id: 'portal-options-reset', handlerId: 'resetPortalOptions', actions: [
+          { id: 'reset-custom-behavior', label: 'Reset Custom Behavior', disabled: portal.disabled || !portal.canReset }
+        ] })] : [])
+      ];
+      if (portal.state?.available) {
+        portalControls.push(addDeclarativeSelectControl(controls, {
+          id: 'portal-state', label: portal.state.label,
+          state: { value: portal.state.value, options: portal.state.options, disabled: portal.disabled }, handlerId: 'setPortalState'
+        }));
+        portalControls.push(addHintControl({ id: 'portal-state-hint', text: portal.hint }));
+      }
+      if (portal.conflict) {
+        portalControls.push(addHintControl({ id: 'portal-state-conflict', text: portal.conflict }));
+        portalControls.push(addActionRowControl({ id: 'portal-state-keep', handlerId: 'keepPortalLiveState', actions: [
+          { id: 'keep', label: 'Keep My State Edit', disabled: portal.disabled }
+        ] }));
+        portalControls.push(addActionRowControl({ id: 'portal-state-current', handlerId: 'useCurrentPortalLiveState', actions: [
+          { id: 'current', label: 'Use Current State', disabled: portal.disabled }
+        ] }));
+      }
+      sections.push({ id: 'portal-options', label: consolidatedPortals ? 'Behavior' : 'Portal Behavior', collapsible: consolidatedPortals, controls: portalControls.filter(Boolean) });
+    }
+
+    if (legacyState?.doorAppearance?.available && !consolidatedPortals) {
+      const appearance = legacyState.doorAppearance;
+      sections.push({ id: 'door-appearance', label: 'Door Artwork', collapsible: false, controls: [
+        addHintControl({ id: 'door-artwork-hint', text: 'Artwork width changes the leaf thickness; the opening stays jamb-to-jamb. Amber marks the pivot; the blue arrow shows opening travel.' }),
+        addToggleControl({
+          id: 'door-artwork-lock-aspect-ratio',
+          label: 'Lock Aspect Ratio',
+          value: appearance.lockAspectRatio === true,
+          disabled: appearance.widthScale.disabled,
+          tooltip: 'Scale artwork thickness proportionally when this Door\'s jamb-to-jamb width changes. Enabling the lock keeps the current dimensions.',
+          handlerId: 'setDoorAspectRatioLock'
+        }),
+        ...[['widthScale', 'Artwork Width', 'setDoorArtworkWidth']].map(([field, label, handlerId]) => addRangeControl({
+            id: `door-artwork-${field}`, label, state: appearance[field], handlerId, ariaLabel: `Door ${label.toLowerCase()}`
+          }))
+      ].filter(Boolean) });
+    }
+
+    if (legacyState?.geometrySelectionHint) {
+      sections.push({ id: 'geometry-selection', label: '', showHeading: false, collapsible: false,
+        controls: [addHintControl({ id: 'geometry-selection-hint', text: legacyState.geometrySelectionHint })] });
+    }
+
+    if (legacyState?.fillRegionSelection?.available) {
+      const selection = legacyState.fillRegionSelection;
+      sections.push({ id: 'fill-region-selection', label: 'Fill Regions', collapsible: false,
+        controls: [
+          addHintControl({ id: 'fill-region-summary', text: selection.summary }),
+          addHintControl({ id: 'fill-region-hint', text: selection.hint })
+        ].filter(Boolean)
+      });
+    }
+
+    if (legacyState?.wallBehavior?.available) {
+      const wallBehavior = legacyState.wallBehavior;
+      const wallBehaviorControlIds = [];
+      if (Array.isArray(wallBehavior.scopeOptions) && wallBehavior.scopeOptions.length > 1) {
+        controls['wall-behavior-scope'] = {
+          id: 'wall-behavior-scope',
+          type: 'segmented',
+          handlerId: 'setWallBehaviorScope',
+          options: wallBehavior.scopeOptions
+        };
+        wallBehaviorControlIds.push('wall-behavior-scope');
+      }
+      wallBehaviorControlIds.push(addHintControl({
+        id: 'wall-behavior-status',
+        text: `${wallBehavior.scopeLabel}: ${wallBehavior.status}`
+      }));
+      wallBehaviorControlIds.push(addActionRowControl({
+        id: 'wall-behavior-actions',
+        handlerId: 'handleWallBehaviorAction',
+        previewHandlerId: 'previewWallBehaviorAction',
+        actions: wallBehavior.actions
+      }));
+      sections.push({
+        id: 'wall-behavior',
+        label: 'Behavior',
+        collapsible: consolidatedPortals,
+        controls: wallBehaviorControlIds.filter(Boolean)
       });
     }
 
@@ -1700,23 +1940,6 @@ export class BuildingManager {
           ariaLabelX: 'Wall texture offset X',
           ariaLabelY: 'Wall texture offset Y'
         }));
-        wallControlIds.push(addRangeControl({
-          id: 'wall-path-tension',
-          label: 'Wall Tension',
-          state: pathAppearance.tension,
-          handlerId: 'setPathTension',
-          ariaLabel: 'Wall tension'
-        }));
-        if (pathAppearance.showWidthTangents?.available) {
-          wallControlIds.push(addToggleControl({
-            id: 'wall-show-width-tangents',
-            label: pathAppearance.showWidthTangents?.label || 'Show Width Tangents',
-            value: pathAppearance.showWidthTangents?.enabled,
-            disabled: pathAppearance.showWidthTangents?.disabled,
-            tooltip: pathAppearance.showWidthTangents?.tooltip || '',
-            handlerId: 'setShowWidthTangents'
-          }));
-        }
       }
       if (legacyState?.flip?.available) {
         wallControlIds.push(addAxisTogglePairControl({
@@ -1742,6 +1965,8 @@ export class BuildingManager {
           type: 'stack-order',
           label: 'Selected Wall',
           state: legacyState.shapeStacking,
+          raiseHandlerId: typeof handlers.raiseSelectedWall === 'function' ? 'raiseSelectedWall' : '',
+          lowerHandlerId: typeof handlers.lowerSelectedWall === 'function' ? 'lowerSelectedWall' : '',
           pushTopHandlerId: 'pushSelectedWallToTop',
           pushBottomHandlerId: 'pushSelectedWallToBottom'
         };
@@ -1758,27 +1983,23 @@ export class BuildingManager {
       const fillControlIds = [];
       const hasFillTransform = !!(legacyState?.fillTexture?.available || legacyState?.fillHsbc?.available);
       if (legacyState?.scale?.available) {
-        fillControlIds.push(addScalarRandomizedControl({
+        fillControlIds.push(addScalarControl({
           id: 'fill-scale',
           variant: 'scale',
           label: 'Scale',
           ariaLabel: 'Scale',
           state: legacyState.scale,
-          handlerId: 'setScale',
-          randomHandlerId: 'toggleScaleRandom',
-          strengthHandlerId: 'setScaleRandomStrength'
+          handlerId: 'setScale'
         }));
       }
       if (legacyState?.rotation?.available) {
-        fillControlIds.push(addScalarRandomizedControl({
+        fillControlIds.push(addScalarControl({
           id: 'fill-rotation',
           variant: 'rotation',
           label: 'Rotation',
           ariaLabel: 'Rotation',
           state: legacyState.rotation,
-          handlerId: 'setRotation',
-          randomHandlerId: 'toggleRotationRandom',
-          strengthHandlerId: 'setRotationRandomStrength'
+          handlerId: 'setRotation'
         }));
       }
       if (legacyState?.fillTexture?.available) {
@@ -1790,6 +2011,15 @@ export class BuildingManager {
           ariaLabelX: 'Fill texture offset X',
           ariaLabelY: 'Fill texture offset Y'
         }));
+        if (legacyState.fillTexture?.opacity?.available) {
+          fillControlIds.push(addRangeControl({
+            id: 'fill-opacity',
+            label: 'Fill Opacity',
+            state: legacyState.fillTexture.opacity,
+            handlerId: 'setFillOpacity',
+            ariaLabel: 'Fill opacity'
+          }));
+        }
       }
       if (hasFillTransform && legacyState?.fillElevation?.available) {
         fillControlIds.push(addRangeControl({
@@ -1843,7 +2073,7 @@ export class BuildingManager {
       if (colorControlIds.length) {
         sections.push({
           id: 'color',
-          label: 'Color',
+          label: activeHsbcTarget === 'fill' ? 'Fill Color' : 'Wall Color',
           controls: colorControlIds.filter(Boolean)
         });
       }
@@ -1864,8 +2094,10 @@ export class BuildingManager {
       }
     }
 
+    appendBuildingV2InteriorPathControls(controls, sections, legacyState);
+    if (consolidatedPortals) appendBuildingV2PortalControls(controls, sections, legacyState);
     const portalControlIds = [];
-    if (legacyState?.doorControls?.available) {
+    if (legacyState?.doorControls?.available && !consolidatedPortals) {
       controls['door-portal-controls'] = {
         id: 'door-portal-controls',
         type: 'portal-controls',
@@ -1874,7 +2106,7 @@ export class BuildingManager {
       };
       portalControlIds.push('door-portal-controls');
     }
-    if (legacyState?.windowControls?.available) {
+    if (legacyState?.windowControls?.available && !consolidatedPortals) {
       controls['window-portal-controls'] = {
         id: 'window-portal-controls',
         type: 'portal-controls',
@@ -1882,6 +2114,15 @@ export class BuildingManager {
         state: legacyState.windowControls
       };
       portalControlIds.push('window-portal-controls');
+    }
+    if (legacyState?.seamlessSecretDoorControls?.available) {
+      controls['seamless-secret-door-portal-controls'] = {
+        id: 'seamless-secret-door-portal-controls',
+        type: 'portal-controls',
+        variant: 'seamlessSecretDoor',
+        state: legacyState.seamlessSecretDoorControls
+      };
+      portalControlIds.push('seamless-secret-door-portal-controls');
     }
     if (portalControlIds.length) {
       sections.push({
@@ -1944,94 +2185,44 @@ export class BuildingManager {
   }
 
   _persistDelegateToolDefaults() {
-    const delegate = this._delegate;
-    if (!delegate) return;
-    if (typeof delegate._persistToolDefaults !== 'function') return;
-    try {
-      delegate._persistToolDefaults();
-    } catch (error) {
-      Logger.warn?.('BuildingManager.delegateToolDefaults.persistFailed', { error: stringifyError(error) });
-    }
+    this._subtoolPreferenceBridge.persistDelegateToolDefaults();
   }
 
   _scheduleToolDefaultsPersist() {
-    if (!this._delegate?.isActive) return;
-    if (this._toolDefaultsPersistTimer) return;
-    this._toolDefaultsPersistTimer = setTimeout(() => {
-      this._toolDefaultsPersistTimer = null;
-      if (!this._delegate?.isActive) return;
-      this._persistDelegateToolDefaults();
-    }, 200);
-  }
-
-  _readSubtoolPreference() {
-    try {
-      const value = game?.settings?.get?.(MODULE_ID, BUILDING_SUBTOOL_SETTING_KEY);
-      const normalized = typeof value === 'string' ? value : '';
-      return BUILDING_PERSISTED_SUBTOOL_IDS.has(normalized) ? normalized : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  _persistSubtoolPreference(value) {
-    if (!value || !BUILDING_PERSISTED_SUBTOOL_IDS.has(value)) return;
-    if (this._lastPersistedSubtool === value) return;
-    this._lastPersistedSubtool = value;
-    try { game?.settings?.set?.(MODULE_ID, BUILDING_SUBTOOL_SETTING_KEY, value); } catch (_) {}
+    this._subtoolPreferenceBridge.scheduleToolDefaultsPersist();
   }
 
   _extractActiveSubtoolId(state) {
-    const toggles = Array.isArray(state?.subtoolToggles) ? state.subtoolToggles : [];
-    for (const toggle of toggles) {
-      if (!toggle || typeof toggle !== 'object') continue;
-      if (!toggle.enabled) continue;
-      const id = String(toggle.id || '');
-      if (BUILDING_ACTIVE_SUBTOOL_IDS.has(id)) return id;
-    }
-    return null;
+    return this._subtoolPreferenceBridge.extractActiveSubtoolId(state);
   }
 
-  _persistSubtoolFromState(state, { suppress = false } = {}) {
-    if (suppress) return;
-    const active = this._extractActiveSubtoolId(state);
-    if (!active) return;
-    this._persistSubtoolPreference(active);
+  _persistSubtoolFromState(state, options = {}) {
+    this._subtoolPreferenceBridge.persistSubtoolFromState(state, options);
   }
 
   _restoreSubtoolPreference() {
     if (this._portalMode) return;
-    const preferred = this._readSubtoolPreference();
-    if (!preferred) return;
-    this._lastPersistedSubtool = preferred;
-    const apply = () => {
-      if (!this._delegate?.isActive) return;
-      this.setActiveTool(preferred);
-    };
-    if (typeof queueMicrotask === 'function') queueMicrotask(apply);
-    else setTimeout(apply, 0);
+    this._subtoolPreferenceBridge.restoreSubtoolPreference();
   }
 
   _ensureMeasurementsEnabled() {
     const delegate = this._delegate;
     if (!delegate?.isActive) return false;
     if (this._forcingMeasurementsEnabled) return false;
-    if (delegate._measurementOverlayEnabled !== false) return false;
     this._forcingMeasurementsEnabled = true;
     try {
-      if (typeof delegate._setMeasurementOverlayEnabled === 'function') {
-        delegate._setMeasurementOverlayEnabled(true);
-      } else {
-        delegate._measurementOverlayEnabled = true;
-        try { delegate._refreshMeasurementOverlay?.(); } catch (_) {}
-        try { delegate._persistToolDefaults?.(); } catch (_) {}
-      }
-      return true;
+      return callRequiredDelegateMethod({
+        delegate,
+        methodName: 'ensureMeasurementsEnabled',
+        loggerPrefix: 'BuildingManager',
+        logScope: 'delegateMeasurements',
+        bundleLabel: 'building editor'
+      }) === true;
     } catch (error) {
-      Logger.warn?.('BuildingManager.ensureMeasurementsEnabled.failed', {
+      Logger.error?.('BuildingManager.ensureMeasurementsEnabled.failed', {
         error: String(error?.message || error)
       });
-      return false;
+      throw error;
     } finally {
       this._forcingMeasurementsEnabled = false;
     }

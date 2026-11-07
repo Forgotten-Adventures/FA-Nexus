@@ -5,7 +5,7 @@ import {
   normalizeGridSnapSubdivision,
   readGridSnapSubdivisionSetting
 } from '../grid-snap-utils.js';
-import { normalizeToolOptionsPayload } from '../tool-options-descriptor.js';
+import { normalizeToolOptionsPayload } from './tool-options-descriptor.js';
 import {
   GRID_SNAP_SETTING_KEY,
   MODULE_ID,
@@ -219,9 +219,23 @@ export class ToolOptionsController {
     if (typeof handler !== 'function') return false;
     try {
       const result = handler(enabled);
-      if (result?.then) return result;
+      if (result?.then) {
+        return result.catch((error) => {
+          Logger.error('ToolOptionsController.dropShadowToggle.failed', {
+            toolId: activeId,
+            enabled: !!enabled,
+            error: String(error?.message || error)
+          });
+          throw error;
+        });
+      }
       return result;
-    } catch (_) {
+    } catch (error) {
+      Logger.error('ToolOptionsController.dropShadowToggle.failed', {
+        toolId: activeId,
+        enabled: !!enabled,
+        error: String(error?.message || error)
+      });
       return false;
     }
   }
@@ -234,9 +248,25 @@ export class ToolOptionsController {
     if (typeof handler !== 'function') return false;
     try {
       const result = handler(enabled);
-      if (result?.then) return result;
+      if (result?.then) {
+        return result.catch((error) => {
+          Logger.error('ToolOptionsController.customToggle.failed', {
+            toolId: activeId,
+            toggleId: String(toggleId),
+            enabled: !!enabled,
+            error: String(error?.message || error)
+          });
+          throw error;
+        });
+      }
       return result;
-    } catch (_) {
+    } catch (error) {
+      Logger.error('ToolOptionsController.customToggle.failed', {
+        toolId: activeId,
+        toggleId: String(toggleId),
+        enabled: !!enabled,
+        error: String(error?.message || error)
+      });
       return false;
     }
   }

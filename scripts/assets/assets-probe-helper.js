@@ -1,5 +1,5 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { forgeIntegration } from '../core/forge-integration.js';
+import { forgeIntegration } from '../storage/forge-integration.js';
 
 export class AssetsTabProbeHelper {
   constructor(tab) {
@@ -70,12 +70,12 @@ export class AssetsTabProbeHelper {
 
   async _probeCard(card) {
     if (forgeIntegration.isRunningOnForge()) return;
+    const item = card?._assetItem || null;
     try {
-      const item = card._assetItem || null;
       const download = this.tab.downloadManager;
-      const filename = card.getAttribute('data-filename') || item?.filename || '';
-      const filePathAttr = card.getAttribute('data-file-path') || '';
-      const folderPathAttr = card.getAttribute('data-path') || '';
+      const filePathAttr = card.getAttribute('data-content-path') || card.getAttribute('data-file-path') || '';
+      const filename = card.getAttribute('data-filename') || item?.filename || (filePathAttr.split('/').pop() || '');
+      const folderPathAttr = card.getAttribute('data-folder') || card.getAttribute('data-path') || '';
       if (!download || typeof download.probeLocal !== 'function' || !filename) return;
       const job = card._probeJob || { cancelled: false, item };
       card._probeJob = job;
@@ -96,8 +96,8 @@ export class AssetsTabProbeHelper {
     } catch (error) {
       Logger.debug('AssetsTab.probe.error', {
         filename: card.getAttribute('data-filename') || item?.filename || '',
-        file_path: card.getAttribute('data-file-path') || '',
-        path: card.getAttribute('data-path') || '',
+        file_path: card.getAttribute('data-content-path') || card.getAttribute('data-file-path') || '',
+        path: card.getAttribute('data-folder') || card.getAttribute('data-path') || '',
         error: String(error?.message || error)
       });
     }

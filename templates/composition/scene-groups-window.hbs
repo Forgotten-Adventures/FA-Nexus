@@ -1,0 +1,160 @@
+<section class="fa-nexus-scene-groups" aria-label="Scene Groups" data-scene-group-drop="create">
+  <header class="fa-nexus-scene-groups__header">
+    {{#if prefabsEnabled}}<button type="button" class="fa-nexus-scene-groups__icon-button" data-action="prefab-library" title="Local Prefab Library" aria-label="Local Prefab Library"><i class="fa-solid fa-box-archive" aria-hidden="true"></i></button>{{/if}}
+    <div class="fa-nexus-scene-groups__summary" aria-live="polite">
+      <strong>Scene Groups</strong>
+      {{#if hasSelection}}<small>{{selectionCount}} selected</small>{{/if}}
+    </div>
+    <button type="button"
+            class="fa-nexus-scene-groups__icon-button"
+            data-action="toggle-all-groups"
+            title="{{#if allGroupsCollapsed}}Expand all groups{{else}}Collapse all groups{{/if}}"
+            aria-label="{{#if allGroupsCollapsed}}Expand all groups{{else}}Collapse all groups{{/if}}"
+            {{#unless groupCount}}disabled{{/unless}}>
+      <i class="fa-solid {{#if allGroupsCollapsed}}fa-angles-down{{else}}fa-angles-up{{/if}}" aria-hidden="true"></i>
+    </button>
+  </header>
+
+  {{#if hasError}}
+  <div class="fa-nexus-scene-groups__error" role="alert">{{error}}</div>
+  {{/if}}
+
+  {{#if hasRecovery}}
+  <div class="fa-nexus-scene-groups__error" role="status">
+    {{recoveryMessage}}
+    <button type="button" class="fa-nexus-scene-groups__button" data-action="recover-registry" {{#if busy}}disabled{{/if}}>Recover</button>
+  </div>
+  {{/if}}
+
+  {{#if canvasReady}}
+  <button type="button" class="fa-nexus-scene-groups__button" data-action="canvas-select" title="Draw an area on the canvas and review its contents before creating a group">
+    <i class="fa-solid fa-vector-square" aria-hidden="true"></i> Canvas Select
+  </button>
+  <div class="fa-nexus-scene-groups__create-drop"
+       data-scene-group-drop="create"
+       aria-label="Drop scene objects here to create a Scene Group"
+       title="Drag from Layer Manager, Placeables or Scene Groups to create a Scene Group">
+    <i class="fa-solid fa-circle-plus" aria-hidden="true"></i>
+    <span>Drop here to create a Scene Group</span>
+  </div>
+
+  <ol class="fa-nexus-scene-groups__list" role="listbox" aria-multiselectable="true" aria-label="Scene Group tree">
+    {{#each rows}}
+    <li class="fa-nexus-scene-groups__group {{#if selected}}is-selected{{/if}} {{#if primary}}is-primary{{/if}}"
+        role="option"
+        aria-selected="{{#if selected}}true{{else}}false{{/if}}"
+        draggable="true"
+        data-scene-group-id="{{id}}"
+        data-tree-depth="{{depth}}"
+        data-scene-group-drop="parent"
+        style="{{depthStyle}}">
+      <div class="fa-nexus-scene-groups__group-row">
+        <button type="button"
+                class="fa-nexus-scene-groups__icon-button fa-nexus-scene-groups__visibility"
+                data-action="{{visibilityAction}}"
+                data-scene-group-id="{{id}}"
+                title="{{visibilityTitle}}"
+                aria-label="{{visibilityTitle}}: {{name}}">
+          <i class="fa-solid {{visibilityIcon}}" aria-hidden="true"></i>
+        </button>
+        <span class="fa-nexus-scene-groups__divider" aria-hidden="true"></span>
+        <div class="fa-nexus-scene-groups__branch">
+        {{#if hasSubtree}}
+        <button type="button"
+                class="fa-nexus-scene-groups__icon-button"
+                data-action="toggle-disclosure"
+                data-scene-group-id="{{id}}"
+                aria-expanded="{{#if expanded}}true{{else}}false{{/if}}"
+                title="{{#if expanded}}Collapse{{else}}Expand{{/if}} {{name}}">
+          <i class="fa-solid {{#if expanded}}fa-chevron-down{{else}}fa-chevron-right{{/if}}" aria-hidden="true"></i>
+        </button>
+        {{else}}
+        <span class="fa-nexus-scene-groups__nest-spacer" aria-hidden="true"></span>
+        {{/if}}
+        <i class="{{displayIcon}} fa-nexus-scene-groups__group-icon" style="color:{{displayIconColor}}" aria-hidden="true"></i>
+        <span class="fa-nexus-scene-groups__name" title="{{name}}">{{name}}</span>
+        </div>
+        {{#if locked}}<button type="button" class="fa-nexus-scene-groups__icon-button fa-nexus-scene-groups__lock-state" data-action="unlock-group" data-scene-group-id="{{id}}" title="Unlock complete group" aria-label="Unlock {{name}}"><i class="fa-solid {{lockIcon}}" aria-hidden="true"></i></button>{{/if}}
+      </div>
+      {{#if hasMembers}}
+      <ol class="fa-nexus-scene-groups__members">
+        {{#each structures}}
+        <li class="fa-nexus-scene-groups__member fa-nexus-scene-groups__presentation-row is-structure {{#if selected}}is-selected{{/if}}"
+            role="option" aria-selected="{{#if selected}}true{{else}}false{{/if}}" draggable="true"
+            data-scene-group-member-uuid="{{ownerUuid}}" data-structure-owner-uuid="{{ownerUuid}}" title="{{typeLabel}} — {{label}}">
+          <button type="button" class="fa-nexus-scene-groups__icon-button" data-action="{{visibilityAction}}" data-owner-uuid="{{ownerUuid}}" title="{{#if (eq visibilityAction 'show-structure')}}Show{{else}}Hide{{/if}} {{label}}"><i class="fa-solid {{visibilityIcon}}" aria-hidden="true"></i></button>
+          <button type="button" class="fa-nexus-scene-groups__icon-button" data-action="toggle-structure" data-owner-uuid="{{ownerUuid}}" aria-expanded="{{#if expanded}}true{{else}}false{{/if}}" title="{{#if expanded}}Collapse{{else}}Expand{{/if}} {{label}}"><i class="fa-solid {{#if expanded}}fa-chevron-down{{else}}fa-chevron-right{{/if}}" aria-hidden="true"></i></button>
+          <i class="{{icon}}" style="color:{{iconColor}}" aria-hidden="true"></i><strong class="fa-nexus-scene-groups__name">{{label}}</strong>
+          <small class="fa-nexus-scene-groups__composite-badge" title="{{typeLabel}} composite: selects the object and its generated parts together. This is not a Scene Group."><i class="fa-solid fa-link" aria-hidden="true"></i>{{typeLabel}}</small>
+          {{#if locked}}<button type="button" class="fa-nexus-scene-groups__icon-button fa-nexus-scene-groups__lock-state" data-action="unlock-structure" data-owner-uuid="{{ownerUuid}}" title="Unlock structure" aria-label="Unlock {{label}}"><i class="fa-solid fa-lock" aria-hidden="true"></i></button>{{/if}}
+        </li>
+        {{#if expanded}}
+        {{#each generatedMembers}}
+        <li class="fa-nexus-scene-groups__member is-relationship-dependent {{#if selected}}is-selected{{/if}} is-building-structure-member"
+            role="option" aria-selected="{{#if selected}}true{{else}}false{{/if}}" draggable="true"
+            data-scene-group-member-uuid="{{uuid}}" style="{{relationshipDepthStyle}}" title="{{typeLabel}} — {{name}}">
+          {{#if canHide}}<button type="button" class="fa-nexus-scene-groups__icon-button" data-action="{{visibilityAction}}" data-member-uuid="{{uuid}}" title="{{#if hidden}}Show{{else}}Hide{{/if}} {{name}}"><i class="fa-solid {{visibilityIcon}}" aria-hidden="true"></i></button>{{/if}}
+          <i class="{{icon}}" aria-hidden="true"></i><span>{{name}}</span><small>{{typeLabel}}</small>
+          {{#if locked}}<button type="button" class="fa-nexus-scene-groups__icon-button fa-nexus-scene-groups__lock-state" data-action="unlock-member" data-member-uuid="{{uuid}}" title="Unlock item" aria-label="Unlock {{name}}"><i class="fa-solid fa-lock" aria-hidden="true"></i></button>{{/if}}
+        </li>
+        {{/each}}
+        {{#if wallCollection}}
+        <li class="fa-nexus-scene-groups__presentation-row is-building-wall-collection">
+          <button type="button" class="fa-nexus-scene-groups__icon-button" data-action="toggle-structure-walls" data-owner-uuid="{{ownerUuid}}"
+                  aria-expanded="{{#if wallCollection.expanded}}true{{else}}false{{/if}}" title="{{#if wallCollection.expanded}}Collapse{{else}}Expand{{/if}} generated Walls">
+            <i class="fa-solid {{#if wallCollection.expanded}}fa-chevron-down{{else}}fa-chevron-right{{/if}}" aria-hidden="true"></i>
+          </button>
+          <i class="fa-solid fa-grip-lines-vertical" aria-hidden="true"></i><span>Walls</span>
+        </li>
+        {{#if wallCollection.expanded}}
+        {{#each wallCollection.members}}
+        <li class="fa-nexus-scene-groups__member is-relationship-dependent {{#if selected}}is-selected{{/if}} is-building-wall-member"
+            role="option" aria-selected="{{#if selected}}true{{else}}false{{/if}}" draggable="true"
+            data-scene-group-member-uuid="{{uuid}}" style="{{relationshipDepthStyle}}" title="{{typeLabel}} — {{name}}">
+          <button type="button" class="fa-nexus-scene-groups__icon-button" data-action="{{visibilityAction}}" data-member-uuid="{{uuid}}" title="{{#if hidden}}Show{{else}}Hide{{/if}} {{name}}"><i class="fa-solid {{visibilityIcon}}" aria-hidden="true"></i></button>
+          <i class="{{icon}}" aria-hidden="true"></i><span>{{name}}</span><small>{{typeLabel}}</small>
+          {{#if locked}}<button type="button" class="fa-nexus-scene-groups__icon-button fa-nexus-scene-groups__lock-state" data-action="unlock-member" data-member-uuid="{{uuid}}" title="Unlock item" aria-label="Unlock {{name}}"><i class="fa-solid fa-lock" aria-hidden="true"></i></button>{{/if}}
+        </li>
+        {{/each}}
+        {{/if}}
+        {{/if}}
+        {{/if}}
+        {{/each}}
+        {{#each ordinaryMembers}}
+        <li class="fa-nexus-scene-groups__member {{#unless direct}}is-relationship-dependent{{/unless}} {{#if selected}}is-selected{{/if}}"
+            role="option"
+            aria-selected="{{#if selected}}true{{else}}false{{/if}}"
+            draggable="true"
+            data-scene-group-member-uuid="{{uuid}}"
+            style="{{relationshipDepthStyle}}"
+            title="{{typeLabel}} — {{name}}">
+          {{#if canHide}}<button type="button" class="fa-nexus-scene-groups__icon-button" data-action="{{visibilityAction}}" data-member-uuid="{{uuid}}" title="{{#if hidden}}Show{{else}}Hide{{/if}} {{name}}"><i class="fa-solid {{visibilityIcon}}" aria-hidden="true"></i></button>{{/if}}
+          <i class="{{icon}}" aria-hidden="true"></i>
+          <span>{{name}}</span>
+          <small>{{typeLabel}}</small>
+          {{#if locked}}<button type="button" class="fa-nexus-scene-groups__icon-button fa-nexus-scene-groups__lock-state" data-action="unlock-member" data-member-uuid="{{uuid}}" title="Unlock item" aria-label="Unlock {{name}}"><i class="fa-solid fa-lock" aria-hidden="true"></i></button>{{/if}}
+        </li>
+        {{/each}}
+      </ol>
+      {{/if}}
+    </li>
+    {{/each}}
+
+  </ol>
+
+    <div class="fa-nexus-scene-groups__root-drop"
+        data-scene-group-drop="root"
+        aria-label="Drop here to remove from Scene Group(s)">
+      <i class="fa-solid fa-arrow-turn-up" aria-hidden="true"></i>
+      Drop here to remove from Scene Group(s)
+    </div>
+
+  {{#if empty}}
+  <div class="fa-nexus-scene-groups__empty">
+    No Scene Groups yet. Use Canvas Select or drag items from Layer Manager or Placeables.
+  </div>
+  {{/if}}
+  {{else}}
+  <div class="fa-nexus-scene-groups__empty">Open a Scene to manage Scene Groups.</div>
+  {{/if}}
+</section>

@@ -43,6 +43,19 @@ export function getTileRenderOrder(doc, indexFallback = 0) {
 }
 
 export function sortLayerManagerRenderEntries(a, b) {
+  const buildingPreviewTieRank = (entry) => entry?.previewKind === 'building-preview'
+    ? 0
+    : (entry?.previewKind === 'building-fill-preview' ? 1 : 2);
+  const aBuildingPreviewRank = buildingPreviewTieRank(a);
+  const bBuildingPreviewRank = buildingPreviewTieRank(b);
+  if (aBuildingPreviewRank < 2 && bBuildingPreviewRank < 2) {
+    const renderDiffWithoutInsertionOrder = (normalizeRenderOrderValue(b?.elevation) - normalizeRenderOrderValue(a?.elevation))
+      || (normalizeRenderOrderValue(b?.sortLayer) - normalizeRenderOrderValue(a?.sortLayer))
+      || (normalizeRenderOrderValue(b?.sort) - normalizeRenderOrderValue(a?.sort))
+      || (normalizeRenderOrderValue(b?.zIndex) - normalizeRenderOrderValue(a?.zIndex));
+    if (renderDiffWithoutInsertionOrder) return renderDiffWithoutInsertionOrder;
+    return aBuildingPreviewRank - bBuildingPreviewRank;
+  }
   const renderDiff = comparePrimaryRenderOrder(b, a);
   if (renderDiff) return renderDiff;
   const aRank = a?.levelBoundarySeparator ? 3 : (a?.marker ? 2 : (a?.preview ? 1 : 0));
@@ -63,6 +76,213 @@ export function sortLayerManagerTileDocs(a, b) {
   if (aId) return -1;
   if (bId) return 1;
   return 0;
+}
+
+function requireEntryDependency(name, value, caller) {
+  if (typeof value !== 'function') {
+    throw new Error(`${caller} requires ${name}`);
+  }
+  return value;
+}
+
+function resolveLayerManagerPreviewElevation(container, quantizeElevation) {
+  if (!container) return 0;
+  const candidate = Number(
+    container.faNexusPathPreviewElevation
+    ?? container.faNexusElevationDoc
+    ?? container.faNexusElevation
+    ?? container.elevation
+    ?? 0
+  );
+  return quantizeElevation(candidate);
+}
+
+export function resolveLayerManagerPreviewPlacementSort(container) {
+  if (!container) return 0;
+  const candidate = Number(
+    container.faNexusPlacementSort
+    ?? container.zIndex
+    ?? container.faNexusSort
+    ?? container.sort
+    ?? 0
+  );
+  return Number.isFinite(candidate) ? candidate : 0;
+}
+
+function resolveLayerManagerPreviewRenderSort(container, fallback = 0) {
+  if (!container) return normalizeRenderOrderValue(fallback);
+  return normalizeRenderOrderValue(
+    container.faNexusSort
+    ?? container.sort
+    ?? fallback
+  );
+}
+
+function resolveLayerManagerPreviewPlacementLevelId(container) {
+  const normalized = String(container?.faNexusPlacementLevelId || '').trim();
+  return normalized || null;
+}
+
+function resolveLayerManagerPreviewBandKind(container) {
+  const normalized = String(container?.faNexusBandKind || '').trim().toLowerCase();
+  return normalized === 'foreground' || normalized === 'ground' ? normalized : null;
+}
+
+export function buildLayerManagerPreviewEntry(container, {
+  label,
+  icon,
+  kind,
+  previewActiveOverride,
+  canDragPreviewOverride
+} = {}, {
+  quantizeElevation = null,
+  elevationGroupKey = null,
+  getDefaultTilePlacementLevelId = null,
+  resolveSceneLevelName = null,
+  getSortLayers = getPrimaryCanvasSortLayers,
+  getRenderOrder = resolveTileRenderOrder
+} = {}) {
+  if (!container || container.destroyed) return null;
+  const caller = 'buildLayerManagerPreviewEntry';
+  const quantize = requireEntryDependency('quantizeElevation', quantizeElevation, caller);
+  const groupKey = requireEntryDependency('elevationGroupKey', elevationGroupKey, caller);
+  const defaultPlacementLevelId = requireEntryDependency('getDefaultTilePlacementLevelId', getDefaultTilePlacementLevelId, caller);
+  const levelNameForId = requireEntryDependency('resolveSceneLevelName', resolveSceneLevelName, caller);
+  const resolveOrder = requireEntryDependency('getRenderOrder', getRenderOrder, caller);
+  const sortLayersForCanvas = requireEntryDependency('getSortLayers', getSortLayers, caller);
+  const previewKind = String(kind || '').trim();
+  if (!previewKind) throw new Error(`${caller} requires kind`);
+  const baseLabel = String(label || '').trim();
+  if (!baseLabel) throw new Error(`${caller} requires label`);
+  const typeIcon = String(icon || '').trim();
+  if (!typeIcon) throw new Error(`${caller} requires icon`);
+
+  const documentElevation = resolveLayerManagerPreviewElevation(container, quantize);
+  const placementSort = resolveLayerManagerPreviewPlacementSort(container);
+  const previewKey = String(
+    container?.faNexusPathPreviewKey
+    || container?.faNexusScatterPreviewKey
+    || container?.faNexusTexturePreviewKey
+    || container?.faNexusBuildingPreviewKey
+    || container?.name
+    || String(documentElevation)
+  ).trim();
+  const previewActive = previewActiveOverride !== undefined
+    ? !!previewActiveOverride
+    : !!container?.faNexusPreviewActive;
+  const previewHasContent = !!container?.faNexusPreviewHasContent;
+  const explicitPlacementLevelId = resolveLayerManagerPreviewPlacementLevelId(container);
+  const derivedRenderOrder = resolveOrder({ elevation: documentElevation, sort: placementSort }, {
+    elevation: documentElevation,
+    sort: placementSort,
+    placementLevelId: explicitPlacementLevelId || defaultPlacementLevelId(),
+    allowCurrentLevelFallback: true
+  });
+  const renderKind = resolveLayerManagerPreviewBandKind(container)
+    || String(derivedRenderOrder?.kind || 'normal').trim().toLowerCase()
+    || 'normal';
+  const placementLevelId = explicitPlacementLevelId
+    || String(derivedRenderOrder?.placementLevelId || '').trim()
+    || null;
+  const placementLevelName = levelNameForId(placementLevelId)
+    || String(derivedRenderOrder?.analysis?.placementRange?.levelName || '').trim()
+    || null;
+  const renderElevation = quantize(Number(
+    container.faNexusElevation
+    ?? container.elevation
+    ?? derivedRenderOrder?.elevation
+    ?? documentElevation
+  ) || 0);
+  const renderElevationKey = groupKey(renderElevation);
+  const documentElevationKey = groupKey(documentElevation);
+  const sortLayers = sortLayersForCanvas();
+  const explicitRenderSort = resolveLayerManagerPreviewRenderSort(container, derivedRenderOrder?.sort);
+  const explicitSortLayer = normalizeRenderOrderValue(container?.sortLayer, derivedRenderOrder?.sortLayer ?? sortLayers.TILES);
+  const explicitZIndex = normalizeRenderOrderValue(container?.zIndex ?? derivedRenderOrder?.zIndex ?? 0);
+  const bandVisualizationLabel = renderKind === 'foreground'
+    ? (placementLevelName ? `${placementLevelName} Foreground` : 'Foreground Band')
+    : (renderKind === 'ground'
+      ? (placementLevelName ? `${placementLevelName} Background` : 'Background Band')
+      : null);
+  const isSpecialBand = renderKind === 'foreground' || renderKind === 'ground';
+  return {
+    preview: true,
+    previewKind,
+    previewKey,
+    previewId: `${previewKind}-${previewKey}`,
+    previewActive,
+    previewHasContent,
+    sectionId: String(container?.faNexusSectionId || '').trim() || null,
+    canDragPreview: canDragPreviewOverride !== undefined
+      ? !!canDragPreviewOverride
+      : (previewActive || previewHasContent),
+    name: baseLabel,
+    baseName: baseLabel,
+    elevation: renderElevation,
+    documentElevation,
+    documentElevationKey,
+    renderElevation,
+    renderElevationKey,
+    placementSort,
+    sort: isSpecialBand
+      ? normalizeRenderOrderValue(explicitRenderSort, derivedRenderOrder?.sort)
+      : explicitRenderSort,
+    sortLayer: isSpecialBand
+      ? normalizeRenderOrderValue(explicitSortLayer, derivedRenderOrder?.sortLayer)
+      : explicitSortLayer,
+    zIndex: isSpecialBand
+      ? normalizeRenderOrderValue(explicitZIndex, derivedRenderOrder?.zIndex)
+      : explicitZIndex,
+    lastSortedIndex: normalizeRenderOrderValue(container?._lastSortedIndex ?? 0),
+    renderKind,
+    placementLevelId,
+    placementLevelName,
+    bandVisualizationLabel,
+    typeIcon,
+    typeLabel: baseLabel
+  };
+}
+
+export function buildLayerManagerSceneMarkerEntry(texture, index = 0, {
+  quantizeElevation = null,
+  elevationGroupKey = null,
+  isLevelTextureMarkerHidden = null,
+  user = globalThis.game?.user,
+  getSortLayers = getPrimaryCanvasSortLayers
+} = {}) {
+  const caller = 'buildLayerManagerSceneMarkerEntry';
+  const quantize = requireEntryDependency('quantizeElevation', quantizeElevation, caller);
+  const groupKey = requireEntryDependency('elevationGroupKey', elevationGroupKey, caller);
+  const isMarkerHidden = requireEntryDependency('isLevelTextureMarkerHidden', isLevelTextureMarkerHidden, caller);
+  const sortLayersForCanvas = requireEntryDependency('getSortLayers', getSortLayers, caller);
+  const kind = texture?.isBackground ? 'background' : 'foreground';
+  const numeric = Number(texture?.elevation);
+  if (!Number.isFinite(numeric)) return null;
+  const level = texture?.level || null;
+  const rawLevelName = String(level?.name || '').trim();
+  const levelLabel = rawLevelName || (Number.isFinite(level?.index) ? `Level ${Number(level.index) + 1}` : 'Level');
+  const label = `${levelLabel} ${kind === 'foreground' ? 'Foreground' : 'Background'} Image`;
+  const icon = kind === 'foreground' ? 'fa-solid fa-layer-group' : 'fa-solid fa-image';
+  const sortLayers = sortLayersForCanvas();
+  return {
+    marker: true,
+    markerKind: kind,
+    markerId: `scene-${String(level?.id || texture?.sort || 'unknown')}-${kind}`,
+    markerLevelId: String(level?.id || ''),
+    markerLevelName: levelLabel,
+    markerScope: texture?.isUpper ? 'upper' : (level?.isView ? 'viewed' : 'visible'),
+    name: label,
+    hidden: isMarkerHidden(level, kind),
+    canToggleVisibility: !!level?.canUserModify?.(user, 'update'),
+    elevation: quantize(numeric),
+    elevationKey: groupKey(numeric),
+    sort: normalizeRenderOrderValue(texture?.sort ?? 0),
+    sortLayer: normalizeRenderOrderValue(sortLayers?.SCENE),
+    zIndex: normalizeRenderOrderValue(texture?.zIndex ?? 0),
+    lastSortedIndex: normalizeRenderOrderValue(index),
+    typeIcon: icon,
+    typeLabel: label
+  };
 }
 
 export function buildTileSearchText(entry) {

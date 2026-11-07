@@ -4,18 +4,38 @@ import {
   getFilePickerClass,
   normalizePickedFolderPath as normalizePickedFolderPathWithContext,
   prepareFolderPickerContext
-} from '../core/file-picker-folder-browser.js';
-import { forgeIntegration } from '../core/forge-integration.js';
+} from '../storage/file-picker-folder-browser.js';
+import { forgeIntegration } from '../storage/forge-integration.js';
 import { TileFlattenCanvasPreview } from './tile-flatten-canvas-preview.js';
 import { resolveAutoChunking } from './tile-flatten-chunking.js';
 import {
+  applyExtraPadding,
+  computeFlattenResolution,
+  computeShadowBlurMargin,
+  computeShadowedBounds,
+  computeTileShadowMargins,
+  computeTileWorldBounds,
+  expandBoundsWithMargins,
+  normalizeFlattenPaddingExtra,
+  normalizeFlattenPaddingSnap,
+  snapBounds
+} from './flatten-bounds.js';
+import {
   appendStoragePath,
-  buildGeneratedRoot,
   getConfiguredAssetsDir,
-  resolveGeneratedSceneFolder,
   sanitizeStoragePathSegments
 } from '../storage/generated-paths.js';
-import { normalizeGeneratedFlattenRoot } from '../storage/generated-output-policy.js';
+import {
+  buildFlattenOutputBaseName,
+  buildFlattenOutputFilename,
+  buildFlattenLevelOutputSlugs,
+  getStoredFlattenOutputFolder,
+  normalizeFlattenOutputFolder,
+  normalizeFlattenOutputName,
+  resolveFlattenOutputFolder,
+  sanitizeFlattenOutputBaseName,
+  sanitizeFlattenOutputPart
+} from './flatten-output-paths.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 const EXPORT_SCOPE_LEVEL = 'level';
@@ -47,6 +67,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
       middlePlacement: MIDDLE_PLACEMENT_SEPARATE
     };
     this.tiles = options.tiles || [];
+    this._sceneLevelCoverage = options.sceneLevelCoverage || null;
     this._levelRanges = this._normalizeLevelRanges(options.levelRanges);
     this._currentLevelRange = this._normalizeLevelRange(options.currentLevelRange) || this._levelRanges[0] || null;
     this._previewBoundsResolver = typeof options.previewBoundsResolver === 'function'
@@ -68,6 +89,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     this._outputCollisionPending = null;
     this._outputCollisionPendingKey = null;
     this._outputCollisionRequestId = 0;
+    this._viewportFitFrame = null;
 
     if (this._mode === 'export') {
       try { this.options.window.title = 'Flatten / Export Level'; } catch (_) {}
@@ -91,7 +113,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
 
   static PARTS = {
     form: {
-      template: 'modules/fa-nexus/templates/canvas/tile-flatten-dialog.hbs'
+      template: 'modules/fa-nexus/templates/flatten/tile-flatten-dialog.hbs'
     }
   };
 
@@ -125,7 +147,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
       : `Flatten ${tileCount} tile${pluralSuffix ? 's' : ''}`;
     const dialogDescription = isExport
       ? exportActionStrings.description
-      : 'Flatten the selected tiles into a WebP image while preserving FA Nexus metadata for future restoration.';
+      : 'Flatten complete buildings and selected artwork into ground and foreground images. Deconstruct restores the editable originals.';
     const submitLabel = isExport ? exportActionStrings.submitLabel : 'Flatten Tiles';
     const submitIcon = isExport ? exportActionStrings.submitIcon : 'fa-compress-arrows-alt';
     const exportChunkHint = defaultExportChunked
@@ -140,8 +162,11 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     const defaultOutputName = this._getOutputDefaultsForAction(defaultOutputAction, defaultOutputScope).name;
     const defaultOutputFolder = this._getOutputDefaultsForAction(defaultOutputAction, defaultOutputScope).folder;
 
+    const exportCoverage = this._getExportCoverageStrings(defaultExportScope);
     return {
       tileCount,
+      exportTileCountLabel: exportCoverage.count,
+      exportLeftOutText: exportCoverage.leftOut,
       isExport,
       dialogTitle,
       dialogDescription,
@@ -260,6 +285,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     this._renderEffectiveOutputFolder(exportActionInputs, exportScopeInputs);
     this._updatePreview(ppiInput, paddingSnapInput, paddingExtraInput, exportChunkInput);
     this._scheduleOutputCollisionCheck();
+    this._fitToViewport();
 
     // Event handlers
     this.element.addEventListener('click', async (event) => {
@@ -400,6 +426,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
       for (const input of exportActionInputs) {
         input.addEventListener('change', () => {
           this._updateExportActionUI(exportActionInputs, exportScopeInputs);
+          this._updateExportSplitUI(exportSplitInput, exportMiddlePlacementInput);
           this._syncOutputFieldsForAction(exportActionInputs, exportScopeInputs);
           this._renderEffectiveOutputFolder(exportActionInputs, exportScopeInputs);
           this._scheduleOutputCollisionCheck();
@@ -498,6 +525,10 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
       clearTimeout(this._outputCollisionTimer);
       this._outputCollisionTimer = null;
     }
+    if (this._viewportFitFrame) {
+      cancelAnimationFrame(this._viewportFitFrame);
+      this._viewportFitFrame = null;
+    }
     this._previewBoundsPending = null;
     this._previewBoundsPendingKey = null;
     this._outputCollisionPending = null;
@@ -506,6 +537,30 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     this._inputRefs = null;
     this._destroyCanvasPreview();
     super._onClose();
+  }
+
+  _fitToViewport() {
+    if (this._viewportFitFrame) cancelAnimationFrame(this._viewportFitFrame);
+    this._viewportFitFrame = requestAnimationFrame(() => {
+      this._viewportFitFrame = null;
+      const element = this.element;
+      if (!element?.isConnected || typeof this.setPosition !== 'function') return;
+      const rect = element.getBoundingClientRect();
+      const viewportWidth = element.ownerDocument?.documentElement?.clientWidth || window.innerWidth || 0;
+      const viewportHeight = element.ownerDocument?.documentElement?.clientHeight || window.innerHeight || 0;
+      const margin = 12;
+      const maxLeft = Math.max(margin, viewportWidth - rect.width - margin);
+      const maxTop = Math.max(margin, viewportHeight - rect.height - margin);
+      const targetLeft = Math.min(Math.max(margin, rect.left), maxLeft);
+      const targetTop = Math.min(Math.max(margin, rect.top), maxTop);
+      if (Math.abs(targetLeft - rect.left) < 0.5 && Math.abs(targetTop - rect.top) < 0.5) return;
+      const currentLeft = Number(this.position?.left);
+      const currentTop = Number(this.position?.top);
+      this.setPosition({
+        left: (Number.isFinite(currentLeft) ? currentLeft : rect.left) + (targetLeft - rect.left),
+        top: (Number.isFinite(currentTop) ? currentTop : rect.top) + (targetTop - rect.top)
+      });
+    });
   }
 
   _estimateRenderBounds(ppi, paddingSnap = 'none', paddingExtra = 0) {
@@ -774,40 +829,14 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   }
 
   _computeResolution(ppi, gridSize) {
-    const numericPPI = Math.max(10, Number(ppi) || 200);
-    const numericGrid = Math.max(1, Number(gridSize) || 100);
-    const resolution = numericPPI / numericGrid;
-    return Math.max(0.1, Math.min(8, resolution));
+    return computeFlattenResolution(ppi, gridSize);
   }
 
   _computeShadowedBounds(tiles) {
-    if (!Array.isArray(tiles) || !tiles.length) return null;
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-
-    for (const doc of tiles) {
-      const base = this._computeTileWorldBounds(doc);
-      if (!base) continue;
-      const margins = this._computeTileShadowMargins(doc);
-      const expanded = this._expandBoundsWithMargins(base, margins);
-      minX = Math.min(minX, expanded.x);
-      minY = Math.min(minY, expanded.y);
-      maxX = Math.max(maxX, expanded.x + expanded.width);
-      maxY = Math.max(maxY, expanded.y + expanded.height);
-    }
-
-    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
-      return null;
-    }
-
-    return {
-      x: minX,
-      y: minY,
-      width: maxX - minX,
-      height: maxY - minY
-    };
+    return computeShadowedBounds(tiles, {
+      computeTileWorldBounds: (doc) => this._computeTileWorldBounds(doc),
+      computeTileShadowMargins: (doc) => this._computeTileShadowMargins(doc)
+    });
   }
 
   _computeTileShadowMargins(doc) {
@@ -819,178 +848,32 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     if (alphaValue !== undefined && Number.isFinite(alpha) && alpha <= 0) return margins;
     const dilation = Math.max(0, this._readShadowNumeric(doc, 'shadowDilation'));
     const blur = Math.max(0, this._readShadowNumeric(doc, 'shadowBlur'));
-    const blurMargin = this._computeShadowBlurMargin(blur);
-    const extra = dilation + blurMargin;
     const offset = this._resolveShadowOffset(doc);
-    margins.left = Math.max(0, extra - offset.x);
-    margins.right = Math.max(0, extra + offset.x);
-    margins.top = Math.max(0, extra - offset.y);
-    margins.bottom = Math.max(0, extra + offset.y);
-    return margins;
+    return computeTileShadowMargins({ dilation, blur, offset });
   }
 
   _computeShadowBlurMargin(blur) {
-    const numeric = Math.max(0, Number(blur) || 0);
-    if (!numeric) return 0;
-    return Math.ceil((numeric * 2) + 1);
+    return computeShadowBlurMargin(blur);
   }
 
   _computeTileWorldBounds(doc) {
-    try {
-      const placeable = doc?.object;
-      const mesh = placeable?.mesh || placeable?.sprite;
-      if (mesh) {
-        const width = Math.abs(Number(mesh.width || 0));
-        const height = Math.abs(Number(mesh.height || 0));
-        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
-          const anchorX = Number(mesh.anchor?.x ?? 0);
-          const anchorY = Number(mesh.anchor?.y ?? 0);
-          const posX = Number(mesh.position?.x ?? mesh.x ?? 0);
-          const posY = Number(mesh.position?.y ?? mesh.y ?? 0);
-          const rotation = Number.isFinite(Number(mesh.rotation))
-            ? Number(mesh.rotation)
-            : (Number(mesh.angle || 0) * (Math.PI / 180));
-          const left = -width * anchorX;
-          const top = -height * anchorY;
-          const right = left + width;
-          const bottom = top + height;
-          if (!rotation) {
-            return {
-              x: posX + left,
-              y: posY + top,
-              width,
-              height
-            };
-          }
-          const cos = Math.cos(rotation);
-          const sin = Math.sin(rotation);
-          const corners = [
-            { x: left, y: top },
-            { x: right, y: top },
-            { x: right, y: bottom },
-            { x: left, y: bottom }
-          ];
-          let minX = Infinity;
-          let minY = Infinity;
-          let maxX = -Infinity;
-          let maxY = -Infinity;
-          for (const corner of corners) {
-            const rx = (corner.x * cos) - (corner.y * sin) + posX;
-            const ry = (corner.x * sin) + (corner.y * cos) + posY;
-            minX = Math.min(minX, rx);
-            minY = Math.min(minY, ry);
-            maxX = Math.max(maxX, rx);
-            maxY = Math.max(maxY, ry);
-          }
-          if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxX) && Number.isFinite(maxY)) {
-            return {
-              x: minX,
-              y: minY,
-              width: maxX - minX,
-              height: maxY - minY
-            };
-          }
-        }
-      }
-      const bounds = placeable?.bounds;
-      if (bounds && Number.isFinite(bounds.width) && Number.isFinite(bounds.height) && bounds.width > 0 && bounds.height > 0) {
-        return {
-          x: Number(bounds.x) || 0,
-          y: Number(bounds.y) || 0,
-          width: Number(bounds.width) || 0,
-          height: Number(bounds.height) || 0
-        };
-      }
-      const x = Number(doc?.x) || 0;
-      const y = Number(doc?.y) || 0;
-      const width = Number(doc?.width) || 0;
-      const height = Number(doc?.height) || 0;
-      const rotation = Number(doc?.rotation) || 0;
-      if (!rotation) {
-        return { x, y, width, height };
-      }
-      const rad = rotation * (Math.PI / 180);
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
-      const cx = x + width / 2;
-      const cy = y + height / 2;
-      const corners = [
-        { x, y },
-        { x: x + width, y },
-        { x: x + width, y: y + height },
-        { x, y: y + height }
-      ];
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const corner of corners) {
-        const dx = corner.x - cx;
-        const dy = corner.y - cy;
-        const rx = cx + (dx * cos) - (dy * sin);
-        const ry = cy + (dx * sin) + (dy * cos);
-        if (rx < minX) minX = rx;
-        if (ry < minY) minY = ry;
-        if (rx > maxX) maxX = rx;
-        if (ry > maxY) maxY = ry;
-      }
-      return {
-        x: minX,
-        y: minY,
-        width: maxX - minX,
-        height: maxY - minY
-      };
-    } catch (_) {
-      return null;
-    }
+    return computeTileWorldBounds(doc);
   }
 
   _expandBoundsWithMargins(bounds, margins) {
-    const left = Math.max(0, Number(margins?.left) || 0);
-    const right = Math.max(0, Number(margins?.right) || 0);
-    const top = Math.max(0, Number(margins?.top) || 0);
-    const bottom = Math.max(0, Number(margins?.bottom) || 0);
-    return {
-      x: bounds.x - left,
-      y: bounds.y - top,
-      width: bounds.width + left + right,
-      height: bounds.height + top + bottom
-    };
+    return expandBoundsWithMargins(bounds, margins);
   }
 
   _applyExtraPadding(bounds, extraPadding) {
-    const pad = Number(extraPadding) || 0;
-    if (!pad) return bounds;
-    const width = bounds.width + pad * 2;
-    const height = bounds.height + pad * 2;
-    if (width <= 1 || height <= 1) return bounds;
-    return {
-      x: bounds.x - pad,
-      y: bounds.y - pad,
-      width,
-      height
-    };
+    return applyExtraPadding(bounds, extraPadding);
   }
 
   _snapBounds(bounds, gridSize, paddingSnap) {
-    const snap = this._normalizePaddingSnap(paddingSnap);
-    if (snap === 'none') return bounds;
-    const increment = snap === 'half' ? (Number(gridSize) / 2) : Number(gridSize);
-    if (!Number.isFinite(increment) || increment <= 0) return bounds;
-    const minX = Math.floor(bounds.x / increment) * increment;
-    const minY = Math.floor(bounds.y / increment) * increment;
-    const maxX = Math.ceil((bounds.x + bounds.width) / increment) * increment;
-    const maxY = Math.ceil((bounds.y + bounds.height) / increment) * increment;
-    return {
-      x: minX,
-      y: minY,
-      width: maxX - minX,
-      height: maxY - minY
-    };
+    return snapBounds(bounds, gridSize, paddingSnap);
   }
 
   _normalizePaddingExtra(value, gridSize) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric) || numeric === 0) return 0;
-    const size = Math.max(1, Number(gridSize) || 100);
-    return numeric * size;
+    return normalizeFlattenPaddingExtra(value, gridSize);
   }
 
   _isDropShadowEnabled() {
@@ -1096,9 +979,8 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
       level: range.level || null,
       levelId: String(range.levelId || range.level?.id || '').trim() || null,
       levelName: String(range.levelName || range.level?.name || '').trim(),
-      bottom: Number.isFinite(Number(range.bottom ?? range.level?.elevation?.bottom))
-        ? Number(range.bottom ?? range.level.elevation.bottom)
-        : 0,
+      bottom: Number(range.bottom ?? range.level?.elevation?.bottom ?? -Infinity),
+      base: Number(range.base ?? range.level?.elevation?.base ?? 0),
       top: Number.isFinite(Number(range.top ?? range.level?.elevation?.top))
         ? Number(range.top ?? range.level.elevation.top)
         : Infinity
@@ -1116,13 +998,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   }
 
   _sanitizeOutputPart(value, fallback = 'item') {
-    const fallbackText = String(fallback || 'item').trim() || 'item';
-    let text = String(value ?? '').trim() || fallbackText;
-    text = text.replace(/\.[^./\\]+$/, '');
-    text = text.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-');
-    text = text.replace(/\s+/g, '-').replace(/-+/g, '-').trim();
-    text = text.replace(/^\.+/, '').replace(/[. ]+$/, '');
-    return text || fallbackText;
+    return sanitizeFlattenOutputPart(value, fallback);
   }
 
   _getExportActionStrings(action, scope = EXPORT_SCOPE_LEVEL) {
@@ -1173,29 +1049,16 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   }
 
   _buildSuggestedOutputName(action = 'flatten', scope = EXPORT_SCOPE_LEVEL) {
-    const scenePart = this._sanitizeOutputPart(canvas?.scene?.name || canvas?.scene?.id || 'scene', 'scene');
-    const scopePart = scope === EXPORT_SCOPE_SCENE
-      ? 'all-levels'
-      : this._sanitizeOutputPart(this._getLevelRangeName(this._currentLevelRange), 'level');
-    const actionPart = action === 'export' ? 'export' : 'flattened';
-    const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
-    const rand = Math.floor(Math.random() * 1e6).toString().padStart(6, '0');
-    return `${scenePart}-${scopePart}-${actionPart}-${timestamp}-${rand}`;
+    return buildFlattenOutputBaseName({
+      action,
+      scope,
+      sceneName: canvas?.scene?.name || canvas?.scene?.id || 'scene',
+      levelName: this._getLevelRangeName(this._currentLevelRange)
+    });
   }
 
   _getStoredOutputFolder(action = 'flatten', stored = {}) {
-    const key = action === 'export' ? 'exportOutputFolder' : 'flattenOutputFolder';
-    const configured = String(stored?.[key] || '').trim();
-    const assetsDir = this._getAssetsDir();
-    if (configured) {
-      if (action === 'flatten') {
-        const normalizedConfigured = normalizeGeneratedFlattenRoot(configured, { assetsDir });
-        if (normalizedConfigured) return normalizedConfigured;
-      }
-      return sanitizeStoragePathSegments(configured);
-    }
-    if (action === 'export') return appendStoragePath(assetsDir, 'exports');
-    return buildGeneratedRoot('flattened', { assetsDir });
+    return getStoredFlattenOutputFolder(action, stored, { assetsDir: this._getAssetsDir() });
   }
 
   _getAssetsDir() {
@@ -1203,32 +1066,19 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   }
 
   _normalizeOutputName(value, fallback = '') {
-    const trimmed = String(value ?? '').trim();
-    if (trimmed) return trimmed;
-    return String(fallback || '').trim();
+    return normalizeFlattenOutputName(value, fallback);
   }
 
   _normalizeOutputFolder(value, fallback = '') {
-    const trimmed = String(value ?? '').trim();
-    if (trimmed) return sanitizeStoragePathSegments(trimmed);
-    return sanitizeStoragePathSegments(String(fallback || '').trim());
+    return normalizeFlattenOutputFolder(value, fallback);
   }
 
   _sanitizeOutputBaseName(value, fallbackBase = '') {
-    const fallback = String(fallbackBase || '').trim() || 'flattened';
-    let name = String(value ?? '').trim();
-    if (!name) name = fallback;
-    name = name.replace(/\.[^./\\]+$/, '');
-    name = name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-');
-    name = name.replace(/\s+/g, '-').replace(/-+/g, '-').trim();
-    name = name.replace(/^\.+/, '').replace(/[. ]+$/, '');
-    return name || fallback;
+    return sanitizeFlattenOutputBaseName(value, fallbackBase);
   }
 
   _buildOutputFilename(baseName, suffix = '') {
-    const safeBase = this._sanitizeOutputBaseName(baseName, this._buildSuggestedOutputName('flatten'));
-    const cleanSuffix = String(suffix || '').trim();
-    return `${safeBase}${cleanSuffix}.webp`;
+    return buildFlattenOutputFilename(baseName, suffix, this._buildSuggestedOutputName('flatten'));
   }
 
   _buildChunkOutputFilenames(baseName, pixelWidth, pixelHeight, options = {}) {
@@ -1386,24 +1236,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   }
 
   _resolveEffectiveOutputFolder(action, folder) {
-    const outputRoot = String(folder || '').trim();
-    if (action === 'export') {
-      return {
-        outputRoot,
-        effectiveFolder: outputRoot,
-        sceneOwned: false,
-        worldId: '',
-        sceneId: ''
-      };
-    }
-    const generatedPath = resolveGeneratedSceneFolder('flattened', { root: outputRoot });
-    return {
-      outputRoot: generatedPath.root,
-      effectiveFolder: generatedPath.folder,
-      sceneOwned: true,
-      worldId: generatedPath.worldId,
-      sceneId: generatedPath.sceneId
-    };
+    return resolveFlattenOutputFolder(action, folder, { assetsDir: this._getAssetsDir() });
   }
 
   _renderEffectiveOutputFolder(exportActionInputs = null, exportScopeInputs = null) {
@@ -1507,9 +1340,10 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
         : ['background', 'foreground'])
       : [''];
     const suffixes = [];
-    for (const range of ranges) {
+    const levelSlugs = buildFlattenLevelOutputSlugs(ranges.map(range => this._getLevelRangeName(range)));
+    for (let index = 0; index < ranges.length; index++) {
       const levelSlug = scope === EXPORT_SCOPE_SCENE
-        ? this._sanitizeOutputPart(this._getLevelRangeName(range), 'level')
+        ? levelSlugs[index]
         : '';
       for (const layer of layerSuffixes) {
         const parts = [];
@@ -1524,6 +1358,7 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   _renderOutputCollisionState() {
     const refs = this._inputRefs;
     if (!refs) return;
+    this._fitToViewport();
     const statusEl = refs.outputStatusEl;
     const nameInput = refs.outputNameInput;
     const folderInput = refs.outputFolderInput;
@@ -1869,11 +1704,45 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
     return this._normalizeExportScope(selected?.value);
   }
 
+  // The layers the chosen scope takes, and for "All scene levels" the visible ones that are in no picture.
+  _getExportCoverageStrings(scope) {
+    const plural = (n) => (n === 1 ? '' : 's');
+    const levelCount = Array.isArray(this.tiles) ? this.tiles.length : 0;
+    const coverage = this._sceneLevelCoverage;
+    if (scope !== EXPORT_SCOPE_SCENE || !coverage) {
+      return { count: `${levelCount} tile${plural(levelCount)} ${this._levelRanges.length ? 'on the current level' : 'in scene'}`, leftOut: '' };
+    }
+    const n = coverage.leftOut.length;
+    const shown = coverage.leftOut.slice(0, 3);
+    const names = shown.map((entry) => `"${entry.name}" (${entry.reason})`).join('; ') + (n > 3 ? `; and ${n - 3} more` : '');
+    const one = n === 1;
+    const kinds = new Set(coverage.leftOut.map((entry) => entry.kind));
+    const advice = [
+      kinds.has('not-shown') ? 'show the layer on that Level too (Tile sheet, Levels), or give it an Elevation of a Level that shows it' : '',
+      kinds.has('parent') ? 'make that Level its Parent Level (Tile sheet, FA Nexus tab)' : '',
+      kinds.has('no-level') ? 'give the layer an Elevation inside a Level' : ''
+    ].filter(Boolean).join('; ');
+    return {
+      count: `${coverage.includedCount} tile${plural(coverage.includedCount)} on all levels`,
+      leftOut: n
+        ? `${n} visible ${one ? 'layer is' : 'layers are'} in no picture: ${names}. To include ${one ? 'it' : 'them'}: ${advice}.`
+        : ''
+    };
+  }
+
   _updateExportActionUI(exportActionInputs, exportScopeInputs = null) {
     if (this._mode !== 'export') return;
     const action = this._readExportAction(exportActionInputs);
     const scope = this._readExportScope(exportScopeInputs);
     const strings = this._getExportActionStrings(action, scope);
+    const coverage = this._getExportCoverageStrings(scope);
+    const countEl = this.element?.querySelector?.('[data-export-tile-count]');
+    if (countEl) countEl.textContent = coverage.count;
+    const leftOutEl = this.element?.querySelector?.('[data-export-left-out]');
+    if (leftOutEl) {
+      leftOutEl.textContent = coverage.leftOut;
+      leftOutEl.hidden = !coverage.leftOut;
+    }
     const descriptionEl = this.element?.querySelector?.('[data-dialog-description]');
     if (descriptionEl && strings.description) {
       descriptionEl.textContent = strings.description;
@@ -1903,7 +1772,12 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
 
   _updateExportSplitUI(exportSplitInput, exportMiddlePlacementInput) {
     if (!exportMiddlePlacementInput) return;
-    const enabled = !!exportSplitInput?.checked;
+    const flatten = this._mode !== 'export' || !!this.element?.querySelector('#flatten-export-action-flatten:checked');
+    if (exportSplitInput) {
+      exportSplitInput.disabled = flatten;
+      if (flatten) exportSplitInput.checked = true;
+    }
+    const enabled = flatten || !!exportSplitInput?.checked;
     exportMiddlePlacementInput.disabled = !enabled;
     const group = exportMiddlePlacementInput.closest?.('[data-export-middle-placement-group]');
     if (group) group.hidden = !enabled;
@@ -1967,8 +1841,6 @@ export class TileFlattenDialog extends HandlebarsApplicationMixin(ApplicationV2)
   }
 
   _normalizePaddingSnap(value) {
-    const snap = String(value || 'none').toLowerCase();
-    if (snap === 'half' || snap === 'full') return snap;
-    return 'none';
+    return normalizeFlattenPaddingSnap(value);
   }
 }

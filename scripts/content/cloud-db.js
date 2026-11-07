@@ -1,7 +1,8 @@
 // CloudDB — IndexedDB wrapper for cloud manifests (tokens, assets)
-// Stores: items_<kind> (key: file_path), meta_<kind> (single key 'meta')
+// Stores: items_<kind> (key: id), meta_<kind> (single key 'meta')
 
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { contentFilename, toInventoryV2Item } from './cloud-inventory-v2.js';
 
 /**
  * @typedef {import('../core/fa-nexus-types.js').FaNexusFolderCountEntry} FaNexusFolderCountEntry
@@ -21,7 +22,7 @@ function abortError() {
  * Lightweight IndexedDB wrapper for storing cloud manifests for tokens and assets.
  *
  * Object stores per kind:
- * - `items_<kind>`: keyed by `file_path`, holds inventory records
+ * - `items_<kind>`: keyed by `id`, holds inventory records
  * - `meta_<kind>`: single record keyed by `id='meta'`, tracks `latest` hash and counts
  */
 export class CloudDB {
@@ -30,6 +31,7 @@ export class CloudDB {
   static _safeCloseInstance(inst) {
     try { inst?.db?.close?.(); } catch (_) {}
     try { inst.db = null; } catch (_) {}
+    try { CloudDB._instances.delete(inst); } catch (_) {}
   }
   static closeAll(dbName) {
     try {
@@ -46,7 +48,10 @@ export class CloudDB {
     this.db = null;
     this.CHUNK_SIZE = 7000;
     this._rebuildInFlight = new Map();
-    try { CloudDB._instances.add(this); } catch (_) {}
+  }
+
+  close() {
+    CloudDB._safeCloseInstance(this);
   }
 
   /**
@@ -66,10 +71,10 @@ export class CloudDB {
           const meta = `meta_${kind}`;
           const items2 = `items2_${kind}`;
           if (!db.objectStoreNames.contains(items)) {
-            const s = db.createObjectStore(items, { keyPath: 'file_path' });
-            try { s.createIndex('filename', 'filename', { unique: false }); } catch (_) {}
-            try { s.createIndex('path', 'path', { unique: false }); } catch (_) {}
+            const s = db.createObjectStore(items, { keyPath: 'id' });
+            try { s.createIndex('folder', 'folder', { unique: false }); } catch (_) {}
             try { s.createIndex('tier', 'tier', { unique: false }); } catch (_) {}
+            try { s.createIndex('asset_class', 'asset_class', { unique: false }); } catch (_) {}
           }
           if (!db.objectStoreNames.contains(meta)) {
             db.createObjectStore(meta, { keyPath: 'id' });
@@ -83,10 +88,13 @@ export class CloudDB {
       };
       req.onsuccess = () => {
         const db = (this.db = req.result);
+        try { CloudDB._instances.add(this); } catch (_) {}
         try {
           db.onversionchange = () => {
-            try { db.close(); } catch (_) {}
-            if (this.db === db) this.db = null;
+            if (this.db === db) this.close();
+            else {
+              try { db.close(); } catch (_) {}
+            }
           };
         } catch (_) {}
         resolve(db);
@@ -147,9 +155,8 @@ export class CloudDB {
     if (onProgress) emit(true); // initial fire (0/total)
     return new Promise((resolve, reject) => {
       let settled = false;
-      let txClear = null;
-      let txPut = null;
-      let txChunks = null;
+      let tx = null;
+      let operationError = null;
       const cleanupSignal = () => { if (signal) signal.removeEventListener('abort', onSignalAbort); };
       const finishResolve = (value) => {
         if (settled) return;
@@ -164,9 +171,7 @@ export class CloudDB {
         reject(error);
       };
       const abortTransactions = () => {
-        try { txClear?.abort(); } catch (_) {}
-        try { txPut?.abort(); } catch (_) {}
-        try { txChunks?.abort(); } catch (_) {}
+        try { tx?.abort(); } catch (_) {}
       };
       const checkAbort = () => {
         if (!signal?.aborted) return false;
@@ -184,44 +189,41 @@ export class CloudDB {
         signal.addEventListener('abort', onSignalAbort, { once: true });
       }
       try {
-        // Clear both per-item and chunked stores first
-        txClear = db.transaction([`items_${kind}`, `items2_${kind}`], 'readwrite');
-        txClear.objectStore(`items_${kind}`).clear();
-        txClear.objectStore(`items2_${kind}`).clear();
-        txClear.oncomplete = () => {
-          if (checkAbort()) return;
-          if (!total) {
-            emit(true);
-            finishResolve(true);
-            return;
-          }
-          // Populate per-item store
-          txPut = db.transaction([`items_${kind}`], 'readwrite');
-          const sPut = txPut.objectStore(`items_${kind}`);
+        // Keep the previous catalog intact unless every item and chunk commits.
+        tx = db.transaction([`items_${kind}`, `items2_${kind}`], 'readwrite');
+        const sPut = tx.objectStore(`items_${kind}`);
+        const sChunks = tx.objectStore(`items2_${kind}`);
+        tx.oncomplete = () => {
+          inserted = total;
+          emit(true);
+          finishResolve(true);
+        };
+        tx.onerror = () => finishReject(operationError || tx.error || new Error(`Could not replace ${kind} catalog.`));
+        tx.onabort = () => finishReject(signal?.aborted
+          ? abortError()
+          : (operationError || tx.error || new Error(`Could not replace ${kind} catalog.`)));
+
+        let clearsRemaining = 2;
+        const populate = () => {
+          clearsRemaining -= 1;
+          if (clearsRemaining > 0 || settled) return;
+          if (checkAbort() || !total) return;
           let i = 0;
           const putNext = () => {
             if (settled) return;
             if (checkAbort()) return;
             if (i >= arr.length) {
-              // Build chunked store for fast bulk reads
-              txChunks = db.transaction([`items2_${kind}`], 'readwrite');
-              const s2 = txChunks.objectStore(`items2_${kind}`);
               let chunkIndex = 0;
-              const sorted = arr.slice().sort((a, b) => String(a?.file_path || '').localeCompare(String(b?.file_path || '')));
+              const sorted = arr.slice().sort((a, b) => String(a?.id || '').localeCompare(String(b?.id || '')));
               for (let j = 0; j < sorted.length; j += this.CHUNK_SIZE) {
                 if (settled) return;
                 if (checkAbort()) return;
                 const slice = sorted.slice(j, j + this.CHUNK_SIZE);
                 inserted = Math.min(total, j + slice.length);
                 emit();
-                s2.put({ chunk: chunkIndex++, records: slice });
+                const chunkRequest = sChunks.put({ chunk: chunkIndex++, records: slice });
+                chunkRequest.onerror = () => { operationError = chunkRequest.error; };
               }
-              txChunks.oncomplete = () => {
-                inserted = total;
-                emit(true);
-                finishResolve(true);
-              };
-              txChunks.onerror = () => finishReject(txChunks.error);
               return;
             }
             const rec = arr[i++];
@@ -232,12 +234,15 @@ export class CloudDB {
               emit();
               putNext();
             };
-            req.onerror = () => finishReject(req.error);
+            req.onerror = () => { operationError = req.error; };
           };
-          txPut.onerror = () => finishReject(txPut.error);
           putNext();
         };
-        txClear.onerror = () => finishReject(txClear.error);
+        for (const store of [sPut, sChunks]) {
+          const clearRequest = store.clear();
+          clearRequest.onsuccess = populate;
+          clearRequest.onerror = () => { operationError = clearRequest.error; };
+        }
       } catch (e) { finishReject(e); }
     });
   }
@@ -256,14 +261,17 @@ export class CloudDB {
       try {
         if (!op || typeof op !== 'object') { resolve(false); return; }
         if (op.op === 'add' || op.op === 'up') {
-          const req = items.put(op.item);
+          const normalized = toInventoryV2Item(kind, op.item, 'cloud');
+          const req = items.put(normalized);
           req.onsuccess = () => resolve(true);
           req.onerror = () => reject(req.error);
         } else if (op.op === 'del') {
-          const req = items.delete(op.file_path);
+          const key = String(op.path || op.id || '').trim();
+          if (!key) { reject(new Error(`Missing ${kind} v2 delta delete path.`)); return; }
+          const req = items.delete(key);
           req.onsuccess = () => resolve(true);
           req.onerror = () => reject(req.error);
-        } else resolve(false);
+        } else reject(new Error(`Unknown ${kind} v2 delta op: ${String(op.op || '')}`));
       } catch (e) { reject(e); }
     });
   }
@@ -278,40 +286,83 @@ export class CloudDB {
     const task = (async () => {
       const db = await this._open();
       try {
-        const all = await new Promise((resolve) => {
-          const out = [];
-          try {
-            const s = db.transaction([`items_${kind}`], 'readonly').objectStore(`items_${kind}`);
-            const req = s.openCursor();
-            req.onsuccess = (e) => {
-              const cursor = e.target.result;
-              if (cursor) { out.push(cursor.value); cursor.continue(); }
-              else resolve(out);
-            };
-            req.onerror = () => resolve(out);
-          } catch (_) { resolve(out); }
-        });
         await new Promise((resolve, reject) => {
           try {
-            const tx = db.transaction([`items2_${kind}`], 'readwrite');
-            const s2 = tx.objectStore(`items2_${kind}`);
-            s2.clear();
+            const tx = db.transaction([`items_${kind}`, `items2_${kind}`], 'readwrite');
+            const items = tx.objectStore(`items_${kind}`);
+            const chunks = tx.objectStore(`items2_${kind}`);
             let chunkIndex = 0;
-            const sorted = all.slice().sort((a, b) => String(a?.file_path || '').localeCompare(String(b?.file_path || '')));
-            for (let i = 0; i < sorted.length; i += this.CHUNK_SIZE) {
-              const slice = sorted.slice(i, i + this.CHUNK_SIZE);
-              s2.put({ chunk: chunkIndex++, records: slice });
-            }
+            let buffer = [];
+            const fail = (error) => {
+              try { tx.abort(); } catch (_) {}
+              reject(error);
+            };
+            const flush = () => {
+              if (!buffer.length) return;
+              const records = buffer;
+              buffer = [];
+              const chunk = chunkIndex++;
+              const req = chunks.put({ chunk, records });
+              req.onerror = () => fail(req.error || new Error(`Could not write ${kind} chunk ${chunk}.`));
+            };
             tx.oncomplete = () => resolve(true);
-            tx.onerror = () => reject(tx.error);
-          } catch (e) { resolve(false); }
+            tx.onerror = () => reject(tx.error || new Error(`Could not rebuild ${kind} chunks.`));
+            tx.onabort = () => reject(tx.error || new Error(`Could not rebuild ${kind} chunks.`));
+            const clearReq = chunks.clear();
+            clearReq.onerror = () => fail(clearReq.error || new Error(`Could not clear ${kind} chunks.`));
+            const cursorReq = items.openCursor();
+            cursorReq.onsuccess = (event) => {
+              try {
+                const cursor = event.target.result;
+                if (!cursor) {
+                  flush();
+                  return;
+                }
+                buffer.push(cursor.value);
+                if (buffer.length >= this.CHUNK_SIZE) flush();
+                cursor.continue();
+              } catch (error) { fail(error); }
+            };
+            cursorReq.onerror = () => fail(cursorReq.error || new Error(`Could not read ${kind} records for chunk rebuild.`));
+          } catch (e) { reject(e); }
         });
         return true;
-      } catch (_) { return false; }
+      } catch (error) {
+        Logger.warn('CloudDB.rebuildChunks.failed', {
+          kind,
+          error: String(error?.message || error)
+        });
+        return false;
+      }
     })();
     try { this._rebuildInFlight?.set(kind, task); } catch (_) {}
     try { return await task; }
     finally { try { this._rebuildInFlight?.delete(kind); } catch (_) {} }
+  }
+
+  _scheduleBackgroundChunkRebuild(kind, source = 'unknown') {
+    try {
+      return this.rebuildChunks(kind)
+        .then((ok) => {
+          if (!ok) Logger.warn('CloudDB.rebuildChunks.background.incomplete', { kind, source });
+          return ok;
+        })
+        .catch((error) => {
+          Logger.warn('CloudDB.rebuildChunks.background.failed', {
+            kind,
+            source,
+            error: String(error?.message || error)
+          });
+          return false;
+        });
+    } catch (error) {
+      Logger.warn('CloudDB.rebuildChunks.background.startFailed', {
+        kind,
+        source,
+        error: String(error?.message || error)
+      });
+      return Promise.resolve(false);
+    }
   }
 
   /**
@@ -339,10 +390,14 @@ export class CloudDB {
   async getMeta(kind) {
     const db = await this._open();
     const s = db.transaction([`meta_${kind}`], 'readonly').objectStore(`meta_${kind}`);
-    return new Promise((resolve) => {
-      const req = s.get('meta');
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
+    return new Promise((resolve, reject) => {
+      try {
+        const req = s.get('meta');
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error || new Error(`Could not read ${kind} metadata.`));
+      } catch (error) {
+        reject(error);
+      }
     });
   }
 
@@ -364,12 +419,12 @@ export class CloudDB {
   async count(kind) {
     const db = await this._open();
     const s = db.transaction([`items_${kind}`], 'readonly').objectStore(`items_${kind}`);
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       try {
         const req = s.count();
         req.onsuccess = () => resolve(req.result || 0);
-        req.onerror = () => resolve(0);
-      } catch (_) { resolve(0); }
+        req.onerror = () => reject(req.error || new Error(`Could not count ${kind} records.`));
+      } catch (error) { reject(error); }
     });
   }
 
@@ -387,7 +442,7 @@ export class CloudDB {
     const onChunk = typeof options.onChunk === 'function' ? options.onChunk : null;
     const preferChunks = options.preferChunks !== false;
     const chunkSize = Math.max(100, Number(options.chunkSize) || this.CHUNK_SIZE);
-    const meta = await this.getMeta(kind).catch(() => null);
+    const meta = await this.getMeta(kind);
     const latest = meta?.latest || null;
     const chunksLatest = meta?.chunksLatest || null;
     const totalHint = Math.max(0, Number(meta?.count) || 0);
@@ -412,24 +467,24 @@ export class CloudDB {
       }
     };
 
-    const countChunkRecords = async () => new Promise((resolve) => {
+    const countChunkRecords = async () => new Promise((resolve, reject) => {
       try {
         const tx = db.transaction([`items2_${kind}`], 'readonly');
         const store = tx.objectStore(`items2_${kind}`);
         const req = store.count();
         req.onsuccess = () => resolve(Math.max(0, Number(req.result) || 0));
-        req.onerror = () => resolve(0);
-      } catch (_) { resolve(0); }
+        req.onerror = () => reject(req.error || new Error(`Could not count ${kind} chunks.`));
+      } catch (error) { reject(error); }
     });
 
-    const readChunkRecord = async (chunkIndex) => new Promise((resolve) => {
+    const readChunkRecord = async (chunkIndex) => new Promise((resolve, reject) => {
       try {
         const tx = db.transaction([`items2_${kind}`], 'readonly');
         const store = tx.objectStore(`items2_${kind}`);
         const req = store.get(chunkIndex);
         req.onsuccess = () => resolve(req.result || null);
-        req.onerror = () => resolve(null);
-      } catch (_) { resolve(null); }
+        req.onerror = () => reject(req.error || new Error(`Could not read ${kind} chunk ${chunkIndex}.`));
+      } catch (error) { reject(error); }
     });
 
     const readCursorBatch = async (afterKey = null) => new Promise((resolve, reject) => {
@@ -453,7 +508,7 @@ export class CloudDB {
             return;
           }
           out.push(cursor.value);
-          lastKey = cursor.primaryKey ?? cursor.key ?? cursor.value?.file_path ?? lastKey;
+          lastKey = cursor.primaryKey ?? cursor.key ?? cursor.value?.id ?? lastKey;
           if (out.length >= chunkSize) {
             finish({ records: out, lastKey });
             return;
@@ -488,7 +543,7 @@ export class CloudDB {
       } else {
         if (preferChunks) {
           Logger.info('CloudDB.streamAll:chunks.stale', { kind, latest, chunksLatest });
-          this.rebuildChunks(kind).catch(() => {});
+          this._scheduleBackgroundChunkRebuild(kind, 'streamAll:stale-chunks');
         }
         Logger.info('CloudDB.streamAll:mode', { kind, mode: 'cursor', chunkSize });
         let afterKey = null;
@@ -518,7 +573,7 @@ export class CloudDB {
   /**
    * Query items with simple client-side filtering and pagination
    * @param {'tokens'|'assets'} kind
-   * @param {{text?:string,tier?:string,pathPrefix?:string,offset?:number,limit?:number,onProgress?:(count:number,total:number)=>void,progressBatch?:number,signal?:AbortSignal}} [opts]
+   * @param {{text?:string,tier?:string,pathPrefix?:string,assetClass?:string,offset?:number,limit?:number,onProgress?:(count:number,total:number)=>void,progressBatch?:number,signal?:AbortSignal}} [opts]
    * @returns {Promise<FaNexusInventoryListResult>}
    */
   async query(kind, opts = {}) {
@@ -557,29 +612,28 @@ export class CloudDB {
     const text = String(opts.text || '').toLowerCase();
     const tier = opts.tier || null;
     const pathPrefix = opts.pathPrefix || '';
+    const assetClass = opts.assetClass || opts.asset_class || null;
     const offset = Math.max(0, Number(opts.offset) || 0);
     const limit = Math.max(0, Number(opts.limit) || 0);
-    const sortBy = opts.sortBy || 'file_path';
+    const sortBy = opts.sortBy || 'id';
     const sortDir = opts.sortDir === 'desc' ? 'desc' : 'asc';
-    const wantsFastPath = !text && !tier && !pathPrefix && !offset && !limit;
+    const wantsFastPath = !text && !tier && !pathPrefix && !assetClass && !offset && !limit;
 
     let metaSnapshot = null;
     let totalHint = 0;
     if (onProgress || wantsFastPath) {
-      try {
-        metaSnapshot = await this.getMeta(kind);
-        if (onProgress) {
-          totalHint = Number(metaSnapshot?.count) || 0;
-          Logger.info('CloudDB.query:meta', { kind, totalHint });
-        }
-      } catch (_) {}
+      metaSnapshot = await this.getMeta(kind);
+      if (onProgress) {
+        totalHint = Number(metaSnapshot?.count) || 0;
+        Logger.info('CloudDB.query:meta', { kind, totalHint });
+      }
     }
 
     const store = db.transaction([`items_${kind}`], 'readonly').objectStore(`items_${kind}`);
     Logger.time(`CloudDB.query:${kind}`);
     if (signal?.aborted) throw abortError();
 
-    // Helper to build a path range for prefix scans
+    // Helper to build a folder range for prefix scans
     const pathRange = pathPrefix ? IDBKeyRange.bound(pathPrefix, `${pathPrefix}\uffff`) : null;
 
     // Fast path: no filters, no pagination -> use chunked store or getAll()
@@ -609,13 +663,13 @@ export class CloudDB {
       }
       if (chunksFresh) {
         // Try chunked
-        const chunks = await promiseWithAbort(({ resolve }) => {
+        const chunks = await promiseWithAbort(({ resolve, reject }) => {
           try {
             const s2 = db.transaction([`items2_${kind}`], 'readonly').objectStore(`items2_${kind}`);
             const req = s2.getAll();
             req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
-            req.onerror = () => resolve([]);
-          } catch (_) { resolve([]); }
+            req.onerror = () => reject(req.error || new Error(`Could not read ${kind} chunks.`));
+          } catch (error) { reject(error); }
         });
         if (signal?.aborted) throw abortError();
         if (Array.isArray(chunks) && chunks.length) {
@@ -629,7 +683,7 @@ export class CloudDB {
             emitProgress(seen);
           }
           if (onProgress && seen > lastProgressCount) formatProgress(seen, totalHint || seen);
-          if (sortBy === 'file_path' && sortDir === 'desc') merged.reverse();
+          if (sortBy === 'id' && sortDir === 'desc') merged.reverse();
           const total = merged.length;
           if (onProgress && !totalHint && total && lastProgressCount < total) formatProgress(total, total);
           Logger.timeEnd(`CloudDB.query:${kind}`);
@@ -638,8 +692,8 @@ export class CloudDB {
       }
       // Fallback to getAll and rebuild chunks in background
       Logger.info('CloudDB.query:mode', { kind, mode: 'cursor-fallback' });
-      this.rebuildChunks(kind).catch(() => {});
-      const items = await promiseWithAbort(({ resolve }) => {
+      this._scheduleBackgroundChunkRebuild(kind, 'query:cursor-fallback');
+      const items = await promiseWithAbort(({ resolve, reject }) => {
         const out = [];
         try {
           const req = store.openCursor();
@@ -650,13 +704,13 @@ export class CloudDB {
             emitProgress(out.length, totalHint || 0);
             cursor.continue();
           };
-          req.onerror = () => resolve(out);
-        } catch (_) { resolve(out); }
+          req.onerror = () => reject(req.error || new Error(`Could not read ${kind} records.`));
+        } catch (error) { reject(error); }
       });
       if (signal?.aborted) throw abortError();
       if (onProgress && items.length > lastProgressCount) formatProgress(items.length, totalHint || items.length);
-      if (sortBy === 'file_path') {
-        items.sort((a, b) => String(a?.file_path || '').localeCompare(String(b?.file_path || '')));
+      if (sortBy === 'id') {
+        items.sort((a, b) => String(a?.id || '').localeCompare(String(b?.id || '')));
         if (sortDir === 'desc') items.reverse();
       }
       const total = items.length;
@@ -665,33 +719,41 @@ export class CloudDB {
     }
 
     // Choose primary scan source to minimize iteration:
-    // Priority: path prefix (most selective), else tier index, else full store
+    // Priority: asset class, folder prefix, tier, else full store
     let primarySource = store;
     let useRange = null;
     let needsPostFilterTier = false;
     let needsPostFilterPath = false;
+    let needsPostFilterAssetClass = false;
     try {
-      if (pathRange) {
-        primarySource = store.index('path');
+      if (assetClass) {
+        primarySource = store.index('asset_class');
+        useRange = IDBKeyRange.only(assetClass);
+        needsPostFilterTier = !!tier;
+        needsPostFilterPath = !!pathPrefix;
+      } else if (pathRange) {
+        primarySource = store.index('folder');
         useRange = pathRange;
         needsPostFilterTier = !!tier;
       } else if (tier) {
         primarySource = store.index('tier');
         useRange = IDBKeyRange.only(tier);
       }
-    } catch (_) {
+    } catch (error) {
+      if (error?.name !== 'NotFoundError') throw error;
       // If indexes are missing for any reason, fall back to full store
       primarySource = store;
       useRange = null;
       needsPostFilterTier = !!tier;
       needsPostFilterPath = !!pathPrefix;
+      needsPostFilterAssetClass = !!assetClass;
     }
 
     // Collect matching items, then sort and paginate
-    const matched = await promiseWithAbort(({ resolve }) => {
+    const matched = await promiseWithAbort(({ resolve, reject }) => {
       const out = [];
       try {
-        Logger.info('CloudDB.query:mode', { kind, mode: 'filtered-cursor', hasText: !!text, hasTier: !!tier, hasPrefix: !!pathPrefix });
+        Logger.info('CloudDB.query:mode', { kind, mode: 'filtered-cursor', hasText: !!text, hasTier: !!tier, hasPrefix: !!pathPrefix, assetClass });
         const req = primarySource.openCursor ? primarySource.openCursor(useRange || undefined) : store.openCursor();
         req.onsuccess = (e) => {
           const cursor = e.target.result;
@@ -699,10 +761,11 @@ export class CloudDB {
           const v = cursor.value;
           let ok = true;
           if (needsPostFilterTier) ok = ok && String(v.tier || '') === tier;
-          if (needsPostFilterPath) ok = ok && String(v.path || '').startsWith(pathPrefix);
+          if (needsPostFilterPath) ok = ok && String(v.folder || '').startsWith(pathPrefix);
+          if (needsPostFilterAssetClass) ok = ok && String(v.asset_class || '') === assetClass;
           if (ok && text) {
             const tagsText = Array.isArray(v.tags) ? v.tags.join(' ') : v.tags;
-            const fields = [v.display_name, v.filename, v.path, tagsText];
+            const fields = [v.name, contentFilename(v), v.folder, tagsText];
             ok = fields.some(val => String(val || '').toLowerCase().includes(text));
           }
           if (ok) {
@@ -711,15 +774,15 @@ export class CloudDB {
           }
           cursor.continue();
         };
-        req.onerror = () => resolve(out);
-      } catch (_) { resolve(out); }
+        req.onerror = () => reject(req.error || new Error(`Could not read filtered ${kind} records.`));
+      } catch (error) { reject(error); }
     });
     if (signal?.aborted) throw abortError();
     if (onProgress && matched.length > lastProgressCount) formatProgress(matched.length, totalHint || matched.length);
 
     const total = matched.length;
-    if (sortBy === 'file_path') {
-      matched.sort((a, b) => String(a?.file_path || '').localeCompare(String(b?.file_path || '')));
+    if (sortBy === 'id') {
+      matched.sort((a, b) => String(a?.id || '').localeCompare(String(b?.id || '')));
       if (sortDir === 'desc') matched.reverse();
     }
     const page = limit ? matched.slice(offset, offset + limit) : (offset ? matched.slice(offset) : matched);

@@ -1,4 +1,5 @@
 import { NexusLogger as Logger } from '../../core/nexus-logger.js';
+import { isBuildingEditProtectedTile } from '../../buildings/building-edit-delete-guard.js';
 
 export function getOpenTileConfigDocsById() {
   const docsById = new Map();
@@ -60,7 +61,7 @@ export async function deleteSelectedDocs({
   onSelectionActionsUpdated = null
 } = {}) {
   const targets = Array.isArray(docs)
-    ? docs.filter((doc) => doc?.canUserModify?.(user, 'delete'))
+    ? docs.filter((doc) => doc?.canUserModify?.(user, 'delete') && !isBuildingEditProtectedTile(doc))
     : [];
   const ids = targets.map((doc) => doc?.id).filter(Boolean);
   if (!ids.length || typeof deleteEmbeddedDocuments !== 'function') return false;
@@ -82,7 +83,16 @@ export function handleSelectionListFilterStateChange({
   invalidateSelectionListFilterCache = null,
   scheduleSelectionFilterRefresh = null
 } = {}) {
-  try { invalidateSelectionListFilterCache?.(reason); } catch (_) {}
+  try {
+    invalidateSelectionListFilterCache?.(reason);
+  } catch (error) {
+    Logger.error('LayerManager.selectionFilter.listFilterStateChange.failed', {
+      reason,
+      phase: 'invalidate-cache',
+      error: String(error?.message || error)
+    });
+    throw error;
+  }
   if (!selectionFilterState?.active || !selectionFilterState?.skipFiltered) return false;
   try {
     scheduleSelectionFilterRefresh?.({
@@ -90,17 +100,38 @@ export function handleSelectionListFilterStateChange({
       source: 'layer-manager-list-filters',
       resyncSettings: false
     });
-  } catch (_) {}
+  } catch (error) {
+    Logger.error('LayerManager.selectionFilter.listFilterStateChange.failed', {
+      reason,
+      phase: 'schedule-refresh',
+      error: String(error?.message || error)
+    });
+    throw error;
+  }
   return true;
 }
 
 export function activateTilesLayer() {
   try {
     if (canvas?.tiles && canvas.activeLayer !== canvas.tiles) canvas.tiles.activate();
-  } catch (_) {}
+    if (!ui?.controls?.tool?.control) {
+      if (typeof ui?.controls?.activate !== 'function') {
+        throw new Error('Foundry UI controls are unavailable for Tile selection.');
+      }
+      ui.controls.activate({ tool: 'select' });
+      if (!ui?.controls?.tool?.control) {
+        throw new Error('Foundry Select tool did not activate for Tile selection.');
+      }
+    }
+  } catch (error) {
+    Logger.error('LayerManager.selectionFilter.activateTilesLayer.failed', {
+      error: String(error?.message || error)
+    });
+    throw error;
+  }
 }
 
-export function applyRangeFilterChange({
+export async function applyRangeFilterChange({
   root = null,
   isInput = false,
   selectionFilterState = null,
@@ -109,8 +140,7 @@ export function applyRangeFilterChange({
   refreshTileInteractionState = null,
   pruneSelectionForFilter = null,
   rangeMinSetting = '',
-  rangeMaxSetting = '',
-  ignoreForegroundSetting = ''
+  rangeMaxSetting = ''
 } = {}) {
   if (!root || !selectionFilterState || typeof parseElevationInput !== 'function') return;
   const minInput = root.querySelector('input[data-range="min"]');
@@ -119,22 +149,36 @@ export function applyRangeFilterChange({
   const maxRaw = maxInput?.value ?? '';
   const minValue = minRaw.trim();
   const maxValue = maxRaw.trim();
-  selectionFilterState.min = parseElevationInput(minValue);
-  selectionFilterState.max = parseElevationInput(maxValue);
+  const nextMin = parseElevationInput(minValue);
+  const nextMax = parseElevationInput(maxValue);
+  const previousState = {
+    min: selectionFilterState.min,
+    max: selectionFilterState.max
+  };
 
-  if ((minValue || maxValue) && !selectionFilterState.ignoreForeground) {
-    selectionFilterState.ignoreForeground = true;
-    if (!isInput) {
-      try { writeSetting?.(ignoreForegroundSetting, true); } catch (_) {}
-    }
-    try { refreshTileInteractionState?.(); } catch (_) {}
+  if (isInput) {
+    selectionFilterState.min = nextMin;
+    selectionFilterState.max = nextMax;
+    refreshTileInteractionState?.();
+    return;
   }
 
-  if (isInput) return;
-  try { writeSetting?.(rangeMinSetting, minValue); } catch (_) {}
-  try { writeSetting?.(rangeMaxSetting, maxValue); } catch (_) {}
-  try { refreshTileInteractionState?.(); } catch (_) {}
-  try { pruneSelectionForFilter?.(); } catch (_) {}
+  try {
+    await writeSetting?.(rangeMinSetting, minValue);
+    await writeSetting?.(rangeMaxSetting, maxValue);
+    selectionFilterState.min = nextMin;
+    selectionFilterState.max = nextMax;
+  } catch (error) {
+    selectionFilterState.min = previousState.min;
+    selectionFilterState.max = previousState.max;
+    throw error;
+  }
+
+  const effectFailures = [];
+  try { refreshTileInteractionState?.(); } catch (error) { effectFailures.push(error); }
+  try { pruneSelectionForFilter?.(); } catch (error) { effectFailures.push(error); }
+  if (effectFailures.length === 1) throw effectFailures[0];
+  if (effectFailures.length > 1) throw new AggregateError(effectFailures, 'Layer Manager range filter effects failed.');
 }
 
 function readCheckboxValue(root = null, action = '') {
@@ -143,7 +187,7 @@ function readCheckboxValue(root = null, action = '') {
   return !!input?.checked;
 }
 
-export function applySelectionBooleanFilterChange({
+export async function applySelectionBooleanFilterChange({
   root = null,
   action = '',
   selectionFilterState = null,
@@ -155,14 +199,23 @@ export function applySelectionBooleanFilterChange({
 } = {}) {
   if (!root || !selectionFilterState || !stateKey) return false;
   const value = readCheckboxValue(root, action);
+  const previousValue = selectionFilterState[stateKey];
+  try {
+    await writeSetting?.(settingKey, value);
+  } catch (error) {
+    selectionFilterState[stateKey] = previousValue;
+    throw error;
+  }
   selectionFilterState[stateKey] = value;
-  try { writeSetting?.(settingKey, value); } catch (_) {}
-  try { refreshTileInteractionState?.(); } catch (_) {}
-  try { pruneSelectionForFilter?.(); } catch (_) {}
+  const effectFailures = [];
+  try { refreshTileInteractionState?.(); } catch (error) { effectFailures.push(error); }
+  try { pruneSelectionForFilter?.(); } catch (error) { effectFailures.push(error); }
+  if (effectFailures.length === 1) throw effectFailures[0];
+  if (effectFailures.length > 1) throw new AggregateError(effectFailures, 'Layer Manager boolean filter effects failed.');
   return value;
 }
 
-export function applySkipFilteredChange({
+export async function applySkipFilteredChange({
   root = null,
   selectionFilterState = null,
   invalidateSelectionListFilterCache = null,
@@ -172,16 +225,28 @@ export function applySkipFilteredChange({
 } = {}) {
   if (!root || !selectionFilterState) return false;
   const value = readCheckboxValue(root, 'skip-filtered');
-  selectionFilterState.skipFiltered = value;
-  try { invalidateSelectionListFilterCache?.('skip-filtered-toggle'); } catch (_) {}
-  try { writeSetting?.(settingKey, value); } catch (_) {}
+  const previousValue = selectionFilterState.skipFiltered;
   try {
+    await writeSetting?.(settingKey, value);
+  } catch (error) {
+    selectionFilterState.skipFiltered = previousValue;
+    throw error;
+  }
+  selectionFilterState.skipFiltered = value;
+  try {
+    invalidateSelectionListFilterCache?.('skip-filtered-toggle');
     scheduleSelectionFilterRefresh?.({
       reason: 'skip-filtered-toggle',
       source: 'layer-manager-selection-options',
       resyncSettings: false
     });
-  } catch (_) {}
+  } catch (error) {
+    Logger.error('LayerManager.selectionFilter.skipFilteredChange.failed', {
+      phase: 'refresh-selection-filter',
+      error: String(error?.message || error)
+    });
+    throw error;
+  }
   return value;
 }
 
@@ -197,11 +262,14 @@ export function setSelectionFilterActive({
   const next = !!active;
   if (selectionFilterState.active === next) return false;
   selectionFilterState.active = next;
+  const effectFailures = [];
   if (next) {
-    try { setAltKeyHeld?.(!!isAltModifierActive?.()); } catch (_) {}
+    try { setAltKeyHeld?.(!!isAltModifierActive?.()); } catch (error) { effectFailures.push(error); }
   }
-  try { refreshTileInteractionState?.(); } catch (_) {}
-  try { pruneSelectionForFilter?.(); } catch (_) {}
+  try { refreshTileInteractionState?.(); } catch (error) { effectFailures.push(error); }
+  try { pruneSelectionForFilter?.(); } catch (error) { effectFailures.push(error); }
+  if (effectFailures.length === 1) throw effectFailures[0];
+  if (effectFailures.length > 1) throw new AggregateError(effectFailures, 'Layer Manager activation effects failed.');
   return true;
 }
 

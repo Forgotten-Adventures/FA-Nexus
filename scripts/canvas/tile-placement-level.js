@@ -41,8 +41,10 @@ function buildNextTileData(doc, changes = {}) {
 function hasPlacementLevelField(data) {
   if (!data || typeof data !== 'object') return false;
   if (Object.prototype.hasOwnProperty.call(data, `flags.${MODULE_ID}.${FA_NEXUS_TILE_PLACEMENT_LEVEL_FLAG}`)) return true;
+  if (Object.prototype.hasOwnProperty.call(data, `flags.${MODULE_ID}.-=${FA_NEXUS_TILE_PLACEMENT_LEVEL_FLAG}`)) return true;
   const moduleFlags = data.flags?.[MODULE_ID];
-  return !!(moduleFlags && Object.prototype.hasOwnProperty.call(moduleFlags, FA_NEXUS_TILE_PLACEMENT_LEVEL_FLAG));
+  return !!(moduleFlags && (Object.prototype.hasOwnProperty.call(moduleFlags, FA_NEXUS_TILE_PLACEMENT_LEVEL_FLAG)
+    || Object.prototype.hasOwnProperty.call(moduleFlags, `-=${FA_NEXUS_TILE_PLACEMENT_LEVEL_FLAG}`)));
 }
 
 function syncSingleVisibleLevel(update, visibleLevelIds = [], { doc = null, tileId = null, phase = 'unknown' } = {}) {
@@ -173,12 +175,15 @@ function autoAssignCurrentLevelForBandEntry(update, analysis, {
 function maybeAutoAssignPlacementLevelOnCreate(doc, data = {}, userId) {
   if (userId && userId !== game.user?.id) return;
   const explicitPlacementLevelId = getTileExplicitPlacementLevelId(data);
+  const visibleLevelIds = getRawLevelIds(data);
   if (explicitPlacementLevelId) {
-    setPlacementLevelId(data, explicitPlacementLevelId, { doc });
+    // Foundry's paste gives a copy the viewed Level when its original belongs to another one, and the copy
+    // still names the Level of its original. A layer that is drawn on one Level only is placed on that Level.
+    const drawnOnOtherLevelOnly = visibleLevelIds.length === 1 && visibleLevelIds[0] !== explicitPlacementLevelId;
+    setPlacementLevelId(data, drawnOnOtherLevelOnly ? visibleLevelIds[0] : explicitPlacementLevelId, { doc });
     return;
   }
 
-  const visibleLevelIds = getRawLevelIds(data);
   if (syncSingleVisibleLevel(data, visibleLevelIds, {
     doc,
     tileId: doc?.id || null,
@@ -219,13 +224,29 @@ function maybeAutoAssignPlacementLevelOnUpdate(doc, changes = {}, userId) {
   const previousVisibleLevelIds = getRawLevelIds(doc);
   const nextData = buildNextTileData(doc, changes);
   const nextVisibleLevelIds = getRawLevelIds(nextData);
-  if (syncSingleVisibleLevel(changes, nextVisibleLevelIds, {
+  // Tile Config submits unchanged fields too. Only a changed Parent selection
+  // takes priority over a native membership change in the same submission.
+  const previousPlacementLevelId = getTileExplicitPlacementLevelId(doc);
+  const nextPlacementLevelId = getTileExplicitPlacementLevelId(nextData);
+  if (hasPlacementLevelField(changes) && previousPlacementLevelId !== nextPlacementLevelId) {
+    // A layer that belongs to its own Level only goes with it when it is given another Level.
+    if (!hasOwnLevelField(changes) && nextPlacementLevelId
+      && previousVisibleLevelIds.length === 1 && previousVisibleLevelIds[0] === previousPlacementLevelId) {
+      changes.levels = [nextPlacementLevelId];
+    }
+    return;
+  }
+  const membershipChanged = JSON.stringify(previousVisibleLevelIds) !== JSON.stringify(nextVisibleLevelIds);
+  if ((membershipChanged || !nextPlacementLevelId) && syncSingleVisibleLevel(changes, nextVisibleLevelIds, {
     tileId: doc?.id || null,
     phase: 'update'
   })) {
     return;
   }
 
+  // Preserve deliberate Auto/Unset submissions rather than assigning the
+  // currently viewed floor as a side effect of an elevation change.
+  if (hasPlacementLevelField(changes) && !nextPlacementLevelId) return;
   const scene = doc?.parent || canvas?.scene;
   if (assignCurrentLevelOnVisibleLevelsAdded(changes, {
     doc,
@@ -257,6 +278,9 @@ function maybeAutoAssignPlacementLevelOnUpdate(doc, changes = {}, userId) {
 
 try {
   Hooks.on('preCreateTile', (doc, data, options, userId) => {
+    // Restoring an existing Tile must retain its recorded placement, including
+    // legacy Tiles without an explicit placement level.
+    if (options?.isUndo || options?.faNexusSceneGroupRollback) return;
     try {
       maybeAutoAssignPlacementLevelOnCreate(doc, data, userId);
     } catch (error) {

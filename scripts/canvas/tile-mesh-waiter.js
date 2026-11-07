@@ -14,7 +14,10 @@ function resolveTileMesh(tile) {
 
 function isTileMeshWaitActive(tile) {
   try {
-    return !!tile && !tile.destroyed && !!tile.document?.scene;
+    const doc = tile?.document || null;
+    const id = resolveTileId(tile);
+    const activeSceneDoc = id ? globalThis.canvas?.scene?.tiles?.get?.(id) === doc : false;
+    return !!tile && !tile.destroyed && !!(doc?.scene || doc?.parent || activeSceneDoc);
   } catch (_) {
     return false;
   }

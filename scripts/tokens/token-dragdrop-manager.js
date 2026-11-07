@@ -5,9 +5,11 @@
  */
 
 import { ActorFactory } from './actor-factory.js';
+import { createActorTokenPlacement } from './token-placement-transaction-workflow.js';
+import { applyTokenCardCachedState } from './token-card-cache-state.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { PlacementOverlay, createPlacementSpinner } from '../core/placement/placement-overlay.js';
-import { toolOptionsController } from '../core/tool-options-controller.js';
+import { toolOptionsController } from '../core/tool-options/tool-options-controller.js';
 
 /**
  * @typedef {import('../core/fa-nexus-types.js').FaNexusPoint} FaNexusPoint
@@ -97,7 +99,7 @@ export class TokenDragDropManager {
     this._cleanupDragEventListeners();
     
     this._boundMouseDownHandler = async (event) => {
-      Logger.info('TokenDragDropManager._boundMouseDownHandler', { event });
+      Logger.trace('tokenDragDrop', 'TokenDragDropManager._boundMouseDownHandler', { event });
       // Only respond to left-click (button 0). Right-click opens variants.
       if (event.button !== 0) return;
       const card = event.target?.closest('.fa-nexus-card');
@@ -181,24 +183,12 @@ export class TokenDragDropManager {
           const fullUrl = await svc.getFullURL('tokens', item, auth?.state);
           const local = await dl.ensureLocal('tokens', item, fullUrl);
           // Update card attribute so dragstart can read it immediately
-          try { card.setAttribute('data-url', local); } catch (_) {}
-          card._resolvedLocalPath = local;
+          applyTokenCardCachedState(card, local, {
+            iconSelector: '.fa-nexus-status-icon',
+            iconClassesToRemove: ['cloud-plus', 'cloud'],
+            removeLocked: false
+          });
           card._ensureLocalReady = true;
-          // Only mark as cached if actually downloaded (not using direct CDN URL)
-          const isDirectUrl = local && /^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(local);
-          if (!isDirectUrl) {
-            try { card.setAttribute('data-cached', 'true'); } catch (_) {}
-            // Update status icon to indicate cached/local
-            try {
-              const statusIcon = card.querySelector('.fa-nexus-status-icon');
-              if (statusIcon) {
-                statusIcon.classList.remove('cloud-plus', 'cloud');
-                statusIcon.classList.add('cloud','cached');
-                statusIcon.title = 'Downloaded';
-                statusIcon.innerHTML = '<i class="fas fa-cloud-check"></i>';
-              }
-            } catch (_) {}
-          }
           // No need to enable native draggable; unified queued drag handles all sources
           Logger.info('TokenDrag.prep.localReady', { filename });
           return local;
@@ -650,7 +640,7 @@ export class TokenDragDropManager {
           localPath = await TokenDragDropManager._resolveCardImagePath(card, { waitForDownload: true });
         } catch (error) {
           Logger.warn('TokenDrag.queued.resolveImage.failed', { error: String(error?.message || error), card });
-          ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
+          if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
           this._cleanupQueuedDrag();
           return;
         }
@@ -685,7 +675,11 @@ export class TokenDragDropManager {
           // Immediately end queued drag UX before showing dialog to avoid stuck preview and extra clicks
           try { this._cleanupQueuedDrag(); } catch (_) {}
           try { await TokenDragDropManager.handleActorDrop(actorEl, dragData, fauxEvent); }
-          catch (e) { console.warn('fa-nexus | queued drag actor drop failed', e); }
+          catch (error) {
+            const actorId = actorEl?.getAttribute?.('data-entry-id') || actorEl?.getAttribute?.('data-document-id') || actorEl?.getAttribute?.('data-actor-id') || '';
+            Logger.warn('TokenDrag.queued.actorDrop.failed', { actorId, error: String(error?.message || error) });
+            ui.notifications?.error?.(`Failed to update actor token: ${error?.message || error}`);
+          }
           return;
         } else {
           // If over the actors panel but not an actor (e.g., a folder), cancel silently
@@ -704,8 +698,10 @@ export class TokenDragDropManager {
             ui.notifications?.warn?.('Cannot drop token outside the scene boundaries');
             return;
           }
-          try { await ActorFactory.createActorFromDragData(dragData, drop); }
-          catch (e) { console.warn('fa-nexus | queued drag place failed', e); }
+          try { await createActorTokenPlacement({ dragData, drop }); }
+          catch (error) {
+            Logger.warn('TokenDrag.queued.place.failed', { filename, drop, error: String(error?.message || error) });
+          }
         }
       } finally {
         this._cleanupQueuedDrag();
@@ -983,6 +979,9 @@ export class TokenDragDropManager {
       this.dropData = dropData;
       this.resolveCallback = resolveCallback;
       this._resolved = false;
+      this._boundActorUpdateDialogClick = this._onActorUpdateDialogClick.bind(this);
+      this._boundActorUpdateDialogKeydown = this._onActorUpdateDialogKeydown.bind(this);
+      this._boundActorUpdateDialogElement = null;
     }
     
     static DEFAULT_OPTIONS = {
@@ -1047,38 +1046,45 @@ export class TokenDragDropManager {
         this.element.classList.toggle('fa-theme-light', !isDark);
       } catch (e) {}
 
-      // Add event listeners using event delegation
-      this.element.addEventListener('click', (event) => {
-        const action = event.target.closest('[data-action]')?.getAttribute('data-action');
-        
-        if (action === 'confirm') {
-          const updateActorImage = this.element.querySelector('#update-actor-image')?.checked || false;
-          const preserveSize = this.element.querySelector('#preserve-actor-size')?.checked || false;
-          const useWildcard = this.element.querySelector('#use-wildcard-token')?.checked || false;
-          this.dropData._updateActorImage = updateActorImage;
-          this.dropData._preserveSize = preserveSize;
-          this.dropData._useWildcard = useWildcard;
-          this._resolve(true);
-          this.close();
-        } else if (action === 'cancel') {
-          this._resolve(false);
-          this.close();
-        }
-      });
-      
-      // Handle escape key
-      const escapeHandler = (event) => {
-        if (event.key === 'Escape') {
-          this._resolve(false);
-          this.close();
-        }
-      };
-      
-      document.addEventListener('keydown', escapeHandler);
-      
-      this.addEventListener('close', () => {
-        document.removeEventListener('keydown', escapeHandler);
-      });
+      this._bindActorUpdateDialogListeners();
+    }
+
+    _bindActorUpdateDialogListeners() {
+      this._unbindActorUpdateDialogListeners();
+      this._boundActorUpdateDialogElement = this.element;
+      this._boundActorUpdateDialogElement?.addEventListener('click', this._boundActorUpdateDialogClick);
+      document.addEventListener('keydown', this._boundActorUpdateDialogKeydown);
+    }
+
+    _unbindActorUpdateDialogListeners() {
+      this._boundActorUpdateDialogElement?.removeEventListener('click', this._boundActorUpdateDialogClick);
+      this._boundActorUpdateDialogElement = null;
+      document.removeEventListener('keydown', this._boundActorUpdateDialogKeydown);
+    }
+
+    _onActorUpdateDialogClick(event) {
+      const action = event.target.closest('[data-action]')?.getAttribute('data-action');
+
+      if (action === 'confirm') {
+        const updateActorImage = this.element.querySelector('#update-actor-image')?.checked || false;
+        const preserveSize = this.element.querySelector('#preserve-actor-size')?.checked || false;
+        const useWildcard = this.element.querySelector('#use-wildcard-token')?.checked || false;
+        this.dropData._updateActorImage = updateActorImage;
+        this.dropData._preserveSize = preserveSize;
+        this.dropData._useWildcard = useWildcard;
+        this._resolve(true);
+        this.close();
+      } else if (action === 'cancel') {
+        this._resolve(false);
+        this.close();
+      }
+    }
+
+    _onActorUpdateDialogKeydown(event) {
+      if (event.key === 'Escape') {
+        this._resolve(false);
+        this.close();
+      }
     }
 
     _resolve(result) {
@@ -1089,6 +1095,7 @@ export class TokenDragDropManager {
     }
 
     async close(options) {
+      this._unbindActorUpdateDialogListeners();
       if (!this._resolved) this._resolve(false);
       return super.close(options);
     }

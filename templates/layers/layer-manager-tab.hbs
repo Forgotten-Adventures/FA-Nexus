@@ -1,0 +1,433 @@
+<section class="fa-nexus-layer-manager__panel">
+  <header class="fa-nexus-layer-manager__header">
+    <div class="fa-nexus-layer-manager__title-row">
+      {{#if sceneGroupsEnabled}}
+      <button type="button"
+              class="fa-nexus-layer-manager__icon-btn"
+              data-action="open-scene-groups"
+              title="Open Scene Groups"
+              aria-label="Open Scene Groups">
+        <i class="fa-solid fa-object-group"></i>
+      </button>
+      {{else}}
+      <span class="fa-nexus-layer-manager__title-spacer" aria-hidden="true"></span>
+      {{/if}}
+      <div class="fa-nexus-layer-manager__title">FA Nexus - Layer Manager</div>
+      <button type="button"
+              class="fa-nexus-layer-manager__icon-btn fa-nexus-layer-manager__icon-btn--help"
+              data-action="open-help"
+              title="Open Layer Manager Help"
+              aria-label="Open Layer Manager Help">
+        <i class="fa-solid fa-circle-question"></i>
+      </button>
+    </div>
+    {{#if sceneGroupsEnabled}}
+    <div class="fa-nexus-scene-member-selection"
+         data-scene-member-selection-mode
+         data-scene-member-selection-surface="layer-manager"
+         role="group"
+         aria-label="Scene Member Selection Mode">
+      {{#each sceneGroupMemberSelection.options}}
+      <button type="button"
+              class="fa-nexus-scene-member-selection__option {{#if active}}is-active{{/if}}"
+              data-scene-member-selection-mode-value="{{value}}"
+              title="{{title}}"
+              aria-label="{{label}}"
+              aria-pressed="{{#if active}}true{{else}}false{{/if}}">
+        {{label}}
+      </button>
+      {{/each}}
+    </div>
+    {{/if}}
+    <section class="fa-nexus-layer-manager__selection-options {{#if selectionOptionsCollapsed}}is-collapsed{{/if}}">
+      <button type="button" class="fa-nexus-layer-manager__section-toggle" data-action="toggle-selection-options">
+        <i class="fa-solid {{#if selectionOptionsCollapsed}}fa-chevron-right{{else}}fa-chevron-down{{/if}}"></i>
+        <span>Selection Options</span>
+      </button>
+      {{#unless selectionOptionsCollapsed}}
+      <div class="fa-nexus-layer-manager__range">
+        <label class="fa-nexus-layer-manager__range-label">Elevation range</label>
+        <div class="fa-nexus-layer-manager__range-inputs">
+          <input type="number" step="0.0001" data-range="min" placeholder="min" value="{{elevationMin}}" />
+          <span class="fa-nexus-layer-manager__range-sep">&ndash;</span>
+          <input type="number" step="0.0001" data-range="max" placeholder="max" value="{{elevationMax}}" />
+        </div>
+        <div class="fa-nexus-layer-manager__range-toggles">
+          <div class="fa-nexus-layer-manager__range-toggle-group">
+            <span class="fa-nexus-layer-manager__range-toggle-prefix">Skip:</span>
+            <label class="fa-nexus-layer-manager__range-toggle">
+              <input type="checkbox" data-action="skip-locked" {{#if skipLocked}}checked{{/if}} />
+              <span>Locked</span>
+            </label>
+            <label class="fa-nexus-layer-manager__range-toggle">
+              <input type="checkbox" data-action="skip-hidden" {{#if skipHidden}}checked{{/if}} />
+              <span>Hidden</span>
+            </label>
+            <label class="fa-nexus-layer-manager__range-toggle">
+              <input type="checkbox" data-action="skip-filtered" {{#if skipFiltered}}checked{{/if}} />
+              <span>Filtered</span>
+            </label>
+          </div>
+        </div>
+      </div>
+      {{/unless}}
+    </section>
+    <div class="fa-nexus-layer-manager__list-filters">
+      <div class="fa-nexus-layer-manager__search-row">
+        <input class="fa-nexus-layer-manager__search-input"
+               type="text"
+               data-action="search-layers"
+               placeholder="Search layers..."
+               value="{{searchQuery}}"
+               autocomplete="off"
+               spellcheck="false" />
+        <button type="button"
+                class="fa-nexus-layer-manager__icon-btn"
+                data-action="reset-filters"
+                title="Reset all filters"
+                aria-label="Reset all filters"
+                {{#if resetFiltersDisabled}}disabled aria-disabled="true"{{/if}}>
+          <i class="fa-solid fa-rotate-left"></i>
+        </button>
+        <button type="button"
+                class="fa-nexus-layer-manager__icon-btn fa-nexus-layer-manager__icon-btn--danger"
+                data-action="toggle-selection-lock"
+                title="{{selectionActionTitle}}"
+                aria-label="{{selectionActionTitle}}"
+                {{#if selectionActionDisabled}}disabled aria-disabled="true"{{/if}}>
+          <i class="fa-solid fa-lock"></i>
+        </button>
+        <button type="button"
+                class="fa-nexus-layer-manager__icon-btn fa-nexus-layer-manager__icon-btn--danger"
+                data-action="delete-selection"
+                title="Delete selected layers"
+                aria-label="Delete selected layers"
+                {{#if deleteSelectionDisabled}}disabled aria-disabled="true"{{/if}}>
+          <i class="fa-solid fa-trash"></i>
+        </button>
+      </div>
+      <div class="fa-nexus-layer-manager__toolbar">
+        <div class="fa-nexus-layer-manager__chips">
+          {{#each filterChips}}
+          <button type="button"
+                  class="fa-nexus-layer-manager__chip {{#if active}}is-active{{/if}}"
+                  data-action="toggle-filter-chip"
+                  data-filter-kind="{{kind}}"
+                  data-filter-key="{{key}}"
+                  title="{{label}}"
+                  aria-label="{{label}}"
+                  aria-pressed="{{#if active}}true{{else}}false{{/if}}">
+            <i class="{{icon}}"></i>
+          </button>
+          {{/each}}
+        </div>
+        <span class="fa-nexus-layer-manager__toolbar-sep"></span>
+        <div class="fa-nexus-layer-manager__actions-bar">
+          <button type="button"
+                  class="fa-nexus-layer-manager__icon-btn"
+                  data-action="toggle-all-groups"
+                  data-group-toggle-all-action="{{groupToggleAllAction}}"
+                  title="{{groupToggleAllTitle}}"
+                  aria-label="{{groupToggleAllTitle}}"
+                  {{#if groupToggleAllDisabled}}disabled aria-disabled="true"{{/if}}>
+            <i class="fa-solid {{groupToggleAllIcon}}"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  {{#if canvasReady}}
+    <ol class="fa-nexus-layer-manager__list" role="listbox" aria-multiselectable="true">
+      {{#each entries}}
+        {{#if separator}}
+          {{#if levelBoundarySeparator}}
+            <li class="fa-nexus-layer-manager__separator fa-nexus-layer-manager__separator--level-boundary {{#if levelBoundaryRootDropTarget}}fa-nexus-layer-manager__separator--root-drop-target{{/if}}"
+                data-level-boundary="{{levelBoundaryId}}"
+                data-level-boundary-key="{{levelBoundaryKey}}"
+                data-level-ids="{{levelBoundaryLevelIds}}"
+                data-elevation="{{elevationValue}}"
+                data-elevation-key="{{elevationKey}}"
+                data-tree-depth="{{treeDepth}}"
+                {{#if levelBoundaryRootDropTarget}}data-root-drop-elevation-key="{{levelBoundaryRootDropElevationKey}}"{{/if}}>
+              <div class="fa-nexus-layer-manager__separator-main">
+                {{#each levelBoundaryMembers}}
+                  <span class="fa-nexus-layer-manager__level-boundary-marker"
+                        data-level-boundary-kind="{{kind}}">
+                    <span class="fa-nexus-layer-manager__level-boundary-kind"
+                          title="{{#if (eq kind 'T')}}Top boundary{{else}}Bottom boundary{{/if}}"
+                          aria-label="{{#if (eq kind 'T')}}Top boundary{{else}}Bottom boundary{{/if}}">
+                      <i class="{{iconClass}}"></i>
+                    </span>
+                    <span class="fa-nexus-layer-manager__separator-name">{{levelName}}</span>
+                  </span>
+                  {{#unless @last}}
+                    <span class="fa-nexus-layer-manager__level-boundary-join" aria-hidden="true">/</span>
+                  {{/unless}}
+                {{/each}}
+                <span class="fa-nexus-layer-manager__separator-elevation">Elev {{levelBoundaryElevationLabel}}</span>
+              </div>
+            </li>
+          {{else}}
+            {{#if section}}
+            <li class="fa-nexus-layer-manager__separator fa-nexus-layer-manager__separator--section {{#if selected}}is-selected{{/if}}"
+                role="option"
+                aria-selected="{{#if selected}}true{{else}}false{{/if}}"
+                draggable="{{#if canDragSection}}true{{else}}false{{/if}}"
+                data-section-id="{{sectionId}}"
+                data-section-key="{{sectionKey}}"
+                data-elevation-key="{{elevationKey}}"
+                data-tree-depth="{{treeDepth}}"
+                style="--fa-nexus-layer-manager-group-color: {{groupColor}};">
+              <button class="fa-nexus-layer-manager__visibility fa-nexus-layer-manager__visibility--group"
+                      type="button"
+                      data-action="toggle-section-visibility"
+                      data-section-id="{{sectionId}}"
+                      aria-label="{{#if groupHidden}}Show{{else}}Hide{{/if}} Folder {{groupDisplayName}}"
+                      aria-pressed="{{#if groupHidden}}false{{else}}true{{/if}}"
+                      {{#unless canToggleVisibility}}disabled aria-disabled="true"{{/unless}}>
+                <i class="fa-solid {{#if groupHidden}}fa-eye-slash{{else}}fa-eye{{/if}}"></i>
+              </button>
+              <span class="fa-nexus-layer-manager__divider" aria-hidden="true"></span>
+              <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
+              <button class="fa-nexus-layer-manager__collapse"
+                      type="button"
+                      data-action="toggle-section-collapse"
+                      data-section-id="{{sectionId}}"
+                      aria-pressed="{{#if collapsed}}true{{else}}false{{/if}}"
+                      aria-label="{{#if collapsed}}Expand Folder{{else}}Collapse Folder{{/if}}">
+                <i class="fa-solid {{#if collapsed}}fa-chevron-right{{else}}fa-chevron-down{{/if}}"></i>
+              </button>
+              <div class="fa-nexus-layer-manager__separator-main">
+                {{#if editingFolderName}}
+                  <input class="fa-nexus-layer-manager__separator-folder-name-input"
+                         type="text"
+                         value="{{folderNameValue}}"
+                         autocomplete="off"
+                         spellcheck="false"
+                         aria-label="Rename Folder" />
+                {{else}}
+                  <span class="fa-nexus-layer-manager__separator-name" title="Double-click to rename Folder">
+                    <i class="fa-solid fa-folder" aria-hidden="true"></i>
+                    {{groupDisplayName}}
+                  </span>
+                {{/if}}
+              </div>
+              <span class="fa-nexus-layer-manager__separator-count">
+                {{#if groupLocked}}
+                  <span class="fa-nexus-layer-manager__separator-lock" title="All layers in this Folder are locked">
+                    <i class="fa-solid fa-lock"></i>
+                  </span>
+                {{/if}}
+                {{matchingCount}}
+              </span>
+            </li>
+            {{else}}
+            <li class="fa-nexus-layer-manager__separator {{#if groupHasCustomName}}has-custom-name{{/if}} {{groupClass}}"
+                draggable="true"
+                data-elevation="{{elevationValue}}"
+                data-elevation-key="{{elevationKey}}"
+                data-group-can-rename="{{#if groupCanRename}}true{{else}}false{{/if}}"
+                data-group-can-edit-elevation="{{#if groupCanEditElevation}}true{{else}}false{{/if}}"
+                data-group-can-header-drop="{{#if groupCanHeaderDrop}}true{{else}}false{{/if}}"
+                data-tree-depth="{{treeDepth}}">
+              <button class="fa-nexus-layer-manager__visibility fa-nexus-layer-manager__visibility--group"
+                      type="button"
+                      data-action="toggle-elevation-visibility"
+                      aria-label="{{#if groupHidden}}Show{{else}}Hide{{/if}} Elevation {{groupDisplayName}}"
+                      data-elevation-key="{{elevationKey}}"
+                      aria-pressed="{{#if groupHidden}}false{{else}}true{{/if}}"
+                      {{#unless canToggleVisibility}}disabled aria-disabled="true"{{/unless}}>
+                <i class="fa-solid {{#if groupHidden}}fa-eye-slash{{else}}fa-eye{{/if}}"></i>
+              </button>
+              <span class="fa-nexus-layer-manager__divider" aria-hidden="true"></span>
+              <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
+              <button class="fa-nexus-layer-manager__collapse"
+                      type="button"
+                      data-action="toggle-elevation-collapse"
+                      data-elevation-key="{{elevationKey}}"
+                      aria-pressed="{{#if collapsed}}true{{else}}false{{/if}}"
+                      aria-label="{{#if collapsed}}Expand elevation group{{else}}Collapse elevation group{{/if}}">
+                <i class="fa-solid {{#if collapsed}}fa-chevron-right{{else}}fa-chevron-down{{/if}}"></i>
+              </button>
+              <div class="fa-nexus-layer-manager__separator-main">
+                {{#if editingGroupName}}
+                  <input class="fa-nexus-layer-manager__separator-group-name-input"
+                         type="text"
+                         value="{{groupNameValue}}"
+                         autocomplete="off"
+                         spellcheck="false"
+                         aria-label="Rename elevation group" />
+                {{else}}
+                  {{#if editingGroupElevation}}
+                    {{#if groupHasCustomName}}
+                      <span class="fa-nexus-layer-manager__separator-name">{{groupDisplayName}}</span>
+                    {{/if}}
+                  {{else}}
+                    <span class="fa-nexus-layer-manager__separator-name {{#unless groupHasCustomName}}is-elevation-fallback{{/unless}}"
+                          {{#if groupCanRename}}title="Double-click to rename elevation group{{#if groupCanEditElevation}}, Right-click to edit elevation{{/if}}"{{else}}{{#if groupCanEditElevation}}title="Right-click to edit elevation group"{{/if}}{{/if}}>{{groupDisplayName}}</span>
+                  {{/if}}
+                {{/if}}
+                {{#if groupShowElevationLabel}}
+                  {{#if editingGroupElevation}}
+                    <input class="fa-nexus-layer-manager__separator-group-elevation-input"
+                           type="number"
+                           step="0.001"
+                           value="{{groupElevationValue}}"
+                           autocomplete="off"
+                           spellcheck="false"
+                           aria-label="Edit elevation group value" />
+                  {{else}}
+                    {{#unless groupHideDuplicateElevationLabel}}
+                      <span class="fa-nexus-layer-manager__separator-elevation"
+                            {{#if groupCanEditElevation}}title="Right-click to edit elevation group"{{/if}}>Elev {{elevation}}</span>
+                    {{/unless}}
+                  {{/if}}
+                {{/if}}
+              </div>
+              <span class="fa-nexus-layer-manager__separator-count">
+                {{#if groupLocked}}
+                  <span class="fa-nexus-layer-manager__separator-lock"
+                        title="All layers in this elevation group are locked">
+                    <i class="fa-solid fa-lock"></i>
+                  </span>
+                {{/if}}
+                {{matchingCount}}
+              </span>
+            </li>
+            {{/if}}
+        {{/if}}
+      {{else}}
+          {{#if marker}}
+            <li class="fa-nexus-layer-manager__item fa-nexus-layer-manager__marker {{#if hidden}}is-hidden{{/if}}"
+                role="presentation"
+                data-scene-marker="{{markerId}}"
+                data-elevation-key="{{elevationKey}}"
+                data-tree-depth="{{treeDepth}}"
+                data-elevation="{{elevation}}">
+              <button class="fa-nexus-layer-manager__visibility"
+                      type="button"
+                      data-action="toggle-scene-marker-visibility"
+                      aria-label="{{#if hidden}}Show{{else}}Hide{{/if}} {{name}}"
+                      aria-pressed="{{#if hidden}}false{{else}}true{{/if}}"
+                      {{#unless canToggleVisibility}}disabled aria-disabled="true"{{/unless}}>
+                <i class="fa-solid {{#if hidden}}fa-eye-slash{{else}}fa-eye{{/if}}"></i>
+              </button>
+              <span class="fa-nexus-layer-manager__divider" aria-hidden="true"></span>
+              <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
+              <span class="fa-nexus-layer-manager__icon" title="{{typeLabel}}">
+                <i class="{{typeIcon}}"></i>
+              </span>
+              <span class="fa-nexus-layer-manager__name">{{name}}</span>
+            </li>
+          {{else}}
+            {{#if preview}}
+              <li class="fa-nexus-layer-manager__item is-preview {{#if previewActive}}is-selected{{/if}}"
+                  role="presentation"
+                  data-elevation-key="{{elevationKey}}"
+                  data-tree-depth="{{treeDepth}}"
+                  data-preview-id="{{previewId}}"
+                  data-preview-key="{{previewKey}}"
+                  data-preview-kind="{{previewKind}}"
+                  data-section-id="{{sectionId}}"
+                  draggable="{{#if canDragPreview}}true{{else}}false{{/if}}">
+                <span class="fa-nexus-layer-manager__preview-leading-spacer" aria-hidden="true"></span>
+                <span class="fa-nexus-layer-manager__divider" aria-hidden="true"></span>
+                <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
+                <span class="fa-nexus-layer-manager__icon" title="{{typeLabel}}">
+                  <i class="{{typeIcon}}"></i>
+                </span>
+                <span class="fa-nexus-layer-manager__name">{{name}}</span>
+                {{#if previewElevationLabel}}
+                  <span class="fa-nexus-layer-manager__preview-elevation" title="No layer is at this Elevation yet">Elev {{previewElevationLabel}}</span>
+                {{/if}}
+              </li>
+            {{else}}
+              <li class="fa-nexus-layer-manager__item {{#if selected}}is-selected{{/if}} {{#if sceneGroupMember}}is-scene-group-member{{/if}} {{#if hidden}}is-hidden{{/if}} {{#if locked}}is-locked{{/if}}"
+                  role="option"
+                  aria-selected="{{#if selected}}true{{else}}false{{/if}}"
+                  data-tile-id="{{id}}"
+                  data-tile-index="{{index}}"
+                  data-elevation="{{elevation}}"
+                  data-elevation-key="{{elevationKey}}"
+                  data-section-id="{{sectionId}}"
+                  data-tree-depth="{{treeDepth}}"
+                  draggable="{{#if canReorder}}true{{else}}false{{/if}}">
+                <button class="fa-nexus-layer-manager__visibility"
+                        type="button"
+                        data-action="toggle-visibility"
+                        aria-label="{{#if hidden}}Show{{else}}Hide{{/if}} {{name}}"
+                        aria-pressed="{{#if hidden}}false{{else}}true{{/if}}"
+                        {{#unless canToggleVisibility}}disabled aria-disabled="true"{{/unless}}>
+                  <i class="fa-solid {{#if hidden}}fa-eye-slash{{else}}fa-eye{{/if}}"></i>
+                </button>
+                <span class="fa-nexus-layer-manager__divider" aria-hidden="true"></span>
+                <span class="fa-nexus-layer-manager__indent" aria-hidden="true" style="width: {{indentPx}}px;"></span>
+                <span class="fa-nexus-layer-manager__icon" title="{{typeLabel}}">
+                  <i class="{{typeIcon}}"></i>
+                </span>
+                {{#if sceneGroupMembership.visible}}
+                  <span class="fa-nexus-scene-group-membership-icon"
+                        style="--fa-nexus-scene-group-icon-color:{{sceneGroupMembership.iconColor}}"
+                        title="{{sceneGroupMembership.tooltip}}"
+                        data-tooltip
+                        aria-label="{{sceneGroupMembership.tooltip}}">
+                    <i class="{{sceneGroupMembership.iconClass}}" aria-hidden="true"></i>
+                  </span>
+                {{/if}}
+                {{#if hasHsbc}}
+                  <span class="fa-nexus-layer-manager__badge" title="HSBC">
+                    <i class="fa-solid fa-sliders"></i>
+                  </span>
+                {{/if}}
+                {{#if hasMask}}
+                  <span class="fa-nexus-layer-manager__badge" title="Mask">
+                    <i class="fa-solid fa-mask"></i>
+                  </span>
+                {{/if}}
+                {{#if hasShadowOnly}}
+                  <span class="fa-nexus-layer-manager__badge fa-nexus-layer-manager__badge--shadow-only" title="Shadow only">
+                    <i class="fa-solid fa-s"></i>
+                  </span>
+                {{/if}}
+                {{#if editing}}
+                  <input class="fa-nexus-layer-manager__rename-input"
+                         type="text"
+                         value="{{renameValue}}"
+                         autocomplete="off"
+                         spellcheck="false"
+                         aria-label="Rename tile" />
+                {{else}}
+                  <span class="fa-nexus-layer-manager__name">{{name}}</span>
+                {{/if}}
+                {{#if locked}}
+                  <button class="fa-nexus-layer-manager__lock"
+                          type="button"
+                          data-action="toggle-lock"
+                          aria-pressed="true"
+                          {{#unless canToggleLock}}disabled aria-disabled="true"{{/unless}}>
+                    <i class="fa-solid fa-lock"></i>
+                  </button>
+                {{/if}}
+              </li>
+            {{/if}}
+            {{/if}}
+          {{/if}}
+    {{/each}}
+  </ol>
+    <footer class="fa-nexus-layer-manager__footer" data-flatten-footer {{#unless flattenVisible}}hidden{{/unless}}>
+      <button type="button"
+              class="fa-nexus-layer-manager__flatten"
+              data-action="flatten"
+              data-mode="{{flattenAction}}"
+              aria-label="{{flattenAriaLabel}}"
+              title="{{flattenAriaLabel}}"
+              {{#if flattenDisabled}}disabled aria-disabled="true"{{/if}}>
+        <i class="fas {{flattenIconClass}} fa-nexus-layer-manager__flatten-icon"></i>
+        <span class="fa-nexus-layer-manager__flatten-label">{{flattenLabel}}</span>
+      </button>
+    </footer>
+  {{else}}
+    <div class="fa-nexus-layer-manager__empty">Canvas not ready</div>
+  {{/if}}
+</section>

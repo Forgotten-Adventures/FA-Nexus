@@ -1,3 +1,4 @@
+import { sha256Hex } from '../core/content-hash.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { premiumEntitlementsService, PremiumGateError } from './premium-entitlements-service.js';
 
@@ -8,6 +9,7 @@ function getModuleVersion() {
   try { return game?.modules?.get?.(MODULE_ID)?.version; }
   catch (_) { return null; }
 }
+
 
 class EventSignal {
   constructor() { this._map = new Map(); }
@@ -164,9 +166,15 @@ export class PremiumFeatureBroker {
     if (descriptor.hash) {
       const verified = await this._verifyBlobHash(blob, descriptor.hash);
       if (!verified.ok) {
-        throw new PremiumGateError('BUNDLE_HASH_MISMATCH', `Hash mismatch for bundle ${bundleId}`, {
+        const code = verified.code || 'BUNDLE_HASH_MISMATCH';
+        const message = code === 'BUNDLE_HASH_VERIFICATION_UNAVAILABLE'
+          ? `Cannot verify bundle hash for ${bundleId}; WebCrypto is unavailable on this Foundry origin.`
+          : `Hash mismatch for bundle ${bundleId}`;
+        throw new PremiumGateError(code, message, {
           expected: verified.expected,
-          actual: verified.actual
+          actual: verified.actual,
+          reason: verified.reason || null,
+          secureContext: globalThis.isSecureContext === true
         });
       }
       blob = verified.blob;
@@ -236,23 +244,28 @@ export class PremiumFeatureBroker {
 
   async _verifyBlobHash(blob, expectedHash) {
     try {
-      if (!blob) return { ok: false, expected: expectedHash, actual: null, blob }; // fall through to error
-      if (!globalThis.crypto?.subtle) {
-        Logger.warn('PremiumFeatureBroker.hash.verify.unavailable', 'WebCrypto unavailable; skipping hash validation.');
-        return { ok: true, expected: null, actual: null, blob };
+      if (!blob) return { ok: false, code: 'BUNDLE_HASH_MISMATCH', expected: expectedHash, actual: null, blob };
+      const normalizedExpected = PremiumFeatureBroker._normalizeHash(expectedHash);
+      if (!normalizedExpected) {
+        return { ok: false, code: 'BUNDLE_HASH_MISMATCH', expected: null, actual: null, blob, reason: 'invalid-expected-hash' };
       }
       const buffer = await blob.arrayBuffer();
-      const digest = await globalThis.crypto.subtle.digest('SHA-256', buffer);
-      const actualHex = PremiumFeatureBroker._hexStringFromBuffer(digest);
-      const normalizedExpected = PremiumFeatureBroker._normalizeHash(expectedHash);
+      const actualHex = await sha256Hex(buffer);
       if (normalizedExpected && actualHex !== normalizedExpected) {
-        return { ok: false, expected: normalizedExpected, actual: actualHex, blob };
+        return { ok: false, code: 'BUNDLE_HASH_MISMATCH', expected: normalizedExpected, actual: actualHex, blob };
       }
       const typed = blob.type ? { type: blob.type } : undefined;
       return { ok: true, expected: normalizedExpected, actual: actualHex, blob: new Blob([buffer], typed) };
     } catch (err) {
       Logger.warn('PremiumFeatureBroker.hash.verify.failed', String(err?.message || err));
-      return { ok: false, expected: expectedHash, actual: null, blob };
+      return {
+        ok: false,
+        code: 'BUNDLE_HASH_VERIFICATION_UNAVAILABLE',
+        expected: expectedHash,
+        actual: null,
+        blob,
+        reason: 'hash-verify-failed'
+      };
     }
   }
 

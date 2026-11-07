@@ -84,6 +84,18 @@ function getElementZIndex(element) {
   }
 }
 
+export function isPointerCapturedByNonCanvasTarget(event, canvasEl) {
+  const target = event?.target;
+  const pointerId = event?.pointerId == null ? null : Number(event.pointerId);
+  if (!target || !Number.isFinite(pointerId)) return false;
+  if (target === canvasEl || canvasEl?.contains?.(target)) return false;
+  try {
+    return target.hasPointerCapture?.(pointerId) === true;
+  } catch (_) {
+    return false;
+  }
+}
+
 export function resolvePointerEvent(event, { respectZIndex = true } = {}) {
   const controller = getCanvasInteractionController();
   const pointerState = controller.getPointerState?.() ?? {};
@@ -111,6 +123,15 @@ export function resolvePointerEvent(event, { respectZIndex = true } = {}) {
   const ElementCtor = typeof Element === 'undefined' ? null : Element;
   const type = typeof event?.type === 'string' ? event.type.toLowerCase() : '';
   const pointerId = typeof event?.pointerId === 'number' ? event.pointerId : null;
+
+  // Pointer capture intentionally keeps the event target on the control that
+  // began the gesture. Do not look through that control and reclassify the
+  // event as Canvas input merely because elementFromPoint now finds the board.
+  if (isPointerCapturedByNonCanvasTarget(event, canvasEl)) {
+    if (pointerId != null && (type === 'pointerup' || type === 'pointercancel')) overlayPointerIds.delete(pointerId);
+    result.target = event.target;
+    return result;
+  }
 
   const isOverlayElement = (element) => {
     if (!element || !ElementCtor || !(element instanceof ElementCtor)) return false;
@@ -157,6 +178,45 @@ export function resolvePointerEvent(event, { respectZIndex = true } = {}) {
   }
 
   return result;
+}
+
+/**
+ * Resolve a pointer which already owns an active Canvas gesture. The expensive
+ * elementFromPoint/computed-style ownership check was completed on pointer-down;
+ * repeating it for every high-polling-rate move only starves the render loop.
+ */
+export function resolveCapturedPointerEvent(event, { canvas: capturedCanvas = null, rect: capturedRect = null } = {}) {
+  const controller = getCanvasInteractionController();
+  const screen = {
+    x: typeof event?.clientX === 'number' ? event.clientX : null,
+    y: typeof event?.clientY === 'number' ? event.clientY : null
+  };
+  const hasCoords = Number.isFinite(screen.x) && Number.isFinite(screen.y);
+  const canvasEl = capturedCanvas || controller.getCanvasElement?.() || null;
+  const rect = capturedRect || canvasEl?.getBoundingClientRect?.() || null;
+  const withinCanvas = !!(hasCoords && rect
+    && screen.x >= rect.left && screen.x <= rect.right
+    && screen.y >= rect.top && screen.y <= rect.bottom);
+  let world = null;
+  if (hasCoords && rect && globalThis.canvas?.stage?.worldTransform?.applyInverse && globalThis.PIXI?.Point) {
+    try {
+      world = globalThis.canvas.stage.worldTransform.applyInverse(new globalThis.PIXI.Point(
+        screen.x - rect.left,
+        screen.y - rect.top
+      ));
+      world = { x: Number(world.x), y: Number(world.y) };
+    } catch (_) {
+      world = null;
+    }
+  }
+  return {
+    overCanvas: withinCanvas,
+    zOk: withinCanvas,
+    screen: hasCoords ? screen : null,
+    world,
+    target: canvasEl,
+    canvas: canvasEl
+  };
 }
 
 export function isPointerOverCanvas(event, options) {

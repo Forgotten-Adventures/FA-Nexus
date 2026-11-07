@@ -1,5 +1,6 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { resolveTileSelectionForNexusPlacement } from './tile-selection-context.js';
+import { resolveNewLayerLevels } from './new-layer-levels.js';
 const MODULE_ID = 'fa-nexus';
 const SETTING_KEY = 'tokenElevationOffset';
 const BAND_SIZE = 1;
@@ -33,13 +34,23 @@ export function getSceneLevels(scene = canvas?.scene) {
 }
 
 function getLevelBottomElevation(level) {
+  if (level?.elevation?.bottom === null || level?.elevation?.bottom === -Infinity) return -Infinity;
   const numeric = Number(level?.elevation?.bottom);
   return Number.isFinite(numeric) ? numeric : DEFAULT_LEVEL_BASE;
 }
 
 function getLevelTopElevation(level) {
+  if (level?.elevation?.top === null) return Infinity;
   const numeric = Number(level?.elevation?.top);
   return Number.isFinite(numeric) ? numeric : Infinity;
+}
+
+function getLevelBaseElevation(level) {
+  const base = level?.elevation?.base;
+  if (Number.isFinite(base)) return base;
+  // Raw Level sources do not have Foundry's prepared base yet.
+  const bottom = getLevelBottomElevation(level);
+  return Number.isFinite(bottom) ? bottom : Math.min(getLevelTopElevation(level), DEFAULT_LEVEL_BASE);
 }
 
 export function getLevelElevationRange(level) {
@@ -49,6 +60,7 @@ export function getLevelElevationRange(level) {
     levelId: level.id || null,
     levelName: String(level?.name || '').trim(),
     bottom: getLevelBottomElevation(level),
+    base: getLevelBaseElevation(level),
     top: getLevelTopElevation(level)
   };
 }
@@ -82,7 +94,7 @@ function getSceneLevelBandBases(scene = canvas?.scene) {
   const bases = [];
   const seen = new Set();
   for (const level of levels) {
-    const base = getLevelBottomElevation(level);
+    const base = getLevelBaseElevation(level);
     if (!Number.isFinite(base)) continue;
     const key = String(base);
     if (seen.has(key)) continue;
@@ -133,11 +145,12 @@ export function getCurrentViewedLevelIds(scene = canvas?.scene) {
 }
 
 /**
- * Backward-compatible alias used by existing premium bundles.
- * Fresh FA Nexus tile placement is intentionally unscoped so tiles appear on every level.
+ * The Level membership of a new FA Nexus layer, asked for by the Path and Texture editors. By default a new
+ * layer belongs to no Level in particular and so appears on every Level; the world setting "New layers appear
+ * on" can keep it on the Level it is placed on (the viewed Level when none is named).
  */
-export function getDefaultFaNexusPlacementLevels() {
-  return [];
+export function getDefaultFaNexusPlacementLevels(placementLevelId = null) {
+  return resolveNewLayerLevels({ placementLevelId });
 }
 
 export function getCurrentLevelElevationRange(scene = canvas?.scene) {
@@ -163,7 +176,7 @@ export function findSceneLevelElevationRangeForElevation(elevation, {
 export function getCurrentLevelBottomElevation(scene = canvas?.scene) {
   const range = getCurrentLevelElevationRange(scene);
   if (!range) return DEFAULT_LEVEL_BASE;
-  return Number.isFinite(range.bottom) ? range.bottom : DEFAULT_LEVEL_BASE;
+  return range.base;
 }
 
 function getControlledTileTargets(controlledTiles = canvas?.tiles?.controlled, {

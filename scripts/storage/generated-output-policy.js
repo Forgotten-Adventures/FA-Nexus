@@ -4,6 +4,7 @@ import {
   getConfiguredAssetsDir
 } from './generated-paths.js';
 import { sanitizeStorageTargetPath, sanitizeStoragePathSegments } from './path-utils.js';
+import { isPrefabArtifactPath, PREFAB_ARTIFACT_ROOT } from './prefab-paths.js';
 
 const MODULE_ID = 'fa-nexus';
 
@@ -78,6 +79,7 @@ export async function registerGeneratedFlattenRoot(root, {
 } = {}) {
   const normalizedRoot = normalizeGeneratedFlattenRoot(root, { assetsDir });
   if (!normalizedRoot) throw new Error('Generated flatten root is required');
+  if (normalizedRoot === PREFAB_ARTIFACT_ROOT || isPrefabArtifactPath(normalizedRoot)) throw new Error('Shared Prefab artwork cannot be registered for generated cleanup.');
   const current = readRegisteredGeneratedFlattenRoots({ moduleId, assetsDir });
   if (current.includes(normalizedRoot)) return current;
   const next = [...current, normalizedRoot].sort((a, b) => a.localeCompare(b));
@@ -106,6 +108,7 @@ export function detectGeneratedOutputPath(path, {
 } = {}) {
   const normalized = trimTrailingSlashes(sanitizeStorageTargetPath(path));
   if (!normalized) return null;
+  if (isPrefabArtifactPath(normalized)) return null;
 
   if (kind !== 'mask') {
     const aliases = getGeneratedFlattenRootAliases({ assetsDir });

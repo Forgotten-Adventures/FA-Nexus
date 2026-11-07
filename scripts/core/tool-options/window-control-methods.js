@@ -9,7 +9,9 @@ import {
 import { isHelpShortcut } from '../editor-shortcuts.js';
 import {
   TOOL_OPTIONS_RENDERER_MODE
-} from '../tool-options-descriptor.js';
+} from './tool-options-descriptor.js';
+import { DeclarativeControlRuntime } from './declarative-control-runtime.js';
+import { PortalControlRuntime } from './portal-control-runtime.js';
 import {
   DEFAULT_WINDOW_TITLE,
   MODULE_ID,
@@ -203,62 +205,19 @@ class ToolOptionsWindowControlMethods {
   }
 
   _bindDisplayInput(display, inputHandler, commitHandler) {
-    if (!display || display.tagName !== 'INPUT') return;
-    const isNumberInput = display.type === 'number';
-    if (inputHandler && !isNumberInput) display.addEventListener('input', inputHandler);
-    if (commitHandler) {
-      display.addEventListener('change', commitHandler);
-      if (isNumberInput) {
-        const existingHandler = display._faNexusCommitKeydown;
-        if (existingHandler) {
-          try { display.removeEventListener('keydown', existingHandler); } catch (_) {}
-        }
-        const keydownHandler = (event) => {
-          if (event.key !== 'Enter') return;
-          event.preventDefault();
-          try { display._faNexusForceSyncOnCommit = true; } catch (_) {}
-          commitHandler(event);
-        };
-        display.addEventListener('keydown', keydownHandler);
-        display._faNexusCommitKeydown = keydownHandler;
-      }
-    }
+    this._getDeclarativeControlRuntime().bindDisplayInput(display, inputHandler, commitHandler);
   }
 
   _unbindDisplayInput(display, inputHandler, commitHandler) {
-    if (!display || display.tagName !== 'INPUT') return;
-    if (inputHandler) {
-      try { display.removeEventListener('input', inputHandler); } catch (_) {}
-    }
-    if (commitHandler) {
-      try { display.removeEventListener('change', commitHandler); } catch (_) {}
-    }
-    const keydownHandler = display._faNexusCommitKeydown;
-    if (keydownHandler) {
-      try { display.removeEventListener('keydown', keydownHandler); } catch (_) {}
-      try { delete display._faNexusCommitKeydown; } catch (_) {}
-    }
-    try { delete display._faNexusForceSyncOnCommit; } catch (_) {}
+    this._getDeclarativeControlRuntime().unbindDisplayInput(display, inputHandler, commitHandler);
   }
 
   _applyDefaultValue(target, value) {
-    if (!target || typeof target.setAttribute !== 'function') return;
-    const hasValue = value !== undefined && value !== null && value !== '';
-    if (!hasValue || (typeof value === 'number' && !Number.isFinite(value))) {
-      try { target.removeAttribute('data-fa-nexus-default-value'); } catch (_) {}
-      return;
-    }
-    try { target.setAttribute('data-fa-nexus-default-value', String(value)); } catch (_) {}
+    this._getDeclarativeControlRuntime().applyDefaultValue(target, value);
   }
 
   _readNumericControlValue(target) {
-    if (!target) return null;
-    const value = typeof target.value === 'string' ? target.value : '';
-    if (target.type === 'number') {
-      if (!value.trim()) return null;
-      if (target.validity?.badInput) return null;
-    }
-    return value;
+    return this._getDeclarativeControlRuntime().readNumericControlValue(target);
   }
 
   _readDeclarativeNumericValue(input, {
@@ -267,63 +226,24 @@ class ToolOptionsWindowControlMethods {
     sync = null,
     logTag = 'ToolOptions.declarative.invalidNumericInput'
   } = {}) {
-    const value = this._readNumericControlValue(input);
-    if (value !== null) return value;
-    Logger.warn(logTag, {
-      controlId: String(controlId || ''),
-      commit: !!commit,
-      inputType: String(input?.type || ''),
-      rawValue: typeof input?.value === 'string' ? input.value : null
+    return this._getDeclarativeControlRuntime().readDeclarativeNumericValue(input, {
+      controlId,
+      commit,
+      sync,
+      logTag
     });
-    if (typeof sync === 'function') sync.call(this);
-    return null;
   }
 
   _inferStepDecimals(step) {
-    const numeric = Number(step);
-    if (!Number.isFinite(numeric) || numeric <= 0) return null;
-    if (numeric >= 1) return 0;
-    const text = String(step);
-    const dot = text.indexOf('.');
-    if (dot === -1) return 0;
-    const decimals = text.length - dot - 1;
-    return decimals > 0 ? decimals : 0;
+    return this._getDeclarativeControlRuntime().inferStepDecimals(step);
   }
 
   _normalizeNumericInputValue(value, step) {
-    if (value === '' || value === null || value === undefined) return value;
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) return value;
-    const decimals = this._inferStepDecimals(step);
-    if (decimals === null) return numeric;
-    return Number(numeric.toFixed(decimals));
+    return this._getDeclarativeControlRuntime().normalizeNumericInputValue(value, step);
   }
 
   _syncDisplayValue(display, data = {}, { disabled = false } = {}) {
-    if (!display) return;
-    const text = data.display || '';
-    if (display.tagName === 'INPUT') {
-      const isFocused = (typeof document !== 'undefined' && document.activeElement === display);
-      const forceSync = display._faNexusForceSyncOnCommit === true;
-      const rawValue = data.value ?? '';
-      const normalizedValue = (display.type === 'number')
-        ? this._normalizeNumericInputValue(rawValue, data.step ?? display.step)
-        : rawValue;
-      const nextValue = normalizedValue === null || normalizedValue === undefined ? '' : String(normalizedValue);
-      if ((forceSync || !isFocused) && display.value !== nextValue) display.value = nextValue;
-      if (forceSync) {
-        try { delete display._faNexusForceSyncOnCommit; } catch (_) {}
-      }
-      if (data.min !== undefined) display.min = String(data.min);
-      if (data.max !== undefined) display.max = String(data.max);
-      if (data.step !== undefined) display.step = String(data.step);
-      this._applyDefaultValue(display, data.defaultValue);
-      display.disabled = !!data.disabled || !!disabled;
-      if (text) display.title = text;
-      else display.removeAttribute('title');
-    } else if (display.textContent !== text) {
-      display.textContent = text;
-    }
+    this._getDeclarativeControlRuntime().syncDisplayValue(display, data, { disabled });
   }
 
   _bindControls() {
@@ -387,69 +307,7 @@ class ToolOptionsWindowControlMethods {
       this._bindPlacementControls();
       this._syncPortalControls();
       this._bindShortcutsControls();
-      const placeAsToggle = root.querySelector('[data-place-as-toggle]');
-      if (placeAsToggle) {
-        placeAsToggle.addEventListener('click', this._boundPlaceAsToggle);
-        this._placeAsToggleButton = placeAsToggle;
-      }
-      const placeAsFilter = root.querySelector('[data-place-as-filter]');
-      if (placeAsFilter) {
-        placeAsFilter.addEventListener('click', this._boundPlaceAsFilter);
-        this._placeAsFilterButton = placeAsFilter;
-      }
-      const placeAsSearch = root.querySelector('#fa-nexus-place-as-search');
-      if (placeAsSearch) {
-        placeAsSearch.addEventListener('input', this._boundPlaceAsSearch);
-        this._placeAsSearchInput = placeAsSearch;
-      }
-      const placeAsList = root.querySelector('[data-fa-nexus-place-as-list]');
-      if (placeAsList) {
-        placeAsList.addEventListener('click', this._boundPlaceAsOptionClick);
-        this._placeAsList = placeAsList;
-      }
-      const placeAsLinked = root.querySelector('[data-place-as-linked]');
-      if (placeAsLinked) {
-        placeAsLinked.addEventListener('change', this._boundPlaceAsLinkedChange);
-        this._placeAsLinkedToggle = placeAsLinked;
-      }
-      const placeAsActorType = root.querySelector('[data-place-as-actor-type]');
-      if (placeAsActorType) {
-        placeAsActorType.addEventListener('change', this._boundPlaceAsActorTypeChange);
-        this._placeAsActorTypeSelect = placeAsActorType;
-      }
-      const placeAsAppendNumber = root.querySelector('[data-place-as-append-number]');
-      if (placeAsAppendNumber) {
-        placeAsAppendNumber.addEventListener('change', this._boundPlaceAsAppendNumberChange);
-        this._placeAsAppendNumberToggle = placeAsAppendNumber;
-      }
-      const placeAsPrependAdjective = root.querySelector('[data-place-as-prepend-adjective]');
-      if (placeAsPrependAdjective) {
-        placeAsPrependAdjective.addEventListener('change', this._boundPlaceAsPrependAdjectiveChange);
-        this._placeAsPrependAdjectiveToggle = placeAsPrependAdjective;
-      }
-      const hpMode = root.querySelector('[data-place-as-hp-mode]');
-      if (hpMode) {
-        hpMode.addEventListener('change', this._boundPlaceAsHpMode);
-        this._placeAsHpModeSelect = hpMode;
-      }
-      const hpPercent = root.querySelector('[data-place-as-hp-percent]');
-      if (hpPercent) {
-        hpPercent.addEventListener('input', this._boundPlaceAsHpPercent);
-        this._placeAsHpPercentInput = hpPercent;
-      }
-      const hpStatic = root.querySelector('[data-place-as-hp-static]');
-      if (hpStatic) {
-        hpStatic.addEventListener('input', this._boundPlaceAsHpStatic);
-        this._placeAsHpStaticInput = hpStatic;
-      }
-      this._placeAsHpModeHint = root.querySelector('[data-place-as-hp-mode-hint]');
-      this._placeAsActorTypeHint = root.querySelector('[data-place-as-actor-type-hint]');
-      this._placeAsHpPercentHint = root.querySelector('[data-place-as-hp-percent-hint]');
-      this._placeAsHpStaticHint = root.querySelector('[data-place-as-hp-static-hint]');
-      this._placeAsHpStaticError = root.querySelector('[data-place-as-hp-static-error]');
-      this._placeAsHpPercentRow = root.querySelector('[data-place-as-hp-percent-row]');
-      this._placeAsHpStaticRow = root.querySelector('[data-place-as-hp-static-row]');
-      this._syncPlaceAsControls();
+      this._bindPlaceAsControls();
       this._syncToolPanelActivityState();
     } catch (_) {}
   }
@@ -516,68 +374,7 @@ class ToolOptionsWindowControlMethods {
       }
       this._customToggleBindings.clear();
     }
-    if (this._placeAsToggleButton) {
-      try { this._placeAsToggleButton.removeEventListener('click', this._boundPlaceAsToggle); }
-      catch (_) {}
-      this._placeAsToggleButton = null;
-    }
-    if (this._placeAsFilterButton) {
-      try { this._placeAsFilterButton.removeEventListener('click', this._boundPlaceAsFilter); }
-      catch (_) {}
-      this._placeAsFilterButton = null;
-    }
-    if (this._placeAsSearchInput) {
-      try { this._placeAsSearchInput.removeEventListener('input', this._boundPlaceAsSearch); }
-      catch (_) {}
-      this._placeAsSearchInput = null;
-    }
-    if (this._placeAsList) {
-      try { this._placeAsList.removeEventListener('click', this._boundPlaceAsOptionClick); }
-      catch (_) {}
-      this._placeAsList = null;
-    }
-    if (this._placeAsLinkedToggle) {
-      try { this._placeAsLinkedToggle.removeEventListener('change', this._boundPlaceAsLinkedChange); }
-      catch (_) {}
-      this._placeAsLinkedToggle = null;
-    }
-    if (this._placeAsActorTypeSelect) {
-      try { this._placeAsActorTypeSelect.removeEventListener('change', this._boundPlaceAsActorTypeChange); }
-      catch (_) {}
-      this._placeAsActorTypeSelect = null;
-    }
-    if (this._placeAsAppendNumberToggle) {
-      try { this._placeAsAppendNumberToggle.removeEventListener('change', this._boundPlaceAsAppendNumberChange); }
-      catch (_) {}
-      this._placeAsAppendNumberToggle = null;
-    }
-    if (this._placeAsPrependAdjectiveToggle) {
-      try { this._placeAsPrependAdjectiveToggle.removeEventListener('change', this._boundPlaceAsPrependAdjectiveChange); }
-      catch (_) {}
-      this._placeAsPrependAdjectiveToggle = null;
-    }
-    if (this._placeAsHpModeSelect) {
-      try { this._placeAsHpModeSelect.removeEventListener('change', this._boundPlaceAsHpMode); }
-      catch (_) {}
-      this._placeAsHpModeSelect = null;
-    }
-    if (this._placeAsHpPercentInput) {
-      try { this._placeAsHpPercentInput.removeEventListener('input', this._boundPlaceAsHpPercent); }
-      catch (_) {}
-      this._placeAsHpPercentInput = null;
-    }
-    if (this._placeAsHpStaticInput) {
-      try { this._placeAsHpStaticInput.removeEventListener('input', this._boundPlaceAsHpStatic); }
-      catch (_) {}
-      this._placeAsHpStaticInput = null;
-    }
-    this._placeAsHpModeHint = null;
-    this._placeAsActorTypeHint = null;
-    this._placeAsHpPercentHint = null;
-    this._placeAsHpStaticHint = null;
-    this._placeAsHpStaticError = null;
-    this._placeAsHpPercentRow = null;
-    this._placeAsHpStaticRow = null;
+    this._unbindPlaceAsControls();
   }
 
   _handleResettableContext(event) {
@@ -845,7 +642,7 @@ class ToolOptionsWindowControlMethods {
 
   _getPreparedDropShadowControl() {
     const controlId = String(
-      this._dropShadowControlId
+      this._dropShadowControlsWorkflow.controlId
       || this._dropShadowToggle?.getAttribute?.('data-fa-nexus-drop-shadow-toggle-input')
       || ''
     );
@@ -876,381 +673,24 @@ class ToolOptionsWindowControlMethods {
   }
 
   _bindDropShadowControls() {
-    const root = this.element?.querySelector('[data-fa-nexus-drop-shadow-root]') || null;
-    if (!root) {
-      this._unbindDropShadowControls();
-      return;
-    }
-    if (this._dropShadowRoot === root) {
-      this._syncDropShadowControl();
-      this._syncDropShadowControls();
-      return;
-    }
-    this._unbindDropShadowControls();
-    this._dropShadowRoot = root;
-    this._dropShadowControlId = String(root.getAttribute('data-fa-nexus-drop-shadow-root') || '');
-    this._dropShadowScaleDisplay = root.querySelector('[data-fa-nexus-drop-shadow-scale-display]') || null;
-    this._dropShadowAlphaDisplay = root.querySelector('[data-fa-nexus-drop-shadow-alpha-display]') || null;
-    this._dropShadowDilationDisplay = root.querySelector('[data-fa-nexus-drop-shadow-dilation-display]') || null;
-    this._dropShadowBlurDisplay = root.querySelector('[data-fa-nexus-drop-shadow-blur-display]') || null;
-    this._dropShadowOffsetDisplay = root.querySelector('[data-fa-nexus-drop-shadow-offset-display]') || null;
-    this._dropShadowOffsetDistanceDisplay = root.querySelector('[data-fa-nexus-drop-shadow-offset-distance-display]') || null;
-    this._dropShadowOffsetAngleDisplay = root.querySelector('[data-fa-nexus-drop-shadow-offset-angle-display]') || null;
-    this._dropShadowOffsetMaxDisplay = root.querySelector('[data-fa-nexus-drop-shadow-offset-max-display]') || null;
-    this._dropShadowElevationDisplay = root.querySelector('[data-fa-nexus-drop-shadow-elevation]') || null;
-    this._dropShadowStatusDisplay = root.querySelector('[data-fa-nexus-drop-shadow-status]') || null;
-    this._dropShadowNoteDisplay = root.querySelector('[data-fa-nexus-drop-shadow-note]') || null;
-    this._dropShadowCollapseButton = root.querySelector('[data-fa-nexus-drop-shadow-toggle]') || null;
-    if (this._dropShadowCollapseButton) {
-      this._dropShadowCollapseButton.addEventListener('click', this._boundDropShadowCollapse);
-    }
-    this._dropShadowBody = root.querySelector('[data-fa-nexus-drop-shadow-body]') || null;
-    this._dropShadowEditRoot = root.querySelector('[data-fa-nexus-drop-shadow-edit-row]')
-      || root.querySelector('[data-fa-nexus-drop-shadow-edit-root]')
-      || null;
-    this._dropShadowEditToggle = root.querySelector('[data-fa-nexus-drop-shadow-edit]') || null;
-    if (this._dropShadowEditToggle) {
-      this._dropShadowEditToggle.addEventListener('change', this._boundDropShadowEditToggle);
-    }
-    this._dropShadowEditResetButton = root.querySelector('[data-fa-nexus-drop-shadow-edit-reset]') || null;
-    if (this._dropShadowEditResetButton) {
-      this._dropShadowEditResetButton.addEventListener('click', this._boundDropShadowEditReset);
-    }
-    this._dropShadowOnlyRoot = root.querySelector('[data-fa-nexus-drop-shadow-only-row]') || null;
-    this._dropShadowOnlyToggle = root.querySelector('[data-fa-nexus-drop-shadow-only]') || null;
-    if (this._dropShadowOnlyToggle) {
-      this._dropShadowOnlyToggle.addEventListener('change', this._boundDropShadowOnlyToggle);
-    }
-    this._dropShadowPresetsRoot = root.querySelector('[data-fa-nexus-drop-shadow-presets]') || null;
-    if (this._dropShadowPresetsRoot) {
-      this._dropShadowPresetButtons = Array.from(this._dropShadowPresetsRoot.querySelectorAll('[data-fa-nexus-drop-shadow-preset]'));
-      for (const button of this._dropShadowPresetButtons) {
-        button.addEventListener('click', this._boundDropShadowPresetClick);
-        button.addEventListener('contextmenu', this._boundDropShadowPresetContext);
-      }
-    } else {
-      this._dropShadowPresetButtons = [];
-    }
-    this._dropShadowResetButton = root.querySelector('[data-fa-nexus-drop-shadow-reset]') || null;
-    if (this._dropShadowResetButton) {
-      this._dropShadowResetButton.addEventListener('click', this._boundDropShadowReset);
-    }
-
-    const scaleSlider = root.querySelector('[data-fa-nexus-drop-shadow-scale]');
-    if (scaleSlider) {
-      scaleSlider.addEventListener('input', this._boundDropShadowScaleInput);
-      scaleSlider.addEventListener('change', this._boundDropShadowScaleCommit);
-      this._dropShadowScaleSlider = scaleSlider;
-    }
-    this._bindDisplayInput(this._dropShadowScaleDisplay, this._boundDropShadowScaleInput, this._boundDropShadowScaleCommit);
-    const alphaSlider = root.querySelector('[data-fa-nexus-drop-shadow-alpha]');
-    if (alphaSlider) {
-      alphaSlider.addEventListener('input', this._boundDropShadowAlphaInput);
-      alphaSlider.addEventListener('change', this._boundDropShadowAlphaCommit);
-      this._dropShadowAlphaSlider = alphaSlider;
-    }
-    this._bindDisplayInput(this._dropShadowAlphaDisplay, this._boundDropShadowAlphaInput, this._boundDropShadowAlphaCommit);
-    const dilationSlider = root.querySelector('[data-fa-nexus-drop-shadow-dilation]');
-    if (dilationSlider) {
-      dilationSlider.addEventListener('input', this._boundDropShadowDilationInput);
-      dilationSlider.addEventListener('change', this._boundDropShadowDilationCommit);
-      this._dropShadowDilationSlider = dilationSlider;
-    }
-    this._bindDisplayInput(this._dropShadowDilationDisplay, this._boundDropShadowDilationInput, this._boundDropShadowDilationCommit);
-    const blurSlider = root.querySelector('[data-fa-nexus-drop-shadow-blur]');
-    if (blurSlider) {
-      blurSlider.addEventListener('input', this._boundDropShadowBlurInput);
-      blurSlider.addEventListener('change', this._boundDropShadowBlurCommit);
-      this._dropShadowBlurSlider = blurSlider;
-    }
-    this._bindDisplayInput(this._dropShadowBlurDisplay, this._boundDropShadowBlurInput, this._boundDropShadowBlurCommit);
-    const offsetSlider = root.querySelector('[data-fa-nexus-drop-shadow-offset]');
-    if (offsetSlider) {
-      offsetSlider.addEventListener('input', this._boundDropShadowOffsetInput);
-      offsetSlider.addEventListener('change', this._boundDropShadowOffsetCommit);
-      this._dropShadowOffsetSlider = offsetSlider;
-    }
-    this._bindDisplayInput(this._dropShadowOffsetDisplay, this._boundDropShadowOffsetInput, this._boundDropShadowOffsetCommit);
-    const offsetControl = root.querySelector('[data-fa-nexus-drop-shadow-offset-control]');
-    if (offsetControl) {
-      offsetControl.addEventListener('pointerdown', this._boundDropShadowOffsetPointerDown);
-      offsetControl.addEventListener('contextmenu', this._boundDropShadowOffsetContext);
-      this._dropShadowOffsetControl = offsetControl;
-      this._dropShadowOffsetMaxDistance = Number(offsetControl.dataset.maxDistance) || 40;
-    }
-    this._bindDisplayInput(
-      this._dropShadowOffsetMaxDisplay,
-      null,
-      this._boundDropShadowOffsetMaxCommit
-    );
-    if (this._dropShadowOffsetMaxDisplay) {
-      this._dropShadowOffsetMaxDisplay.addEventListener('input', this._boundDropShadowOffsetMaxInput);
-    }
-    this._dropShadowOffsetCircle = root.querySelector('[data-fa-nexus-drop-shadow-offset-circle]') || null;
-    this._dropShadowPreviewRoot = root.querySelector('[data-fa-nexus-drop-shadow-offset-preview]') || null;
-    this._dropShadowPreviewImage = root.querySelector('[data-fa-nexus-drop-shadow-offset-preview-image]') || null;
-    this._dropShadowOffsetHandle = root.querySelector('[data-fa-nexus-drop-shadow-offset-handle]') || null;
-
-    this._syncDropShadowControl();
-    this._syncDropShadowControls();
+    this._dropShadowControlsWorkflow.bind();
   }
 
   _unbindDropShadowControls() {
-    if (this._dropShadowScaleSlider) {
-      try {
-        this._dropShadowScaleSlider.removeEventListener('input', this._boundDropShadowScaleInput);
-        this._dropShadowScaleSlider.removeEventListener('change', this._boundDropShadowScaleCommit);
-      } catch (_) {}
-    }
-    this._unbindDisplayInput(this._dropShadowScaleDisplay, this._boundDropShadowScaleInput, this._boundDropShadowScaleCommit);
-    if (this._dropShadowAlphaSlider) {
-      try {
-        this._dropShadowAlphaSlider.removeEventListener('input', this._boundDropShadowAlphaInput);
-        this._dropShadowAlphaSlider.removeEventListener('change', this._boundDropShadowAlphaCommit);
-      } catch (_) {}
-    }
-    this._unbindDisplayInput(this._dropShadowAlphaDisplay, this._boundDropShadowAlphaInput, this._boundDropShadowAlphaCommit);
-    if (this._dropShadowDilationSlider) {
-      try {
-        this._dropShadowDilationSlider.removeEventListener('input', this._boundDropShadowDilationInput);
-        this._dropShadowDilationSlider.removeEventListener('change', this._boundDropShadowDilationCommit);
-      } catch (_) {}
-    }
-    this._unbindDisplayInput(this._dropShadowDilationDisplay, this._boundDropShadowDilationInput, this._boundDropShadowDilationCommit);
-    if (this._dropShadowBlurSlider) {
-      try {
-        this._dropShadowBlurSlider.removeEventListener('input', this._boundDropShadowBlurInput);
-        this._dropShadowBlurSlider.removeEventListener('change', this._boundDropShadowBlurCommit);
-      } catch (_) {}
-    }
-    this._unbindDisplayInput(this._dropShadowBlurDisplay, this._boundDropShadowBlurInput, this._boundDropShadowBlurCommit);
-    if (this._dropShadowOffsetSlider) {
-      try {
-        this._dropShadowOffsetSlider.removeEventListener('input', this._boundDropShadowOffsetInput);
-        this._dropShadowOffsetSlider.removeEventListener('change', this._boundDropShadowOffsetCommit);
-      } catch (_) {}
-    }
-    this._unbindDisplayInput(this._dropShadowOffsetDisplay, this._boundDropShadowOffsetInput, this._boundDropShadowOffsetCommit);
-    this._unbindDisplayInput(
-      this._dropShadowOffsetMaxDisplay,
-      null,
-      this._boundDropShadowOffsetMaxCommit
-    );
-    if (this._dropShadowOffsetMaxDisplay) {
-      try { this._dropShadowOffsetMaxDisplay.removeEventListener('input', this._boundDropShadowOffsetMaxInput); } catch (_) {}
-    }
-    if (this._dropShadowOffsetControl) {
-      try { this._dropShadowOffsetControl.removeEventListener('pointerdown', this._boundDropShadowOffsetPointerDown); } catch (_) {}
-      try { this._dropShadowOffsetControl.removeEventListener('contextmenu', this._boundDropShadowOffsetContext); } catch (_) {}
-    }
-    if (this._dropShadowCollapseButton) {
-      try { this._dropShadowCollapseButton.removeEventListener('click', this._boundDropShadowCollapse); } catch (_) {}
-    }
-    if (this._dropShadowEditToggle) {
-      try { this._dropShadowEditToggle.removeEventListener('change', this._boundDropShadowEditToggle); } catch (_) {}
-    }
-    if (this._dropShadowEditResetButton) {
-      try { this._dropShadowEditResetButton.removeEventListener('click', this._boundDropShadowEditReset); } catch (_) {}
-    }
-    if (this._dropShadowOnlyToggle) {
-      try { this._dropShadowOnlyToggle.removeEventListener('change', this._boundDropShadowOnlyToggle); } catch (_) {}
-    }
-    if (Array.isArray(this._dropShadowPresetButtons)) {
-      for (const button of this._dropShadowPresetButtons) {
-        try { button.removeEventListener('click', this._boundDropShadowPresetClick); } catch (_) {}
-        try { button.removeEventListener('contextmenu', this._boundDropShadowPresetContext); } catch (_) {}
-      }
-    }
-    if (this._dropShadowResetButton) {
-      try { this._dropShadowResetButton.removeEventListener('click', this._boundDropShadowReset); } catch (_) {}
-    }
-    this._releaseDropShadowOffsetPointer();
-    this._dropShadowRoot = null;
-    this._dropShadowControlId = '';
-    this._dropShadowScaleSlider = null;
-    this._dropShadowAlphaSlider = null;
-    this._dropShadowDilationSlider = null;
-    this._dropShadowBlurSlider = null;
-    this._dropShadowOffsetSlider = null;
-    this._dropShadowOffsetControl = null;
-    this._dropShadowOffsetCircle = null;
-    this._dropShadowPreviewRoot = null;
-    this._dropShadowPreviewImage = null;
-    this._dropShadowOffsetHandle = null;
-    this._dropShadowScaleDisplay = null;
-    this._dropShadowAlphaDisplay = null;
-    this._dropShadowDilationDisplay = null;
-    this._dropShadowBlurDisplay = null;
-    this._dropShadowOffsetDisplay = null;
-    this._dropShadowOffsetDistanceDisplay = null;
-    this._dropShadowOffsetAngleDisplay = null;
-    this._dropShadowOffsetMaxDisplay = null;
-    this._dropShadowElevationDisplay = null;
-    this._dropShadowStatusDisplay = null;
-    this._dropShadowNoteDisplay = null;
-    this._dropShadowCollapseButton = null;
-    this._dropShadowBody = null;
-    this._dropShadowEditRoot = null;
-    this._dropShadowEditToggle = null;
-    this._dropShadowEditResetButton = null;
-    this._dropShadowOnlyRoot = null;
-    this._dropShadowOnlyToggle = null;
-    this._dropShadowPresetsRoot = null;
-    this._dropShadowPresetButtons = [];
-    this._dropShadowResetButton = null;
+    this._dropShadowControlsWorkflow.unbind();
   }
 
   _syncDropShadowControls() {
-    this._syncDropShadowControl();
-    const state = this._getDropShadowControlsState();
-    const available = !!state?.available;
-    if (this._dropShadowRoot) {
-      this._dropShadowRoot.classList.toggle('is-hidden', !available);
-    }
-    if (!this._dropShadowRoot || !available) return;
+    this._dropShadowControlsWorkflow.sync();
+  }
 
-    const assign = (slider, display, entry) => {
-      if (!slider || !entry) return;
-      if (entry.min !== undefined) slider.min = entry.min;
-      if (entry.max !== undefined) slider.max = entry.max;
-      if (entry.step !== undefined) slider.step = entry.step;
-      if (entry.value !== undefined) slider.value = entry.value;
-      this._applyDefaultValue(slider, entry.defaultValue);
-      slider.disabled = !!entry.disabled;
-      if (display) this._syncDisplayValue(display, entry);
-    };
-    const collapsed = !!(state.collapse?.collapsed ?? state.collapsed);
-    if (this._dropShadowRoot) {
-      this._dropShadowRoot.classList.toggle('is-collapsed', collapsed);
-    }
-    if (this._dropShadowBody) {
-      if (collapsed) this._dropShadowBody.setAttribute('aria-hidden', 'true');
-      else this._dropShadowBody.removeAttribute('aria-hidden');
-    }
-    if (this._dropShadowCollapseButton) {
-      const collapseAvailable = state.collapse?.available !== false;
-      this._dropShadowCollapseButton.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-      this._dropShadowCollapseButton.setAttribute('aria-label', collapsed ? 'Expand shadow settings' : 'Collapse shadow settings');
-      this._dropShadowCollapseButton.classList.toggle('is-collapsed', collapsed);
-      this._dropShadowCollapseButton.classList.toggle('is-hidden', !collapseAvailable);
-      this._dropShadowCollapseButton.disabled = !collapseAvailable || !!(state.collapse?.disabled ?? state.disabled);
-      this._dropShadowCollapseButton.title = collapsed ? 'Expand shadow settings' : 'Collapse shadow settings';
-    }
-    if (this._dropShadowEditRoot) {
-      this._dropShadowEditRoot.classList.toggle('is-hidden', !state.edit?.available);
-    }
-    if (this._dropShadowEditToggle) {
-      this._dropShadowEditToggle.checked = !!state.edit?.enabled;
-      this._dropShadowEditToggle.disabled = !state.edit?.available || !!state.edit?.disabled;
-    }
-    if (this._dropShadowEditResetButton) {
-      const editReset = state.edit?.reset || null;
-      this._dropShadowEditResetButton.classList.toggle('is-hidden', !editReset);
-      if (editReset) {
-        this._dropShadowEditResetButton.disabled = !!editReset.disabled;
-        this._dropShadowEditResetButton.textContent = editReset.label || 'Reset';
-        if (editReset.tooltip) this._dropShadowEditResetButton.title = editReset.tooltip;
-        else this._dropShadowEditResetButton.removeAttribute('title');
-      }
-    }
-    if (this._dropShadowOnlyRoot) {
-      this._dropShadowOnlyRoot.classList.toggle('is-hidden', !state.shadowOnly?.available);
-    }
-    if (this._dropShadowOnlyToggle) {
-      this._dropShadowOnlyToggle.checked = !!state.shadowOnly?.enabled;
-      this._dropShadowOnlyToggle.disabled = !state.shadowOnly?.available || !!state.shadowOnly?.disabled;
-      if (state.shadowOnly?.tooltip) this._dropShadowOnlyToggle.closest?.('label')?.setAttribute?.('title', state.shadowOnly.tooltip);
-    }
-    assign(this._dropShadowScaleSlider, this._dropShadowScaleDisplay, state.scale);
-    assign(this._dropShadowAlphaSlider, this._dropShadowAlphaDisplay, state.alpha);
-    assign(this._dropShadowDilationSlider, this._dropShadowDilationDisplay, state.dilation);
-    assign(this._dropShadowBlurSlider, this._dropShadowBlurDisplay, state.blur);
-    if (state.offset) {
-      const disabled = !!state.offset.disabled;
-      if (state.offset.mode === 'polar' && this._dropShadowOffsetControl) {
-        this._dropShadowOffsetMaxDistance = Number(state.offset.maxDistance) || this._dropShadowOffsetMaxDistance || 40;
-        this._dropShadowOffsetControl.dataset.maxDistance = String(this._dropShadowOffsetMaxDistance);
-        this._dropShadowOffsetControl.dataset.disabled = disabled ? 'true' : 'false';
-        this._dropShadowOffsetControl.classList.toggle('is-disabled', disabled);
-      } else if (this._dropShadowOffsetControl) {
-        this._dropShadowOffsetControl.dataset.disabled = 'true';
-        this._dropShadowOffsetControl.classList.add('is-disabled');
-      }
-      if (state.offset.mode === 'polar') {
-        if (disabled) this._releaseDropShadowOffsetPointer();
-        if (this._dropShadowOffsetDistanceDisplay) {
-          this._dropShadowOffsetDistanceDisplay.textContent = state.offset.displayDistance ?? '';
-        }
-        if (this._dropShadowOffsetAngleDisplay) {
-          this._dropShadowOffsetAngleDisplay.textContent = state.offset.displayAngle ?? '';
-        }
-        if (state.offset.offsetMaxHandlerId && this._dropShadowOffsetMaxDisplay) {
-          this._syncDisplayValue(this._dropShadowOffsetMaxDisplay, {
-            value: Math.round(Number(state.offset.maxDistance) || 0),
-            min: state.offset.maxDistanceMin,
-            max: state.offset.maxDistanceLimit,
-            step: state.offset.maxDistanceStep,
-            defaultValue: state.offset.maxDistanceDefault,
-            display: state.offset.maxDistanceHint || '',
-            disabled
-          }, { disabled });
-        }
-        this._positionDropShadowOffsetHandle(state.offset.distance, state.offset.angle, state.offset.maxDistance);
-      } else {
-        this._releaseDropShadowOffsetPointer();
-        assign(this._dropShadowOffsetSlider, this._dropShadowOffsetDisplay, state.offset);
-      }
+  _invokeDropShadowHandlerAndSync(controller, handlerId, ...args) {
+    const result = controller.invokeToolHandler(handlerId, ...args);
+    if (result?.then) {
+      result.catch(() => {}).finally(() => this._syncDropShadowControls());
     } else {
-      this._releaseDropShadowOffsetPointer();
-      if (this._dropShadowOffsetSlider) this._dropShadowOffsetSlider.disabled = true;
-      if (this._dropShadowOffsetDisplay) this._dropShadowOffsetDisplay.disabled = true;
-      if (this._dropShadowOffsetDistanceDisplay) this._dropShadowOffsetDistanceDisplay.textContent = '';
-      if (this._dropShadowOffsetAngleDisplay) this._dropShadowOffsetAngleDisplay.textContent = '';
-      if (this._dropShadowOffsetMaxDisplay) {
-        this._syncDisplayValue(this._dropShadowOffsetMaxDisplay, { value: '', disabled: true }, { disabled: true });
-      }
+      this._syncDropShadowControls();
     }
-    const presetEntries = Array.isArray(state.presets) ? state.presets : [];
-    if (Array.isArray(this._dropShadowPresetButtons)) {
-      for (const button of this._dropShadowPresetButtons) {
-        const index = Number(button.dataset.faNexusDropShadowPreset);
-        const entry = Number.isInteger(index) && presetEntries[index] ? presetEntries[index] : presetEntries.find?.((item) => item?.index === index);
-        const saved = !!entry?.saved;
-        const active = !!entry?.active;
-        button.classList.toggle('is-empty', !saved);
-        button.classList.toggle('is-active', active);
-        button.disabled = !!state.disabled;
-        if (entry?.label) button.textContent = entry.label;
-        button.title = entry?.tooltip || (saved ? 'Click to apply preset.' : 'Shift+Click to save preset.');
-        button.setAttribute('aria-pressed', active ? 'true' : 'false');
-      }
-    }
-    if (this._dropShadowResetButton) {
-      const reset = state.reset || null;
-      this._dropShadowResetButton.disabled = !!reset?.disabled;
-      this._dropShadowResetButton.textContent = reset?.label || 'Reset';
-      if (reset?.tooltip) this._dropShadowResetButton.title = reset.tooltip;
-      else this._dropShadowResetButton.removeAttribute('title');
-    }
-    const context = state.context || {};
-    if (this._dropShadowElevationDisplay) {
-      if (context.display) {
-        this._dropShadowElevationDisplay.textContent = `Elevation ${context.display}`;
-        this._dropShadowElevationDisplay.classList.remove('is-hidden');
-      } else {
-        this._dropShadowElevationDisplay.textContent = '';
-        this._dropShadowElevationDisplay.classList.add('is-hidden');
-      }
-    }
-    if (this._dropShadowStatusDisplay) {
-      this._dropShadowStatusDisplay.textContent = context.status || '';
-      this._dropShadowStatusDisplay.classList.toggle('is-hidden', !context.status);
-    }
-    if (this._dropShadowNoteDisplay) {
-      this._dropShadowNoteDisplay.textContent = context.note || '';
-      this._dropShadowNoteDisplay.classList.toggle('is-hidden', !context.note);
-    }
-    this._syncDropShadowPreview(state.preview || null);
   }
 
   _handleDropShadowOffsetMaxSlider(event, commit) {
@@ -1265,12 +705,7 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId, target.value, !!commit);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId, target.value, !!commit);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1291,12 +726,7 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId, target.value, !!commit);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId, target.value, !!commit);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1315,12 +745,7 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1334,12 +759,7 @@ class ToolOptionsWindowControlMethods {
     if (!handlerId || !this._controller?.invokeToolHandler) return;
     const enabled = !!(event?.currentTarget?.checked ?? event?.target?.checked);
     try {
-      const result = this._controller.invokeToolHandler(handlerId, enabled);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(this._controller, handlerId, enabled);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1356,12 +776,7 @@ class ToolOptionsWindowControlMethods {
       : '';
     if (!handlerId || !this._controller?.invokeToolHandler) return;
     try {
-      const result = this._controller.invokeToolHandler(handlerId);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(this._controller, handlerId);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1375,12 +790,7 @@ class ToolOptionsWindowControlMethods {
     if (!handlerId || !this._controller?.invokeToolHandler) return;
     const enabled = !!(event?.currentTarget?.checked ?? event?.target?.checked);
     try {
-      const result = this._controller.invokeToolHandler(handlerId, enabled);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(this._controller, handlerId, enabled);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1404,12 +814,7 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId, index, save);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId, index, save);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1432,12 +837,7 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId, index, true);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId, index, true);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1456,12 +856,7 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId);
     } catch (_) {
       this._syncDropShadowControls();
     }
@@ -1480,99 +875,34 @@ class ToolOptionsWindowControlMethods {
     const controller = this._controller;
     if (!controller?.invokeToolHandler) return;
     try {
-      const result = controller.invokeToolHandler(handlerId);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDropShadowControls());
-      } else {
-        this._syncDropShadowControls();
-      }
+      this._invokeDropShadowHandlerAndSync(controller, handlerId);
     } catch (_) {
       this._syncDropShadowControls();
     }
   }
 
   _handleDropShadowOffsetPointerDown(event) {
-    if (!this._dropShadowOffsetControl || event.button !== 0) return;
-    if (this._dropShadowOffsetControl.dataset.disabled === 'true') return;
-    this._dropShadowOffsetPointerId = event.pointerId;
-    this._dropShadowOffsetPointerActive = true;
-    try { this._dropShadowOffsetControl.setPointerCapture(event.pointerId); } catch (_) {}
-    window.addEventListener('pointermove', this._boundDropShadowOffsetPointerMove, { passive: false });
-    window.addEventListener('pointerup', this._boundDropShadowOffsetPointerUp, { passive: false });
-    window.addEventListener('pointercancel', this._boundDropShadowOffsetPointerUp, { passive: false });
-    event.preventDefault();
-    this._updateDropShadowOffsetFromPointer(event, false);
+    this._dropShadowControlsWorkflow.handleOffsetPointerDown(event);
   }
 
   _handleDropShadowOffsetPointerMove(event) {
-    if (!this._dropShadowOffsetPointerActive) return;
-    if (this._dropShadowOffsetPointerId !== null && event.pointerId !== this._dropShadowOffsetPointerId) return;
-    event.preventDefault();
-    this._updateDropShadowOffsetFromPointer(event, false);
+    this._dropShadowControlsWorkflow.handleOffsetPointerMove(event);
   }
 
   _handleDropShadowOffsetPointerUp(event) {
-    if (!this._dropShadowOffsetPointerActive) return;
-    if (this._dropShadowOffsetPointerId !== null && event.pointerId !== this._dropShadowOffsetPointerId) return;
-    event.preventDefault();
-    this._updateDropShadowOffsetFromPointer(event, true);
-    this._releaseDropShadowOffsetPointer();
+    this._dropShadowControlsWorkflow.handleOffsetPointerUp(event);
   }
 
   _releaseDropShadowOffsetPointer() {
-    if (this._dropShadowOffsetPointerId !== null && this._dropShadowOffsetControl) {
-      try { this._dropShadowOffsetControl.releasePointerCapture(this._dropShadowOffsetPointerId); } catch (_) {}
-    }
-    window.removeEventListener('pointermove', this._boundDropShadowOffsetPointerMove, false);
-    window.removeEventListener('pointerup', this._boundDropShadowOffsetPointerUp, false);
-    window.removeEventListener('pointercancel', this._boundDropShadowOffsetPointerUp, false);
-    this._dropShadowOffsetPointerId = null;
-    this._dropShadowOffsetPointerActive = false;
+    this._dropShadowControlsWorkflow.releaseOffsetPointer();
   }
 
   _updateDropShadowOffsetFromPointer(event, commit) {
-    if (!this._dropShadowOffsetCircle || !this._controller) return;
-    const control = this._getPreparedDropShadowControl();
-    const handlerId = typeof control?.controls?.offset?.handlerId === 'string'
-      ? control.controls.offset.handlerId
-      : 'setDropShadowOffset';
-    if (!handlerId) return;
-    const rect = this._dropShadowOffsetCircle.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const dx = event.clientX - centerX;
-    const dy = event.clientY - centerY;
-    const radius = Math.min(rect.width, rect.height) / 2;
-    if (radius <= 0) return;
-    const maxDistance = this._dropShadowOffsetMaxDistance || 40;
-    const radial = Math.min(1, Math.sqrt(dx * dx + dy * dy) / radius);
-    const distance = Math.min(maxDistance, Math.max(0, radial * maxDistance));
-    let angle = Math.atan2(dy, dx) * (180 / Math.PI);
-    if (!Number.isFinite(angle)) angle = 0;
-    angle = (angle + 360) % 360;
-    this._positionDropShadowOffsetHandle(distance, angle, maxDistance);
-    const result = this._controller.invokeToolHandler(handlerId, distance, angle, !!commit);
-    if (result?.then) {
-      result.catch(() => {}).finally(() => this._syncDropShadowControls());
-    } else {
-      this._syncDropShadowControls();
-    }
+    this._dropShadowControlsWorkflow.updateOffsetFromPointer(event, commit);
   }
 
   _positionDropShadowOffsetHandle(distance, angle, maxDistance) {
-    if (!this._dropShadowOffsetHandle || !this._dropShadowOffsetCircle) return;
-    const rect = this._dropShadowOffsetCircle.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const radius = Math.min(rect.width, rect.height) / 2;
-    if (radius <= 0) return;
-    const effectiveMax = Number(maxDistance) || this._dropShadowOffsetMaxDistance || 40;
-    const ratio = effectiveMax > 0 ? Math.min(1, Math.max(0, distance / effectiveMax)) : 0;
-    const theta = (Number(angle) || 0) * (Math.PI / 180);
-    const offsetX = Math.cos(theta) * radius * ratio;
-    const offsetY = Math.sin(theta) * radius * ratio;
-    this._dropShadowOffsetHandle.style.setProperty('--fa-nexus-drop-shadow-offset-x', `${offsetX}px`);
-    this._dropShadowOffsetHandle.style.setProperty('--fa-nexus-drop-shadow-offset-y', `${offsetY}px`);
+    this._dropShadowControlsWorkflow.positionOffsetHandle(distance, angle, maxDistance);
   }
 
   _bindDeclarativeSegmentedControls() {
@@ -1700,6 +1030,10 @@ class ToolOptionsWindowControlMethods {
       const buttonMap = new Map();
       for (const button of buttons) {
         button.addEventListener('click', this._boundEditorActionClick);
+        button.addEventListener('pointerenter', this._boundEditorActionPointerEnter);
+        button.addEventListener('pointerleave', this._boundEditorActionPointerLeave);
+        button.addEventListener('focus', this._boundEditorActionFocus);
+        button.addEventListener('blur', this._boundEditorActionBlur);
         const id = button.dataset?.faNexusEditorAction || '';
         if (id) buttonMap.set(id, button);
       }
@@ -1718,6 +1052,14 @@ class ToolOptionsWindowControlMethods {
       for (const { buttons } of this._declarativeActionRows.values()) {
         for (const button of buttons || []) {
           try { button.removeEventListener('click', this._boundEditorActionClick); }
+          catch (_) {}
+          try { button.removeEventListener('pointerenter', this._boundEditorActionPointerEnter); }
+          catch (_) {}
+          try { button.removeEventListener('pointerleave', this._boundEditorActionPointerLeave); }
+          catch (_) {}
+          try { button.removeEventListener('focus', this._boundEditorActionFocus); }
+          catch (_) {}
+          try { button.removeEventListener('blur', this._boundEditorActionBlur); }
           catch (_) {}
         }
       }
@@ -1798,202 +1140,69 @@ class ToolOptionsWindowControlMethods {
     }
   }
 
-  _bindDeclarativeToggleControls() {
-    if (!this.element) return;
-    const roots = Array.from(this.element.querySelectorAll('[data-fa-nexus-toggle-control]'));
-    for (const root of roots) {
-      const controlId = String(root.getAttribute('data-fa-nexus-toggle-control') || '');
-      if (!controlId) continue;
-      const input = root.querySelector(`[data-fa-nexus-toggle-input="${controlId}"]`);
-      if (input) input.addEventListener('change', this._boundDeclarativeToggleChange);
-      this._declarativeToggleControls.set(controlId, {
-        root,
-        input,
-        label: root.querySelector('[data-fa-nexus-toggle-label]') || null,
-        hint: root.querySelector('[data-fa-nexus-toggle-hint]') || null
-      });
+  _handleEditorActionPreview(event, phase) {
+    const button = event?.currentTarget || event?.target;
+    if (!button) return;
+    const id = button.dataset?.faNexusEditorAction;
+    if (!id || button.disabled) return;
+    const controlId = button.closest?.('[data-fa-nexus-editor-actions-root]')?.getAttribute?.('data-fa-nexus-editor-actions-root') || '';
+    const control = this._getPreparedDeclarativeControl(controlId);
+    const handlerId = typeof control?.previewHandlerId === 'string' ? control.previewHandlerId : '';
+    if (!handlerId || !this._controller?.invokeToolHandler) return;
+    try {
+      const result = this._controller.invokeToolHandler(handlerId, id, phase);
+      if (result?.then) result.catch(() => {});
+    } catch (_) {}
+  }
+
+  _getDeclarativeControlRuntime() {
+    if (!this._declarativeControlRuntime) {
+      this._declarativeControlRuntime = new DeclarativeControlRuntime(this);
     }
-    this._syncDeclarativeToggleControls();
+    return this._declarativeControlRuntime;
+  }
+
+  _getPortalControlRuntime() {
+    if (!this._portalControlRuntime) {
+      this._portalControlRuntime = new PortalControlRuntime(this);
+    }
+    return this._portalControlRuntime;
+  }
+
+  _bindDeclarativeToggleControls() {
+    this._getDeclarativeControlRuntime().bindToggleControls();
   }
 
   _unbindDeclarativeToggleControls() {
-    if (this._declarativeToggleControls?.size) {
-      for (const { input } of this._declarativeToggleControls.values()) {
-        if (!input) continue;
-        try { input.removeEventListener('change', this._boundDeclarativeToggleChange); } catch (_) {}
-      }
-      this._declarativeToggleControls.clear();
-    }
+    this._declarativeControlRuntime?.unbindToggleControls();
   }
 
   _syncDeclarativeToggleControls() {
-    if (!this._declarativeToggleControls?.size) return;
-    for (const [controlId, refs] of this._declarativeToggleControls.entries()) {
-      const control = this._getPreparedDeclarativeControl(controlId);
-      const root = refs?.root || null;
-      if (!root) continue;
-      if (!control || control.type !== 'toggle') {
-        root.hidden = true;
-        continue;
-      }
-      root.hidden = false;
-      if (refs.input) {
-        refs.input.checked = !!control.value;
-        refs.input.disabled = !!control.disabled;
-        if (control.tooltip) refs.input.title = control.tooltip;
-        else refs.input.removeAttribute('title');
-      }
-      if (refs.label && refs.label.textContent !== control.label) refs.label.textContent = control.label;
-      if (control.tooltip) root.title = control.tooltip;
-      else root.removeAttribute('title');
-      if (refs.hint) {
-        const text = control.hint || '';
-        refs.hint.textContent = text;
-        refs.hint.hidden = !text;
-      }
-    }
+    this._declarativeControlRuntime?.syncToggleControls();
   }
 
   _handleDeclarativeToggleChange(event) {
-    const input = event?.currentTarget || event?.target;
-    if (!input) return;
-    const controlId = input.getAttribute?.('data-fa-nexus-toggle-input')
-      || input.closest?.('[data-fa-nexus-toggle-control]')?.getAttribute?.('data-fa-nexus-toggle-control')
-      || '';
-    const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = typeof control?.handlerId === 'string' ? control.handlerId : '';
-    if (!handlerId) return;
-    const hasHandlerArg = control?.handlerArg !== undefined;
-    const controller = this._controller;
-    if (!controller?.invokeToolHandler) return;
-    try {
-      const result = hasHandlerArg
-        ? controller.invokeToolHandler(handlerId, control.handlerArg, !!input.checked)
-        : controller.invokeToolHandler(handlerId, !!input.checked);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDeclarativeToggleControls());
-      } else {
-        this._syncDeclarativeToggleControls();
-      }
-    } catch (_) {
-      this._syncDeclarativeToggleControls();
-    }
+    this._getDeclarativeControlRuntime().handleToggleChange(event);
   }
 
   _bindDeclarativeSelectControls() {
-    this._unbindDeclarativeSelectControls();
-    if (!this.element) return;
-    const roots = Array.from(this.element.querySelectorAll('[data-fa-nexus-select-control]'));
-    for (const root of roots) {
-      const controlId = String(root.getAttribute('data-fa-nexus-select-control') || '');
-      if (!controlId) continue;
-      const input = root.querySelector(`[data-fa-nexus-select-input="${controlId}"]`);
-      if (input) input.addEventListener('change', this._boundDeclarativeSelectChange);
-      this._declarativeSelectControls.set(controlId, {
-        root,
-        input,
-        label: root.querySelector('[data-fa-nexus-select-label]') || null,
-        hint: root.querySelector('[data-fa-nexus-select-hint]') || null
-      });
-    }
-    this._syncDeclarativeSelectControls();
+    this._getDeclarativeControlRuntime().bindSelectControls();
   }
 
   _unbindDeclarativeSelectControls() {
-    if (!this._declarativeSelectControls?.size) return;
-    for (const { input } of this._declarativeSelectControls.values()) {
-      if (!input) continue;
-      try { input.removeEventListener('change', this._boundDeclarativeSelectChange); } catch (_) {}
-    }
-    this._declarativeSelectControls.clear();
+    this._declarativeControlRuntime?.unbindSelectControls();
   }
 
   _syncDeclarativeSelectOptions(select, control) {
-    if (!select || !control || control.type !== 'select') return;
-    const options = Array.isArray(control.options) ? control.options : [];
-    const signature = JSON.stringify(options.map((option) => ({
-      value: String(option?.value ?? ''),
-      label: String(option?.label || ''),
-      disabled: !!option?.disabled
-    })));
-    if (select.dataset.faNexusOptionSignature !== signature) {
-      while (select.firstChild) select.removeChild(select.firstChild);
-      for (const option of options) {
-        const node = document.createElement('option');
-        node.value = String(option?.value ?? '');
-        node.textContent = String(option?.label || option?.value || '');
-        node.disabled = !!option?.disabled;
-        select.appendChild(node);
-      }
-      select.dataset.faNexusOptionSignature = signature;
-    }
-    const selectedValue = String(
-      control.value
-      ?? options.find((option) => option?.selected)?.value
-      ?? options[0]?.value
-      ?? ''
-    );
-    const hasSelectedValue = options.some((option) => String(option?.value ?? '') === selectedValue);
-    const nextValue = hasSelectedValue
-      ? selectedValue
-      : String(options[0]?.value ?? '');
-    if (select.value !== nextValue) select.value = nextValue;
+    this._getDeclarativeControlRuntime().syncSelectOptions(select, control);
   }
 
   _syncDeclarativeSelectControls() {
-    if (!this._declarativeSelectControls?.size) return;
-    for (const [controlId, refs] of this._declarativeSelectControls.entries()) {
-      const control = this._getPreparedDeclarativeControl(controlId);
-      const root = refs?.root || null;
-      if (!root) continue;
-      if (!control || control.type !== 'select') {
-        root.hidden = true;
-        continue;
-      }
-      root.hidden = false;
-      if (refs.label && refs.label.textContent !== control.label) refs.label.textContent = control.label;
-      if (refs.input) {
-        refs.input.disabled = !!control.disabled;
-        if (control.tooltip) refs.input.title = control.tooltip;
-        else refs.input.removeAttribute('title');
-        this._syncDeclarativeSelectOptions(refs.input, control);
-      }
-      if (control.tooltip) root.title = control.tooltip;
-      else root.removeAttribute('title');
-      if (refs.hint) {
-        const text = control.hint || '';
-        refs.hint.textContent = text;
-        refs.hint.hidden = !text;
-      }
-    }
+    this._declarativeControlRuntime?.syncSelectControls();
   }
 
   _handleDeclarativeSelectChange(event) {
-    const input = event?.currentTarget || event?.target;
-    if (!input) return;
-    const controlId = input.getAttribute?.('data-fa-nexus-select-input')
-      || input.closest?.('[data-fa-nexus-select-control]')?.getAttribute?.('data-fa-nexus-select-control')
-      || '';
-    const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = typeof control?.handlerId === 'string' ? control.handlerId : '';
-    if (!handlerId) return;
-    const controller = this._controller;
-    if (!controller?.invokeToolHandler) return;
-    const value = this._coercePortalControlValue(input.value, control?.valueMode || 'string');
-    const finalize = () => {
-      this._syncDeclarativeSelectControls();
-      this._syncEditorActions();
-    };
-    try {
-      const result = controller.invokeToolHandler(handlerId, value);
-      if (result?.then) {
-        result.catch(() => {}).finally(finalize);
-      } else {
-        finalize();
-      }
-    } catch (_) {
-      finalize();
-    }
+    this._getDeclarativeControlRuntime().handleSelectChange(event);
   }
 
   _getPreparedDeclarativeControl(controlId) {
@@ -2459,357 +1668,35 @@ class ToolOptionsWindowControlMethods {
   }
 
   _bindDeclarativeScalarRandomizedControls() {
-    if (!this.element) return;
-    const roots = Array.from(this.element.querySelectorAll('[data-fa-nexus-scalar-control]'));
-    for (const root of roots) {
-      const controlId = String(root.getAttribute('data-fa-nexus-scalar-control') || '');
-      if (!controlId) continue;
-      const slider = root.querySelector(`[data-fa-nexus-scalar-slider="${controlId}"]`);
-      const display = root.querySelector(`[data-fa-nexus-scalar-display="${controlId}"]`);
-      const randomButton = root.querySelector(`[data-fa-nexus-scalar-random="${controlId}"]`);
-      const randomRangeShell = root.querySelector(`[data-fa-nexus-scalar-random-range-shell="${controlId}"]`);
-      const randomMinSlider = root.querySelector(`[data-fa-nexus-scalar-random-min-slider="${controlId}"]`);
-      const randomMaxSlider = root.querySelector(`[data-fa-nexus-scalar-random-max-slider="${controlId}"]`);
-      const randomMinDisplay = root.querySelector(`[data-fa-nexus-scalar-random-min-display="${controlId}"]`);
-      const randomMaxDisplay = root.querySelector(`[data-fa-nexus-scalar-random-max-display="${controlId}"]`);
-      const strengthSlider = root.querySelector(`[data-fa-nexus-scalar-strength-slider="${controlId}"]`);
-      const strengthDisplay = root.querySelector(`[data-fa-nexus-scalar-strength-display="${controlId}"]`);
-      if (slider) {
-        slider.addEventListener('input', this._boundDeclarativeScalarRandomizedInput);
-        slider.addEventListener('change', this._boundDeclarativeScalarRandomizedCommit);
-      }
-      this._bindDisplayInput(display, this._boundDeclarativeScalarRandomizedInput, this._boundDeclarativeScalarRandomizedCommit);
-      if (randomButton) randomButton.addEventListener('click', this._boundDeclarativeScalarRandomizedRandom);
-      if (randomMinSlider) {
-        randomMinSlider.addEventListener('input', this._boundDeclarativeScalarRandomizedMin);
-        randomMinSlider.addEventListener('change', this._boundDeclarativeScalarRandomizedMin);
-      }
-      if (randomMaxSlider) {
-        randomMaxSlider.addEventListener('input', this._boundDeclarativeScalarRandomizedMax);
-        randomMaxSlider.addEventListener('change', this._boundDeclarativeScalarRandomizedMax);
-      }
-      this._bindDisplayInput(randomMinDisplay, this._boundDeclarativeScalarRandomizedMin, this._boundDeclarativeScalarRandomizedMin);
-      this._bindDisplayInput(randomMaxDisplay, this._boundDeclarativeScalarRandomizedMax, this._boundDeclarativeScalarRandomizedMax);
-      if (strengthSlider) {
-        strengthSlider.addEventListener('input', this._boundDeclarativeScalarRandomizedStrengthInput);
-        strengthSlider.addEventListener('change', this._boundDeclarativeScalarRandomizedStrengthCommit);
-      }
-      this._bindDisplayInput(strengthDisplay, this._boundDeclarativeScalarRandomizedStrengthInput, this._boundDeclarativeScalarRandomizedStrengthCommit);
-      this._declarativeScalarRandomizedControls.set(controlId, {
-        root,
-        label: root.querySelector('[data-fa-nexus-scalar-label]') || null,
-        slider,
-        display,
-        randomButton,
-        randomRangeShell,
-        randomMinSlider,
-        randomMaxSlider,
-        randomMinDisplay,
-        randomMaxDisplay,
-        strengthRow: root.querySelector(`[data-fa-nexus-scalar-strength-row="${controlId}"]`) || null,
-        strengthLabel: root.querySelector(`[data-fa-nexus-scalar-strength-label="${controlId}"]`) || null,
-        strengthSlider,
-        strengthDisplay,
-        hint: root.querySelector('[data-fa-nexus-scalar-hint]') || null
-      });
-    }
-    this._syncDeclarativeScalarRandomizedControls();
+    this._getDeclarativeControlRuntime().bindScalarRandomizedControls();
   }
 
   _unbindDeclarativeScalarRandomizedControls() {
-    if (this._declarativeScalarRandomizedControls?.size) {
-      for (const {
-        slider,
-        display,
-        randomButton,
-        randomMinSlider,
-        randomMaxSlider,
-        randomMinDisplay,
-        randomMaxDisplay,
-        strengthSlider,
-        strengthDisplay
-      } of this._declarativeScalarRandomizedControls.values()) {
-        if (slider) {
-          try {
-            slider.removeEventListener('input', this._boundDeclarativeScalarRandomizedInput);
-            slider.removeEventListener('change', this._boundDeclarativeScalarRandomizedCommit);
-          } catch (_) {}
-        }
-        this._unbindDisplayInput(display, this._boundDeclarativeScalarRandomizedInput, this._boundDeclarativeScalarRandomizedCommit);
-        if (randomButton) {
-          try { randomButton.removeEventListener('click', this._boundDeclarativeScalarRandomizedRandom); } catch (_) {}
-        }
-        if (randomMinSlider) {
-          try {
-            randomMinSlider.removeEventListener('input', this._boundDeclarativeScalarRandomizedMin);
-            randomMinSlider.removeEventListener('change', this._boundDeclarativeScalarRandomizedMin);
-          } catch (_) {}
-        }
-        if (randomMaxSlider) {
-          try {
-            randomMaxSlider.removeEventListener('input', this._boundDeclarativeScalarRandomizedMax);
-            randomMaxSlider.removeEventListener('change', this._boundDeclarativeScalarRandomizedMax);
-          } catch (_) {}
-        }
-        this._unbindDisplayInput(randomMinDisplay, this._boundDeclarativeScalarRandomizedMin, this._boundDeclarativeScalarRandomizedMin);
-        this._unbindDisplayInput(randomMaxDisplay, this._boundDeclarativeScalarRandomizedMax, this._boundDeclarativeScalarRandomizedMax);
-        if (strengthSlider) {
-          try {
-            strengthSlider.removeEventListener('input', this._boundDeclarativeScalarRandomizedStrengthInput);
-            strengthSlider.removeEventListener('change', this._boundDeclarativeScalarRandomizedStrengthCommit);
-          } catch (_) {}
-        }
-        this._unbindDisplayInput(strengthDisplay, this._boundDeclarativeScalarRandomizedStrengthInput, this._boundDeclarativeScalarRandomizedStrengthCommit);
-      }
-      this._declarativeScalarRandomizedControls.clear();
-    }
+    this._declarativeControlRuntime?.unbindScalarRandomizedControls();
   }
 
   _syncDeclarativeScalarRandomizedRangeShell(shell, control) {
-    if (!shell || !control) return;
-    const min = Number(control.min);
-    const max = Number(control.max);
-    const lower = Number(control.randomMin);
-    const upper = Number(control.randomMax);
-    const span = Math.max(0.0001, max - min);
-    const start = ((lower - min) / span) * 100;
-    const end = ((upper - min) / span) * 100;
-    shell.style.setProperty('--fa-nexus-range-start', `${Math.max(0, Math.min(100, start))}%`);
-    shell.style.setProperty('--fa-nexus-range-end', `${Math.max(0, Math.min(100, end))}%`);
+    this._getDeclarativeControlRuntime().syncScalarRandomizedRangeShell(shell, control);
   }
 
   _syncDeclarativeScalarRandomizedControls() {
-    if (!this._declarativeScalarRandomizedControls?.size) return;
-    for (const [controlId, refs] of this._declarativeScalarRandomizedControls.entries()) {
-      const control = this._getPreparedDeclarativeControl(controlId);
-      const root = refs?.root || null;
-      if (!root) continue;
-      if (!control || control.type !== 'scalar-randomized') {
-        root.hidden = true;
-        continue;
-      }
-      root.hidden = false;
-      if (refs.label && refs.label.textContent !== control.label) refs.label.textContent = control.label;
-      if (refs.slider) {
-        refs.slider.min = String(control.min);
-        refs.slider.max = String(control.max);
-        refs.slider.step = String(control.step);
-        const nextValue = String(control.value);
-        if (refs.slider.value !== nextValue) refs.slider.value = nextValue;
-        refs.slider.disabled = !!control.disabled;
-        refs.slider.setAttribute('aria-label', control.ariaLabel || control.label);
-        this._applyDefaultValue(refs.slider, control.defaultValue);
-      }
-      if (refs.display) {
-        this._syncDisplayValue(refs.display, {
-          min: control.min,
-          max: control.max,
-          step: control.step,
-          value: control.value,
-          display: control.display,
-          defaultValue: control.defaultValue,
-          disabled: control.disabled
-        });
-      }
-      const randomVisible = control.randomButtonVisible !== false;
-      if (refs.randomButton) {
-        refs.randomButton.hidden = !randomVisible;
-        refs.randomButton.classList.toggle('is-active', randomVisible && !!control.randomEnabled);
-        refs.randomButton.setAttribute('aria-pressed', randomVisible && control.randomEnabled ? 'true' : 'false');
-        refs.randomButton.setAttribute('aria-label', control.randomAria || control.randomTooltip || control.randomLabel || 'Toggle random');
-        if (control.randomTooltip) refs.randomButton.title = control.randomTooltip;
-        else refs.randomButton.removeAttribute('title');
-        refs.randomButton.disabled = !randomVisible || !!control.disabled || !control.randomHandlerId;
-        const label = refs.randomButton.querySelector('span');
-        const nextLabel = control.randomLabel || 'Random';
-        if (label && label.textContent !== nextLabel) label.textContent = nextLabel;
-      }
-      const rangeMode = control.randomMode === 'range';
-      const rangeVisible = randomVisible && !!control.randomEnabled && rangeMode;
-      const strengthVisible = randomVisible && !!control.randomEnabled && !rangeMode;
-      if (refs.randomRangeShell) {
-        refs.randomRangeShell.hidden = !rangeVisible;
-        if (rangeVisible) this._syncDeclarativeScalarRandomizedRangeShell(refs.randomRangeShell, control);
-      }
-      if (refs.randomMinSlider) {
-        refs.randomMinSlider.min = String(control.min);
-        refs.randomMinSlider.max = String(control.max);
-        refs.randomMinSlider.step = String(control.step);
-        const nextValue = String(control.randomMin);
-        if (refs.randomMinSlider.value !== nextValue) refs.randomMinSlider.value = nextValue;
-        refs.randomMinSlider.disabled = !rangeVisible || !control.randomMinHandlerId;
-        refs.randomMinSlider.setAttribute('aria-label', control.randomMinAriaLabel || 'Minimum');
-        this._applyDefaultValue(refs.randomMinSlider, control.randomMinDefault);
-      }
-      if (refs.randomMaxSlider) {
-        refs.randomMaxSlider.min = String(control.min);
-        refs.randomMaxSlider.max = String(control.max);
-        refs.randomMaxSlider.step = String(control.step);
-        const nextValue = String(control.randomMax);
-        if (refs.randomMaxSlider.value !== nextValue) refs.randomMaxSlider.value = nextValue;
-        refs.randomMaxSlider.disabled = !rangeVisible || !control.randomMaxHandlerId;
-        refs.randomMaxSlider.setAttribute('aria-label', control.randomMaxAriaLabel || 'Maximum');
-        this._applyDefaultValue(refs.randomMaxSlider, control.randomMaxDefault);
-      }
-      if (refs.randomMinDisplay) {
-        this._syncDisplayValue(refs.randomMinDisplay, {
-          min: control.min,
-          max: control.max,
-          step: control.step,
-          value: control.randomMin,
-          display: control.randomMinDisplay,
-          defaultValue: control.randomMinDefault,
-          disabled: !rangeVisible || !control.randomMinHandlerId
-        });
-      }
-      if (refs.randomMaxDisplay) {
-        this._syncDisplayValue(refs.randomMaxDisplay, {
-          min: control.min,
-          max: control.max,
-          step: control.step,
-          value: control.randomMax,
-          display: control.randomMaxDisplay,
-          defaultValue: control.randomMaxDefault,
-          disabled: !rangeVisible || !control.randomMaxHandlerId
-        });
-      }
-      if (refs.strengthRow) refs.strengthRow.hidden = !strengthVisible;
-      if (refs.strengthLabel && refs.strengthLabel.textContent !== control.strengthLabel) refs.strengthLabel.textContent = control.strengthLabel;
-      if (refs.strengthSlider) {
-        refs.strengthSlider.min = String(control.strengthMin);
-        refs.strengthSlider.max = String(control.strengthMax);
-        refs.strengthSlider.step = String(control.strengthStep);
-        const nextValue = String(control.strength);
-        if (refs.strengthSlider.value !== nextValue) refs.strengthSlider.value = nextValue;
-        refs.strengthSlider.disabled = !strengthVisible || !control.strengthHandlerId;
-        refs.strengthSlider.setAttribute('aria-label', control.strengthAriaLabel || control.strengthLabel);
-        this._applyDefaultValue(refs.strengthSlider, control.strengthDefault);
-      }
-      if (refs.strengthDisplay) {
-        this._syncDisplayValue(refs.strengthDisplay, {
-          min: control.strengthMin,
-          max: control.strengthMax,
-          step: control.strengthStep,
-          value: control.strength,
-          display: control.strengthDisplay,
-          defaultValue: control.strengthDefault,
-          disabled: !strengthVisible || !control.strengthHandlerId
-        });
-      }
-      if (refs.hint) {
-        const text = control.hint || '';
-        refs.hint.textContent = text;
-        refs.hint.hidden = !text;
-      }
-    }
+    this._declarativeControlRuntime?.syncScalarRandomizedControls();
   }
 
   _handleDeclarativeScalarRandomizedInput(event, commit) {
-    const input = event?.currentTarget || event?.target;
-    if (!input) return;
-    const controlId = input.getAttribute?.('data-fa-nexus-scalar-slider')
-      || input.getAttribute?.('data-fa-nexus-scalar-display')
-      || input.closest?.('[data-fa-nexus-scalar-control]')?.getAttribute?.('data-fa-nexus-scalar-control')
-      || '';
-    const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = typeof control?.handlerId === 'string' ? control.handlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    const value = this._readDeclarativeNumericValue(input, {
-      controlId,
-      commit,
-      sync: this._syncDeclarativeScalarRandomizedControls,
-      logTag: 'ToolOptions.declarativeScalar.invalidNumericInput'
-    });
-    if (value === null) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, value, !!commit);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDeclarativeScalarRandomizedControls());
-      } else {
-        this._syncDeclarativeScalarRandomizedControls();
-      }
-    } catch (_) {
-      this._syncDeclarativeScalarRandomizedControls();
-    }
+    this._getDeclarativeControlRuntime().handleScalarRandomizedInput(event, commit);
   }
 
   _handleDeclarativeScalarRandomizedStrength(event) {
-    const input = event?.currentTarget || event?.target;
-    if (!input) return;
-    const controlId = input.getAttribute?.('data-fa-nexus-scalar-strength-slider')
-      || input.getAttribute?.('data-fa-nexus-scalar-strength-display')
-      || input.closest?.('[data-fa-nexus-scalar-control]')?.getAttribute?.('data-fa-nexus-scalar-control')
-      || '';
-    const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = typeof control?.strengthHandlerId === 'string' ? control.strengthHandlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    const value = this._readDeclarativeNumericValue(input, {
-      controlId,
-      sync: this._syncDeclarativeScalarRandomizedControls,
-      logTag: 'ToolOptions.declarativeScalarStrength.invalidNumericInput'
-    });
-    if (value === null) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, value);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDeclarativeScalarRandomizedControls());
-      } else {
-        this._syncDeclarativeScalarRandomizedControls();
-      }
-    } catch (_) {
-      this._syncDeclarativeScalarRandomizedControls();
-    }
+    this._getDeclarativeControlRuntime().handleScalarRandomizedStrength(event);
   }
 
   _handleDeclarativeScalarRandomizedRange(event, boundary) {
-    const input = event?.currentTarget || event?.target;
-    if (!input) return;
-    const controlId = input.getAttribute?.(`data-fa-nexus-scalar-random-${boundary}-slider`)
-      || input.getAttribute?.(`data-fa-nexus-scalar-random-${boundary}-display`)
-      || input.closest?.('[data-fa-nexus-scalar-control]')?.getAttribute?.('data-fa-nexus-scalar-control')
-      || '';
-    const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = boundary === 'min'
-      ? (typeof control?.randomMinHandlerId === 'string' ? control.randomMinHandlerId : '')
-      : (typeof control?.randomMaxHandlerId === 'string' ? control.randomMaxHandlerId : '');
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    const value = this._readDeclarativeNumericValue(input, {
-      controlId: `${controlId}:${boundary}`,
-      sync: this._syncDeclarativeScalarRandomizedControls,
-      logTag: 'ToolOptions.declarativeScalarRange.invalidNumericInput'
-    });
-    if (value === null) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, value);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDeclarativeScalarRandomizedControls());
-      } else {
-        this._syncDeclarativeScalarRandomizedControls();
-      }
-    } catch (_) {
-      this._syncDeclarativeScalarRandomizedControls();
-    }
+    this._getDeclarativeControlRuntime().handleScalarRandomizedRange(event, boundary);
   }
 
   _handleDeclarativeScalarRandomizedRandom(event) {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    const target = event?.currentTarget || event?.target;
-    const controlId = String(target?.getAttribute?.('data-fa-nexus-scalar-random') || '');
-    if (!controlId) return;
-    const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = typeof control?.randomHandlerId === 'string' ? control.randomHandlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId);
-      if (result?.then) {
-        result.catch(() => {}).finally(() => this._syncDeclarativeScalarRandomizedControls());
-      } else {
-        this._syncDeclarativeScalarRandomizedControls();
-      }
-    } catch (_) {
-      this._syncDeclarativeScalarRandomizedControls();
-    }
+    this._getDeclarativeControlRuntime().handleScalarRandomizedRandom(event);
   }
 
   _bindDeclarativeStackOrderControls() {
@@ -2818,8 +1705,12 @@ class ToolOptionsWindowControlMethods {
     for (const root of roots) {
       const controlId = String(root.getAttribute('data-fa-nexus-stack-order-control') || '');
       if (!controlId) continue;
+      const raiseButton = root.querySelector(`[data-fa-nexus-stack-order-raise="${controlId}"]`);
+      const lowerButton = root.querySelector(`[data-fa-nexus-stack-order-lower="${controlId}"]`);
       const topButton = root.querySelector(`[data-fa-nexus-stack-order-top="${controlId}"]`);
       const bottomButton = root.querySelector(`[data-fa-nexus-stack-order-bottom="${controlId}"]`);
+      if (raiseButton) raiseButton.addEventListener('click', this._boundDeclarativeStackOrderRaise);
+      if (lowerButton) lowerButton.addEventListener('click', this._boundDeclarativeStackOrderLower);
       if (topButton) topButton.addEventListener('click', this._boundDeclarativeStackOrderTop);
       if (bottomButton) bottomButton.addEventListener('click', this._boundDeclarativeStackOrderBottom);
       this._declarativeStackOrderControls.set(controlId, {
@@ -2827,6 +1718,8 @@ class ToolOptionsWindowControlMethods {
         label: root.querySelector('[data-fa-nexus-stack-order-label]') || null,
         orderValue: root.querySelector('[data-fa-nexus-stack-order-value]') || null,
         elevationValue: root.querySelector('[data-fa-nexus-stack-order-elevation]') || null,
+        raiseButton,
+        lowerButton,
         topButton,
         bottomButton,
         hint: root.querySelector('[data-fa-nexus-stack-order-hint]') || null
@@ -2837,7 +1730,13 @@ class ToolOptionsWindowControlMethods {
 
   _unbindDeclarativeStackOrderControls() {
     if (this._declarativeStackOrderControls?.size) {
-      for (const { topButton, bottomButton } of this._declarativeStackOrderControls.values()) {
+      for (const { raiseButton, lowerButton, topButton, bottomButton } of this._declarativeStackOrderControls.values()) {
+        if (raiseButton) {
+          try { raiseButton.removeEventListener('click', this._boundDeclarativeStackOrderRaise); } catch (_) {}
+        }
+        if (lowerButton) {
+          try { lowerButton.removeEventListener('click', this._boundDeclarativeStackOrderLower); } catch (_) {}
+        }
         if (topButton) {
           try { topButton.removeEventListener('click', this._boundDeclarativeStackOrderTop); } catch (_) {}
         }
@@ -2871,6 +1770,16 @@ class ToolOptionsWindowControlMethods {
         refs.elevationValue.textContent = text;
         refs.elevationValue.hidden = !text;
       }
+      if (refs.raiseButton) {
+        refs.raiseButton.disabled = !!control.raiseDisabled || !control.raiseHandlerId;
+        const label = refs.raiseButton.querySelector('span');
+        if (label && label.textContent !== control.raiseLabel) label.textContent = control.raiseLabel;
+      }
+      if (refs.lowerButton) {
+        refs.lowerButton.disabled = !!control.lowerDisabled || !control.lowerHandlerId;
+        const label = refs.lowerButton.querySelector('span');
+        if (label && label.textContent !== control.lowerLabel) label.textContent = control.lowerLabel;
+      }
       if (refs.topButton) {
         refs.topButton.disabled = !!control.pushTopDisabled || !control.pushTopHandlerId;
         const label = refs.topButton.querySelector('span');
@@ -2894,14 +1803,21 @@ class ToolOptionsWindowControlMethods {
     event?.stopPropagation?.();
     const target = event?.currentTarget || event?.target;
     if (!target) return;
-    const controlId = String(
-      direction === 'bottom'
-        ? (target.getAttribute?.('data-fa-nexus-stack-order-bottom') || '')
-        : (target.getAttribute?.('data-fa-nexus-stack-order-top') || '')
-    );
+    const attribute = {
+      raise: 'data-fa-nexus-stack-order-raise',
+      lower: 'data-fa-nexus-stack-order-lower',
+      bottom: 'data-fa-nexus-stack-order-bottom',
+      top: 'data-fa-nexus-stack-order-top'
+    }[direction] || 'data-fa-nexus-stack-order-top';
+    const controlId = String(target.getAttribute?.(attribute) || '');
     if (!controlId) return;
     const control = this._getPreparedDeclarativeControl(controlId);
-    const handlerId = direction === 'bottom' ? control?.pushBottomHandlerId : control?.pushTopHandlerId;
+    const handlerId = {
+      raise: control?.raiseHandlerId,
+      lower: control?.lowerHandlerId,
+      bottom: control?.pushBottomHandlerId,
+      top: control?.pushTopHandlerId
+    }[direction];
     if (!handlerId || !this._controller?.invokeToolHandler) return;
     try {
       const result = this._controller.invokeToolHandler(handlerId);
@@ -4699,11 +3615,7 @@ class ToolOptionsWindowControlMethods {
   }
 
   _getPreparedPortalControlFromEvent(event) {
-    const root = event?.currentTarget?.closest?.('[data-fa-nexus-portal-root]')
-      || event?.target?.closest?.('[data-fa-nexus-portal-root]')
-      || null;
-    if (!root) return null;
-    return this._getPreparedPortalControl(root.getAttribute('data-fa-nexus-portal-root') || '');
+    return this._getPortalControlRuntime().getControlFromEvent(event);
   }
 
   _coercePortalControlValue(value, mode = 'string') {
@@ -4744,321 +3656,39 @@ class ToolOptionsWindowControlMethods {
   }
 
   _syncPortalControls() {
-    if (!this.element) return;
-    const roots = Array.from(this.element.querySelectorAll('[data-fa-nexus-portal-root]'));
-    for (const root of roots) {
-      const controlId = root.getAttribute('data-fa-nexus-portal-root') || '';
-      const control = this._getPreparedPortalControl(controlId);
-      if (!control) {
-        root.style.display = 'none';
-        continue;
-      }
-      root.style.display = '';
-      if (!root._faPortalBound) {
-        root._faPortalBound = true;
-        for (const button of root.querySelectorAll('[data-fa-nexus-portal-action]')) {
-          button.addEventListener('click', (event) => this._handlePortalAction(event));
-        }
-        for (const input of root.querySelectorAll('[data-fa-nexus-portal-toggle]')) {
-          input.addEventListener('change', (event) => this._handlePortalToggle(event));
-        }
-        for (const select of root.querySelectorAll('[data-fa-nexus-portal-select]')) {
-          select.addEventListener('change', (event) => this._handlePortalSelect(event));
-        }
-        for (const input of root.querySelectorAll('[data-fa-nexus-portal-color-target]')) {
-          input.addEventListener('change', (event) => this._handlePortalColorTarget(event));
-        }
-        for (const slider of root.querySelectorAll('[data-fa-nexus-portal-setting-input]')) {
-          slider.addEventListener('input', (event) => this._handlePortalSetting(event, false));
-          slider.addEventListener('change', (event) => this._handlePortalSetting(event, true));
-        }
-        for (const display of root.querySelectorAll('[data-fa-nexus-portal-setting-display]')) {
-          this._bindDisplayInput(display, null, (event) => this._handlePortalSetting(event, true));
-        }
-        for (const button of root.querySelectorAll('[data-fa-nexus-portal-section-toggle]')) {
-          button.addEventListener('click', (event) => this._handlePortalSectionToggle(event));
-        }
-      }
-      this._syncPortalControlRoot(root, control);
-    }
+    this._getPortalControlRuntime().syncControls();
   }
 
   _schedulePortalControlsSync() {
-    if (this._portalControlsSyncTimer) {
-      try { clearTimeout(this._portalControlsSyncTimer); } catch (_) {}
-      this._portalControlsSyncTimer = null;
-    }
-    this._portalControlsSyncTimer = setTimeout(() => {
-      this._portalControlsSyncTimer = null;
-      this._syncPortalControls();
-    }, 75);
+    this._getPortalControlRuntime().scheduleSync();
   }
 
   _syncPortalControlRoot(root, control) {
-    const selection = root.querySelector('[data-fa-nexus-portal-selection]');
-    if (selection) selection.textContent = control.selectionLabel || '';
-    const selectionHint = root.querySelector('[data-fa-nexus-portal-selection-hint]');
-    if (selectionHint) {
-      const value = control.selectionHint || '';
-      selectionHint.textContent = value;
-      selectionHint.style.display = value ? '' : 'none';
-    }
-
-    const actionLabelNodes = root.querySelectorAll('[data-fa-nexus-portal-action-label]');
-    for (const node of actionLabelNodes) {
-      const actionId = node.getAttribute('data-fa-nexus-portal-action-label') || '';
-      const action = control.actionMap?.[actionId];
-      if (!action) continue;
-      if (node.textContent !== action.label) node.textContent = action.label;
-    }
-    for (const button of root.querySelectorAll('[data-fa-nexus-portal-action]')) {
-      const actionId = button.getAttribute('data-fa-nexus-portal-action') || '';
-      const action = control.actionMap?.[actionId];
-      if (!action) continue;
-      button.disabled = !!action.disabled;
-      if (action.title) button.title = action.title;
-      else button.removeAttribute('title');
-    }
-
-    for (const groupRoot of root.querySelectorAll('[data-fa-nexus-portal-toggle-group]')) {
-      const groupId = groupRoot.getAttribute('data-fa-nexus-portal-toggle-group') || '';
-      const group = control.toggleGroupMap?.[groupId];
-      groupRoot.style.display = group?.visible === false ? 'none' : '';
-    }
-    for (const input of root.querySelectorAll('[data-fa-nexus-portal-toggle]')) {
-      const toggleId = input.getAttribute('data-fa-nexus-portal-toggle') || '';
-      const toggle = control.toggleMap?.[toggleId];
-      if (!toggle) continue;
-      input.checked = !!toggle.checked;
-      input.disabled = !!toggle.disabled;
-      if (toggle.title) input.closest('label')?.setAttribute('title', toggle.title);
-    }
-
-    for (const groupRoot of root.querySelectorAll('[data-fa-nexus-portal-select-group]')) {
-      const groupId = groupRoot.getAttribute('data-fa-nexus-portal-select-group') || '';
-      const group = control.selectGroupMap?.[groupId];
-      groupRoot.style.display = group?.visible === false ? 'none' : '';
-    }
-    for (const select of root.querySelectorAll('[data-fa-nexus-portal-select]')) {
-      const selectId = select.getAttribute('data-fa-nexus-portal-select') || '';
-      const config = control.selectMap?.[selectId];
-      if (!config) continue;
-      select.disabled = !!config.disabled;
-      const nextValue = String(config.value ?? '');
-      const hasOption = Array.from(select.options || []).some((option) => option?.value === nextValue);
-      if (select.value !== nextValue && hasOption) {
-        select.value = nextValue;
-      } else if (select.value !== nextValue && !select.options.length) {
-        select.value = nextValue;
-      }
-    }
-
-    const colorRoot = root.querySelector('[data-fa-nexus-portal-color]');
-    if (colorRoot) {
-      colorRoot.style.display = control.color?.visible === false ? 'none' : '';
-    }
-    const colorTargetGroup = root.querySelector('[data-fa-nexus-portal-color-target-group]');
-    if (colorTargetGroup) {
-      colorTargetGroup.style.display = control.color?.target?.visible === false ? 'none' : '';
-    }
-    for (const input of root.querySelectorAll('[data-fa-nexus-portal-color-target]')) {
-      const targetId = input.getAttribute('data-fa-nexus-portal-color-target') || '';
-      const item = Array.isArray(control.color?.target?.items)
-        ? control.color.target.items.find((entry) => entry?.id === targetId) || null
-        : null;
-      if (!item) continue;
-      input.checked = !!item.enabled;
-      input.disabled = !!item.disabled;
-      const optionRoot = input.closest('.fa-nexus-declarative-segmented__option');
-      if (optionRoot) {
-        optionRoot.classList.toggle('is-active', !!item.enabled);
-        optionRoot.classList.toggle('is-disabled', !!item.disabled);
-        if (item.title) optionRoot.title = item.title;
-        else optionRoot.removeAttribute('title');
-      }
-    }
-
-    for (const sectionRoot of root.querySelectorAll('[data-fa-nexus-portal-section]')) {
-      const sectionId = sectionRoot.getAttribute('data-fa-nexus-portal-section') || '';
-      const section = sectionId === 'color'
-        ? (control.color && typeof control.color === 'object'
-          ? control.color
-          : null)
-        : control.sectionMap?.[sectionId];
-      sectionRoot.style.display = section?.visible === false ? 'none' : '';
-      const collapsed = !!section?.collapsed;
-      sectionRoot.classList.toggle('is-collapsed', collapsed);
-      const toggle = sectionRoot.querySelector('[data-fa-nexus-portal-section-toggle]');
-      if (toggle) {
-        toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-        toggle.title = `${collapsed ? 'Expand' : 'Collapse'} ${section?.label || ''}`.trim();
-      }
-      const body = sectionRoot.querySelector('[data-fa-nexus-portal-section-body]');
-      if (body) body.setAttribute('aria-hidden', collapsed ? 'true' : 'false');
-    }
-    for (const settingsRoot of root.querySelectorAll('[data-fa-nexus-portal-settings]')) {
-      const settingsId = settingsRoot.getAttribute('data-fa-nexus-portal-settings') || '';
-      const section = Object.values(control.sectionMap || {}).find?.((entry) => entry?.settings?.id === settingsId) || null;
-      settingsRoot.style.display = section?.settings?.visible === false ? 'none' : '';
-    }
-    for (const slider of root.querySelectorAll('[data-fa-nexus-portal-setting-input]')) {
-      const rowId = slider.getAttribute('data-fa-nexus-portal-setting-input') || '';
-      const row = control.settingMap?.[rowId];
-      if (!row) continue;
-      if (row.min !== undefined) slider.min = String(row.min);
-      if (row.max !== undefined) slider.max = String(row.max);
-      if (row.step !== undefined) slider.step = String(row.step);
-      const next = String(row.value ?? '');
-      if (slider.value !== next) slider.value = next;
-      this._applyDefaultValue(slider, row.defaultValue);
-      slider.disabled = !!row.disabled;
-      if (row.hint) slider.title = row.hint;
-      else slider.removeAttribute('title');
-    }
-    for (const display of root.querySelectorAll('[data-fa-nexus-portal-setting-display]')) {
-      const rowId = display.getAttribute('data-fa-nexus-portal-setting-display') || '';
-      const row = control.settingMap?.[rowId];
-      if (!row) continue;
-      this._syncDisplayValue(display, row, { disabled: row.disabled });
-    }
+    this._getPortalControlRuntime().syncControlRoot(root, control);
   }
 
   _handlePortalAction(event) {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    const button = event?.currentTarget || event?.target;
-    const actionId = button?.getAttribute?.('data-fa-nexus-portal-action') || '';
-    if (!actionId) return;
-    const control = this._getPreparedPortalControlFromEvent(event);
-    const action = control?.actionMap?.[actionId];
-    const handlerId = typeof action?.handlerId === 'string' ? action.handlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId);
-      if (result?.then) result.catch(() => {}).finally(() => {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      });
-      else {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      }
-    } catch (_) {
-      this._syncPortalControls();
-      this._schedulePortalControlsSync();
-    }
+    this._getPortalControlRuntime().handleAction(event);
   }
 
   _handlePortalToggle(event) {
-    const input = event?.currentTarget || event?.target;
-    const toggleId = input?.getAttribute?.('data-fa-nexus-portal-toggle') || '';
-    if (!toggleId) return;
-    const control = this._getPreparedPortalControlFromEvent(event);
-    const toggle = control?.toggleMap?.[toggleId];
-    const handlerId = typeof toggle?.handlerId === 'string' ? toggle.handlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, !!input.checked);
-      if (result?.then) result.catch(() => {}).finally(() => {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      });
-      else {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      }
-    } catch (_) {
-      this._syncPortalControls();
-      this._schedulePortalControlsSync();
-    }
+    this._getPortalControlRuntime().handleToggle(event);
   }
 
   _handlePortalColorTarget(event) {
-    const input = event?.currentTarget || event?.target;
-    if (!input?.checked) return;
-    const targetId = input.getAttribute?.('data-fa-nexus-portal-color-target') || '';
-    if (!targetId) return;
-    const control = this._getPreparedPortalControlFromEvent(event);
-    const handlerId = typeof control?.color?.target?.handlerId === 'string' ? control.color.target.handlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, targetId);
-      if (result?.then) result.catch(() => {}).finally(() => {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      });
-      else {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      }
-    } catch (_) {
-      this._syncPortalControls();
-      this._schedulePortalControlsSync();
-    }
+    this._getPortalControlRuntime().handleColorTarget(event);
   }
 
   _handlePortalSelect(event) {
-    const select = event?.currentTarget || event?.target;
-    const selectId = select?.getAttribute?.('data-fa-nexus-portal-select') || '';
-    if (!selectId) return;
-    const control = this._getPreparedPortalControlFromEvent(event);
-    const config = control?.selectMap?.[selectId];
-    const handlerId = typeof config?.handlerId === 'string' ? config.handlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    const value = this._coercePortalControlValue(select.value, config.valueMode);
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, value);
-      if (result?.then) result.catch(() => {}).finally(() => {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      });
-      else {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      }
-    } catch (_) {
-      this._syncPortalControls();
-      this._schedulePortalControlsSync();
-    }
+    this._getPortalControlRuntime().handleSelect(event);
   }
 
   _handlePortalSectionToggle(event) {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    const button = event?.currentTarget || event?.target;
-    const sectionId = button?.getAttribute?.('data-fa-nexus-portal-section-toggle') || '';
-    const root = button?.closest?.('[data-fa-nexus-portal-root]') || null;
-    const controlId = root?.getAttribute?.('data-fa-nexus-portal-root') || '';
-    if (!controlId || !sectionId) return;
-    this._togglePortalSectionCollapsed(controlId, sectionId);
-    this._syncPortalControls();
+    this._getPortalControlRuntime().handleSectionToggle(event);
   }
 
   _handlePortalSetting(event, commit) {
-    const input = event?.currentTarget || event?.target;
-    const rowId = input?.getAttribute?.('data-fa-nexus-portal-setting-input')
-      || input?.getAttribute?.('data-fa-nexus-portal-setting-display')
-      || '';
-    if (!rowId) return;
-    const control = this._getPreparedPortalControlFromEvent(event);
-    const row = control?.settingMap?.[rowId];
-    const handlerId = typeof row?.handlerId === 'string' ? row.handlerId : '';
-    if (!handlerId || !this._controller?.invokeToolHandler) return;
-    const value = this._coercePortalControlValue(input.value, row.valueMode);
-    try {
-      const result = this._controller.invokeToolHandler(handlerId, value, !!commit);
-      if (result?.then) result.catch(() => {}).finally(() => {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      });
-      else {
-        this._syncPortalControls();
-        this._schedulePortalControlsSync();
-      }
-    } catch (_) {
-      this._syncPortalControls();
-      this._schedulePortalControlsSync();
-    }
+    this._getPortalControlRuntime().handleSetting(event, commit);
   }
 
   _bindShortcutsControls() {
@@ -5158,9 +3788,18 @@ class ToolOptionsWindowControlMethods {
         payload[toolId] = true;
       }
       const maybePromise = settings.set(MODULE_ID, SHORTCUTS_SETTING_KEY, payload);
-      if (maybePromise?.catch) maybePromise.catch(() => {});
-    } catch (_) {
-      // ignore persistence errors
+      if (maybePromise?.catch) {
+        maybePromise.catch((error) => {
+          Logger.warn('ToolOptionsWindow.shortcuts.persistFailed', {
+            toolIds: Object.keys(payload),
+            error: String(error?.message || error)
+          });
+        });
+      }
+    } catch (error) {
+      Logger.warn('ToolOptionsWindow.shortcuts.persistFailed', {
+        error: String(error?.message || error)
+      });
     }
   }
 
@@ -5226,302 +3865,60 @@ class ToolOptionsWindowControlMethods {
     this._controller?.openActiveToolHelp?.({ focus: true });
   }
 
+  _bindPlaceAsControls() {
+    this._placeAsControlsWorkflow.bind();
+  }
+
+  _unbindPlaceAsControls() {
+    this._placeAsControlsWorkflow.unbind();
+  }
+
   _syncPlaceAsControls() {
-    const state = this._toolOptionState?.placeAs || {};
-    const toggle = this._placeAsToggleButton;
-    if (toggle) {
-      toggle.setAttribute('aria-expanded', state.open ? 'true' : 'false');
-      const labelEl = toggle.querySelector('.fa-nexus-place-as__selection-label');
-      if (labelEl) {
-        const nextLabel = state.selectedLabel || 'Create new basic actor';
-        if (labelEl.textContent !== nextLabel) labelEl.textContent = nextLabel;
-      }
-      const subtitle = state.selectedSubtitle || '';
-      let subtitleEl = toggle.querySelector('.fa-nexus-place-as__selection-subtitle');
-      if (subtitle) {
-        if (!subtitleEl) {
-          subtitleEl = document.createElement('span');
-          subtitleEl.className = 'fa-nexus-place-as__selection-subtitle';
-          subtitleEl.textContent = subtitle;
-          const wrapper = toggle.querySelector('.fa-nexus-place-as__selection-text');
-          if (wrapper) wrapper.appendChild(subtitleEl);
-        } else if (subtitleEl.textContent !== subtitle) {
-          subtitleEl.textContent = subtitle;
-        }
-        if (subtitleEl) subtitleEl.hidden = false;
-      } else if (subtitleEl) {
-        subtitleEl.textContent = '';
-        subtitleEl.hidden = true;
-      }
-    }
-    const container = this.element?.querySelector('.fa-nexus-place-as');
-    if (container) container.classList.toggle('is-open', !!state.open);
-    if (this._placeAsSearchInput) {
-      this._placeAsSearchInput.value = state.searchValue || '';
-      if (state.open) {
-        const el = this._placeAsSearchInput;
-        if (document.activeElement !== el) {
-          try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
-        }
-        const len = el.value.length;
-        try { el.setSelectionRange(len, len); } catch (_) {}
-      }
-    }
-    if (this._placeAsLinkedToggle) {
-      this._placeAsLinkedToggle.checked = !!state.linked;
-      this._placeAsLinkedToggle.disabled = !!state.linkedDisabled;
-      const label = this._placeAsLinkedToggle.closest('label');
-      if (label && state.linkedTooltip) label.title = state.linkedTooltip;
-    }
-    const actorTypeState = state.actorType || {};
-    if (this._placeAsActorTypeSelect) {
-      const actorTypeOptions = Array.isArray(actorTypeState.options)
-        ? actorTypeState.options.filter((option) => !!option?.id)
-        : [];
-      const currentValues = Array.from(this._placeAsActorTypeSelect.options, (option) => option.value);
-      const nextValues = actorTypeOptions.map((option) => String(option.id));
-      const needsRebuild = currentValues.length !== nextValues.length
-        || currentValues.some((value, index) => value !== nextValues[index]);
-      if (needsRebuild) {
-        const fragment = document.createDocumentFragment();
-        for (const entry of actorTypeOptions) {
-          const optionElement = document.createElement('option');
-          optionElement.value = String(entry.id);
-          optionElement.textContent = entry.label || String(entry.id);
-          optionElement.selected = !!entry.selected;
-          optionElement.disabled = !!entry.disabled;
-          fragment.appendChild(optionElement);
-        }
-        this._placeAsActorTypeSelect.replaceChildren(fragment);
-      } else {
-        const optionMap = new Map();
-        for (const option of actorTypeOptions) {
-          optionMap.set(String(option.id), option);
-        }
-        for (const optionElement of this._placeAsActorTypeSelect.options) {
-          const entry = optionMap.get(optionElement.value);
-          if (!entry) continue;
-          optionElement.disabled = !!entry.disabled;
-          optionElement.selected = !!entry.selected;
-          if (entry.label && optionElement.textContent !== entry.label) {
-            optionElement.textContent = entry.label;
-          }
-        }
-      }
-      if (actorTypeState.value) this._placeAsActorTypeSelect.value = actorTypeState.value;
-      this._placeAsActorTypeSelect.disabled = !!actorTypeState.disabled;
-    }
-    if (this._placeAsActorTypeHint) {
-      const hint = actorTypeState.hint || '';
-      this._placeAsActorTypeHint.textContent = hint;
-      this._placeAsActorTypeHint.hidden = !hint;
-    }
-    const namingState = state.naming || {};
-    if (this._placeAsAppendNumberToggle) {
-      this._placeAsAppendNumberToggle.checked = !!namingState.appendNumber;
-      this._placeAsAppendNumberToggle.disabled = !namingState.available;
-      const label = this._placeAsAppendNumberToggle.closest('label');
-      if (label && namingState.appendNumberTooltip) label.title = namingState.appendNumberTooltip;
-    }
-    if (this._placeAsPrependAdjectiveToggle) {
-      this._placeAsPrependAdjectiveToggle.checked = !!namingState.prependAdjective;
-      this._placeAsPrependAdjectiveToggle.disabled = !namingState.available;
-      const label = this._placeAsPrependAdjectiveToggle.closest('label');
-      if (label && namingState.prependAdjectiveTooltip) label.title = namingState.prependAdjectiveTooltip;
-    }
-    if (this._placeAsList) {
-      const selectedId = state.selectedId || '';
-      const buttons = this._placeAsList.querySelectorAll('[data-place-as-option]');
-      for (const button of buttons) {
-        const id = button.getAttribute('data-place-as-option');
-        button.classList.toggle('is-selected', !!selectedId && id === selectedId);
-      }
-    }
-    const hpState = state.hp || {};
-    if (this._placeAsHpModeSelect) {
-      if (Array.isArray(hpState.modeOptions)) {
-        const optionMap = new Map();
-        for (const option of hpState.modeOptions) {
-          if (!option) continue;
-          optionMap.set(String(option.id), option);
-        }
-        for (const optionElement of this._placeAsHpModeSelect.options) {
-          const entry = optionMap.get(optionElement.value);
-          if (!entry) continue;
-          optionElement.disabled = !!entry.disabled;
-          if (entry.label && optionElement.textContent !== entry.label) {
-            optionElement.textContent = entry.label;
-          }
-          optionElement.selected = !!entry.selected;
-        }
-      }
-      if (hpState.mode) this._placeAsHpModeSelect.value = hpState.mode;
-    }
-    if (this._placeAsHpModeHint) {
-      const hint = hpState.modeHint || '';
-      this._placeAsHpModeHint.textContent = hint;
-      this._placeAsHpModeHint.hidden = !hint;
-    }
-    if (this._placeAsHpPercentRow) {
-      this._placeAsHpPercentRow.hidden = !hpState.showPercent;
-    }
-    if (this._placeAsHpPercentInput) {
-      const percentFocused = document.activeElement === this._placeAsHpPercentInput;
-      const percentValue = hpState.percentValue !== undefined && hpState.percentValue !== null
-        ? String(hpState.percentValue)
-        : '';
-      if (!percentFocused && this._placeAsHpPercentInput.value !== percentValue) {
-        this._placeAsHpPercentInput.value = percentValue;
-      }
-      this._placeAsHpPercentInput.disabled = !hpState.showPercent;
-    }
-    if (this._placeAsHpPercentHint) {
-      const hint = hpState.percentHint || '';
-      this._placeAsHpPercentHint.textContent = hint;
-      this._placeAsHpPercentHint.hidden = !hpState.showPercent || !hint;
-    }
-    if (this._placeAsHpStaticRow) {
-      this._placeAsHpStaticRow.hidden = !hpState.showStatic;
-    }
-    if (this._placeAsHpStaticInput) {
-      const staticFocused = document.activeElement === this._placeAsHpStaticInput;
-      const staticValue = typeof hpState.staticValue === 'string' ? hpState.staticValue : '';
-      if (!staticFocused && this._placeAsHpStaticInput.value !== staticValue) {
-        this._placeAsHpStaticInput.value = staticValue;
-      }
-      this._placeAsHpStaticInput.classList.toggle('has-error', !!hpState.staticError);
-      if (hpState.staticError) {
-        this._placeAsHpStaticInput.setAttribute('aria-invalid', 'true');
-      } else {
-        this._placeAsHpStaticInput.removeAttribute('aria-invalid');
-      }
-      this._placeAsHpStaticInput.disabled = !hpState.showStatic;
-    }
-    if (this._placeAsHpStaticHint) {
-      const hint = hpState.staticHint || '';
-      this._placeAsHpStaticHint.textContent = hint;
-      this._placeAsHpStaticHint.hidden = !hpState.showStatic || !hint;
-    }
-    if (this._placeAsHpStaticError) {
-      const error = hpState.staticError || '';
-      this._placeAsHpStaticError.textContent = error;
-      this._placeAsHpStaticError.hidden = !error;
-    }
+    this._placeAsControlsWorkflow.sync();
   }
 
   _handlePlaceAsSearch(event) {
-    const value = event?.currentTarget?.value ?? '';
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsSearch', value);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleSearch(event);
   }
 
   _handlePlaceAsOptionClick(event) {
-    const button = event?.target?.closest?.('[data-place-as-option]');
-    if (!button) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const optionId = button.getAttribute('data-place-as-option') || '';
-    const result = this._controller?.invokeToolHandler?.('selectPlaceAsOption', optionId);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleOptionClick(event);
   }
 
   _handlePlaceAsLinked(event) {
-    const checked = !!event?.currentTarget?.checked;
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsLinked', checked);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleLinked(event);
   }
 
   _handlePlaceAsActorType(event) {
-    const value = event?.currentTarget?.value ?? '';
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsActorType', value);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleActorType(event);
   }
 
   _handlePlaceAsAppendNumber(event) {
-    const checked = !!event?.currentTarget?.checked;
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsAppendNumber', checked);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleAppendNumber(event);
   }
 
   _handlePlaceAsPrependAdjective(event) {
-    const checked = !!event?.currentTarget?.checked;
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsPrependAdjective', checked);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handlePrependAdjective(event);
   }
 
   _handlePlaceAsToggle(event) {
-    if (event) {
-      event.preventDefault?.();
-      event.stopPropagation?.();
-    }
-    const result = this._controller?.invokeToolHandler?.('togglePlaceAsOpen');
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleToggle(event);
   }
 
   _handlePlaceAsFilter(event) {
-    if (event) {
-      event.preventDefault?.();
-      event.stopPropagation?.();
-    }
-    this._controller?.invokeToolHandler?.('openCompendiumFilterDialog');
+    return this._placeAsControlsWorkflow.handleFilter(event);
   }
 
   _handlePlaceAsHpMode(event) {
-    const value = event?.currentTarget?.value ?? '';
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsHpMode', value);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleHpMode(event);
   }
 
   _handlePlaceAsHpPercent(event) {
-    const value = event?.currentTarget?.value ?? '';
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsHpPercent', value);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleHpPercent(event);
   }
 
   _handlePlaceAsHpStatic(event) {
-    const value = event?.currentTarget?.value ?? '';
-    const result = this._controller?.invokeToolHandler?.('setPlaceAsHpStatic', value);
-    if (result?.then) {
-      result.finally(() => this._syncPlaceAsControls());
-    } else {
-      this._syncPlaceAsControls();
-    }
+    return this._placeAsControlsWorkflow.handleHpStatic(event);
   }
 
 }

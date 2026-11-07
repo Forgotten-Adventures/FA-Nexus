@@ -3,19 +3,22 @@ import BuildingWallMesher from './building-wall-mesher.js';
 import { gatherBuildingLoops } from './building-shape-helpers.js';
 import {
   attachCustomTileOverhead,
+  createCustomTileOverheadMaterial,
   detachCustomTileOverhead,
   invalidateCustomTileOverhead
 } from '../canvas/custom-tile-overhead.js';
-import { resolveTileId } from '../canvas/tile-targets.js';
+import { resolveCanvasTilePlaceable, resolveTileId } from '../canvas/tile-targets.js';
 import { createDisplayProxyFactory } from '../canvas/display-object-proxy.js';
 import {
   loadTexture,
   ensureMeshTransparent,
   restoreMeshTexture
 } from '../textures/texture-runtime-core.js';
+import { createOwnedSamplerTexture } from '../textures/owned-sampler-texture.js';
 import { syncStandardMaskCustomSourceSuppression } from '../textures/standard-mask-custom-base.js';
 import {
   applyHsbcToDisplayObject,
+  clearHsbcFromDisplayObject,
   normalizeHsbc,
   readDocumentHsbc
 } from '../core/hsbc.js';
@@ -23,68 +26,21 @@ import {
   waitForTileMesh,
   clearTileMeshWaiters as clearSharedTileMeshWaiters
 } from '../canvas/tile-mesh-waiter.js';
+import {
+  cleanupLinkedBuildingTiles,
+  shouldSkipLinkedBuildingDeletes
+} from './building-linked-cleanup-workflow.js';
+import { canDeleteTileDuringBuildingEdit } from './building-edit-delete-guard.js';
+import {
+  readBuildingV2Data,
+  resolveBuildingV2ContainerTransform,
+  resolveBuildingV2RootFrameOffset
+} from './v2/building-v2-root-frame.js';
+
+const DISPLAY_TRANSFORM_PREVIEW_SLOT = Symbol.for('fa-nexus.scene-group-display-transform-preview');
+import { registerCustomTileRenderLifecycle } from '../canvas/custom-tile-render-scheduler.js';
 
 const EDITING_TILE_SET_KEY = '__faNexusBuildingEditingTileIds';
-const BUILDING_WALL_DELETE_QUEUE = new Map();
-const BUILDING_TILE_DELETE_IN_FLIGHT = new Map();
-const PRESERVE_LINKED_TILE_CLEANUP_OPTION = 'faNexusPreserveLinkedTileCleanup';
-const SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION = 'faNexusSuppressFillTriggeredBuildingCleanup';
-const SKIP_LINKED_BUILDING_FILL_DELETE_OPTION = 'faNexusSkipLinkedBuildingFillDelete';
-
-function resolveLiveSceneDocument(scene = null) {
-  const activeScene = canvas?.scene || null;
-  const sceneId = scene?.id || scene?._id || null;
-  if (sceneId) {
-    if (activeScene?.id && String(activeScene.id) === String(sceneId)) return activeScene;
-    const worldScene = game?.scenes?.get?.(sceneId) || null;
-    if (worldScene) return worldScene;
-  }
-  return scene || activeScene || null;
-}
-
-function readBuildingFlag(doc = null, key = '') {
-  try {
-    const direct = doc?.getFlag?.('fa-nexus', key);
-    if (direct !== undefined) return direct;
-  } catch (_) {}
-  const flags = doc?.flags?.['fa-nexus'] || doc?._source?.flags?.['fa-nexus'] || null;
-  return flags && key ? (flags[key] ?? null) : null;
-}
-
-function readBuildingWallFlag(doc = null) {
-  return readBuildingFlag(doc, 'buildingWall');
-}
-
-function readBuildingRegionFlag(doc = null) {
-  return readBuildingFlag(doc, 'buildingRegion');
-}
-
-function isBuildingTileDocument(doc = null) {
-  return !!readBuildingFlag(doc, 'building');
-}
-
-function isBuildingFillDocument(doc = null) {
-  return !!readBuildingFlag(doc, 'buildingFill');
-}
-
-function isBuildingCompositeSillDocument(doc = null) {
-  const composite = readBuildingFlag(doc, 'buildingComposite');
-  return String(composite?.role || '').toLowerCase() === 'sill';
-}
-
-function shouldSkipLinkedBuildingDeletes(doc = null, options = {}) {
-  try {
-    if (isBuildingFillDocument(doc) && options?.[SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION]) return true;
-    if (options?.[PRESERVE_LINKED_TILE_CLEANUP_OPTION]) return true;
-    if (globalThis?.FA_NEXUS_SUPPRESS_LINKED_TILE_DELETE) return true;
-    if (globalThis?.FA_NEXUS_SUPPRESS_BUILDING_TILE_DELETE) return true;
-    const suppressedIds = globalThis?.FA_NEXUS_SUPPRESS_LINKED_TILE_DELETE_IDS;
-    const docId = doc?.id || doc?._id || null;
-    return !!(docId && suppressedIds instanceof Set && suppressedIds.has(docId));
-  } catch (_) {
-    return false;
-  }
-}
 
 function getEditingTileSet() {
   try {
@@ -109,334 +65,34 @@ function isEditingTile(tile) {
 }
 
 const DEFAULT_GRID_SCALE = 200;
+const OWNED_SAMPLER_TEXTURES = new WeakMap();
+const OWNED_SAMPLER_DESTROY_HOOKS = new WeakSet();
 
-function sleep(ms = 60) {
-  if (foundry?.utils?.sleep) return foundry.utils.sleep(ms);
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function releaseOwnedSamplerTextures(container) {
+  const owners = OWNED_SAMPLER_TEXTURES.get(container);
+  if (!owners) return false;
+  OWNED_SAMPLER_TEXTURES.delete(container);
+  for (const owner of owners) {
+    try { owner?.release?.(); } catch (_) {}
+  }
+  return true;
 }
 
-function getSceneQueueKey(scene) {
-  if (!scene) return null;
-  return scene.uuid || scene.id || null;
-}
-
-function isMissingEmbeddedDocumentError(error) {
-  return String(error?.message || error).includes('does not exist');
-}
-
-function hasEmbeddedSourceDocument(scene, type, id) {
-  const documentId = String(id || '').trim();
-  if (!scene || !documentId) return null;
-  const sourceKey = type === 'Tile' ? 'tiles' : type === 'Wall' ? 'walls' : null;
-  if (!sourceKey) return null;
-  const source = scene?._source?.[sourceKey];
-  if (!Array.isArray(source)) return null;
-  return source.some((entry) => String(entry?._id || entry?.id || '').trim() === documentId);
-}
-
-async function deleteWallsRobustly(scene, wallIds = [], logCode = 'BuildingTiles.delete.walls') {
-  const requestedIds = Array.from(new Set(
-    (Array.isArray(wallIds) ? wallIds : []).filter(Boolean)
-  ));
-  if (!scene || !requestedIds.length) return;
-  const liveScene = resolveLiveSceneDocument(scene);
-  const collectExistingIds = (targetScene, ids) => {
-    const collection = targetScene?.walls;
-    return (Array.isArray(ids) ? ids : []).filter((wallId) => {
-      if (!wallId) return false;
-      const doc = collection?.get?.(wallId);
-      return (!!doc && !doc._destroyed) || hasEmbeddedSourceDocument(targetScene, 'Wall', wallId);
-    });
-  };
-  const normalizeDeletedIds = (deleted) => Array.from(new Set(
-    (Array.isArray(deleted) ? deleted : []).map((entry) => {
-      if (typeof entry === 'string') return entry;
-      return entry?.id || entry?._id || null;
-    }).filter(Boolean)
-  ));
-  const errors = [];
-  const deletedIds = new Set();
-
-  // Tile delete hooks can fire while Foundry is still reconciling document collections.
-  // Yield once so linked wall cleanup runs against settled scene state.
-  await sleep(75);
-
-  const existingIds = collectExistingIds(liveScene, requestedIds);
-  const missingCollectionIds = requestedIds.filter((wallId) => !existingIds.includes(wallId));
-  if (missingCollectionIds.length) {
-    Logger.debug?.(`${logCode}.collectionMissingBeforeDelete`, {
-      sceneId: liveScene?.id || null,
-      sceneName: liveScene?.name || null,
-      requestedIds,
-      existingIds,
-      missingCollectionIds,
-      viewedLevelId: canvas?.scene?.id === liveScene?.id ? (canvas?.scene?._view || null) : null
-    });
+function retainOwnedSamplerTexture(container, owner) {
+  if (!container || !owner?.texture || typeof owner.release !== 'function') {
+    throw new Error('Building Wall sampler ownership requires a live container and owned texture.');
   }
-
-  Logger.debug?.(`${logCode}.deleteAttempt`, {
-    sceneId: liveScene?.id || null,
-    sceneName: liveScene?.name || null,
-    requestedIds,
-    existingIds,
-    viewedLevelId: canvas?.scene?.id === liveScene?.id ? (canvas?.scene?._view || null) : null
-  });
-
-  try {
-    const deleted = await liveScene.deleteEmbeddedDocuments('Wall', requestedIds);
-    for (const wallId of normalizeDeletedIds(deleted)) deletedIds.add(wallId);
-  } catch (error) {
-    const message = String(error?.message || error);
-    if (isMissingEmbeddedDocumentError(error) && existingIds.length) {
-      try {
-        const deleted = await liveScene.deleteEmbeddedDocuments('Wall', existingIds);
-        for (const wallId of normalizeDeletedIds(deleted)) deletedIds.add(wallId);
-      } catch (retryError) {
-        const retryMessage = String(retryError?.message || retryError);
-        if (!isMissingEmbeddedDocumentError(retryError)) {
-          errors.push({ phase: 'initialExistingBatch', error: retryMessage, wallIds: existingIds });
-        }
-      }
-    } else if (!isMissingEmbeddedDocumentError(error)) {
-      errors.push({ phase: 'initialBatch', error: message, wallIds: requestedIds });
-    }
+  let owners = OWNED_SAMPLER_TEXTURES.get(container);
+  if (!owners) {
+    owners = new Set();
+    OWNED_SAMPLER_TEXTURES.set(container, owners);
   }
-
-  await sleep(50);
-  let survivingIds = collectExistingIds(liveScene, requestedIds);
-
-  if (survivingIds.length) {
-    Logger.warn?.(`${logCode}.survivorsAfterBatch`, {
-      sceneId: liveScene?.id || null,
-      sceneName: liveScene?.name || null,
-      requestedIds,
-      existingIds,
-      deletedIds: [...deletedIds],
-      survivingIds
-    });
-    try {
-      const retried = await liveScene.deleteEmbeddedDocuments('Wall', survivingIds, { noHook: true });
-      for (const wallId of normalizeDeletedIds(retried)) deletedIds.add(wallId);
-    } catch (error) {
-      const message = String(error?.message || error);
-      if (!isMissingEmbeddedDocumentError(error)) {
-        errors.push({ phase: 'retryNoHook', error: message, wallIds: survivingIds });
-      }
-    }
-    await sleep(50);
-    survivingIds = collectExistingIds(liveScene, requestedIds);
+  owners.add(owner);
+  if (!OWNED_SAMPLER_DESTROY_HOOKS.has(container)) {
+    OWNED_SAMPLER_DESTROY_HOOKS.add(container);
+    container.once?.('destroyed', () => releaseOwnedSamplerTextures(container));
   }
-
-  if (errors.length) {
-    Logger.warn?.(`${logCode}.failed`, {
-      sceneId: liveScene?.id || null,
-      sceneName: liveScene?.name || null,
-      requestedIds,
-      deletedIds: [...deletedIds],
-      survivingIds,
-      errors
-    });
-  }
-  if (survivingIds.length) {
-    Logger.error?.(`${logCode}.persisted`, {
-      sceneId: liveScene?.id || null,
-      sceneName: liveScene?.name || null,
-      requestedIds,
-      deletedIds: [...deletedIds],
-      survivingIds
-    });
-  } else {
-    Logger.debug?.(`${logCode}.complete`, {
-      sceneId: liveScene?.id || null,
-      sceneName: liveScene?.name || null,
-      requestedIds,
-      deletedIds: [...deletedIds]
-    });
-  }
-}
-
-function queueWallDeletes(scene, wallIds = [], logCode = 'BuildingTiles.delete.walls') {
-  const uniqueIds = Array.from(new Set(
-    (Array.isArray(wallIds) ? wallIds : []).filter(Boolean)
-  ));
-  if (!scene || !uniqueIds.length) return Promise.resolve();
-  const queueKey = getSceneQueueKey(scene);
-  if (!queueKey) return deleteWallsRobustly(scene, uniqueIds, logCode);
-  let entry = BUILDING_WALL_DELETE_QUEUE.get(queueKey);
-  if (!entry) {
-    entry = {
-      scene,
-      wallIds: new Set(),
-      logCode,
-      task: null
-    };
-    BUILDING_WALL_DELETE_QUEUE.set(queueKey, entry);
-  }
-  entry.scene = scene;
-  entry.logCode = logCode || entry.logCode;
-  for (const wallId of uniqueIds) entry.wallIds.add(wallId);
-  if (entry.task) return entry.task;
-  entry.task = (async () => {
-    await sleep(150);
-    while (entry.wallIds.size) {
-      const pendingIds = Array.from(entry.wallIds);
-      entry.wallIds.clear();
-      await deleteWallsRobustly(entry.scene, pendingIds, entry.logCode);
-      if (entry.wallIds.size) await sleep(75);
-    }
-  })().finally(() => {
-    BUILDING_WALL_DELETE_QUEUE.delete(queueKey);
-  });
-  return entry.task;
-}
-
-function resolveBuildingCleanupTargets(doc, scene = null) {
-  try {
-    const buildingData = readBuildingFlag(doc, 'building');
-    if (buildingData) return [{ doc, data: buildingData }];
-    const isFill = !!readBuildingFlag(doc, 'buildingFill');
-    const isSill = isBuildingCompositeSillDocument(doc);
-    if (!isFill && !isSill) return [];
-    const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
-    if (!resolvedScene?.tiles?.size) return [];
-    const targets = [];
-    const composite = isSill ? readBuildingFlag(doc, 'buildingComposite') : null;
-    const explicitWallTileId = String(composite?.wallTileId || '').trim();
-    if (explicitWallTileId) {
-      const owner = resolvedScene.tiles?.get?.(explicitWallTileId) || null;
-      const ownerData = readBuildingFlag(owner, 'building');
-      if (ownerData) targets.push({ doc: owner, data: ownerData });
-    }
-    for (const tileDoc of resolvedScene.tiles) {
-      if (!tileDoc || tileDoc.id === doc.id) continue;
-      const data = readBuildingFlag(tileDoc, 'building');
-      if (!data) continue;
-      const fillTileId = data?.meta?.fillTileId || null;
-      const sillTileId = data?.meta?.sillTileId || data?.meta?.composite?.sillTileId || null;
-      if (isFill && fillTileId === doc.id) targets.push({ doc: tileDoc, data });
-      else if (isSill && sillTileId === doc.id && !targets.some((target) => target?.doc?.id === tileDoc.id)) {
-        targets.push({ doc: tileDoc, data });
-      }
-    }
-    return targets;
-  } catch (_) {
-    return [];
-  }
-}
-
-function resolveBuildingWallTileGroupId(tileDoc) {
-  try {
-    const building = readBuildingFlag(tileDoc, 'building');
-    if (!building) return null;
-    return building?.meta?.wallGroupId || building?.wall?.wallGroupId || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function summarizeSceneBuildingWallCandidates(scene, { tileId = null, groupId = null, wallIds = [] } = {}) {
-  const walls = scene?.walls || null;
-  const wallIdSet = new Set((Array.isArray(wallIds) ? wallIds : []).filter(Boolean));
-  const summary = {
-    buildingWallCount: 0,
-    tileMatches: [],
-    groupMatches: [],
-    wallIdMatches: []
-  };
-  if (!walls?.size) return summary;
-  for (const wall of walls) {
-    if (!wall?.id) continue;
-    const flag = readBuildingWallFlag(wall);
-    if (!flag) continue;
-    summary.buildingWallCount += 1;
-    const entry = {
-      id: wall.id,
-      tileId: flag.tileId || null,
-      groupId: flag.groupId || null,
-      levels: Array.isArray(wall.levels) ? wall.levels : Array.from(wall.levels || wall._source?.levels || [])
-    };
-    if (tileId && flag.tileId === tileId) summary.tileMatches.push(entry);
-    if (groupId && flag.groupId === groupId) summary.groupMatches.push(entry);
-    if (wallIdSet.has(wall.id)) summary.wallIdMatches.push(entry);
-  }
-  return summary;
-}
-
-async function deleteLinkedTilesRobustly(scene, tileIds = [], options = null, logCode = 'BuildingTiles.delete.tiles') {
-  const uniqueIds = Array.from(new Set(
-    (Array.isArray(tileIds) ? tileIds : []).filter(Boolean)
-  ));
-  if (!scene || !uniqueIds.length) return false;
-  const liveScene = resolveLiveSceneDocument(scene);
-  if (!liveScene) return false;
-  const queueKey = getSceneQueueKey(liveScene);
-  let inFlightIds = null;
-  if (queueKey) {
-    inFlightIds = BUILDING_TILE_DELETE_IN_FLIGHT.get(queueKey);
-    if (!inFlightIds) {
-      inFlightIds = new Set();
-      BUILDING_TILE_DELETE_IN_FLIGHT.set(queueKey, inFlightIds);
-    }
-  }
-  const requestedIds = uniqueIds.filter((tileId) => {
-    if (!inFlightIds) return true;
-    if (inFlightIds.has(tileId)) return false;
-    inFlightIds.add(tileId);
-    return true;
-  });
-  const duplicateInFlightIds = uniqueIds.filter((tileId) => !requestedIds.includes(tileId));
-  if (duplicateInFlightIds.length) {
-    Logger.debug?.(`${logCode}.duplicateInFlightSkipped`, {
-      sceneId: liveScene?.id || null,
-      sceneName: liveScene?.name || null,
-      requestedIds: uniqueIds,
-      duplicateInFlightIds
-    });
-  }
-  if (!requestedIds.length) return false;
-
-  try {
-    // Delete hooks may chain while Foundry is still removing placeables. Yield once
-    // and only ask Foundry to delete IDs still present in the embedded collection.
-    await sleep(50);
-    const collection = liveScene.tiles;
-    const existingIds = requestedIds.filter((tileId) => {
-      const doc = collection?.get?.(tileId);
-      return !!doc && !doc._destroyed;
-    });
-    const missingCollectionIds = requestedIds.filter((tileId) => !existingIds.includes(tileId));
-    if (missingCollectionIds.length) {
-      Logger.debug?.(`${logCode}.collectionMissingBeforeDelete`, {
-        sceneId: liveScene?.id || null,
-        sceneName: liveScene?.name || null,
-        requestedIds,
-        existingIds,
-        missingCollectionIds,
-        viewedLevelId: canvas?.scene?.id === liveScene?.id ? (canvas?.scene?._view || null) : null
-      });
-    }
-    if (!existingIds.length) return false;
-    await liveScene.deleteEmbeddedDocuments('Tile', existingIds, options || {});
-    return true;
-  } catch (error) {
-    if (isMissingEmbeddedDocumentError(error)) {
-      Logger.debug?.(`${logCode}.alreadyMissingDuringDelete`, {
-        error: String(error?.message || error),
-        tileIds: requestedIds
-      });
-      return false;
-    }
-    Logger.warn?.(`${logCode}.failed`, {
-      error: String(error?.message || error),
-      tileIds: requestedIds
-    });
-    return false;
-  } finally {
-    if (inFlightIds) {
-      for (const tileId of requestedIds) inFlightIds.delete(tileId);
-      if (!inFlightIds.size && queueKey) BUILDING_TILE_DELETE_IN_FLIGHT.delete(queueKey);
-    }
-  }
+  return owner.texture;
 }
 
 function cleanupContainerChildren(container) {
@@ -444,9 +100,13 @@ function cleanupContainerChildren(container) {
   const children = container.children ? [...container.children] : [];
   container.removeChildren();
   for (const child of children) {
+    try { clearHsbcFromDisplayObject(child, { slot: 'building-v2-portal-artwork' }); } catch (_) {}
+    try { clearHsbcFromDisplayObject(child, { slot: 'building-v2-door-frame' }); } catch (_) {}
+    try { child.faNexusOwnedTexture?.destroy?.(false); } catch (_) {}
     try { child.destroy?.({ children: true, texture: false, baseTexture: false }); }
     catch (_) {}
   }
+  releaseOwnedSamplerTextures(container);
   container.faNexusBuildingMeshes = null;
 }
 
@@ -548,9 +208,14 @@ function collectBuildingRenderSections(data) {
         textureKey: segment?.pathKey || data?.wall?.pathKey || null,
         width: Number(segment?.width),
         repeatDistance: Number(segment?.repeatDistance),
+        texturePhaseDistance: Number.isFinite(Number(segment?.texturePhaseDistance))
+          ? Number(segment.texturePhaseDistance)
+          : 0,
         scalePercent: Number(segment?.scalePercent) || 100,
         textureOffset: normalizeTextureOffset(segment?.textureOffset),
         textureFlip: normalizeTextureFlip(segment?.textureFlip),
+        startCapNormal: segment?.startCapNormal || null,
+        endCapNormal: segment?.endCapNormal || null,
         startJoinDir: segment?.startJoinDir ? {
           x: Number(segment.startJoinDir.x) || 0,
           y: Number(segment.startJoinDir.y) || 0
@@ -606,16 +271,75 @@ function collectBuildingRenderSections(data) {
     });
 }
 
+export function collectBuildingV2PortalArtwork(data) {
+  return Array.isArray(data?.runtime?.portalArtwork)
+    ? data.runtime.portalArtwork.filter((entry) => (
+      ['door-frame', 'window-frame', 'window-surface'].includes(entry?.kind) && Array.isArray(entry.artwork)
+    ))
+    : [];
+}
+
+async function addBuildingV2PortalArtwork(container, entries) {
+  let rendered = 0;
+  for (const portal of entries) {
+    for (const artwork of portal.artwork) {
+      const textureSrc = String(artwork?.textureSrc || '').trim();
+      if (!textureSrc) continue;
+      let sourceTexture;
+      try { sourceTexture = await loadTexture(textureSrc); }
+      catch (error) {
+        Logger.warn?.('BuildingTiles.v2PortalArtwork.texture.loadFailed', {
+          portalId: portal.portalId,
+          textureSrc,
+          error: String(error?.message || error)
+        });
+        continue;
+      }
+      const base = sourceTexture?.baseTexture;
+      if (!base?.valid) continue;
+      base.mipmap = PIXI.MIPMAP_MODES.OFF;
+      base.wrapMode = PIXI.WRAP_MODES.CLAMP;
+      let texture = sourceTexture;
+      if (artwork.sourceFrame) {
+        const frame = artwork.sourceFrame;
+        texture = new PIXI.Texture(base, new PIXI.Rectangle(
+          Number(frame.x), Number(frame.y), Number(frame.width), Number(frame.height)
+        ));
+      }
+      const sprite = new PIXI.Sprite(texture);
+      sprite.name = `fa-nexus-building-v2-portal-artwork:${portal.kind}:${portal.portalId}:${artwork.side || artwork.role}`;
+      sprite.faNexusBuildingV2PortalArtwork = {
+        kind: portal.kind, portalId: portal.portalId, part: artwork.side || artwork.role
+      };
+      if (portal.kind === 'door-frame') {
+        sprite.faNexusBuildingV2DoorFrame = { portalId: portal.portalId, side: artwork.side };
+      }
+      if (texture !== sourceTexture) sprite.faNexusOwnedTexture = texture;
+      sprite.anchor.set(0.5, 0.5);
+      sprite.position.set(Number(artwork.x), Number(artwork.y));
+      sprite.width = Math.max(1, Number(artwork.width));
+      sprite.height = Math.max(1, Number(artwork.height));
+      if (Number(artwork.flipX) < 0) sprite.scale.x *= -1;
+      if (Number(artwork.flipY) < 0) sprite.scale.y *= -1;
+      sprite.rotation = Number(artwork.rotation) || 0;
+      sprite.eventMode = 'none';
+      applyHsbcToDisplayObject(sprite, artwork.hsbc || null, { slot: 'building-v2-portal-artwork' });
+      container.addChild(sprite);
+      rendered += 1;
+    }
+  }
+  return rendered;
+}
+
 async function loadBuildingTextureEntry(textureSrc) {
   if (!textureSrc) return null;
-  const texture = await loadTexture(textureSrc);
-  const base = texture?.baseTexture;
-  if (base) {
-    base.wrapMode = PIXI.WRAP_MODES.REPEAT;
-    base.mipmap = PIXI.MIPMAP_MODES.OFF;
-  }
-  const visibleData = await detectVisibleRows(texture);
-  return { texture, visibleData };
+  const sourceTexture = await loadTexture(textureSrc);
+  const visibleData = await detectVisibleRows(sourceTexture);
+  const owner = createOwnedSamplerTexture(sourceTexture, {
+    wrapMode: PIXI.WRAP_MODES.REPEAT,
+    mipmap: PIXI.MIPMAP_MODES.OFF
+  });
+  return { texture: owner.texture, visibleData, owner };
 }
 
 function resetBuildingOverlayToTransparent(tile, mesh, doc) {
@@ -746,16 +470,54 @@ function setContainerTransform(container, mesh, doc) {
   if (!container || !mesh || mesh.destroyed) return;
   const docWidth = Math.max(1, Number(doc?.width) || Number(mesh?.width) || 1);
   const docHeight = Math.max(1, Number(doc?.height) || Number(mesh?.height) || 1);
-  const rawSx = Number(mesh.scale?.x ?? 1) || 1;
-  const rawSy = Number(mesh.scale?.y ?? 1) || 1;
-  const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
-  const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
   const anchorX = Number(doc?.texture?.anchorX);
   const anchorY = Number(doc?.texture?.anchorY);
-  const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
-  const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
-  container.scale.set(1 / sx, 1 / sy);
-  container.position.set(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
+  const building = readBuildingV2Data(doc);
+  const frame = resolveBuildingV2RootFrameOffset(building);
+  if (frame.version !== 1) {
+    const rawSx = Number(mesh.scale?.x ?? 1) || 1;
+    const rawSy = Number(mesh.scale?.y ?? 1) || 1;
+    const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
+    const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
+    const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
+    const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
+    container.scale.set(1 / sx, 1 / sy);
+    container.position.set(-(docWidth * ax) / sx, -(docHeight * ay) / sy);
+    return;
+  }
+  const transform = resolveBuildingV2ContainerTransform({
+    docWidth,
+    docHeight,
+    docX: doc?._source?.x ?? doc?.x,
+    docY: doc?._source?.y ?? doc?.y,
+    docRotation: doc?.rotation,
+    flipX: Number(doc?.texture?.scaleX) < 0, flipY: Number(doc?.texture?.scaleY) < 0,
+    anchorX,
+    anchorY,
+    toMeshLocal(point) {
+      const PointClass = globalThis.PIXI?.Point;
+      if (!PointClass || typeof mesh.toLocal !== 'function') {
+        throw new Error('Building V2 committed artwork requires the live Pixi Tile-mesh transform.');
+      }
+      return mesh.toLocal(new PointClass(point.x, point.y), mesh.parent);
+    },
+    building
+  });
+  const MatrixClass = globalThis.PIXI?.Matrix;
+  if (!MatrixClass || typeof container.transform?.setFromMatrix !== 'function') {
+    throw new Error('Building V2 committed artwork requires Pixi Matrix transform support.');
+  }
+  container.transform.setFromMatrix(new MatrixClass(
+    transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty
+  ));
+}
+
+function syncBuildingOverheadTransform(container, mesh, doc) {
+  // Mouse-up ends input before the asynchronous group commit owns rendering.
+  // Its planner temporarily restores the source pose; keep this participant's
+  // held matrix until handoff completes instead of projecting that old pose.
+  if (container?.[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return;
+  setContainerTransform(container, mesh, doc);
 }
 
 function hasRenderableChildren(container) {
@@ -803,7 +565,7 @@ function syncReusableBuildingRuntime(tile, mesh, doc, container, reason) {
     contentContainer: container,
     proxyFactory: createDisplayProxyFactory(container),
     syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-      setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+      syncBuildingOverheadTransform(entry?.contentContainer, currentMesh, currentTile?.document);
     }
   });
   try {
@@ -813,6 +575,58 @@ function syncReusableBuildingRuntime(tile, mesh, doc, container, reason) {
       tileId: tile?.document?.id,
       error: String(error?.message || error)
     });
+  }
+}
+
+export function applyBuildingTileHsbcToExistingRenderer(tile) {
+  try {
+    if (!tile || tile.destroyed) return false;
+    const doc = tile.document;
+    const mesh = tile.mesh;
+    const container = tile.faNexusBuildingContainer || mesh?.faNexusBuildingContainer || null;
+    if (!doc || !container || container.destroyed) return false;
+    const data = doc?.getFlag?.('fa-nexus', 'building');
+    if (!data) return false;
+    const renderSections = collectBuildingRenderSections(data);
+    const portalArtwork = collectBuildingV2PortalArtwork(data);
+    const compositeData = doc?.getFlag?.('fa-nexus', 'buildingComposite');
+    const foregroundParts = compositeData?.role === 'foreground' && Array.isArray(compositeData?.parts)
+      ? compositeData.parts.filter((part) => part && typeof part === 'object')
+      : [];
+    const rootHsbc = normalizeHsbc(readDocumentHsbc(doc, { nullIfMissing: true, nullIfNeutral: true }), null);
+    const meshes = Array.isArray(container.faNexusBuildingMeshes)
+      ? container.faNexusBuildingMeshes.filter((entry) => entry && !entry.destroyed)
+      : [];
+    let useContainerHsbc = foregroundParts.length <= 0 && portalArtwork.length <= 0;
+    const sectionMeshes = meshes.map((sectionMesh) => ({
+      mesh: sectionMesh,
+      hsbc: normalizeHsbc(
+        renderSections[Number(sectionMesh.faNexusBuildingSectionRenderIndex)]?.hsbc
+          ?? sectionMesh.faNexusBuildingSectionHsbc
+          ?? rootHsbc,
+        null
+      )
+    }));
+    for (const { hsbc: sectionHsbc } of sectionMeshes) {
+      if (!hsbcValuesEqual(sectionHsbc, rootHsbc)) useContainerHsbc = false;
+    }
+    applyHsbcToDisplayObject(container, useContainerHsbc ? rootHsbc : null);
+    if (useContainerHsbc) {
+      for (const { mesh: sectionMesh } of sectionMeshes) {
+        applyHsbcToDisplayObject(sectionMesh, null);
+      }
+    } else {
+      for (const { mesh: sectionMesh, hsbc } of sectionMeshes) {
+        applyHsbcToDisplayObject(sectionMesh, hsbc);
+      }
+    }
+    return true;
+  } catch (error) {
+    Logger.warn?.('BuildingTiles.hsbcPreview.apply.failed', {
+      tileId: tile?.document?.id,
+      error: String(error?.message || error)
+    });
+    return false;
   }
 }
 
@@ -827,7 +641,7 @@ function syncReusableDoorFrameRuntime(tile, mesh, doc, container, reason) {
     contentContainer: container,
     proxyFactory: createDisplayProxyFactory(container),
     syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-      setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+      syncBuildingOverheadTransform(entry?.contentContainer, currentMesh, currentTile?.document);
     }
   });
   try {
@@ -854,7 +668,7 @@ function syncReusableBuildingCompositeRuntime(tile, mesh, doc, container, reason
     contentContainer: container,
     proxyFactory: createDisplayProxyFactory(container),
     syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-      setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+      syncBuildingOverheadTransform(entry?.contentContainer, currentMesh, currentTile?.document);
     }
   });
   try {
@@ -921,9 +735,16 @@ function createCompositePartRoot(part = {}, doc = null) {
   const origin = getTileWorldOrigin(doc);
   const width = Math.max(1, Number(part?.width) || 1);
   const height = Math.max(1, Number(part?.height) || 1);
-  const centerX = (Number(part?.x) || 0) - origin.x;
-  const centerY = (Number(part?.y) || 0) - origin.y;
-  const rotation = (Number(part?.rotation) || 0) * (Math.PI / 180);
+  const anchorX = Number.isFinite(Number(doc?.texture?.anchorX)) ? Number(doc.texture.anchorX) : 0.5;
+  const anchorY = Number.isFinite(Number(doc?.texture?.anchorY)) ? Number(doc.texture.anchorY) : 0.5;
+  const documentRotation = (Number(doc?.rotation) || 0) * (Math.PI / 180);
+  const worldDx = (Number(part?.x) || 0) - (Number(doc?.x) || 0);
+  const worldDy = (Number(part?.y) || 0) - (Number(doc?.y) || 0);
+  const cosine = Math.cos(-documentRotation);
+  const sine = Math.sin(-documentRotation);
+  const centerX = (worldDx * cosine) - (worldDy * sine) + (origin.width * anchorX);
+  const centerY = (worldDx * sine) + (worldDy * cosine) + (origin.height * anchorY);
+  const rotation = ((Number(part?.rotation) || 0) * (Math.PI / 180)) - documentRotation;
   const root = new PIXI.Container();
   root.eventMode = 'none';
   root.sortableChildren = false;
@@ -990,10 +811,21 @@ function addCompositeSpriteShadow(root, texture, part, width, height, rotationRa
   root.addChild(shadow);
 }
 
+function isAssetShadowManagedCompositePart(part = {}) {
+  const flags = part?.flags && typeof part.flags === 'object' ? part.flags : {};
+  if (!flags.shadow) return false;
+  const kind = String(part?.kind || part?.elementType || '').toLowerCase();
+  return part?.flagKey === 'buildingWindowSill'
+    || String(part?.role || '').toLowerCase() === 'sill'
+    || kind === 'sill';
+}
+
 function addSimpleCompositeSprite(root, texture, part, width, height, rotationRad = 0) {
   const base = texture?.baseTexture;
   if (!texture || !base?.valid) return false;
-  addCompositeSpriteShadow(root, texture, part, width, height, rotationRad);
+  if (!isAssetShadowManagedCompositePart(part)) {
+    addCompositeSpriteShadow(root, texture, part, width, height, rotationRad);
+  }
   const sprite = new PIXI.Sprite(texture);
   sprite.anchor.set(0.5, 0.5);
   sprite.position.set(width / 2, height / 2);
@@ -1177,49 +1009,19 @@ function remapVisibleRows(geometry, visibleData) {
   uvBuffer.update();
 }
 
-function createWallShader(texture) {
+function createWallShader(texture, tile) {
   if (!texture) return null;
-  try {
-    if (PIXI?.MeshMaterial) {
-      const material = new PIXI.MeshMaterial(texture);
-      material.alpha = 1;
-      if (material.uvMatrix) {
-        material.uvMatrix.isSimple = false;
-        material.uvMatrix.clampOffset = false;
-        material.uvMatrix.clampMargin = -0.5;
-        material.uvMatrix.update();
-      }
-      return material;
-    }
-    if (PIXI?.Mesh?.Material) {
-      const material = new PIXI.Mesh.Material(texture);
-      material.alpha = 1;
-      if (material.uvMatrix) {
-        material.uvMatrix.isSimple = false;
-        material.uvMatrix.clampOffset = false;
-        material.uvMatrix.clampMargin = -0.5;
-        material.uvMatrix.update();
-      }
-      return material;
-    }
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.shader.create.failed', { error: String(error?.message || error) });
-  }
-  try {
-    const material = new PIXI.MeshMaterial(texture);
-    if (material.uvMatrix) {
-      material.uvMatrix.isSimple = false;
-      material.uvMatrix.clampOffset = false;
-      material.uvMatrix.clampMargin = -0.5;
-      material.uvMatrix.update();
-    }
-    return material;
-  } catch (_) {
-    return null;
-  }
+  const material = createCustomTileOverheadMaterial(texture, tile);
+  material.alpha = 1;
+  material.uvMatrix.isSimple = false;
+  material.uvMatrix.clampOffset = false;
+  material.uvMatrix.clampMargin = -0.5;
+  material.uvMatrix.update();
+  return material;
 }
 
 export async function applyBuildingTile(tile) {
+  const pendingTextureOwners = new Set();
   try {
     if (!tile || tile.destroyed) return;
     const doc = tile.document;
@@ -1237,6 +1039,7 @@ export async function applyBuildingTile(tile) {
       return;
     }
     const renderSections = collectBuildingRenderSections(data);
+    const portalArtwork = collectBuildingV2PortalArtwork(data);
     const compositeData = doc?.getFlag?.('fa-nexus', 'buildingComposite');
     const foregroundParts = compositeData?.role === 'foreground' && Array.isArray(compositeData?.parts)
       ? compositeData.parts.filter((part) => part && typeof part === 'object')
@@ -1244,7 +1047,7 @@ export async function applyBuildingTile(tile) {
     let mesh = tile.mesh;
     if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
     if (!mesh || mesh.destroyed) return;
-    if (!renderSections.length && !foregroundParts.length) {
+    if (!renderSections.length && !foregroundParts.length && !portalArtwork.length) {
       resetBuildingOverlayToTransparent(tile, mesh, doc);
       return;
     }
@@ -1254,6 +1057,7 @@ export async function applyBuildingTile(tile) {
       tile: getTileRenderSignature(doc),
       data,
       foregroundParts,
+      portalArtwork,
       renderSections
     }, doc?.id);
     const reusableContainer = tile.faNexusBuildingContainer || mesh.faNexusBuildingContainer;
@@ -1272,7 +1076,10 @@ export async function applyBuildingTile(tile) {
     await Promise.all(textureSources.map(async (textureSrc) => {
       try {
         const entry = await loadBuildingTextureEntry(textureSrc);
-        if (entry?.texture) textureEntries.set(textureSrc, entry);
+        if (entry?.texture) {
+          textureEntries.set(textureSrc, entry);
+          if (entry.owner) pendingTextureOwners.add(entry.owner);
+        }
       } catch (error) {
         Logger.warn?.('BuildingTiles.texture.loadFailed', {
           error: String(error?.message || error),
@@ -1287,7 +1094,7 @@ export async function applyBuildingTile(tile) {
 	    cleanupContainerChildren(container);
 	    container.faNexusBuildingMeshes = [];
 	    const sectionMeshes = [];
-	    let useContainerHsbc = foregroundParts.length <= 0;
+	    let useContainerHsbc = foregroundParts.length <= 0 && portalArtwork.length <= 0;
 
     const isOverWallPart = (part) => {
       const kind = String(part?.kind || part?.elementType || '').toLowerCase();
@@ -1324,30 +1131,39 @@ export async function applyBuildingTile(tile) {
         if (Number.isFinite(stored) && stored > 0) return stored;
         return computeTextureRepeatDistance(texture, data);
       })();
-	      const geometryResult = BuildingWallMesher.buildGeometry(points, {
-	        width: wallWidth,
-	        closed,
+      const geometryResult = BuildingWallMesher.buildGeometry(points, {
+        width: wallWidth,
+        closed,
         joinStyle: 'mitre',
         mitreLimit: 4,
         textureRepeatDistance: repeatDistance,
+        texturePhaseDistance: section?.texturePhaseDistance,
         textureOffset: normalizeTextureOffset(section?.textureOffset),
         textureFlip: normalizeTextureFlip(section?.textureFlip),
         startJoinDir: section?.startJoinDir || null,
+        startCapNormal: section?.startCapNormal || null,
+        endCapNormal: section?.endCapNormal || null,
         endJoinDir: section?.endJoinDir || null
       });
-	      const geometry = geometryResult?.geometry;
-	      if (!geometry || !geometryResult?.data?.positions?.length) continue;
+      const geometry = geometryResult?.geometry;
+      if (!geometry || !geometryResult?.data?.positions?.length) continue;
 	      remapVisibleRows(geometry, textureEntry?.visibleData);
-	      const shader = createWallShader(texture);
+	      const shader = createWallShader(texture, tile);
 	      if (!shader) continue;
 	      const sectionMesh = new PIXI.Mesh(geometry, shader);
 	      sectionMesh.name = `fa-nexus-building-wall-${doc?.id || 'tile'}-${meshIndex}`;
 	      sectionMesh.eventMode = 'none';
 	      sectionMesh.interactiveChildren = false;
 	      container.addChild(sectionMesh);
+	      if (textureEntry?.owner && pendingTextureOwners.has(textureEntry.owner)) {
+	        retainOwnedSamplerTexture(container, textureEntry.owner);
+	        pendingTextureOwners.delete(textureEntry.owner);
+	      }
 	      container.faNexusBuildingMeshes.push(sectionMesh);
 	      applyMeshAlpha(sectionMesh, layerOpacity);
 	      const sectionHsbc = normalizeHsbc(section?.hsbc ?? rootHsbc, null);
+	      sectionMesh.faNexusBuildingSectionHsbc = sectionHsbc;
+	      sectionMesh.faNexusBuildingSectionRenderIndex = section.renderIndex;
 	      if (!hsbcValuesEqual(sectionHsbc, rootHsbc)) useContainerHsbc = false;
 	      sectionMeshes.push({ mesh: sectionMesh, hsbc: sectionHsbc });
 	      meshIndex += 1;
@@ -1356,6 +1172,7 @@ export async function applyBuildingTile(tile) {
     for (const part of overWallParts) {
       await addCompositePart(container, doc, part);
     }
+    await addBuildingV2PortalArtwork(container, portalArtwork);
 
 	    if (!container.children?.length) {
 	      resetBuildingOverlayToTransparent(tile, mesh, doc);
@@ -1380,7 +1197,7 @@ export async function applyBuildingTile(tile) {
       contentContainer: container,
       proxyFactory: createDisplayProxyFactory(container),
       syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-        setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        syncBuildingOverheadTransform(entry?.contentContainer, currentMesh, currentTile?.document);
       }
     });
     try {
@@ -1394,6 +1211,10 @@ export async function applyBuildingTile(tile) {
     invalidateCustomTileOverhead(tile, 'building-refresh');
   } catch (error) {
     Logger.warn?.('BuildingTiles.apply.failed', { error: String(error?.message || error) });
+  } finally {
+    for (const owner of pendingTextureOwners) {
+      try { owner.release(); } catch (_) {}
+    }
   }
 }
 
@@ -1542,7 +1363,7 @@ export async function applyDoorFrameTile(tile) {
       contentContainer: container,
       proxyFactory: createDisplayProxyFactory(container),
       syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-        setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        syncBuildingOverheadTransform(entry?.contentContainer, currentMesh, currentTile?.document);
       }
     });
     try {
@@ -1559,6 +1380,18 @@ export async function applyDoorFrameTile(tile) {
   }
 }
 
+// The parts container the composite renderer draws. The retired legacy `buildingComposite` flag
+// and the current-state `buildingSills` flag describe the SAME thing — an ordered list of parts
+// on a transparent Tile — and the sill part path already keys on `flagKey buildingWindowSill`
+// (see isAssetShadowManagedCompositePart), so managed sills are a flag-recognition change here
+// rather than a second renderer.
+export function readBuildingCompositePartsFlag(doc) {
+  const composite = doc?.getFlag?.('fa-nexus', 'buildingComposite');
+  if (composite) return composite;
+  const sills = doc?.getFlag?.('fa-nexus', 'buildingSills');
+  return sills ? { ...sills, role: 'sill' } : null;
+}
+
 export async function applyBuildingCompositeTile(tile) {
   try {
     if (!tile || tile.destroyed) return;
@@ -1567,7 +1400,7 @@ export async function applyBuildingCompositeTile(tile) {
       cleanupBuildingCompositeOverlay(tile);
       return;
     }
-    const data = doc?.getFlag?.('fa-nexus', 'buildingComposite');
+    const data = readBuildingCompositePartsFlag(doc);
     if (!data) {
       cleanupBuildingCompositeOverlay(tile);
       return;
@@ -1629,7 +1462,7 @@ export async function applyBuildingCompositeTile(tile) {
       contentContainer: container,
       proxyFactory: createDisplayProxyFactory(container),
       syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-        setContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        syncBuildingOverheadTransform(entry?.contentContainer, currentMesh, currentTile?.document);
       }
     });
     try {
@@ -1660,7 +1493,7 @@ export function rehydrateBuildingTiles() {
         if (frameData) applyDoorFrameTile(tile);
         else cleanupDoorFrameOverlay(tile);
 
-        const compositeData = tile?.document?.getFlag?.('fa-nexus', 'buildingComposite');
+        const compositeData = readBuildingCompositePartsFlag(tile?.document);
         if (compositeData) applyBuildingCompositeTile(tile);
         else cleanupBuildingCompositeOverlay(tile);
       } catch (_) {}
@@ -1672,323 +1505,28 @@ export function clearBuildingTileMeshWaiters() {
   clearSharedTileMeshWaiters('BuildingTiles.clearBuildingTileMeshWaiters');
 }
 
-async function deleteLinkedFillAndWalls(doc, { scene = null, data = null, options = null } = {}) {
-  try {
-    if (!doc || !game?.user?.isGM) return;
-    const buildingData = data ?? readBuildingFlag(doc, 'building');
-    if (!buildingData) return;
-    const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
-    if (!resolvedScene) return;
-    const meta = buildingData?.meta || {};
-    const fillTileId = meta?.fillTileId;
-    if (fillTileId && fillTileId !== doc.id && !options?.[SKIP_LINKED_BUILDING_FILL_DELETE_OPTION]) {
-      await deleteLinkedTilesRobustly(resolvedScene, [fillTileId], {
-        [SUPPRESS_FILL_TRIGGERED_BUILDING_CLEANUP_OPTION]: true
-      }, 'BuildingTiles.delete.fill');
-    }
-    const sillTileId = meta?.sillTileId || meta?.composite?.sillTileId || null;
-    if (sillTileId && sillTileId !== doc.id) {
-      await deleteLinkedTilesRobustly(resolvedScene, [sillTileId], {
-        [PRESERVE_LINKED_TILE_CLEANUP_OPTION]: true
-      }, 'BuildingTiles.delete.sillComposite');
-    }
-    // NOTE: We intentionally do NOT use meta.wallIds here, as those can be stale.
-    // When multiple islands are committed, wall IDs may get reassigned to different
-    // tiles during _assignWallsToCommittedIslands. The meta.wallIds stored at commit
-    // time may contain walls that were later claimed by other islands.
-    // Instead, we rely exclusively on the wall's actual flag.tileId and flag.groupId
-    // which are the authoritative sources after commit.
-    const wallIds = new Set();
-    const staleWallLinks = [];
-    const groupId = meta?.wallGroupId || null;
-    const collection = resolvedScene.walls;
-    if (collection?.size) {
-      for (const wall of collection) {
-        if (!wall) continue;
-        const flag = readBuildingWallFlag(wall);
-        if (!flag) continue;
-        // Only delete walls where the flag actually points to this tile
-        if (flag.tileId === doc.id) {
-          wallIds.add(wall.id);
-          continue;
-        }
-        if (!groupId || flag.groupId !== groupId) continue;
-        if (!flag.tileId) {
-          // Also catch walls that have our groupId but no specific tileId
-          // (e.g., from interrupted commits or legacy data)
-          wallIds.add(wall.id);
-          continue;
-        }
-
-        const linkedTile = resolvedScene.tiles?.get?.(flag.tileId) || null;
-        const linkedGroupId = resolveBuildingWallTileGroupId(linkedTile);
-        if (!linkedTile || linkedTile?._destroyed || linkedGroupId !== groupId) {
-          wallIds.add(wall.id);
-          staleWallLinks.push({
-            wallId: wall.id,
-            staleTileId: flag.tileId,
-            flagGroupId: flag.groupId || null,
-            linkedGroupId: linkedGroupId || null,
-            deletingTileId: doc.id
-          });
-        }
-      }
-    }
-    if (staleWallLinks.length) {
-      Logger.warn?.('BuildingTiles.delete.walls.staleTileLinks', {
-        tileId: doc.id,
-        wallGroupId: groupId,
-        staleWallLinks
-      });
-    }
-    const expectedWallIds = Array.isArray(meta?.wallIds) ? meta.wallIds.filter(Boolean) : [];
-    if (!wallIds.size) {
-      const fallbackWallIds = [];
-      const skippedFallbackWallIds = [];
-      for (const wallId of expectedWallIds) {
-        const wall = collection?.get?.(wallId) || null;
-        const flag = readBuildingWallFlag(wall);
-        if (!wall || wall?._destroyed || !flag) {
-          fallbackWallIds.push(wallId);
-          continue;
-        }
-        const flagGroupId = flag.groupId || null;
-        const linkedTile = flag.tileId ? (resolvedScene.tiles?.get?.(flag.tileId) || null) : null;
-        const linkedGroupId = resolveBuildingWallTileGroupId(linkedTile);
-        const safeToDelete = flag.tileId === doc.id
-          || (!!groupId && flagGroupId === groupId)
-          || !flag.tileId
-          || !linkedTile
-          || linkedTile?._destroyed
-          || (!!groupId && linkedGroupId !== groupId);
-        if (safeToDelete) {
-          fallbackWallIds.push(wallId);
-        } else {
-          skippedFallbackWallIds.push({
-            wallId,
-            claimedTileId: flag.tileId || null,
-            flagGroupId,
-            linkedGroupId: linkedGroupId || null
-          });
-        }
-      }
-      if (fallbackWallIds.length) {
-        for (const wallId of fallbackWallIds) wallIds.add(wallId);
-        Logger.warn?.('BuildingTiles.delete.walls.usingStoredFallbackIds', {
-          tileId: doc.id,
-          sceneId: resolvedScene?.id || null,
-          sceneName: resolvedScene?.name || null,
-          wallGroupId: groupId,
-          fallbackWallIds,
-          skippedFallbackWallIds
-        });
-      }
-    }
-    if (!wallIds.size) {
-      if (groupId || expectedWallIds.length) {
-        Logger.warn?.('BuildingTiles.delete.walls.missingLinkedWalls', {
-          tileId: doc.id,
-          sceneId: resolvedScene?.id || null,
-          sceneName: resolvedScene?.name || null,
-          wallGroupId: groupId,
-          expectedWallIds,
-          candidates: summarizeSceneBuildingWallCandidates(resolvedScene, {
-            tileId: doc.id,
-            groupId,
-            wallIds: expectedWallIds
-          })
-        });
-      }
-      return;
-    }
-    Logger.debug?.('BuildingTiles.delete.walls.start', {
-      tileId: doc.id,
-      sceneId: resolvedScene?.id || null,
-      sceneName: resolvedScene?.name || null,
-      wallGroupId: groupId,
-      wallIds: [...wallIds],
-      expectedWallIds: Array.isArray(meta?.wallIds) ? meta.wallIds.filter(Boolean) : []
-    });
-    await queueWallDeletes(resolvedScene, [...wallIds], 'BuildingTiles.delete.walls');
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.delete.cleanup.failed', { error: String(error?.message || error) });
-  }
-}
-
-async function deleteLinkedDoorFrameTiles(doc, { scene = null, data = null } = {}) {
-  try {
-    if (!doc || !game?.user?.isGM) return;
-    const buildingData = data ?? readBuildingFlag(doc, 'building');
-    if (!buildingData) return;
-    const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
-    if (!resolvedScene?.tiles?.size) return;
-    const meta = buildingData?.meta || {};
-    const wallGroupId = meta?.wallGroupId || null;
-    if (!wallGroupId) return;
-    const frameTileIds = [];
-    for (const tileDoc of resolvedScene.tiles) {
-      if (!tileDoc || tileDoc.id === doc.id) continue;
-      const flag = readBuildingFlag(tileDoc, 'buildingDoorFrame');
-      if (flag?.wallGroupId === wallGroupId) {
-        frameTileIds.push(tileDoc.id);
-      }
-    }
-    if (!frameTileIds.length) return;
-    await deleteLinkedTilesRobustly(resolvedScene, frameTileIds, null, 'BuildingTiles.delete.doorFrames');
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.delete.doorFrames.cleanup.failed', { error: String(error?.message || error) });
-  }
-}
-
-async function deleteLinkedWindowTiles(doc, { scene = null, data = null } = {}) {
-  try {
-    if (!doc || !game?.user?.isGM) return;
-    const buildingData = data ?? readBuildingFlag(doc, 'building');
-    if (!buildingData) return;
-    const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
-    if (!resolvedScene?.tiles?.size) return;
-    const meta = buildingData?.meta || {};
-    const wallGroupId = meta?.wallGroupId || null;
-    if (!wallGroupId) return;
-    const windowTileIds = [];
-    for (const tileDoc of resolvedScene.tiles) {
-      if (!tileDoc || tileDoc.id === doc.id) continue;
-      // Check for window sill, window texture, or window frame tiles
-      const sillFlag = readBuildingFlag(tileDoc, 'buildingWindowSill');
-      const windowFlag = readBuildingFlag(tileDoc, 'buildingWindowWindow');
-      const frameFlag = readBuildingFlag(tileDoc, 'buildingWindowFrame');
-      const flag = sillFlag || windowFlag || frameFlag;
-      if (flag?.wallGroupId === wallGroupId) {
-        windowTileIds.push(tileDoc.id);
-      }
-    }
-    if (!windowTileIds.length) return;
-    await deleteLinkedTilesRobustly(resolvedScene, windowTileIds, null, 'BuildingTiles.delete.windowTiles');
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.delete.windowTiles.cleanup.failed', { error: String(error?.message || error) });
-  }
-}
-
-async function deleteLinkedInnerWallTiles(doc, { scene = null, data = null } = {}) {
-  try {
-    if (!doc || !game?.user?.isGM) return;
-    const buildingData = data ?? readBuildingFlag(doc, 'building');
-    if (!buildingData) return;
-    const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
-    if (!resolvedScene?.tiles?.size) return;
-    const meta = buildingData?.meta || {};
-    // Only outer wall tiles should cascade delete their inner walls
-    const wallType = meta?.wallType || buildingData?.wall?.mode;
-    if (wallType === 'inner') return;
-    const wallGroupId = meta?.wallGroupId || null;
-    const innerWallTileIds = [];
-    for (const tileDoc of resolvedScene.tiles) {
-      if (!tileDoc || tileDoc.id === doc.id) continue;
-      const innerData = readBuildingFlag(tileDoc, 'building');
-      if (!innerData) continue;
-      const innerMeta = innerData.meta || {};
-      const innerWallType = innerMeta?.wallType || innerData?.wall?.mode;
-      // Only consider inner wall tiles
-      if (innerWallType !== 'inner') continue;
-      // Check if this inner tile is linked to the deleted outer tile
-      const matchesTileId = innerMeta.parentWallTileId === doc.id;
-      const matchesGroupId = wallGroupId && innerMeta.parentWallGroupId === wallGroupId;
-      if (matchesTileId || matchesGroupId) {
-        innerWallTileIds.push(tileDoc.id);
-      }
-    }
-    if (!innerWallTileIds.length) return;
-    await deleteLinkedTilesRobustly(resolvedScene, innerWallTileIds, null, 'BuildingTiles.delete.innerWallTiles');
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.delete.innerWallTiles.cleanup.failed', { error: String(error?.message || error) });
-  }
-}
-
-async function deleteLinkedBuildingRegions(doc, { scene = null, data = null } = {}) {
-  try {
-    if (!doc || !game?.user?.isGM) return;
-    const buildingData = data ?? readBuildingFlag(doc, 'building');
-    if (!buildingData) return;
-    const resolvedScene = resolveLiveSceneDocument(scene || doc.parent || canvas?.scene);
-    if (!resolvedScene?.regions?.size) return;
-    const meta = buildingData?.meta || {};
-    const explicitRegionIds = new Set((Array.isArray(meta?.regionIds) ? meta.regionIds : [])
-      .map((id) => String(id || '').trim())
-      .filter(Boolean));
-    const wallGroupId = String(meta?.wallGroupId || '').trim();
-    const regionIds = new Set();
-    for (const regionDoc of resolvedScene.regions) {
-      if (!regionDoc) continue;
-      const flag = readBuildingRegionFlag(regionDoc);
-      if (!flag) continue;
-      const regionId = String(regionDoc.id || '').trim();
-      const matchesExplicit = regionId && explicitRegionIds.has(regionId);
-      const matchesWallTile = String(flag?.wallTileId || '').trim() === doc.id;
-      const matchesWallGroup = !!wallGroupId && String(flag?.wallGroupId || '').trim() === wallGroupId;
-      if (matchesExplicit || matchesWallTile || matchesWallGroup) regionIds.add(regionId);
-    }
-    if (!regionIds.size) return;
-    await resolvedScene.deleteEmbeddedDocuments('Region', [...regionIds]);
-    Logger.info?.('BuildingTiles.delete.regions.deleted', {
-      tileId: doc.id || null,
-      wallGroupId: wallGroupId || null,
-      regionIds: [...regionIds]
-    });
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.delete.regions.cleanup.failed', { error: String(error?.message || error) });
-  }
-}
-
-async function cleanupLinkedBuildingTiles(doc, options = {}) {
-  try {
-    if (!doc || !game?.user?.isGM) return;
-    const scene = resolveLiveSceneDocument(doc.parent || canvas?.scene);
-    if (!scene) return;
-    const targets = resolveBuildingCleanupTargets(doc, scene);
-    if (!targets.length) return;
-    const isFillTrigger = !isBuildingTileDocument(doc) && isBuildingFillDocument(doc);
-    const isSillTrigger = !isBuildingTileDocument(doc) && isBuildingCompositeSillDocument(doc);
-    if (isFillTrigger || isSillTrigger) {
-      const ownerTileIds = Array.from(new Set(
-        targets.map((target) => target?.doc?.id).filter(Boolean)
-      ));
-      if (!ownerTileIds.length) return;
-      const triggerOptions = isFillTrigger
-        ? { [SKIP_LINKED_BUILDING_FILL_DELETE_OPTION]: true }
-        : null;
-      await deleteLinkedTilesRobustly(
-        scene,
-        ownerTileIds,
-        triggerOptions,
-        isFillTrigger ? 'BuildingTiles.delete.fillOwners' : 'BuildingTiles.delete.sillOwners'
-      );
-      return;
-    }
-    for (const target of targets) {
-      if (!target?.doc || !target?.data) continue;
-      await deleteLinkedFillAndWalls(target.doc, { scene, data: target.data, options });
-      await deleteLinkedDoorFrameTiles(target.doc, { scene, data: target.data });
-      await deleteLinkedWindowTiles(target.doc, { scene, data: target.data });
-      await deleteLinkedInnerWallTiles(target.doc, { scene, data: target.data });
-      await deleteLinkedBuildingRegions(target.doc, { scene, data: target.data });
-    }
-  } catch (error) {
-    Logger.warn?.('BuildingTiles.delete.linked.cleanup.failed', { error: String(error?.message || error) });
-  }
-}
-
 try {
+  registerCustomTileRenderLifecycle({
+    id: 'building-tiles',
+    callback: applyBuildingTile,
+    logCode: 'BuildingTiles.lifecycle.failed'
+  });
+  registerCustomTileRenderLifecycle({
+    id: 'building-door-frame-tiles',
+    callback: applyDoorFrameTile,
+    logCode: 'BuildingTiles.doorFrame.lifecycle.failed'
+  });
+  registerCustomTileRenderLifecycle({
+    id: 'building-composite-tiles',
+    callback: applyBuildingCompositeTile,
+    logCode: 'BuildingTiles.composite.lifecycle.failed'
+  });
   Hooks.on('canvasReady', () => {
     try { rehydrateBuildingTiles(); } catch (_) {}
   });
-  Hooks.on('drawTile', (tile) => {
-    try { applyBuildingTile(tile); } catch (_) {}
-    try { applyDoorFrameTile(tile); } catch (_) {}
-    try { applyBuildingCompositeTile(tile); } catch (_) {}
-  });
   Hooks.on('updateTile', (doc) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
+      const tile = resolveCanvasTilePlaceable(doc);
       if (tile) {
         applyBuildingTile(tile);
         applyDoorFrameTile(tile);
@@ -1996,25 +1534,78 @@ try {
       }
     } catch (_) {}
   });
+  // SINGLE-WRITER RULE for the linked Building cascade: it runs ONLY in the browsing session that
+  // INITIATED the deletion. The discriminator is Foundry's own dispatch asymmetry: `preDeleteTile`
+  // fires exclusively on the initiating client (ClientDatabaseBackend.#preDeleteDocumentArray runs
+  // inside _deleteDocuments before the socket request), while broadcast receivers only ever run
+  // `deleteTile`. A userId comparison is NOT a session discriminator — two tabs logged in as the
+  // same GM share the userId, so under a userId rule a kicked-but-still-running zombie tab would
+  // also consider itself the initiator and cascade concurrently. Entries expire so a vetoed
+  // preDelete never leaks.
+  const LOCAL_TILE_DELETE_INITIATIONS = new Map();
+  const LOCAL_TILE_DELETE_INITIATION_TTL_MS = 60000;
+  Hooks.on('preDeleteTile', (doc, options = {}) => {
+    if (!canDeleteTileDuringBuildingEdit(doc, options)) {
+      Logger.warn?.('BuildingTiles.deleteTile.blockedDuringEdit', {
+        tileId: doc?.id || null,
+        optionKeys: Object.keys(options || {})
+      });
+      globalThis.ui?.notifications?.warn?.(
+        'This Building is currently being edited. Finish or cancel the edit before deleting it.'
+      );
+      return false;
+    }
+    try {
+      const now = Date.now();
+      for (const [tileId, at] of LOCAL_TILE_DELETE_INITIATIONS) {
+        if (now - at > LOCAL_TILE_DELETE_INITIATION_TTL_MS) LOCAL_TILE_DELETE_INITIATIONS.delete(tileId);
+      }
+      if (doc?.id) LOCAL_TILE_DELETE_INITIATIONS.set(doc.id, now);
+    } catch (_) {}
+    return true;
+  });
   Hooks.on('deleteTile', (doc, options) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
+      const tile = resolveCanvasTilePlaceable(doc);
       if (tile) {
         cleanupBuildingOverlay(tile);
         cleanupDoorFrameOverlay(tile);
         cleanupBuildingCompositeOverlay(tile);
       }
     } catch (_) {}
+    const locallyInitiated = doc?.id ? LOCAL_TILE_DELETE_INITIATIONS.delete(doc.id) : false;
+    if (!locallyInitiated) {
+      Logger.debug?.('BuildingTiles.deleteTile.cascadeSkipped.foreignSession', {
+        tileId: doc?.id || null,
+        optionKeys: Object.keys(options || {})
+      });
+      return;
+    }
     if (!shouldSkipLinkedBuildingDeletes(doc, options)) {
       Promise.resolve(cleanupLinkedBuildingTiles(doc, options)).catch((error) => {
         Logger.warn?.('BuildingTiles.deleteTile.cleanup.failed', {
           tileId: doc?.id || null,
           error: String(error?.message || error)
         });
+        // The cascade owns removing a deleted Building's generated documents; a rejection here
+        // leaves orphans on the Scene, so the user is told, not only the console.
+        globalThis.ui?.notifications?.warn?.(
+          `Building linked cleanup failed for Tile ${doc?.id || '(unknown)'}: ${String(error?.message || error)}.`
+          + ' Generated documents may remain on the Scene.'
+        );
       });
     }
   });
   Hooks.on('canvasTearDown', () => {
     try { clearBuildingTileMeshWaiters(); } catch (_) {}
   });
-} catch (_) {}
+} catch (error) {
+  // These registrations install the Building render lifecycle AND the single-writer cascade
+  // guards. Failing to register them silently would disable both without a trace, so the failure
+  // is loud: without the guards, Building deletions stop cascading at all.
+  Logger.error?.('BuildingTiles.hookRegistration.failed', { error: String(error?.message || error) });
+  globalThis.ui?.notifications?.error?.(
+    `FA Nexus Building Tile hooks failed to register: ${String(error?.message || error)}.`
+    + ' Building rendering and linked cleanup are disabled for this session.'
+  );
+}

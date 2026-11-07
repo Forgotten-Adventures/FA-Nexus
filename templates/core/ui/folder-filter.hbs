@@ -1,0 +1,18 @@
+<div class="fa-nexus-folder-window">
+  {{#if collectionsEnabled}}
+  <nav class="fa-nexus-collection-toolbar" aria-label="Browse by"><button type="button" data-collection-action="folders">Folders</button><button type="button" data-collection-action="collections">Collections</button></nav>
+  <div class="fa-nexus-collections-browser" hidden></div>
+  {{/if}}
+  <aside class="fa-nexus-folder-browser collapsed is-hidden" aria-hidden="true">
+    <label class="fa-nexus-folder-mode" title="Turn off to show only files directly inside each selected folder.">
+      <input type="checkbox" data-action="include-subfolders" checked />
+      <span>Include subfolders</span>
+    </label>
+    <div class="fa-nexus-folder-tree" data-role="folder-tree"></div>
+  </aside>
+  <footer class="fa-nexus-folder-shortcuts">
+    <small><strong>Click</strong> to select • <strong>Right-Click</strong> to expand/collapse
+    <br />
+    <strong>Ctrl+Click</strong> to multi-select • <strong>Alt+Click</strong> to exclude</small>
+  </footer>
+</div>

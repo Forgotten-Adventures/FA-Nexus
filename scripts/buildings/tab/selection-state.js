@@ -23,6 +23,30 @@ export const selectionStateMethods = {
     this._selectedFillTextureKey = normalized;
   },
 
+  syncFillSelectionFromSession(sessionView = null) {
+    // The Building's own Fill is the default of its Fill model; rooms may override it.
+    const fill = sessionView?.authoring?.fill?.default;
+    const key = fill?.active === true
+      ? String(fill.asset?.key || fill.asset?.src || '').trim()
+      : NONE_TEXTURE_KEY;
+    if (fill?.active === true && !key) {
+      throw new Error('An active Building Fill session requires a stable catalog key.');
+    }
+    this._selectFillTexture(key);
+    this._refreshVisibleTextureSelection();
+    return key;
+  },
+
+  /** The editor reports the Fill its controls act on with every state change; the highlighted card follows it. */
+  syncFillSelectionFromToolOptions(state = null) {
+    const selection = state?.fillSelection;
+    if (!selection?.available) return;
+    const key = selection.active ? String(selection.key || '').trim() : NONE_TEXTURE_KEY;
+    if (!key || key === this._selectedFillTextureKey) return;
+    this._selectFillTexture(key);
+    this._refreshVisibleTextureSelection();
+  },
+
   async _handleFillTextureSelectionChanged({ key = NONE_TEXTURE_KEY, item = null, cardElement = null } = {}) {
     const manager = this._buildingManager;
     if (!manager || !manager.isActive) return;

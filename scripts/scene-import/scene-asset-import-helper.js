@@ -11,6 +11,7 @@ import {
 } from '../storage/generated-paths.js';
 import { detectGeneratedOutputPath } from '../storage/generated-output-policy.js';
 import { ensureGeneratedFlattenRootsRegisteredFromPaths } from '../storage/generated-output-roots.js';
+import { preserveBuildingFingerprints } from '../composition/scene-group-building-fingerprints.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
@@ -246,7 +247,7 @@ function isGeneratedLocalSourceReference(source) {
   if (!normalized) return false;
   if (detectGeneratedOutputPath(normalized, { assetsDir: getConfiguredAssetsDir({ moduleId: MODULE_ID }) })) return true;
   if (/(^|\/)assets\/tiles\/[^/]+-texture-src\.png$/.test(normalized)) return true;
-  return /(^|\/)fa-nexus-assets\/masks\/[^/]+\.(avif|jpe?g|png|webp)$/.test(normalized);
+  return /(^|\/)(?:fa-nexus-assets|fa-nexus\/assets)\/masks\/[^/]+\.(avif|jpe?g|png|webp)$/.test(normalized);
 }
 
 function isTransparentPlaceholderReference(source) {
@@ -334,12 +335,14 @@ function buildSourceCandidates(source) {
     '/free_assets/',
     '/premium_assets/',
     '/fa-nexus-assets/',
+    '/fa-nexus/assets/',
     'assets/free_assets/',
     'assets/premium_assets/',
     'assets/thumbnails/',
     'free_assets/',
     'premium_assets/',
-    'fa-nexus-assets/'
+    'fa-nexus-assets/',
+    'fa-nexus/assets/'
   ];
 
   for (const marker of markers) {
@@ -490,6 +493,19 @@ function collectTileReferences(scene) {
         src: value,
         doc
       });
+    });
+  }
+  return refs;
+}
+
+function collectWallReferences(scene) {
+  const refs = [];
+  for (const doc of valuesFromCollection(scene?.walls)) {
+    const add = (src, updatePath) => refs.push({scope:'wall-field', documentType:'Wall', documentId:doc.id,
+      documentName:getDocumentName(doc, 'Portal'), updatePath, src, doc});
+    if (isImageReference(doc.animation?.texture)) add(doc.animation.texture, 'animation.texture');
+    walkImageStrings(doc.flags?.[MODULE_ID], [], (value, path) => {
+      if (!shouldSkipFlagImageReference(path, value)) add(value, `flags.${MODULE_ID}.${path.join('.')}`);
     });
   }
   return refs;
@@ -692,63 +708,160 @@ class CloudAssetIndex {
   }
 }
 
-export class SceneAssetImportHelperService {
-  constructor(options = {}) {
-    this.contentService = options.contentService || null;
-    this.downloadManager = options.downloadManager || null;
+class SceneAssetImportReferenceResolver {
+  constructor({ getContentService, getDownloadManager, initializeDownloadManager } = {}) {
+    this.getContentService = getContentService;
+    this.getDownloadManager = getDownloadManager;
+    this.initializeDownloadManager = initializeDownloadManager;
   }
 
-  _getNexusApp() {
-    try { return foundry?.applications?.instances?.get?.('fa-nexus-app') || null; }
-    catch (_) { return null; }
-  }
+  async resolve(report, refs, options = {}) {
+    const scene = report.scene;
+    let cloudIndex = null;
+    let download = null;
+    const getCloudIndex = async () => {
+      if (!cloudIndex) {
+        const cloudItems = await this._loadCloudAssets(options);
+        cloudIndex = new CloudAssetIndex(cloudItems);
+      }
+      return cloudIndex;
+    };
+    const getDownloadManager = async () => {
+      if (!download) {
+        download = this.getDownloadManager();
+        await this.initializeDownloadManager(download);
+      }
+      return download;
+    };
+    const localProbeCache = new Map();
+    const staticLocalCache = new Map();
+    const authed = hasPremiumAuth();
 
-  _getContentService() {
-    if (this.contentService) return this.contentService;
-    const app = this._getNexusApp();
-    if (app?._contentService) {
-      this.contentService = app._contentService;
-      return this.contentService;
+    for (let i = 0; i < refs.length; i += 1) {
+      const ref = refs[i];
+      options.onProgress?.(`Checking scene reference ${i + 1}/${refs.length}...`);
+      const localOnly = isLocalOnlyReference(ref);
+      if (localOnly) {
+        const exactLocalEntry = await this._resolveExistingLocalReference(ref, staticLocalCache, {
+          staticOnly: false,
+          reason: 'local-only-current'
+        });
+        if (exactLocalEntry) {
+          addReportEntry(report, exactLocalEntry);
+          continue;
+        }
+
+        if (isMaskFlagReference(ref)) {
+          const localMaskEntry = await this._resolveLocalMaskReference(ref, await getDownloadManager(), scene);
+          if (localMaskEntry) {
+            addReportEntry(report, localMaskEntry);
+            continue;
+          }
+        }
+
+        const missingLocalEntry = buildLocalOnlyMissingEntry(ref, scene);
+        if (missingLocalEntry) {
+          Logger.warn('SceneImportHelper.localOnly.missing', {
+            source: ref.src,
+            updatePath: ref.updatePath,
+            documentId: ref.documentId,
+            reason: missingLocalEntry.reason,
+            expectedLocalPaths: missingLocalEntry.expectedLocalPaths || []
+          });
+          addReportEntry(report, missingLocalEntry);
+          continue;
+        }
+
+        Logger.debug('SceneImportHelper.localOnly.skipped', {
+          source: ref.src,
+          updatePath: ref.updatePath,
+          documentId: ref.documentId,
+          reason: 'non-reportable-local-only'
+        });
+        continue;
+      }
+
+      const staticLocalEntry = await this._resolveExistingLocalReference(ref, staticLocalCache);
+      if (staticLocalEntry) {
+        addReportEntry(report, staticLocalEntry);
+        continue;
+      }
+
+      if (isMaskFlagReference(ref)) {
+        const localMaskEntry = await this._resolveLocalMaskReference(ref, await getDownloadManager(), scene);
+        if (localMaskEntry) {
+          addReportEntry(report, localMaskEntry);
+          continue;
+        }
+      }
+
+      const index = await getCloudIndex();
+      const match = index.match(ref.src);
+      if (match.status !== 'matched') {
+        const maskCandidates = isMaskFlagReference(ref) ? buildLocalMaskCandidates(basename(ref.src), scene) : [];
+        addReportEntry(report, {
+          ref,
+          status: match.status,
+          reason: maskCandidates.length && match.status === STATUS.unmatched ? 'local-mask-missing' : match.reason,
+          matches: match.matches || [],
+          source: ref.src,
+          localPath: '',
+          cloudPath: '',
+          expectedLocalPaths: maskCandidates.map((entry) => entry.expectedPath),
+          error: maskCandidates.length && match.status === STATUS.unmatched
+            ? `No matching local mask file found. Expected one of: ${maskCandidates.map((entry) => entry.expectedPath).join(', ')}`
+            : ''
+        });
+        continue;
+      }
+
+      const record = match.record;
+      const cloudPath = match.cloudPath || normalizeCloudPath(record);
+      const cloudKey = cloudPath.toLowerCase();
+      if (isCurrentDirectFreeCloudReference(ref.src, record, cloudPath)) {
+        Logger.debug('SceneImportHelper.directFree.current', {
+          source: ref.src,
+          cloudPath,
+          updatePath: ref.updatePath
+        });
+        continue;
+      }
+
+      let localPath = localProbeCache.get(cloudKey);
+      if (localPath === undefined) {
+        try {
+          const initializedDownload = await getDownloadManager();
+          localPath = initializedDownload.getLocalPath('assets', record) || await initializedDownload.probeLocal('assets', record) || '';
+        } catch (error) {
+          Logger.error('SceneImportHelper.localProbe.failed', {
+            cloudPath,
+            source: ref.src,
+            error: String(error?.message || error)
+          });
+          localPath = '';
+        }
+        localProbeCache.set(cloudKey, localPath);
+      }
+
+      const normalizedCurrent = normalizeReferencePath(ref.src);
+      const normalizedLocal = normalizeReferencePath(localPath);
+      let status = STATUS.downloadable;
+      if (localPath && normalizedCurrent === normalizedLocal) status = STATUS.current;
+      else if (localPath) status = STATUS.ready;
+      else if (isPremiumRecord(record) && !authed) status = STATUS.auth;
+
+      addReportEntry(report, {
+        ref,
+        record,
+        status,
+        reason: match.reason,
+        source: ref.src,
+        localPath,
+        cloudPath,
+        cloudKey,
+        tier: record?.tier || 'free'
+      });
     }
-    const authProvider = app && typeof app._getAuthService === 'function' ? () => app._getAuthService() : undefined;
-    this.contentService = new NexusContentService({ app: app || null, authService: authProvider });
-    return this.contentService;
-  }
-
-  _getDownloadManager() {
-    if (this.downloadManager) return this.downloadManager;
-    const app = this._getNexusApp();
-    this.downloadManager = app?._downloadManager || new NexusDownloadManager();
-    return this.downloadManager;
-  }
-
-  async _initializeDownloadManager(download) {
-    const initialized = await download?.initialize?.();
-    if (initialized !== true) {
-      Logger.error('SceneImportHelper.download.initialize.failed', { initialized });
-      throw new Error('Scene asset import could not initialize the Nexus download manager.');
-    }
-  }
-
-  _resolveScene(scene = null) {
-    const resolved = scene || canvas?.scene || game?.scenes?.active || null;
-    if (!resolved) throw new Error('No active scene is available.');
-    return resolved;
-  }
-
-  _collectReferences(scene) {
-    const refs = [
-      ...collectTileReferences(scene),
-      ...collectLevelReferences(scene)
-    ];
-    Logger.info('SceneImportHelper.refs.collected', {
-      sceneId: scene?.id || null,
-      sceneName: scene?.name || null,
-      total: refs.length,
-      tiles: refs.filter((ref) => ref.documentType === 'Tile').length,
-      levels: refs.filter((ref) => ref.documentType === 'Level').length
-    });
-    return refs;
   }
 
   async _resolveExistingLocalReference(ref, cache = new Map(), { staticOnly = true, reason = 'local-file-current' } = {}) {
@@ -874,7 +987,7 @@ export class SceneAssetImportHelperService {
   }
 
   async _loadCloudAssets({ onProgress = null } = {}) {
-    const content = this._getContentService();
+    const content = this.getContentService();
     try {
       onProgress?.('Syncing cloud asset index...');
       await content.sync('assets', {
@@ -905,188 +1018,20 @@ export class SceneAssetImportHelperService {
       throw new Error(`Cloud asset list failed: ${error?.message || error}`);
     }
   }
+}
 
-  async analyze(scene = null, options = {}) {
-    const resolvedScene = this._resolveScene(scene);
-    const refs = this._collectReferences(resolvedScene);
-    const report = {
-      scene: resolvedScene,
-      sceneId: resolvedScene.id || null,
-      sceneName: resolvedScene.name || 'Current Scene',
-      scannedRefs: refs.length,
-      entries: [],
-      summary: summarizeEntries([], refs.length)
-    };
-    if (!refs.length) {
-      Logger.warn('SceneImportHelper.analyze.noRefs', { sceneId: report.sceneId, sceneName: report.sceneName });
-      return report;
-    }
-
-    let cloudIndex = null;
-    let download = null;
-    const getCloudIndex = async () => {
-      if (!cloudIndex) {
-        const cloudItems = await this._loadCloudAssets(options);
-        cloudIndex = new CloudAssetIndex(cloudItems);
-      }
-      return cloudIndex;
-    };
-    const getDownloadManager = async () => {
-      if (!download) {
-        download = this._getDownloadManager();
-        await this._initializeDownloadManager(download);
-      }
-      return download;
-    };
-    const localProbeCache = new Map();
-    const staticLocalCache = new Map();
-    const authed = hasPremiumAuth();
-
-    for (let i = 0; i < refs.length; i += 1) {
-      const ref = refs[i];
-      options.onProgress?.(`Checking scene reference ${i + 1}/${refs.length}...`);
-      const localOnly = isLocalOnlyReference(ref);
-      if (localOnly) {
-        const exactLocalEntry = await this._resolveExistingLocalReference(ref, staticLocalCache, {
-          staticOnly: false,
-          reason: 'local-only-current'
-        });
-        if (exactLocalEntry) {
-          addReportEntry(report, exactLocalEntry);
-          continue;
-        }
-
-        if (isMaskFlagReference(ref)) {
-          const localMaskEntry = await this._resolveLocalMaskReference(ref, await getDownloadManager(), resolvedScene);
-          if (localMaskEntry) {
-            addReportEntry(report, localMaskEntry);
-            continue;
-          }
-        }
-
-        const missingLocalEntry = buildLocalOnlyMissingEntry(ref, resolvedScene);
-        if (missingLocalEntry) {
-          Logger.warn('SceneImportHelper.localOnly.missing', {
-            source: ref.src,
-            updatePath: ref.updatePath,
-            documentId: ref.documentId,
-            reason: missingLocalEntry.reason,
-            expectedLocalPaths: missingLocalEntry.expectedLocalPaths || []
-          });
-          addReportEntry(report, missingLocalEntry);
-          continue;
-        }
-
-        Logger.debug('SceneImportHelper.localOnly.skipped', {
-          source: ref.src,
-          updatePath: ref.updatePath,
-          documentId: ref.documentId,
-          reason: 'non-reportable-local-only'
-        });
-        continue;
-      }
-
-      const staticLocalEntry = await this._resolveExistingLocalReference(ref, staticLocalCache);
-      if (staticLocalEntry) {
-        addReportEntry(report, staticLocalEntry);
-        continue;
-      }
-
-      if (isMaskFlagReference(ref)) {
-        const localMaskEntry = await this._resolveLocalMaskReference(ref, await getDownloadManager(), resolvedScene);
-        if (localMaskEntry) {
-          addReportEntry(report, localMaskEntry);
-          continue;
-        }
-      }
-
-      const index = await getCloudIndex();
-      const match = index.match(ref.src);
-      if (match.status !== 'matched') {
-        const maskCandidates = isMaskFlagReference(ref) ? buildLocalMaskCandidates(basename(ref.src), resolvedScene) : [];
-        addReportEntry(report, {
-          ref,
-          status: match.status,
-          reason: maskCandidates.length && match.status === STATUS.unmatched ? 'local-mask-missing' : match.reason,
-          matches: match.matches || [],
-          source: ref.src,
-          localPath: '',
-          cloudPath: '',
-          expectedLocalPaths: maskCandidates.map((entry) => entry.expectedPath),
-          error: maskCandidates.length && match.status === STATUS.unmatched
-            ? `No matching local mask file found. Expected one of: ${maskCandidates.map((entry) => entry.expectedPath).join(', ')}`
-            : ''
-        });
-        continue;
-      }
-
-      const record = match.record;
-      const cloudPath = match.cloudPath || normalizeCloudPath(record);
-      const cloudKey = cloudPath.toLowerCase();
-      if (isCurrentDirectFreeCloudReference(ref.src, record, cloudPath)) {
-        Logger.debug('SceneImportHelper.directFree.current', {
-          source: ref.src,
-          cloudPath,
-          updatePath: ref.updatePath
-        });
-        continue;
-      }
-
-      let localPath = localProbeCache.get(cloudKey);
-      if (localPath === undefined) {
-        try {
-          const initializedDownload = await getDownloadManager();
-          localPath = initializedDownload.getLocalPath('assets', record) || await initializedDownload.probeLocal('assets', record) || '';
-        } catch (error) {
-          Logger.error('SceneImportHelper.localProbe.failed', {
-            cloudPath,
-            source: ref.src,
-            error: String(error?.message || error)
-          });
-          localPath = '';
-        }
-        localProbeCache.set(cloudKey, localPath);
-      }
-
-      const normalizedCurrent = normalizeReferencePath(ref.src);
-      const normalizedLocal = normalizeReferencePath(localPath);
-      let status = STATUS.downloadable;
-      if (localPath && normalizedCurrent === normalizedLocal) status = STATUS.current;
-      else if (localPath) status = STATUS.ready;
-      else if (isPremiumRecord(record) && !authed) status = STATUS.auth;
-
-      addReportEntry(report, {
-        ref,
-        record,
-        status,
-        reason: match.reason,
-        source: ref.src,
-        localPath,
-        cloudPath,
-        cloudKey,
-        tier: record?.tier || 'free'
-      });
-    }
-
-    report.summary = summarizeEntries(report.entries, report.scannedRefs ?? refs.length);
-    Logger.info('SceneImportHelper.analyze.done', {
-      sceneId: report.sceneId,
-      sceneName: report.sceneName,
-      summary: report.summary
-    });
-    return report;
+class SceneAssetImportRepairExecutor {
+  constructor({ contentService, downloadManager, initializeDownloadManager } = {}) {
+    this.contentService = contentService;
+    this.downloadManager = downloadManager;
+    this.initializeDownloadManager = initializeDownloadManager;
   }
 
-  async repair(report, options = {}) {
-    if (!report?.scene) report = await this.analyze(null, options);
+  async execute(report, options = {}) {
     const scene = report.scene;
-    if (!scene?.canUserModify?.(game.user, 'update')) {
-      throw new Error(`You do not have permission to update scene "${scene?.name || scene?.id || ''}".`);
-    }
-
-    const content = this._getContentService();
-    const download = this._getDownloadManager();
-    await this._initializeDownloadManager(download);
+    const content = this.contentService;
+    const download = this.downloadManager;
+    await this.initializeDownloadManager(download);
     const auth = readAuthState();
     const authState = auth?.authenticated && auth?.state ? auth.state : undefined;
     const downloadCache = new Map();
@@ -1129,16 +1074,7 @@ export class SceneAssetImportHelperService {
     }
 
     await this._applyReferenceUpdates(scene, actionableEntries, options);
-    if (actionableEntries.some((entry) => entry.status === STATUS.repaired)) {
-      invalidateSharedAssetCatalog('scene-import-helper');
-    }
-    report.summary = summarizeEntries(report.entries, report.scannedRefs ?? report.summary?.totalRefs ?? report.entries.length);
-    Logger.info('SceneImportHelper.repair.done', {
-      sceneId: report.sceneId,
-      sceneName: report.sceneName,
-      summary: report.summary
-    });
-    return report;
+    return actionableEntries;
   }
 
   async _applyReferenceUpdates(scene, entries, { onProgress = null } = {}) {
@@ -1198,6 +1134,7 @@ export class SceneAssetImportHelperService {
     }
 
     const tileUpdatesById = new Map();
+    const wallUpdatesById = new Map();
     const levelUpdatesById = new Map();
     const levelUpdateCount = { value: 0 };
     const tileUpdateCount = { value: 0 };
@@ -1227,7 +1164,20 @@ export class SceneAssetImportHelperService {
     for (const entry of entries) {
       if (entry.status !== STATUS.repaired || !entry.localPath) continue;
       const ref = entry.ref;
+      if (scene.getEmbeddedDocument(ref.documentType,ref.documentId) !== ref.doc
+        || getObjectValue(ref.doc._source,ref.updatePath.split('.')) !== ref.src) {
+        throw new Error('Scene assets changed during the scan. Scan again before repairing.');
+      }
       const encodedLocalPath = encodeTexturePath(entry.localPath);
+      if (ref.scope === 'wall-field') {
+        const update = wallUpdatesById.get(ref.documentId) || {_id:ref.documentId};
+        if (ref.updatePath.startsWith(`flags.${MODULE_ID}.`)) {
+          const flags=update[`flags.${MODULE_ID}`] ||= clonePlain(ref.doc.flags[MODULE_ID]);
+          if (!setPath(flags,ref.updatePath.split('.').slice(2),encodedLocalPath)) throw new Error(`Unable to update ${ref.updatePath}`);
+        } else update[ref.updatePath] = encodedLocalPath;
+        wallUpdatesById.set(ref.documentId, update);
+        continue;
+      }
       if (ref.scope === 'tile-texture') {
         const state = getTileState(ref.doc);
         if (!state) continue;
@@ -1264,24 +1214,162 @@ export class SceneAssetImportHelperService {
       }
     }
 
+    // Asset paths are shared by V2 authoring, compiled artwork, and native Walls.
+    // Keep their derived fingerprint valid and publish the complete repair together.
+    // An inactive Fill region can change the root's composite fingerprint without
+    // changing any rendered asset reference on its dependent Tile.
+    const fillRoots = new Set([...tileUpdatesById.values()]
+      .filter(state => [4, 5].includes(Number(state.moduleFlags?.building?.schemaVersion)) && state.moduleFlags.building.runtime?.fillProjection)
+      .map(state => state.doc.id));
+    for (const tile of scene.tiles || []) {
+      if (!fillRoots.has(tile.flags?.[MODULE_ID]?.buildingFill?.wallTileId)) continue;
+      const state = getTileState(tile);
+      if (!state.moduleFlags) state.update[`flags.${MODULE_ID}`] = state.moduleFlags = clonePlain(tile.flags[MODULE_ID]);
+    }
+    const flagStates = [...tileUpdatesById.values()].filter(state => state.moduleFlags);
+    preserveBuildingFingerprints(flagStates.map(state => ({source:state.doc.toObject()})),
+      flagStates.map(state => ({source:{flags:{[MODULE_ID]:state.moduleFlags}}})));
     const tileUpdates = Array.from(tileUpdatesById.values()).map((state) => state.update);
     const levelUpdates = Array.from(levelUpdatesById.values()).map((state) => state.update);
-
-    if (levelUpdates.length) {
-      onProgress?.(`Updating ${levelUpdateCount.value} level image reference(s)...`);
-      Logger.info('SceneImportHelper.update.levels', { count: levelUpdates.length, refs: levelUpdateCount.value });
-      await scene.updateEmbeddedDocuments('Level', levelUpdates);
-    }
-
-    if (tileUpdates.length) {
-      onProgress?.(`Updating ${tileUpdateCount.value} tile asset reference(s)...`);
-      Logger.info('SceneImportHelper.update.tiles', { count: tileUpdates.length, refs: tileUpdateCount.value });
-      await scene.updateEmbeddedDocuments('Tile', tileUpdates);
-    }
-
-    if (!tileUpdates.length && !levelUpdates.length) {
+    const wallUpdates = [...wallUpdatesById.values()];
+    const operations = [['Level',levelUpdates],['Tile',tileUpdates],['Wall',wallUpdates]]
+      .filter(([,updates]) => updates.length)
+      .map(([documentName, updates]) => ({action:'update',documentName,parent:scene,updates,faNexusBuildingEditorDocumentWrite:true}));
+    if (operations.length) {
+      onProgress?.(`Updating ${levelUpdateCount.value + tileUpdateCount.value + wallUpdates.length} asset reference(s)...`);
+      const originals = operations.map(operation => ({...operation,updates:operation.updates.map(update => {
+        const source=scene.getEmbeddedDocument(operation.documentName,update._id).toObject();
+        return Object.fromEntries(Object.keys(update).map(path=>[path,clonePlain(getObjectValue(source,path.split('.')))]));
+      })}));
+      try { await foundry.documents.modifyBatch(operations); }
+      catch(error) {
+        for(const entry of entries) if(entry.status===STATUS.repaired){entry.status=STATUS.failed;entry.error=String(error.message||error);}
+        try {await foundry.documents.modifyBatch(originals);}
+        catch(rollbackError) {throw new AggregateError([error,rollbackError],'Asset repair failed and its previous paths could not all be restored.');}
+        throw error;
+      }
+    } else {
       Logger.warn('SceneImportHelper.update.none', { entries: entries.length });
     }
+  }
+}
+
+export class SceneAssetImportHelperService {
+  constructor(options = {}) {
+    this.contentService = options.contentService || null;
+    this.downloadManager = options.downloadManager || null;
+  }
+
+  _getNexusApp() {
+    try { return foundry?.applications?.instances?.get?.('fa-nexus-app') || null; }
+    catch (_) { return null; }
+  }
+
+  _getContentService() {
+    if (this.contentService) return this.contentService;
+    const app = this._getNexusApp();
+    if (app?._contentService) {
+      this.contentService = app._contentService;
+      return this.contentService;
+    }
+    const authProvider = app && typeof app._getAuthService === 'function' ? () => app._getAuthService() : undefined;
+    this.contentService = new NexusContentService({ app: app || null, authService: authProvider });
+    return this.contentService;
+  }
+
+  _getDownloadManager() {
+    if (this.downloadManager) return this.downloadManager;
+    const app = this._getNexusApp();
+    this.downloadManager = app?._downloadManager || new NexusDownloadManager();
+    return this.downloadManager;
+  }
+
+  async _initializeDownloadManager(download) {
+    const initialized = await download?.initialize?.();
+    if (initialized !== true) {
+      Logger.error('SceneImportHelper.download.initialize.failed', { initialized });
+      throw new Error('Scene asset import could not initialize the Nexus download manager.');
+    }
+  }
+
+  _resolveScene(scene = null) {
+    const resolved = scene || canvas?.scene || game?.scenes?.active || null;
+    if (!resolved) throw new Error('No active scene is available.');
+    return resolved;
+  }
+
+  _collectReferences(scene) {
+    const refs = [
+      ...collectTileReferences(scene),
+      ...collectWallReferences(scene),
+      ...collectLevelReferences(scene)
+    ];
+    Logger.info('SceneImportHelper.refs.collected', {
+      sceneId: scene?.id || null,
+      sceneName: scene?.name || null,
+      total: refs.length,
+      tiles: refs.filter((ref) => ref.documentType === 'Tile').length,
+      walls: refs.filter((ref) => ref.documentType === 'Wall').length,
+      levels: refs.filter((ref) => ref.documentType === 'Level').length
+    });
+    return refs;
+  }
+
+  async analyze(scene = null, options = {}) {
+    const resolvedScene = this._resolveScene(scene);
+    const refs = this._collectReferences(resolvedScene);
+    const report = {
+      scene: resolvedScene,
+      sceneId: resolvedScene.id || null,
+      sceneName: resolvedScene.name || 'Current Scene',
+      scannedRefs: refs.length,
+      entries: [],
+      summary: summarizeEntries([], refs.length)
+    };
+    if (!refs.length) {
+      Logger.warn('SceneImportHelper.analyze.noRefs', { sceneId: report.sceneId, sceneName: report.sceneName });
+      return report;
+    }
+
+    const resolver = new SceneAssetImportReferenceResolver({
+      getContentService: () => this._getContentService(),
+      getDownloadManager: () => this._getDownloadManager(),
+      initializeDownloadManager: (download) => this._initializeDownloadManager(download)
+    });
+    await resolver.resolve(report, refs, options);
+
+    report.summary = summarizeEntries(report.entries, report.scannedRefs ?? refs.length);
+    Logger.info('SceneImportHelper.analyze.done', {
+      sceneId: report.sceneId,
+      sceneName: report.sceneName,
+      summary: report.summary
+    });
+    return report;
+  }
+
+  async repair(report, options = {}) {
+    if (!report?.scene) report = await this.analyze(null, options);
+    const scene = report.scene;
+    if (!scene?.canUserModify?.(game.user, 'update')) {
+      throw new Error(`You do not have permission to update scene "${scene?.name || scene?.id || ''}".`);
+    }
+
+    const executor = new SceneAssetImportRepairExecutor({
+      contentService: this._getContentService(),
+      downloadManager: this._getDownloadManager(),
+      initializeDownloadManager: (download) => this._initializeDownloadManager(download)
+    });
+    const actionableEntries = await executor.execute(report, options);
+    if (actionableEntries.some((entry) => entry.status === STATUS.repaired)) {
+      invalidateSharedAssetCatalog('scene-import-helper');
+    }
+    report.summary = summarizeEntries(report.entries, report.scannedRefs ?? report.summary?.totalRefs ?? report.entries.length);
+    Logger.info('SceneImportHelper.repair.done', {
+      sceneId: report.sceneId,
+      sceneName: report.sceneName,
+      summary: report.summary
+    });
+    return report;
   }
 }
 

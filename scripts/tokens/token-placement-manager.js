@@ -1,25 +1,39 @@
 import { TokenDragDropManager } from './token-dragdrop-manager.js';
 import { ActorFactory } from './actor-factory.js';
+import { TokenPlacementInteractionWorkflow } from './token-placement-interaction-workflow.js';
+import { createActorTokenPlacement, createTokenPlacementDocument } from './token-placement-transaction-workflow.js';
+import {
+  buildMatchTokens,
+  derivePlaceAsMatchKey,
+  normalizeMatchString,
+  scorePlaceAsOption,
+  stripFileExtension,
+  tokenizeMatchString
+} from './token-place-as-matching.js';
+import {
+  AUTO_NEW_ACTOR_TYPE_SELECTION,
+  MAX_PLACE_AS_SUGGESTIONS,
+  TokenPlaceAsSelectionState
+} from './token-place-as-selection-state.js';
 import * as SystemDetection from './system-detection.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { getCanvasInteractionController, announceChange } from '../canvas/canvas-interaction-controller.js';
-import { getZoomAtCursorView, isPointerOverCanvas } from '../canvas/canvas-pointer-utils.js';
-import { SHORTCUT_ACTION, createShortcut, isGridSnapShortcut, isHelpShortcut } from '../core/editor-shortcuts.js';
-import { createNormalizedToolOptionsDescriptor, TOOL_OPTIONS_RENDERER_MODE } from '../core/tool-options-descriptor.js';
-import { toolOptionsController } from '../core/tool-options-controller.js';
+import { isPointerOverCanvas } from '../canvas/canvas-pointer-utils.js';
+import { SHORTCUT_ACTION, createShortcut } from '../core/editor-shortcuts.js';
+import { createNormalizedToolOptionsDescriptor, TOOL_OPTIONS_RENDERER_MODE } from '../core/tool-options/tool-options-descriptor.js';
+import {
+  addDeclarativeAxisTogglePairControl,
+  addDeclarativeScalarRandomizedControl
+} from '../core/tool-options/tool-options-control-builders.js';
+import { toolOptionsController } from '../core/tool-options/tool-options-controller.js';
 import { PlacementPrefetchQueue } from '../core/placement/placement-prefetch-queue.js';
 import {
   activatePlacementToolOptions,
-  createManagedPlacementGestureSession,
-  deactivatePlacementToolOptions,
-  stopManagedPlacementGestureSession
+  deactivatePlacementToolOptions
 } from '../core/placement/placement-session-utils.js';
+import { normalizeTokenPlacementEntry } from './token-placement-entry.js';
+import { applyTokenCardCachedState, isDirectTokenCacheUrl } from './token-card-cache-state.js';
 
-const DEFAULT_PLACE_AS_SELECTION = 'fa-nexus:create-new';
-const AUTO_NEW_ACTOR_TYPE_SELECTION = 'fa-nexus:auto-actor-type';
-const MAX_PLACE_AS_RESULTS = 60;
-const MAX_PLACE_AS_SUGGESTIONS = 10;
-const MIN_AUTO_PLACE_AS_SCORE = 35;
 const HP_MODES = ['actor', 'formula', 'percent', 'static'];
 const DEFAULT_HP_PERCENT = 20;
 const DEFAULT_ROTATION_RANDOM_MIN = 0;
@@ -41,11 +55,11 @@ export class TokenPlacementManager {
   constructor(app) {
     this.app = app;
     this._interactionController = getCanvasInteractionController();
+    this._interactionWorkflow = new TokenPlacementInteractionWorkflow(this);
     this.isPlacementActive = false;
     this._stickyMode = false;
     this._current = null; // { card, payload }
     this._preview = null;
-    this._session = null;
     this._lastPointer = null;
     this._lastPointerWorld = null;
     this._rotation = 0;
@@ -62,14 +76,9 @@ export class TokenPlacementManager {
     this._pendingFlipHorizontal = false;
     this._pendingFlipVertical = false;
     this._placing = false;
-    this._hoveredActorEl = null;
-    this._pendingActorClickBlocker = null;
-    this._suppressNextActorClick = false;
     this._settingsHook = null;
     this._gridSnapHook = null;
     this._actorOptionHook = null;
-    this._gridSnapShortcutHeld = false;
-    this._gridSnapShortcutPendingToggle = false;
     this._randomMode = false;
     this._randomEntries = [];
     this._currentEntry = null;
@@ -82,28 +91,11 @@ export class TokenPlacementManager {
       logger: Logger,
       loggerTag: 'TokenPlacement.prefetch'
     });
-    this._placeAsSelectionId = DEFAULT_PLACE_AS_SELECTION;
-    this._placeAsLinked = false;
-    this._placeAsSearch = '';
-    this._placeAsOptions = [];
-    this._placeAsWorldOptions = [];
-    this._placeAsCompendiumOptions = [];
-    this._placeAsOptionMap = new Map();
+    this._placeAsSelection = new TokenPlaceAsSelectionState();
     this._placeAsResolvedCompendium = new Map();
-    this._placeAsLoading = false;
-    this._placeAsLoadError = null;
     this._placeAsRefreshPromise = null;
     this._placeAsRefreshTimer = null;
     this._placeAsActorHooksInstalled = false;
-    this._placeAsOpen = false;
-    this._placeAsMatchRaw = '';
-    this._placeAsMatchNormalized = '';
-    this._placeAsMatchTokens = [];
-    this._placeAsSuggestions = [];
-    this._placeAsUserModified = false;
-    this._placeAsSelectionAuto = false;
-    this._placeAsSelectedOption = null;
-    this._placeAsExcludedPacks = new Set();
     this._placeAsAvailablePacks = [];
     this._placeAsFilterDialogOpen = false;
     this._newActorTypeChoices = [];
@@ -186,8 +178,6 @@ export class TokenPlacementManager {
 
       this._ensureActorOptionsLoaded();
       this._ensureNewActorTypeOptionsLoaded();
-      this._placeAsOpen = false;
-      this._placeAsSearch = '';
       this._applyPlaceAsMatchContext(payload, cardElement, { resetContext: true, autoSelect: true });
 
       this.isPlacementActive = true;
@@ -224,12 +214,12 @@ export class TokenPlacementManager {
 
       this._installPreview(cardElement, startPointer);
       this._applyRotationToPreview();
-      this._hoveredActorEl = null;
+      this._clearActorHoverHighlight();
       this._setupEvents();
       this._announceStart(sticky);
     } catch (error) {
       Logger.warn('TokenPlacement.start.failed', { error: String(error?.message || error) });
-      ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
+      if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
       this.cancelPlacement('error');
     }
   }
@@ -282,12 +272,7 @@ export class TokenPlacementManager {
       this._placing = false;
       this._ensureActorOptionsLoaded();
       this._ensureNewActorTypeOptionsLoaded();
-      this._placeAsOpen = false;
-      this._placeAsSearch = '';
-      this._placeAsUserModified = false;
-      this._placeAsSelectionAuto = false;
-      this._placeAsSelectionId = DEFAULT_PLACE_AS_SELECTION;
-      this._placeAsLinked = false;
+      this._applyPlaceAsMatchContext(null, null, { resetContext: true, autoSelect: false });
       this._activateToolOptions();
       this._activateTokensLayer();
 
@@ -305,12 +290,12 @@ export class TokenPlacementManager {
 
       await this._switchToNextRandomEntry({ initial: true, pointerEvent });
 
-      this._hoveredActorEl = null;
+      this._clearActorHoverHighlight();
       this._setupEvents();
       this._announceStart(true);
     } catch (error) {
       Logger.warn('TokenPlacement.random.start.failed', { error: String(error?.message || error) });
-      ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
+      if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
       this.cancelPlacement('error');
     }
   }
@@ -531,231 +516,39 @@ export class TokenPlacementManager {
   }
 
   _setupEvents() {
-    this._teardownEvents();
-
-    const pointerMoveHandler = (event, { pointer }) => {
-      if (!this.isPlacementActive) return;
-      if (pointer?.screen) {
-        this._lastPointer = { x: pointer.screen.x, y: pointer.screen.y };
-      }
-      if (pointer?.world) {
-        this._lastPointerWorld = { x: pointer.world.x, y: pointer.world.y };
-      } else if (pointer?.screen) {
-        const world = this._screenToWorld(pointer.screen.x, pointer.screen.y, pointer.canvas);
-        if (world) this._lastPointerWorld = world;
-      }
-      if (this._preview?.box) {
-        if (this._preview.box.style.display === 'none') this._preview.box.style.display = 'block';
-        this._updatePreviewPosition({ pointer });
-      }
-      if (pointer?.screen) {
-        this._updateActorHoverHighlight(pointer.screen.x, pointer.screen.y);
-      }
-    };
-
-    const wheelHandler = (event, { pointer }) => {
-      if (!this.isPlacementActive) return;
-      if (!pointer?.overCanvas || !pointer.zOk) return;
-
-      if (this._gridSnapShortcutHeld && !event.altKey && !event.ctrlKey && !event.metaKey) {
-        this._gridSnapShortcutPendingToggle = false;
-      }
-
-      if (event.ctrlKey || event.metaKey) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        const baseStep = 15;
-        const step = event.shiftKey ? baseStep / 3 : baseStep;
-        const dir = event.deltaY > 0 ? 1 : -1;
-        this._rotation = ((this._rotation + dir * step) % 360 + 360) % 360;
-        this._updateRotationPreview({ clampOffset: true });
-        this._syncToolOptionsState();
-        return;
-      }
-
-      try {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        const stage = canvas?.stage; if (!stage) return;
-        const rect = pointer.canvas?.getBoundingClientRect();
-        if (!rect) return;
-        const currentScale = Number(stage.scale?.x || 1);
-        const step = 1.25;
-        const dir = event.deltaY < 0 ? 1 : -1;
-        const targetScale = currentScale * Math.pow(step, dir);
-        const view = getZoomAtCursorView({
-          canvasEl: pointer.canvas,
-          screenX: pointer.screen.x,
-          screenY: pointer.screen.y,
-          targetScale
-        });
-        if (!view) return;
-        const centerX = rect.width / 2; const centerY = rect.height / 2;
-        if (typeof canvas?.animatePan === 'function') {
-          canvas.animatePan({ ...view, duration: 50 });
-        } else {
-          stage.scale.set(view.scale, view.scale);
-          stage.position.set(centerX - view.scale * view.x, centerY - view.scale * view.y);
-        }
-      } catch (_) {}
-    };
-
-    const pointerDownHandler = async (event, { pointer }) => {
-      if (!this.isPlacementActive) return;
-      if (event.button !== 0) return;
-      if (this._placing) {
-        event.preventDefault();
-        return;
-      }
-      if (pointer?.screen) {
-        this._updateActorHoverHighlight(pointer.screen.x, pointer.screen.y);
-      }
-      const actorEl = pointer?.screen ? this._findActorElement(pointer.screen.x, pointer.screen.y) : null;
-      const overCanvas = pointer?.overCanvas && pointer.zOk;
-      if (!overCanvas && !actorEl) return;
-      if (actorEl) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-        this._installActorClickBlocker();
-      } else {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-      const result = await this._placeAtPointer(event, actorEl);
-      if (result === 'none') {
-        this.cancelPlacement('error');
-        return;
-      }
-      const keepPlacing = event.shiftKey || this._stickyMode;
-      if (!keepPlacing && (result === 'canvas' || result === 'actor')) {
-        this.cancelPlacement('placed');
-      } else if (keepPlacing && result === 'actor' && pointer?.screen) {
-        this._updateActorHoverHighlight(pointer.screen.x, pointer.screen.y);
-      }
-      if (keepPlacing && (result === 'canvas' || result === 'actor') && this._randomMode) {
-        await this._switchToNextRandomEntry({ pointerEvent: event });
-      }
-    };
-
-    const keyDownHandler = (event) => {
-      if (!this.isPlacementActive) return;
-      const keyName = typeof event?.key === 'string' ? event.key : '';
-      if (keyName === 'Escape') {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        this.cancelPlacement('esc');
-        return;
-      }
-      if (typeof isHelpShortcut === 'function' && isHelpShortcut(event)) {
-        if (this._shouldIgnorePlacementHotkey(event, keyName)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        toolOptionsController.openActiveToolHelp?.({ focus: true });
-        return;
-      }
-      if (isGridSnapShortcut(event)) {
-        if (this._shouldIgnorePlacementHotkey(event, keyName)) return;
-        this._gridSnapShortcutHeld = true;
-        if (!event.repeat) this._gridSnapShortcutPendingToggle = true;
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-      }
-    };
-
-    const keyUpHandler = (event) => {
-      if (String(event?.key || '').toLowerCase() === 's') {
-        const shouldToggle = this._gridSnapShortcutHeld && this._gridSnapShortcutPendingToggle;
-        this._gridSnapShortcutHeld = false;
-        this._gridSnapShortcutPendingToggle = false;
-        if (shouldToggle) {
-          event.preventDefault?.();
-          event.stopPropagation?.();
-          event.stopImmediatePropagation?.();
-          void Promise.resolve(toolOptionsController.toggleGridSnapShortcut())
-            .finally(() => this._refreshPlacementAfterGridSnapChange());
-        }
-      }
-    };
-
-    this._session = createManagedPlacementGestureSession({
-      pointermove: { handler: pointerMoveHandler, respectZIndex: false },
-      wheel: { handler: wheelHandler, respectZIndex: true },
-      pointerdown: pointerDownHandler,
-      keydown: keyDownHandler,
-      keyup: keyUpHandler
-    }, {
-      cancelPlacement: (reason) => this.cancelPlacement(reason),
-      lockCanvasLayer: 'tokens',
-      onStop: () => this._cleanupInteractionSessionState()
-    });
+    return this._interactionWorkflow.start();
   }
 
   _cleanupInteractionSessionState() {
-    this._session = null;
-    this._gridSnapShortcutHeld = false;
-    this._gridSnapShortcutPendingToggle = false;
-    this._clearActorHoverHighlight();
-    this._teardownActorClickBlocker();
+    return this._interactionWorkflow.cleanup();
   }
 
   _teardownEvents() {
-    stopManagedPlacementGestureSession(this._session, {
-      cleanup: () => this._cleanupInteractionSessionState()
-    });
+    return this._interactionWorkflow.stop();
   }
 
   _updateActorHoverHighlight(clientX, clientY) {
-    try {
-      const actorEl = this._findActorElement(clientX, clientY);
-      if (actorEl === this._hoveredActorEl) return;
-      if (this._hoveredActorEl) {
-        try { this._hoveredActorEl.classList.remove('actor-drop-target'); } catch (_) {}
-      }
-      if (actorEl) {
-        try { actorEl.classList.add('actor-drop-target'); } catch (_) {}
-      }
-      this._hoveredActorEl = actorEl || null;
-    } catch (_) {}
+    return this._interactionWorkflow.updateActorHoverHighlight(clientX, clientY);
   }
 
   _clearActorHoverHighlight() {
-    if (this._hoveredActorEl) {
-      try { this._hoveredActorEl.classList.remove('actor-drop-target'); } catch (_) {}
-      this._hoveredActorEl = null;
-    }
+    return this._interactionWorkflow.clearActorHoverHighlight();
   }
 
   _installActorClickBlocker() {
-    this._suppressNextActorClick = true;
-    if (this._pendingActorClickBlocker) return;
-    const blocker = (ev) => {
-      if (!this._suppressNextActorClick) {
-        document.removeEventListener('click', blocker, true);
-        this._pendingActorClickBlocker = null;
-        return;
-      }
-      ev.stopImmediatePropagation();
-      ev.preventDefault();
-      this._suppressNextActorClick = false;
-      document.removeEventListener('click', blocker, true);
-      this._pendingActorClickBlocker = null;
-    };
-    this._pendingActorClickBlocker = blocker;
-    document.addEventListener('click', blocker, true);
+    return this._interactionWorkflow.installActorClickBlocker();
   }
 
   _teardownActorClickBlocker() {
-    this._suppressNextActorClick = false;
-    if (this._pendingActorClickBlocker) {
-      document.removeEventListener('click', this._pendingActorClickBlocker, true);
-      this._pendingActorClickBlocker = null;
-    }
+    return this._interactionWorkflow.teardownActorClickBlocker();
+  }
+
+  _clearActorHoverIf(actorEl) {
+    return this._interactionWorkflow.clearActorHoverIf(actorEl);
+  }
+
+  _clearActorClickSuppression() {
+    return this._interactionWorkflow.clearActorClickSuppression();
   }
 
   async _prepareTokenPayload(cardElement, { authed = false, authState = null, allowPendingDownload = false } = {}) {
@@ -794,27 +587,16 @@ export class TokenPlacementManager {
             if (!local) throw new Error('Unable to download token asset');
             // Update card attributes for preview loading
             try {
-              cardElement._resolvedLocalPath = local;
-              cardElement.setAttribute('data-url', local);
-              // Only mark as cached if actually downloaded (not using direct CDN URL)
-              const isDirectUrl = /^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(local);
-              if (!isDirectUrl) {
-                cardElement.setAttribute('data-cached', 'true');
-                const icon = cardElement.querySelector('.fa-nexus-status-icon');
-                if (icon) {
-                  icon.classList.remove('cloud-plus', 'cloud', 'premium');
-                  icon.classList.add('cloud', 'cached');
-                  icon.title = 'Downloaded';
-                  icon.innerHTML = '<i class="fas fa-cloud-check"></i>';
-                }
-                const variantIcon = cardElement.querySelector('.fa-nexus-token-status-icon');
-                if (variantIcon) {
-                  variantIcon.classList.remove('premium', 'cloud-plus');
-                  variantIcon.classList.add('cloud', 'cached');
-                  variantIcon.title = 'Downloaded';
-                  variantIcon.innerHTML = '<i class="fas fa-cloud-check"></i>';
-                  cardElement.classList.remove('locked-token');
-                }
+              const cacheState = applyTokenCardCachedState(cardElement, local, {
+                iconSelector: '.fa-nexus-status-icon',
+                removeLocked: false
+              });
+              if (cacheState.cached && cardElement.querySelector('.fa-nexus-token-status-icon')) {
+                applyTokenCardCachedState(cardElement, local, {
+                  iconSelector: '.fa-nexus-token-status-icon',
+                  iconClassesToRemove: ['premium', 'cloud-plus'],
+                  setResolvedLocalPath: false
+                });
               }
             } catch (_) {}
             return local;
@@ -832,7 +614,7 @@ export class TokenPlacementManager {
         downloadPromise.catch((error) => {
           Logger.warn('TokenPlacement.download.pendingFailed', { error: String(error?.message || error) });
           if (this._current?.card === cardElement) {
-            ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
+            if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
             this.cancelPlacement('error');
           }
         });
@@ -927,7 +709,7 @@ export class TokenPlacementManager {
           });
         } finally {
           try { resolvedActorEl.classList.remove('actor-drop-target'); } catch (_) {}
-          if (this._hoveredActorEl === resolvedActorEl) this._hoveredActorEl = null;
+          this._clearActorHoverIf(resolvedActorEl);
           this._teardownActorClickBlocker();
           if (this.isPlacementActive && (event.shiftKey || this._stickyMode)) {
             const pointer = this._lastPointer || pointerSnapshot;
@@ -954,25 +736,29 @@ export class TokenPlacementManager {
       } else {
         let pendingHpOverride = null;
         const actorTypeOverride = this._getSelectedNewActorType();
-        const created = await ActorFactory.createActorFromDragData(dragData, drop, {
-          actorTypeOverride,
-          beforeTokenCreate: async (actorDoc) => {
-            const tokenOptions = {};
-            try {
-              pendingHpOverride = await this._resolveHpOverride({ actor: actorDoc });
-            } catch (error) {
-              Logger.warn('TokenPlacement.hp.resolveFailed', { scope: 'new-actor', error: String(error?.message || error) });
-              pendingHpOverride = null;
+        const created = await createActorTokenPlacement({
+          dragData,
+          drop,
+          options: {
+            actorTypeOverride,
+            beforeTokenCreate: async (actorDoc) => {
+              const tokenOptions = {};
+              try {
+                pendingHpOverride = await this._resolveHpOverride({ actor: actorDoc });
+              } catch (error) {
+                Logger.warn('TokenPlacement.hp.resolveFailed', { scope: 'new-actor', error: String(error?.message || error) });
+                pendingHpOverride = null;
+              }
+              if (pendingHpOverride) {
+                await this._applyHpOverrideToActorDocument(actorDoc, pendingHpOverride);
+                tokenOptions.hpOverride = pendingHpOverride;
+              }
+              if (this._supportsTokenNamingOptions()) {
+                if (this._appendNumberOverride !== null) tokenOptions.appendNumber = !!this._appendNumberOverride;
+                if (this._prependAdjectiveOverride !== null) tokenOptions.prependAdjective = !!this._prependAdjectiveOverride;
+              }
+              return tokenOptions;
             }
-            if (pendingHpOverride) {
-              await this._applyHpOverrideToActorDocument(actorDoc, pendingHpOverride);
-              tokenOptions.hpOverride = pendingHpOverride;
-            }
-            if (this._supportsTokenNamingOptions()) {
-              if (this._appendNumberOverride !== null) tokenOptions.appendNumber = !!this._appendNumberOverride;
-              if (this._prependAdjectiveOverride !== null) tokenOptions.prependAdjective = !!this._prependAdjectiveOverride;
-            }
-            return tokenOptions;
           }
         });
         Logger.info('TokenPlacement.actorType.createNew', {
@@ -999,12 +785,12 @@ export class TokenPlacementManager {
       return 'canvas';
     } catch (error) {
       Logger.warn('TokenPlacement.place.failed', { error: String(error?.message || error) });
-      ui.notifications?.error?.(`Failed to place token: ${error?.message || error}`);
+      if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to place token: ${error?.message || error}`);
       this._clearActorHoverHighlight();
       this._teardownActorClickBlocker();
       return 'none';
     } finally {
-      this._suppressNextActorClick = false;
+      this._clearActorClickSuppression();
       this._placing = false;
     }
   }
@@ -1050,50 +836,9 @@ export class TokenPlacementManager {
   }
 
   _normalizeEntry(entry) {
-    if (!entry) return null;
-    if (entry._nexusNormalized) return entry;
-    const card = entry.card || null;
-    const item = entry.source_item || entry.item || null;
-    const filename = entry.filename ?? item?.filename ?? card?.getAttribute?.('data-filename') ?? '';
-    const folderPath = entry.path ?? item?.path ?? card?.getAttribute?.('data-path') ?? '';
-    const filePathRaw = entry.file_path ?? item?.file_path ?? card?.getAttribute?.('data-file-path') ?? '';
-    const resolvedFilePath = filePathRaw || (folderPath && filename ? joinPath(folderPath, filename) : filename);
-    let cachedLocalPath = entry.cachedLocalPath ?? item?.cachedLocalPath ?? card?._resolvedLocalPath ?? '';
-    if (!cachedLocalPath) {
-      const cardCached = card?.getAttribute?.('data-cached') === 'true';
-      const cardUrl = card?.getAttribute?.('data-url') ?? '';
-      if (cardCached && cardUrl) cachedLocalPath = cardUrl;
-    }
-    // For local tokens, file_path is always available - use it as cachedLocalPath
-    const source = entry.source ?? item?.source ?? card?.getAttribute?.('data-source') ?? 'local';
-    if (!cachedLocalPath && String(source).toLowerCase() === 'local' && resolvedFilePath) {
-      cachedLocalPath = resolvedFilePath;
-    }
-    let resolvedPath = folderPath;
-    if (!resolvedPath && cachedLocalPath) resolvedPath = cachedLocalPath;
-    const normalized = {
-      card,
-      source_item: item,
-      source,
-      tier: entry.tier ?? item?.tier ?? card?.getAttribute?.('data-tier') ?? 'free',
-      filename,
-      file_path: resolvedFilePath,
-      path: resolvedPath,
-      cachedLocalPath,
-      display_name: entry.display_name ?? item?.display_name ?? card?.getAttribute?.('data-display-name') ?? '',
-      grid_width: Number(entry.grid_width ?? item?.grid_width ?? card?.getAttribute?.('data-grid-w') ?? 1) || 1,
-      grid_height: Number(entry.grid_height ?? item?.grid_height ?? card?.getAttribute?.('data-grid-h') ?? 1) || 1,
-      scale: (() => { const s = entry.scale ?? item?.scale ?? card?.getAttribute?.('data-scale') ?? 1; return (typeof s === 'string' && s.endsWith('x')) ? (Number(s.replace('x', '')) || 1) : (Number(s) || 1); })(),
-      color_variant: entry.color_variant ?? item?.color_variant ?? card?.getAttribute?.('data-variant') ?? null,
-      base_name_no_variant: entry.base_name_no_variant ?? item?.base_name_no_variant ?? '',
-      has_color_variant: entry.has_color_variant ?? !!item?.has_color_variant,
-      variant_group: entry.variant_group ?? item?.base_name_no_variant ?? item?.display_name ?? '',
-      thumbnail_url: entry.thumbnail_url ?? item?.thumbnail_url ?? '',
-      _ensureLocalPromise: entry._ensureLocalPromise || null
-    };
-    normalized.key = this._entryKey(normalized);
-    this._applyEntryAttributesToCard(normalized, card || null);
-    normalized._nexusNormalized = true;
+    const normalized = normalizeTokenPlacementEntry(entry);
+    if (!normalized) return null;
+    this._applyEntryAttributesToCard(normalized, normalized.card || null);
     return normalized;
   }
 
@@ -1189,7 +934,7 @@ export class TokenPlacementManager {
   _markEntryCached(entry, localPath) {
     if (!entry || !localPath) return;
     // Check if this is a direct CDN URL (not actually cached locally)
-    const isDirectUrl = /^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(localPath);
+    const isDirectUrl = isDirectTokenCacheUrl(localPath);
     if (!isDirectUrl) {
       entry.cachedLocalPath = localPath;
     }
@@ -1198,20 +943,7 @@ export class TokenPlacementManager {
     const card = entry.card || null;
     if (!card) return;
     try {
-      card._resolvedLocalPath = localPath;
-      card.setAttribute('data-url', localPath);
-      // Only mark as cached if actually downloaded locally
-      if (!isDirectUrl) {
-        card.setAttribute('data-cached', 'true');
-        const statusIcon = card.querySelector?.('.fa-nexus-status-icon');
-        if (statusIcon) {
-          statusIcon.classList.remove('cloud-plus', 'cloud', 'premium');
-          statusIcon.classList.add('cloud', 'cached');
-          statusIcon.title = 'Downloaded';
-          statusIcon.innerHTML = '<i class="fas fa-cloud-check"></i>';
-        }
-        card.classList.remove('locked-token');
-      }
+      applyTokenCardCachedState(card, localPath, { iconSelector: '.fa-nexus-status-icon' });
     } catch (_) {}
   }
 
@@ -1236,11 +968,10 @@ export class TokenPlacementManager {
     try { if (entry.key) card.setAttribute('data-key', entry.key); } catch (_) {}
     try {
       if (entry.cachedLocalPath) {
-        card.setAttribute('data-url', entry.cachedLocalPath);
-        card._resolvedLocalPath = entry.cachedLocalPath;
-        if (!/^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(entry.cachedLocalPath)) {
-          card.setAttribute('data-cached', 'true');
-        }
+        applyTokenCardCachedState(card, entry.cachedLocalPath, {
+          iconSelector: null,
+          removeLocked: false
+        });
       }
     } catch (_) {}
     try { card.setAttribute('data-display-name', entry.display_name || ''); } catch (_) {}
@@ -1313,7 +1044,7 @@ export class TokenPlacementManager {
     } catch (error) {
       Logger.warn('TokenPlacement.random.preparePayload.failed', { error: String(error?.message || error) });
       if (initial) {
-        ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
+        if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to start token placement: ${error?.message || error}`);
         this.cancelPlacement('error');
       }
       return;
@@ -1325,7 +1056,7 @@ export class TokenPlacementManager {
     }
 
     payload.url = this._resolveCurrentUrl(card, payload);
-    const autoAllowed = !this._placeAsUserModified;
+    const autoAllowed = !this._placeAsSelection.userModified;
     this._applyPlaceAsMatchContext(payload, card, {
       resetContext: autoAllowed && initial,
       autoSelect: autoAllowed
@@ -1384,7 +1115,7 @@ export class TokenPlacementManager {
       .catch((error) => {
         Logger.warn('TokenPlacement.random.pendingDownload.failed', { error: String(error?.message || error) });
         if (this._current && this._current.card === card) {
-          ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
+          if (!error?.faNexusNotified) ui.notifications?.error?.(`Failed to download token asset: ${error?.message || error}`);
           this.cancelPlacement('error');
         }
       })
@@ -1658,56 +1389,8 @@ export class TokenPlacementManager {
   _buildDeclarativeToolOptionsConfig(legacyState = {}) {
     const controls = {};
     const sections = [];
-    const addScalarRandomizedControl = ({
-      id,
-      label,
-      ariaLabel = '',
-      state,
-      variant = 'scale',
-      handlerId,
-      randomHandlerId = '',
-      strengthHandlerId = '',
-      randomMinHandlerId = '',
-      randomMaxHandlerId = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'scalar-randomized',
-        variant,
-        label: typeof state.label === 'string' && state.label.trim().length ? state.label.trim() : label,
-        ariaLabel,
-        state,
-        handlerId,
-        randomHandlerId,
-        strengthHandlerId,
-        randomMinHandlerId,
-        randomMaxHandlerId
-      };
-      return id;
-    };
-    const addAxisTogglePairControl = ({
-      id,
-      label,
-      state,
-      horizontalHandlerId,
-      verticalHandlerId,
-      horizontalRandomHandlerId = '',
-      verticalRandomHandlerId = ''
-    } = {}) => {
-      if (!id || !state || typeof state !== 'object') return null;
-      controls[id] = {
-        id,
-        type: 'axis-toggle-pair',
-        label,
-        state,
-        horizontalHandlerId,
-        verticalHandlerId,
-        horizontalRandomHandlerId,
-        verticalRandomHandlerId
-      };
-      return id;
-    };
+    const addScalarRandomizedControl = (config) => addDeclarativeScalarRandomizedControl(controls, config);
+    const addAxisTogglePairControl = (config) => addDeclarativeAxisTogglePairControl(controls, config);
     const transformControlIds = [];
     if (legacyState?.rotation?.available) {
       transformControlIds.push(addScalarRandomizedControl({
@@ -1927,7 +1610,7 @@ export class TokenPlacementManager {
   _ensureActorOptionsLoaded() {
     if (!globalThis?.game) return null;
     if (this._placeAsRefreshPromise) return this._placeAsRefreshPromise;
-    if (this._placeAsOptions.length) return null;
+    if (this._placeAsSelection.hasOptions) return null;
     return this._refreshActorOptions({ includeCompendium: true });
   }
 
@@ -2070,32 +1753,26 @@ export class TokenPlacementManager {
     if (this._placeAsRefreshPromise) return this._placeAsRefreshPromise;
     const promise = (async () => {
       const worldOptions = this._collectWorldActorOptions();
-      this._placeAsWorldOptions = worldOptions;
-      this._placeAsOptions = worldOptions.concat(this._placeAsCompendiumOptions || []);
-      this._rebuildPlaceAsOptionMap();
-      this._syncPlaceAsSelection();
+      this._applyPlaceAsStateResult(this._placeAsSelection.setWorldOptions(worldOptions));
       this._refreshPlaceAsSuggestions({ autoSelect: true });
       this._syncToolOptionsState({ suppressRender: false });
 
       if (!includeCompendium) return;
 
-      this._placeAsLoading = true;
+      this._placeAsSelection.setLoading(true);
       this._syncToolOptionsState({ suppressRender: false });
 
       try {
         const compOptions = await this._collectCompendiumActorOptions();
-        this._placeAsCompendiumOptions = compOptions;
-        this._placeAsLoadError = null;
+        this._applyPlaceAsStateResult(this._placeAsSelection.setCompendiumOptions(compOptions));
+        this._placeAsSelection.setLoadError(null);
       } catch (error) {
-        this._placeAsLoadError = error?.message || String(error);
-        Logger.warn('TokenPlacement.placeAs.compendiumLoadFailed', { error: this._placeAsLoadError });
+        this._placeAsSelection.setLoadError(error?.message || String(error));
+        Logger.warn('TokenPlacement.placeAs.compendiumLoadFailed', { error: this._placeAsSelection.loadError });
       } finally {
-        this._placeAsLoading = false;
+        this._placeAsSelection.setLoading(false);
       }
 
-      this._placeAsOptions = this._placeAsWorldOptions.concat(this._placeAsCompendiumOptions || []);
-      this._rebuildPlaceAsOptionMap();
-      this._syncPlaceAsSelection();
       this._refreshPlaceAsSuggestions({ autoSelect: true });
       this._syncToolOptionsState({ suppressRender: false });
     })();
@@ -2202,39 +1879,31 @@ export class TokenPlacementManager {
   }
 
   _rebuildPlaceAsOptionMap() {
-    this._placeAsOptionMap.clear();
-    for (const option of this._placeAsOptions) {
-      if (!option || !option.id) continue;
-      this._placeAsOptionMap.set(option.id, option);
-    }
-    if (this._placeAsSelectedOption) {
-      const replacement = this._placeAsOptionMap.get(this._placeAsSelectedOption.id);
-      if (replacement) this._placeAsSelectedOption = replacement;
-    }
+    this._placeAsSelection.rebuildOptionMap();
   }
 
   _syncPlaceAsSelection() {
-    if (this._placeAsSelectionId !== DEFAULT_PLACE_AS_SELECTION && !this._placeAsOptionMap.has(this._placeAsSelectionId)) {
-      this._placeAsSelectionId = DEFAULT_PLACE_AS_SELECTION;
-      this._placeAsLinked = false;
-      this._resetTokenNamingOverrides();
-    }
+    this._applyPlaceAsStateResult(this._placeAsSelection.syncSelection());
+  }
+
+  _applyPlaceAsStateResult(stateResult = null) {
+    if (stateResult?.resetTokenNamingOverrides) this._resetTokenNamingOverrides();
   }
 
   _loadExcludedPacks() {
     try {
       const raw = globalThis?.game?.settings?.get?.('fa-nexus', 'placeAsExcludedPacks') || '[]';
       const parsed = JSON.parse(raw);
-      this._placeAsExcludedPacks = new Set(Array.isArray(parsed) ? parsed : []);
+      this._placeAsSelection.setExcludedPacks(Array.isArray(parsed) ? parsed : []);
     } catch (error) {
       Logger.warn('TokenPlacement.placeAs.loadExcludedPacksFailed', { error: String(error?.message || error) });
-      this._placeAsExcludedPacks = new Set();
+      this._placeAsSelection.setExcludedPacks([]);
     }
   }
 
   _saveExcludedPacks() {
     try {
-      const value = JSON.stringify(Array.from(this._placeAsExcludedPacks));
+      const value = JSON.stringify(this._placeAsSelection.getExcludedPackIds());
       globalThis?.game?.settings?.set?.('fa-nexus', 'placeAsExcludedPacks', value);
     } catch (error) {
       Logger.warn('TokenPlacement.placeAs.saveExcludedPacksFailed', { error: String(error?.message || error) });
@@ -2242,27 +1911,17 @@ export class TokenPlacementManager {
   }
 
   _isPackExcluded(packId) {
-    return this._placeAsExcludedPacks.has(packId);
+    return this._placeAsSelection.isPackExcluded(packId);
   }
 
   _setPackExcluded(packId, excluded) {
-    if (excluded) {
-      this._placeAsExcludedPacks.add(packId);
-    } else {
-      this._placeAsExcludedPacks.delete(packId);
-    }
+    this._placeAsSelection.setPackExcluded(packId, excluded);
     this._saveExcludedPacks();
     this._refreshActorOptions();
   }
 
   _setMultiplePacksExcluded(packIds, excluded) {
-    for (const packId of packIds) {
-      if (excluded) {
-        this._placeAsExcludedPacks.add(packId);
-      } else {
-        this._placeAsExcludedPacks.delete(packId);
-      }
-    }
+    this._placeAsSelection.setMultiplePacksExcluded(packIds, excluded);
     this._saveExcludedPacks();
     this._refreshActorOptions();
   }
@@ -2279,7 +1938,7 @@ export class TokenPlacementManager {
           label: pack.metadata?.label || pack.title || pack.collection,
           folder: folderPath,
           packageName,
-          excluded: this._placeAsExcludedPacks.has(pack.collection)
+          excluded: this._placeAsSelection.isPackExcluded(pack.collection)
         };
       })
       .sort((a, b) => {
@@ -2303,7 +1962,7 @@ export class TokenPlacementManager {
   }
 
   _getExcludedPackCount() {
-    return this._placeAsExcludedPacks.size;
+    return this._placeAsSelection.getExcludedPackCount();
   }
 
   _openCompendiumFilterDialog() {
@@ -2320,395 +1979,87 @@ export class TokenPlacementManager {
 
   _togglePlaceAsOpen(value) {
     if (typeof value === 'boolean') return this._setPlaceAsOpen(value);
-    return this._setPlaceAsOpen(!this._placeAsOpen);
+    return this._setPlaceAsOpen(!this._placeAsSelection.open);
   }
 
   _setPlaceAsOpen(value) {
     const next = !!value;
     if (next) this._ensureActorOptionsLoaded();
-    const wasOpen = !!this._placeAsOpen;
-    if (wasOpen === next) {
+    const stateResult = this._placeAsSelection.setOpen(next);
+    this._applyPlaceAsStateResult(stateResult);
+    if (!stateResult.changed) {
       this._syncToolOptionsState();
       return true;
     }
-    this._placeAsOpen = next;
-    if (!next && this._placeAsSearch) {
-      this._placeAsSearch = '';
-    }
-    if (next) this._refreshPlaceAsSuggestions({ autoSelect: false });
     this._syncToolOptionsState({ suppressRender: false });
     return true;
   }
 
   _normalizeMatchString(value) {
-    if (!value) return '';
-    return String(value)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+    return normalizeMatchString(value);
   }
 
   _tokenizeMatchString(value) {
-    const normalized = this._normalizeMatchString(value);
-    if (!normalized) return [];
-    return normalized.split(' ');
+    return tokenizeMatchString(value);
   }
 
   _buildMatchTokens(...values) {
-    const tokens = new Set();
-    for (const value of values) {
-      if (!value) continue;
-      const parts = this._tokenizeMatchString(value);
-      for (const part of parts) {
-        if (part) tokens.add(part);
-      }
-    }
-    return Array.from(tokens);
+    return buildMatchTokens(...values);
   }
 
   _stripFileExtension(value) {
-    if (!value) return '';
-    return String(value).replace(/\.[^./\\]+$/, '');
+    return stripFileExtension(value);
   }
 
   _derivePlaceAsMatchKey(payload, card) {
-    const displayName = payload?.displayName || card?.getAttribute?.('data-display-name') || '';
-    const filename = payload?.filename || card?.getAttribute?.('data-filename') || '';
-    const variant = payload?.variant_group || payload?.variantGroup || '';
-    const fileStem = this._stripFileExtension(filename).replace(/[_-]+/g, ' ');
-    const baseName = displayName || fileStem || filename || variant || '';
-    const tokens = this._buildMatchTokens(displayName, fileStem, filename, variant);
-    const normalized = this._normalizeMatchString(baseName);
-    return {
-      raw: baseName,
-      normalized,
-      tokens
-    };
+    return derivePlaceAsMatchKey(payload, card);
   }
 
   _scorePlaceAsOption(option, { tokens = [], normalized = '' } = {}) {
-    if (!option) return 0;
-    const optionTokens = option.matchTokens && option.matchTokens.length
-      ? option.matchTokens
-      : this._tokenizeMatchString(option.label);
-    const optionNormalized = option.matchNormalized || this._normalizeMatchString(option.label);
-    const tokenSet = new Set(optionTokens);
-    let score = 0;
-
-    if (normalized) {
-      if (optionNormalized === normalized) score += 50;
-      else if (optionNormalized.startsWith(normalized) && normalized.length >= 3) score += 20;
-      else if (normalized.startsWith(optionNormalized) && optionNormalized.length >= 3) score += 12;
-      else if (optionNormalized.includes(normalized) && normalized.length >= 3) score += 10;
-    }
-
-    let matchCount = 0;
-    for (const token of tokens) {
-      if (!token) continue;
-      if (tokenSet.has(token)) {
-        matchCount += 1;
-        score += 12;
-      } else if (optionNormalized.includes(token)) {
-        matchCount += 0.5;
-        score += 6;
-      }
-      const sourceTokens = option.sourceTokens;
-      if (sourceTokens && sourceTokens.includes(token)) score += 3;
-      const packTokens = option.packTokens;
-      if (packTokens && packTokens.includes(token)) score += 2;
-    }
-
-    if (tokens.length && matchCount >= tokens.length) score += 8;
-
-    if (tokens.length) {
-      const diff = Math.abs(optionTokens.length - tokens.length);
-      score -= diff * 1.5;
-    }
-
-    if (option.type === 'world') score += 2;
-
-    if (normalized && option.sourceNormalized && option.sourceNormalized.includes(normalized)) {
-      score += 4;
-    }
-
-    return Math.max(score, 0);
+    return scorePlaceAsOption(option, { tokens, normalized });
   }
 
   _rankPlaceAsOptions({ tokens = [], normalized = '', includeCompendium = true, limit = MAX_PLACE_AS_SUGGESTIONS, allowZero = false } = {}) {
-    const candidates = [...this._placeAsWorldOptions];
-    if (includeCompendium) {
-      const filteredCompendium = this._placeAsCompendiumOptions.filter(
-        (option) => !this._placeAsExcludedPacks.has(option.pack)
-      );
-      candidates.push(...filteredCompendium);
-    }
-    const results = new Map();
-
-    candidates.forEach((option, index) => {
-      const score = this._scorePlaceAsOption(option, { tokens, normalized });
-      if (score <= 0 && !allowZero) return;
-      const existing = results.get(option.id);
-      if (existing) {
-        if (score > existing.score) {
-          existing.score = score;
-          existing.order = index;
-        }
-        return;
-      }
-      results.set(option.id, {
-        option,
-        score,
-        rank: option.type === 'world' ? 0 : 1,
-        order: index
-      });
+    return this._placeAsSelection.rankOptions({
+      tokens,
+      normalized,
+      includeCompendium,
+      limit,
+      allowZero
     });
-
-    let ranked = Array.from(results.values());
-
-    if (allowZero && ranked.length < limit) {
-      const seen = new Set(ranked.map((entry) => entry.option.id));
-      for (let i = 0; i < candidates.length && ranked.length < limit; i += 1) {
-        const option = candidates[i];
-        if (!option || seen.has(option.id)) continue;
-        ranked.push({
-          option,
-          score: 0,
-          rank: option.type === 'world' ? 0 : 1,
-          order: ranked.length + i
-        });
-        seen.add(option.id);
-      }
-    }
-
-    ranked.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (a.rank !== b.rank) return a.rank - b.rank;
-      const aSort = a.option.sort || '';
-      const bSort = b.option.sort || '';
-      if (aSort !== bSort) return aSort.localeCompare(bSort);
-      return a.order - b.order;
-    });
-
-    return ranked.slice(0, limit);
   }
 
   _refreshPlaceAsSuggestions({ autoSelect = false } = {}) {
-    const tokens = Array.isArray(this._placeAsMatchTokens) ? this._placeAsMatchTokens : [];
-    const normalized = this._placeAsMatchNormalized || '';
-    const allowZero = !tokens.length;
-    this._placeAsSuggestions = this._rankPlaceAsOptions({
-      tokens,
-      normalized,
-      includeCompendium: true,
-      limit: MAX_PLACE_AS_SUGGESTIONS,
-      allowZero
-    });
-    if (autoSelect) this._autoSelectPlaceAsFromSuggestions();
+    this._applyPlaceAsStateResult(this._placeAsSelection.refreshSuggestions({ autoSelect }));
   }
 
   _autoSelectPlaceAsFromSuggestions() {
-    if (this._placeAsUserModified) return;
-    const suggestions = this._placeAsSuggestions || [];
-    if (!suggestions.length) {
-      if (this._placeAsSelectionAuto && this._placeAsSelectionId !== DEFAULT_PLACE_AS_SELECTION) {
-        this._selectPlaceAsOption(DEFAULT_PLACE_AS_SELECTION, { user: false, auto: false });
-      }
-      this._placeAsSelectionAuto = false;
-      return;
-    }
-    const top = suggestions[0];
-    if (!top || top.score < MIN_AUTO_PLACE_AS_SCORE) {
-      if (this._placeAsSelectionAuto && this._placeAsSelectionId !== DEFAULT_PLACE_AS_SELECTION) {
-        this._selectPlaceAsOption(DEFAULT_PLACE_AS_SELECTION, { user: false, auto: false });
-      }
-      this._placeAsSelectionAuto = false;
-      return;
-    }
-    if (this._placeAsSelectionId !== DEFAULT_PLACE_AS_SELECTION && !this._placeAsSelectionAuto) return;
-    if (this._placeAsSelectionId === top.option.id) {
-      this._placeAsSelectionAuto = true;
-      return;
-    }
-    this._selectPlaceAsOption(top.option.id, { user: false, auto: true, option: top.option });
+    this._applyPlaceAsStateResult(this._placeAsSelection.autoSelectFromSuggestions());
   }
 
   _applyPlaceAsMatchContext(payload, card, { resetContext = false, autoSelect = true } = {}) {
     const derived = this._derivePlaceAsMatchKey(payload, card);
-    this._placeAsMatchRaw = derived.raw || '';
-    this._placeAsMatchNormalized = derived.normalized || '';
-    this._placeAsMatchTokens = Array.isArray(derived.tokens) ? derived.tokens : [];
-    if (resetContext) {
-      this._placeAsUserModified = false;
-      this._placeAsSelectionAuto = false;
-      this._placeAsSelectionId = DEFAULT_PLACE_AS_SELECTION;
-      this._placeAsLinked = false;
-      this._placeAsSelectedOption = null;
-      // Ensure naming controls reflect whatever actor gets auto-selected for this token,
-      // rather than retaining overrides from a previous placement session.
-      this._resetTokenNamingOverrides();
-    }
-    this._refreshPlaceAsSuggestions({ autoSelect });
+    this._applyPlaceAsStateResult(this._placeAsSelection.applyMatchContext(derived, { resetContext, autoSelect }));
   }
 
   _composePlaceAsDisplayList() {
-    const list = [];
-    const defaultSelected = this._placeAsSelectionId === DEFAULT_PLACE_AS_SELECTION;
-    list.push({
-      isHeader: false,
-      id: DEFAULT_PLACE_AS_SELECTION,
-      label: 'Create new basic actor',
-      subtitle: 'Creates a new actor for each placement.',
-      type: 'default',
-      selected: defaultSelected
-    });
-    const addedIds = new Set([DEFAULT_PLACE_AS_SELECTION]);
-
-    const queryNormalized = this._normalizeMatchString(this._placeAsSearch);
-    const queryTokens = queryNormalized ? queryNormalized.split(' ').filter(Boolean) : [];
-
-    if (queryTokens.length) {
-      let ranked = this._rankPlaceAsOptions({
-        tokens: queryTokens,
-        normalized: queryNormalized,
-        includeCompendium: true,
-        limit: MAX_PLACE_AS_RESULTS,
-        allowZero: false
-      });
-      if (!ranked.length) {
-        ranked = this._rankPlaceAsOptions({
-          tokens: queryTokens,
-          normalized: queryNormalized,
-          includeCompendium: true,
-          limit: MAX_PLACE_AS_RESULTS,
-          allowZero: true
-        });
-      }
-      for (const entry of ranked) {
-        if (!entry?.option) continue;
-        if (addedIds.has(entry.option.id)) continue;
-        list.push(this._formatPlaceAsOption(entry.option));
-        addedIds.add(entry.option.id);
-      }
-      return list;
-    }
-
-    const suggestions = (this._placeAsSuggestions || []).map((entry) => entry.option).filter(Boolean);
-    if (suggestions.length) {
-      list.push({ isHeader: true, label: 'Suggested Matches' });
-      for (const option of suggestions) {
-        if (addedIds.has(option.id)) continue;
-        list.push(this._formatPlaceAsOption(option));
-        addedIds.add(option.id);
-      }
-    }
-
-    const existingNonDefault = list.filter((entry) => !entry.isHeader && entry.id !== DEFAULT_PLACE_AS_SELECTION).length;
-    const remainingSlots = Math.max(0, MAX_PLACE_AS_RESULTS - existingNonDefault);
-    if (remainingSlots > 0 && this._placeAsWorldOptions.length) {
-      const worldOptions = this._placeAsWorldOptions
-        .filter((option) => !addedIds.has(option.id))
-        .slice(0, remainingSlots);
-      if (worldOptions.length) {
-        list.push({ isHeader: true, label: 'All World Actors' });
-        for (const option of worldOptions) {
-          list.push(this._formatPlaceAsOption(option));
-          addedIds.add(option.id);
-        }
-      }
-    }
-
-    return list;
+    return this._placeAsSelection.composeDisplayList();
   }
 
   _formatPlaceAsOption(option) {
-    return {
-      isHeader: false,
-      id: option.id,
-      label: option.label,
-      subtitle: this._formatPlaceAsSubtitle(option),
-      type: option.type,
-      selected: this._placeAsSelectionId === option.id
-    };
+    return this._placeAsSelection.formatOption(option);
   }
 
   _formatPlaceAsSubtitle(option) {
-    if (!option) return '';
-    if (option.type === 'world') {
-      return option.source ? option.source : 'World Actor';
-    }
-    if (option.type === 'compendium') {
-      return option.source ? `Compendium • ${option.source}` : 'Compendium Actor';
-    }
-    return 'Default';
+    return this._placeAsSelection.formatSubtitle(option);
   }
 
   _buildPlaceAsUIState() {
-    const options = this._composePlaceAsDisplayList();
     const selection = this._getActivePlaceAsSelection();
     const hpState = this._buildHpUIState(selection);
     const namingState = this._buildTokenNamingUIState(selection);
     const actorTypeState = this._buildNewActorTypeUIState(selection);
-    const isFiltered = (this._placeAsSearch || '').trim().length > 0;
-    const selectedLabel = (() => {
-      if (selection.mode === 'actor' && selection.option) {
-        return selection.option.label || 'Unnamed Actor';
-      }
-      return 'Create new basic actor';
-    })();
-    const actorSubtitle = (() => {
-      if (selection.mode === 'actor' && selection.option) {
-        return this._formatPlaceAsSubtitle(selection.option);
-      }
-      return 'Creates a new actor for each placement.';
-    })();
-    const selectedSubtitle = (() => {
-      const parts = [];
-      if (actorSubtitle) parts.push(actorSubtitle);
-      if (actorTypeState?.summary) parts.push(actorTypeState.summary);
-      if (hpState?.summary) parts.push(hpState.summary);
-      return parts.join(' • ');
-    })();
-    const hasSelectableOptions = options.some((entry) => !entry.isHeader && entry.id !== DEFAULT_PLACE_AS_SELECTION);
-    const emptyMessage = (() => {
-      if (!this._placeAsOpen) return '';
-      if (this._placeAsLoading) return 'Loading actors…';
-      if (isFiltered) return hasSelectableOptions ? '' : 'No actors match your search.';
-      return hasSelectableOptions ? '' : 'No world actors available. Create or import actors to reuse them.';
-    })();
-    const linkedDisabled = this._placeAsSelectionId === DEFAULT_PLACE_AS_SELECTION;
-    const excludedPackCount = this._getExcludedPackCount();
-    return {
-      available: true,
-      open: !!this._placeAsOpen,
-      searchValue: this._placeAsSearch,
-      options,
-      hasOptions: options.some((entry) => !entry.isHeader),
-      isLoading: !!this._placeAsLoading,
-      loadError: this._placeAsLoadError || '',
-      linked: !linkedDisabled && !!this._placeAsLinked,
-      linkedDisabled,
-      linkedLabel: 'Link placed tokens to actor',
-      linkedTooltip: linkedDisabled
-        ? 'Select an actor to enable linked placement.'
-        : 'Linked tokens reuse the actor sheet and update the prototype.',
-      emptyMessage,
-      isFiltered,
-      selectedId: this._placeAsSelectionId,
-      selectedLabel,
-      selectedSubtitle,
-      hasSelectableOptions,
-      actorType: actorTypeState,
-      hp: hpState,
-      naming: namingState,
-      filter: {
-        excludedCount: excludedPackCount,
-        hasExcluded: excludedPackCount > 0,
-        tooltip: excludedPackCount > 0
-          ? `${excludedPackCount} compendium${excludedPackCount === 1 ? '' : 's'} excluded`
-          : 'Filter compendiums'
-      }
-    };
+    return this._placeAsSelection.buildUiState({ hpState, namingState, actorTypeState });
   }
 
   _buildNewActorTypeUIState(selection) {
@@ -3138,87 +2489,34 @@ export class TokenPlacementManager {
   }
 
   _getActivePlaceAsSelection() {
-    const id = this._placeAsSelectionId;
-    if (!id || id === DEFAULT_PLACE_AS_SELECTION) return { mode: 'new' };
-    const option = this._placeAsOptionMap.get(id) || this._placeAsSelectedOption;
-    if (!option) return { mode: 'new' };
-    return {
-      mode: 'actor',
-      option,
-      linked: !!this._placeAsLinked
-    };
+    return this._placeAsSelection.getActiveSelection();
   }
 
   _setPlaceAsSearch(value) {
-    const next = typeof value === 'string' ? value.slice(0, 120) : '';
-    if (this._placeAsSearch === next) {
+    const stateResult = this._placeAsSelection.setSearch(value);
+    this._applyPlaceAsStateResult(stateResult);
+    if (!stateResult.changed) {
       this._syncToolOptionsState();
       return true;
     }
-    this._placeAsUserModified = true;
-    this._placeAsSelectionAuto = false;
-    this._placeAsSearch = next;
     this._syncToolOptionsState({ suppressRender: false });
     return true;
   }
 
   _selectPlaceAsOption(optionId, { user = true, auto = false, option = null } = {}) {
-    const previousSelectionId = this._placeAsSelectionId;
-    const id = typeof optionId === 'string' && optionId.length ? optionId : DEFAULT_PLACE_AS_SELECTION;
-    if (user) {
-      this._placeAsUserModified = true;
-      this._placeAsSelectionAuto = false;
-    } else if (auto) {
-      this._placeAsUserModified = false;
-      this._placeAsSelectionAuto = true;
-    }
-    if (id === DEFAULT_PLACE_AS_SELECTION) {
-      this._placeAsSelectionId = DEFAULT_PLACE_AS_SELECTION;
-      this._placeAsLinked = false;
-      this._placeAsOpen = false;
-      this._placeAsSearch = '';
-      this._placeAsSelectedOption = null;
-      if (!auto) this._placeAsSelectionAuto = false;
-      if (previousSelectionId !== this._placeAsSelectionId) this._resetTokenNamingOverrides();
-      this._syncToolOptionsState({ suppressRender: false });
-      return true;
-    }
-    let resolvedOption = option || this._placeAsOptionMap.get(id);
-    if (!resolvedOption && Array.isArray(this._placeAsSuggestions)) {
-      const entry = this._placeAsSuggestions.find((suggestion) => suggestion?.option?.id === id);
-      if (entry?.option) resolvedOption = entry.option;
-    }
-    if (!resolvedOption) {
-      this._syncPlaceAsSelection();
-      this._syncToolOptionsState({ suppressRender: false });
-      return false;
-    }
-    if (this._placeAsSelectionId === id) {
-      this._placeAsOpen = false;
-      this._syncToolOptionsState({ suppressRender: false });
-      return true;
-    }
-    this._placeAsSelectionId = id;
-    this._placeAsOpen = false;
-    this._placeAsSearch = '';
-    this._placeAsSelectedOption = resolvedOption;
-    if (previousSelectionId !== this._placeAsSelectionId) this._resetTokenNamingOverrides();
+    const stateResult = this._placeAsSelection.selectOption(optionId, { user, auto, option });
+    this._applyPlaceAsStateResult(stateResult);
     this._syncToolOptionsState({ suppressRender: false });
-    return true;
+    return stateResult.found !== false;
   }
 
   _setPlaceAsLinked(value, { user = true } = {}) {
-    const canLink = this._placeAsSelectionId !== DEFAULT_PLACE_AS_SELECTION;
-    const next = !!value && canLink;
-    if (this._placeAsLinked === next) {
+    const stateResult = this._placeAsSelection.setLinked(value, { user });
+    this._applyPlaceAsStateResult(stateResult);
+    if (!stateResult.changed) {
       this._syncToolOptionsState();
       return true;
     }
-    if (user) {
-      this._placeAsUserModified = true;
-      this._placeAsSelectionAuto = false;
-    }
-    this._placeAsLinked = next;
     this._syncToolOptionsState({ suppressRender: false });
     return true;
   }
@@ -3254,13 +2552,7 @@ export class TokenPlacementManager {
 
   _handleMissingActorOption(optionId) {
     if (!optionId) return;
-    this._placeAsOptionMap.delete(optionId);
-    this._placeAsWorldOptions = this._placeAsWorldOptions.filter((option) => option.id !== optionId);
-    this._placeAsOptions = this._placeAsOptions.filter((option) => option.id !== optionId);
-    if (this._placeAsSelectionId === optionId) {
-      this._placeAsSelectionId = DEFAULT_PLACE_AS_SELECTION;
-      this._placeAsLinked = false;
-    }
+    this._applyPlaceAsStateResult(this._placeAsSelection.handleMissingOption(optionId));
     this._syncToolOptionsState({ suppressRender: false });
   }
 
@@ -3372,218 +2664,16 @@ export class TokenPlacementManager {
   }
 
   async _createTokenFromSelection(actor, dragData, drop, { linked = false, hpOverride = null } = {}) {
-    if (!actor || !drop?.world) throw new Error('Missing placement context');
-    const tokenSize = dragData?.tokenSize || { gridWidth: 1, gridHeight: 1, scale: 1 };
-    let tokenProto = null;
-    if (typeof ActorFactory._buildTokenData === 'function') {
-      try {
-        tokenProto = ActorFactory._buildTokenData(dragData) || null;
-      } catch (_) {
-        tokenProto = null;
-      }
-    }
-    if (!tokenProto) {
-      const width = Number(tokenSize.gridWidth || 1) || 1;
-      const height = Number(tokenSize.gridHeight || 1) || 1;
-      const scale = Number(tokenSize.scale || 1) || 1;
-      tokenProto = {
-        width,
-        height,
-        depth: ActorFactory.resolveTokenDepthFromGridDimensions(width, height),
-        texture: {
-          src: dragData?.url || actor.prototypeToken?.texture?.src || '',
-          scaleX: scale * (dragData?.mirrorX ? -1 : 1),
-          scaleY: scale * (dragData?.mirrorY ? -1 : 1),
-          fit: 'contain'
-        }
-      };
-    }
-
-    const gridSize = canvas?.grid?.size || 100;
-    const tokenWidthPx = Number(tokenProto.width || 1) * gridSize;
-    const tokenHeightPx = Number(tokenProto.height || 1) * gridSize;
-    const tokenDepth = ActorFactory.resolveTokenDepthFromGridDimensions(
-      tokenProto.width,
-      tokenProto.height,
-      tokenProto.depth
-    );
-    const rotation = Number.isFinite(dragData?.rotation) ? Number(dragData.rotation) : 0;
-    const world = drop.world;
-    const x = world.x - tokenWidthPx / 2;
-    const y = world.y - tokenHeightPx / 2;
-    const {
-      levelId: tokenLevelId,
-      elevation: tokenElevation
-    } = ActorFactory._resolveCurrentTokenPlacementContext(canvas.scene);
-
-    const utils = foundry?.utils;
-    const protoScaleX = Number(tokenProto?.texture?.scaleX ?? tokenSize.scale ?? 1) || 1;
-    const protoScaleY = Number(tokenProto?.texture?.scaleY ?? tokenSize.scale ?? 1) || 1;
-    const protoMirrorX = tokenProto?.mirrorX ?? (protoScaleX < 0);
-    const protoMirrorY = tokenProto?.mirrorY ?? (protoScaleY < 0);
-    const baseScaleX = Math.abs(protoScaleX);
-    const baseScaleY = Math.abs(protoScaleY);
-    const actorProtoScaleX = Number(actor?.prototypeToken?.texture?.scaleX ?? 1) || 1;
-    const actorProtoScaleY = Number(actor?.prototypeToken?.texture?.scaleY ?? 1) || 1;
-    const actorProtoMirrorX = (actorProtoScaleX < 0) || !!actor?.prototypeToken?.mirrorX;
-    const actorProtoMirrorY = (actorProtoScaleY < 0) || !!actor?.prototypeToken?.mirrorY;
-    const requestMirrorX = dragData?.mirrorX !== undefined
-      ? !!dragData.mirrorX
-      : (protoMirrorX || actorProtoMirrorX);
-    const requestMirrorY = dragData?.mirrorY !== undefined
-      ? !!dragData.mirrorY
-      : (protoMirrorY || actorProtoMirrorY);
-    const appliedScaleX = baseScaleX * (requestMirrorX ? -1 : 1);
-    const appliedScaleY = baseScaleY * (requestMirrorY ? -1 : 1);
-
-    // Build token data using Actor#getTokenDocument where available so system-specific
-    // prototype token behavior (e.g. name generation) is preserved.
-    let merged = {};
-    try {
-      if (typeof actor.getTokenDocument === 'function') {
-        const namingOverrides = (!linked && this._supportsTokenNamingOptions())
-          ? {
-            ...(this._appendNumberOverride !== null ? { appendNumber: !!this._appendNumberOverride } : {}),
-            ...(this._prependAdjectiveOverride !== null ? { prependAdjective: !!this._prependAdjectiveOverride } : {})
-          }
-          : {};
-        const tokenTemplate = actor.getTokenDocument({
-          x,
-          y,
-          level: tokenLevelId,
-          elevation: tokenElevation,
-          width: Number(tokenProto.width || 1) || 1,
-          height: Number(tokenProto.height || 1) || 1,
-          depth: tokenDepth,
-          rotation,
-          lockRotation: false,
-          randomImg: false,
-          actorLink: !!linked,
-          ...namingOverrides
-        }, { parent: canvas.scene });
-        const resolvedTemplate = tokenTemplate && typeof tokenTemplate.then === 'function'
-          ? await tokenTemplate
-          : tokenTemplate;
-        merged = resolvedTemplate?.toObject?.() ?? resolvedTemplate ?? {};
-      } else {
-        merged = actor.prototypeToken?.toObject?.() ?? foundry?.utils?.deepClone?.(actor.prototypeToken ?? {}) ?? {};
-        if (utils?.mergeObject) {
-          merged = utils.mergeObject(merged, {
-            x,
-            y,
-            level: tokenLevelId,
-            elevation: tokenElevation,
-            width: Number(tokenProto.width || 1) || 1,
-            height: Number(tokenProto.height || 1) || 1,
-            depth: tokenDepth,
-            rotation,
-            lockRotation: false,
-            randomImg: false,
-            actorLink: !!linked
-          }, { inplace: false, overwrite: true, recursive: true });
-        }
-      }
-    } catch (error) {
-      Logger.error('TokenPlacement.actorTokenDocument.failed', {
-        actorId: actor?.id || null,
-        actorName: actor?.name || null,
-        level: tokenLevelId,
-        error: String(error?.message || error)
-      });
-      throw new Error(`Failed to prepare token document for ${actor?.name || 'actor'}: ${error?.message || error}`);
-    }
-
-    // Apply explicit texture overrides while preserving the rest of the prototype token data.
-    if (utils?.mergeObject) {
-      try {
-        merged = utils.mergeObject(merged, {
-          texture: {
-            ...(merged?.texture || {}),
-            src: dragData?.url || merged?.texture?.src || actor.prototypeToken?.texture?.src || '',
-            scaleX: appliedScaleX,
-            scaleY: appliedScaleY,
-            fit: tokenProto?.texture?.fit || merged?.texture?.fit || actor.prototypeToken?.texture?.fit || 'contain'
-          },
-          flags: {
-            ...(merged?.flags || {}),
-            'fa-nexus': {
-              ...(merged?.flags?.['fa-nexus'] || {}),
-              customScale: true,
-              originalScale: baseScaleX
-            }
-          }
-        }, { inplace: false, overwrite: true, recursive: true });
-      } catch (_) {}
-    } else {
-      merged.texture = merged.texture || {};
-      merged.texture.src = dragData?.url || merged.texture.src || actor.prototypeToken?.texture?.src || '';
-      merged.texture.scaleX = appliedScaleX;
-      merged.texture.scaleY = appliedScaleY;
-      merged.texture.fit = tokenProto?.texture?.fit || merged.texture.fit || actor.prototypeToken?.texture?.fit || 'contain';
-      merged.flags = merged.flags || {};
-      merged.flags['fa-nexus'] = {
-        ...(merged.flags['fa-nexus'] || {}),
-        customScale: true,
-        originalScale: baseScaleX
-      };
-    }
-
-    if (!linked && this._supportsTokenNamingOptions()) {
-      if (this._appendNumberOverride !== null) merged.appendNumber = !!this._appendNumberOverride;
-      if (this._prependAdjectiveOverride !== null) merged.prependAdjective = !!this._prependAdjectiveOverride;
-    }
-
-    try { delete merged._id; } catch (_) {}
-    merged.actorId = actor.id;
-    merged.actorLink = !!linked;
-    merged.randomImg = false;
-    merged.level = tokenLevelId;
-    merged.elevation = tokenElevation;
-    merged.depth = tokenDepth;
-    if (hpOverride && !linked) {
-      this._applyHpOverrideToTokenData(merged, hpOverride);
-    }
-
-    const tokenDoc = await TokenDocument.create(merged, { parent: canvas.scene });
-    if (dragData?.mirrorX !== undefined || dragData?.mirrorY !== undefined) {
-      try {
-        await tokenDoc.update({
-          'texture.scaleX': appliedScaleX,
-          'texture.scaleY': appliedScaleY
-        }, { animate: false });
-      } catch (_) {}
-    }
-    await this._applySystemScaleFixes(tokenDoc, {
-      appliedScaleX,
-      appliedScaleY,
-      baseScaleX
+    return createTokenPlacementDocument({
+      actor,
+      dragData,
+      drop,
+      linked,
+      hpOverride,
+      appendNumberOverride: this._appendNumberOverride,
+      prependAdjectiveOverride: this._prependAdjectiveOverride,
+      supportsTokenNamingOptions: this._supportsTokenNamingOptions()
     });
-    return tokenDoc;
-  }
-
-  async _applySystemScaleFixes(tokenDoc, { appliedScaleX, appliedScaleY, baseScaleX }) {
-    const systemId = SystemDetection.getCurrentSystemId?.();
-    if (!systemId || !tokenDoc) return;
-    try {
-      if (systemId === 'pf2e') {
-        await tokenDoc.update({
-          'texture.scaleX': appliedScaleX,
-          'texture.scaleY': appliedScaleY,
-          'flags.pf2e.linkToActorSize': false,
-          'flags.fa-nexus.customScale': true,
-          'flags.fa-nexus.originalScale': baseScaleX
-        }, { animate: false });
-      } else if (systemId === 'dsa5') {
-        setTimeout(async () => {
-          try {
-            await tokenDoc.update({
-              'texture.scaleX': appliedScaleX,
-              'texture.scaleY': appliedScaleY
-            }, { animate: false });
-          } catch (_) {}
-        }, 50);
-      }
-    } catch (_) {}
   }
 
   async _resolveHpOverride({ actor = null, tokenDoc = null } = {}) {
@@ -3646,12 +2736,24 @@ export class TokenPlacementManager {
     await this._withScrollingTextSuppressed(async () => {
       const updateOptions = { animate: false };
       const updatePromises = [];
+      const updateContexts = [];
+      const tokenId = tokenDoc?.id ?? tokenDoc?._id;
+      const queueUpdate = (promise, context) => {
+        updatePromises.push(promise);
+        updateContexts.push(context);
+      };
+      const hpErrorString = (error) => String(error?.message || error).replace(/https?:\/\/\S+/gi, '[url]');
 
       if (applyToActor && actor?.update) {
         const payload = {};
         payload[valuePath] = hpOverride.value;
         payload[maxPath] = hpOverride.max;
-        updatePromises.push(actor.update(payload, updateOptions));
+        queueUpdate(actor.update(payload, updateOptions), {
+          scope: 'actor-prototype',
+          actorId: actor?.id ?? actor?._id,
+          actorName: actor?.name,
+          tokenId
+        });
       }
 
       const tokenIsLinked = tokenDoc?.actorLink ?? tokenDoc?.data?.actorLink ?? tokenDoc?._source?.actorLink;
@@ -3659,12 +2761,17 @@ export class TokenPlacementManager {
         const payload = {};
         payload[`actorData.${valuePath}`] = hpOverride.value;
         payload[`actorData.${maxPath}`] = hpOverride.max;
-        updatePromises.push(tokenDoc.update(payload, {
+        queueUpdate(tokenDoc.update(payload, {
           ...updateOptions,
           render: false,
           diff: false,
           faNexusSuppressFloaty: true
-        }));
+        }), {
+          scope: 'unlinked-token-actor-data',
+          actorId: actor?.id ?? actor?._id ?? tokenDoc?.actor?.id ?? tokenDoc?.actor?._id,
+          actorName: actor?.name ?? tokenDoc?.actor?.name,
+          tokenId
+        });
       }
 
       const tokenActor = tokenDoc?.actor;
@@ -3672,16 +2779,29 @@ export class TokenPlacementManager {
         const payload = {};
         payload[valuePath] = hpOverride.value;
         payload[maxPath] = hpOverride.max;
-        updatePromises.push(tokenActor.update(payload, {
+        queueUpdate(tokenActor.update(payload, {
           ...updateOptions,
           render: false,
           diff: false,
           faNexusSuppressFloaty: true
-        }));
+        }), {
+          scope: 'token-actor',
+          actorId: tokenActor?.id ?? tokenActor?._id,
+          actorName: tokenActor?.name,
+          tokenId
+        });
       }
 
       if (updatePromises.length) {
-        await Promise.allSettled(updatePromises);
+        const updateResults = await Promise.allSettled(updatePromises);
+        for (const [index, result] of updateResults.entries()) {
+          if (result.status !== 'rejected') continue;
+          Logger.warn('TokenPlacement.hp.updateRejected', {
+            ...updateContexts[index],
+            hpPath,
+            error: hpErrorString(result.reason)
+          });
+        }
       }
     });
   }
@@ -3708,43 +2828,6 @@ export class TokenPlacementManager {
       Logger.warn('TokenPlacement.hp.applyToActorFailed', { error: String(error?.message || error) });
       return false;
     }
-  }
-
-  _applyHpOverrideToTokenData(target, override) {
-    if (!target || !override) return false;
-    const utils = foundry?.utils;
-    const hpPath = override.path || 'system.attributes.hp';
-    const valuePath = `actorData.${hpPath}.value`;
-    const maxPath = `actorData.${hpPath}.max`;
-    try {
-      if (utils?.setProperty) {
-        utils.setProperty(target, valuePath, override.value);
-        utils.setProperty(target, maxPath, override.max);
-        return true;
-      }
-    } catch (error) {
-      Logger.warn('TokenPlacement.hp.injectFailed', { error: String(error?.message || error) });
-    }
-    // Fallback manual assignment
-    const ensure = (obj, pathParts) => {
-      let cursor = obj;
-      for (let i = 0; i < pathParts.length - 1; i += 1) {
-        const key = pathParts[i];
-        if (cursor[key] === undefined || cursor[key] === null) cursor[key] = {};
-        cursor = cursor[key];
-      }
-      return cursor;
-    };
-    const apply = (path, value) => {
-      const parts = String(path).split('.').filter((part) => part.length);
-      if (!parts.length) return;
-      const leafParent = ensure(target, parts);
-      const leafKey = parts[parts.length - 1];
-      leafParent[leafKey] = value;
-    };
-    apply(valuePath, override.value);
-    apply(maxPath, override.max);
-    return true;
   }
 
   _resolveActorHpData(actor, tokenDoc) {

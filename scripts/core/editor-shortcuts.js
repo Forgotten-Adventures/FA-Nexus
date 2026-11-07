@@ -5,6 +5,7 @@ export const SHORTCUT_ACTION = Object.freeze({
   UNDO: 'undo',
   REDO: 'redo',
   TOGGLE_GRID_SNAP: 'toggle-grid-snap',
+  TOGGLE_WALL_SNAP: 'toggle-wall-snap',
   ADJUST_GRID_SNAP: 'adjust-grid-snap',
   TOGGLE_POLARITY: 'toggle-polarity',
   TEMPORARY_INVERT_POLARITY: 'temporary-invert-polarity'
@@ -17,6 +18,7 @@ export const SHORTCUT_BINDING = Object.freeze({
   [SHORTCUT_ACTION.UNDO]: 'Ctrl/Cmd+Z',
   [SHORTCUT_ACTION.REDO]: 'Ctrl/Cmd+Y / Ctrl/Cmd+Shift+Z',
   [SHORTCUT_ACTION.TOGGLE_GRID_SNAP]: 'S',
+  [SHORTCUT_ACTION.TOGGLE_WALL_SNAP]: 'Shift+S',
   [SHORTCUT_ACTION.ADJUST_GRID_SNAP]: 'S + Wheel',
   [SHORTCUT_ACTION.TOGGLE_POLARITY]: 'E',
   [SHORTCUT_ACTION.TEMPORARY_INVERT_POLARITY]: 'Hold Alt'
@@ -132,6 +134,16 @@ export function isGridSnapShortcut(event) {
     && !event.altKey
     && !event.ctrlKey
     && !event.metaKey
+    && !event.shiftKey
+    && String(event.key || '').toLowerCase() === 's';
+}
+
+export function isWallSnapShortcut(event) {
+  return !!event
+    && !event.altKey
+    && !event.ctrlKey
+    && !event.metaKey
+    && event.shiftKey === true
     && String(event.key || '').toLowerCase() === 's';
 }
 

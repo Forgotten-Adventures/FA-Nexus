@@ -1,4 +1,6 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { buildPatreonConnectedHoverText } from './patreon-auth-contract.js';
+import { premiumEntitlementsService } from './premium-entitlements-service.js';
 import { getPremiumHeaderBadge } from './premium-runtime-config.js';
 
 function createFaIcon(iconClass) {
@@ -93,14 +95,14 @@ export function renderPatreonAuthHeader({ app, headerElement, getAuthService }) 
     }
 
     if (auth && auth.authenticated) {
-      const status = document.createElement('div');
+      const status = document.createElement('button');
+      status.type = 'button';
       status.className = 'auth-status-display';
-      const tier = String(auth.tier || 'vip');
-      const src = String(auth.source || 'patreon:main');
       status.appendChild(createFaIcon('fa-check-circle'));
-      status.appendChild(createTextSpan('auth-tier-text', `${tier} supporter`));
-      status.appendChild(createTextSpan('auth-source-text', `(${src})`));
-      status.title = 'Click to disconnect';
+      status.appendChild(createTextSpan('auth-tier-text', 'Patreon connected'));
+      const hoverText = buildPatreonConnectedHoverText(auth, premiumEntitlementsService.entitlements);
+      status.title = hoverText;
+      status.setAttribute('aria-label', hoverText.replace(/\n/g, '. '));
       status.setAttribute('data-disconnect-handler', 'true');
       status.style.pointerEvents = 'auto';
       status.addEventListener('click', (event) => {

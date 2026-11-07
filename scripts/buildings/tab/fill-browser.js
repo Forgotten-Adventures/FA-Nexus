@@ -1,5 +1,6 @@
 import { AssetsTab } from '../../assets/assets-tab.js';
-import { BookmarkToolbar } from '../../core/bookmarks/bookmark-toolbar.js';
+import { BookmarkToolbar } from '../../core/ui/bookmarks/bookmark-toolbar.js';
+import { applyGridDensityStyles } from '../../core/ui/grid-density-styles.js';
 import {
   BUILDING_TEXTURE_BOOKMARK_TAB,
   BUILDING_TEXTURE_THUMB_SETTING,
@@ -271,15 +272,10 @@ export const fillBrowserMethods = {
       try { this._texturesGrid.setCardSize(dims.width, dims.height); } catch (_) {}
     }
     const container = this._texturesGrid?.container || this._texturesGridContainer;
-    if (container) {
-      const min = this.thumbSliderMin;
-      const max = this.thumbSliderMax;
-      const t = Math.max(0, Math.min(1, (sanitized - min) / (max - min || 1)));
-      container.style.setProperty('--fa-nexus-card-pad', `${2 + (6 - 2) * t}px`);
-      container.style.setProperty('--fa-nexus-title-size', `${0.68 + (0.78 - 0.68) * t}rem`);
-      container.style.setProperty('--fa-nexus-details-size', `${0.58 + (0.68 - 0.58) * t}rem`);
-      container.style.setProperty('--fa-nexus-footer-pt', `${4 * t}px`);
-    }
+    const min = this.thumbSliderMin;
+    const max = this.thumbSliderMax;
+    const t = Math.max(0, Math.min(1, (sanitized - min) / (max - min || 1)));
+    applyGridDensityStyles(container, t);
   },
 
   _ensureTextureBookmarkToolbar() {
@@ -605,12 +601,11 @@ export const fillBrowserMethods = {
       event.preventDefault();
       event.stopPropagation();
       if (!(await this._ensureBuildingEditorAccess())) return;
-      const previousKey = this._selectedFillTextureKey;
       this._selectFillTexture(NONE_TEXTURE_KEY);
       this._refreshVisibleTextureSelection();
-      if (previousKey !== NONE_TEXTURE_KEY) {
-        await this._handleFillTextureSelectionChanged({ key: NONE_TEXTURE_KEY, item: this._noneTextureItem, cardElement, triggerEvent: event });
-      }
+      // Every click reaches the editor, as for a texture card: the card last clicked here says nothing
+      // about the Fill of the Building or room now being edited (Undo, or selecting a room, changes it).
+      await this._handleFillTextureSelectionChanged({ key: NONE_TEXTURE_KEY, item: this._noneTextureItem, cardElement, triggerEvent: event });
     };
     cardElement.addEventListener('click', clickHandler);
     cardElement._faNoneTextureClick = clickHandler;

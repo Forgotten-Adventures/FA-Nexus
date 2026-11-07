@@ -9,7 +9,7 @@ import {
 import { isHelpShortcut } from '../editor-shortcuts.js';
 import {
   TOOL_OPTIONS_RENDERER_MODE
-} from '../tool-options-descriptor.js';
+} from './tool-options-descriptor.js';
 import {
   DEFAULT_WINDOW_TITLE,
   MODULE_ID,
@@ -36,22 +36,15 @@ import {
   prepareShowWidthTangentsContext,
   prepareTextureOffsetContext
 } from './context-normalizers.js';
+import { prepareDeclarativePortalControl } from './portal-control-preparation.js';
+import {
+  shouldForceToolOptionsRenderForStateChange,
+  syncToolOptionsWindowInPlace
+} from './render-update-plan.js';
 
 class ToolOptionsWindowRenderMethods {
   _syncDropShadowPreview(preview) {
-    const root = this._dropShadowPreviewRoot;
-    const image = this._dropShadowPreviewImage;
-    if (!root || !image) return;
-    const hasPreview = preview && typeof preview === 'object' && typeof preview.src === 'string' && preview.src.length > 0;
-    if (hasPreview) {
-      if (image.src !== preview.src) image.src = preview.src;
-      if (preview.alt !== undefined) image.alt = String(preview.alt || '');
-      root.classList.remove('is-empty');
-    } else {
-      if (image.hasAttribute('src')) image.removeAttribute('src');
-      image.alt = '';
-      root.classList.add('is-empty');
-    }
+    this._dropShadowControlsWorkflow.syncPreview(preview);
   }
 
   applyDropShadowPreview(preview) {
@@ -72,137 +65,9 @@ class ToolOptionsWindowRenderMethods {
 
 
   _shouldForceRenderForStateChange(previousState = {}, nextState = {}) {
-    const prevRevision = previousState?.layoutRevision ?? null;
-    const nextRevision = nextState?.layoutRevision ?? null;
-    if (prevRevision !== nextRevision) return true;
-    const buildPortalLayoutSignature = (portalState, variant = '') => {
-      const prepared = this._prepareDeclarativePortalControl({
-        id: `__${variant}-portal-layout-signature__`,
-        type: 'portal-controls',
-        variant,
-        state: portalState
-      }, `__${variant}-portal-layout-signature__`);
-      if (!prepared) return '';
-      return JSON.stringify({
-        variant: prepared.variant,
-        title: String(prepared.title || ''),
-        selectionLabel: String(prepared.selectionLabel || ''),
-        headerActions: Array.isArray(prepared.headerActions)
-          ? prepared.headerActions.map((action) => ({
-              id: String(action?.id || ''),
-              hidden: !!action?.hidden
-            }))
-          : [],
-        toggleGroups: Array.isArray(prepared.toggleGroups)
-          ? prepared.toggleGroups.map((group) => ({
-              id: String(group?.id || ''),
-              visible: group?.visible !== false,
-              items: Array.isArray(group?.items)
-                ? group.items.map((item) => String(item?.id || ''))
-                : []
-            }))
-          : [],
-        selectGroups: Array.isArray(prepared.selectGroups)
-          ? prepared.selectGroups.map((group) => ({
-              id: String(group?.id || ''),
-              visible: group?.visible !== false,
-              items: Array.isArray(group?.items)
-                ? group.items.map((item) => ({
-                    id: String(item?.id || ''),
-                    options: Array.isArray(item?.options)
-                      ? item.options.map((option, index) => ({
-                          value: String(option?.value ?? index),
-                          label: String(option?.label || '')
-                        }))
-                      : []
-                  }))
-                : []
-            }))
-          : [],
-        color: prepared.color ? {
-          visible: prepared.color.visible !== false,
-          target: prepared.color.target ? {
-            id: String(prepared.color.target.id || ''),
-            visible: prepared.color.target.visible !== false,
-            items: Array.isArray(prepared.color.target.items)
-              ? prepared.color.target.items.map((item) => ({
-                  id: String(item?.id || ''),
-                  label: String(item?.label || ''),
-                  enabled: !!item?.enabled,
-                  disabled: !!item?.disabled
-                }))
-              : []
-          } : null,
-          rows: Array.isArray(prepared.color.rows)
-            ? prepared.color.rows.map((row) => ({
-                id: String(row?.id || ''),
-                label: String(row?.label || '')
-              }))
-            : []
-        } : null,
-        sections: Array.isArray(prepared.sections)
-          ? prepared.sections.map((section) => ({
-              id: String(section?.id || ''),
-              visible: section?.visible !== false,
-              summary: String(section?.summary || ''),
-              picker: section?.picker ? {
-                id: String(section.picker.id || ''),
-                hidden: !!section.picker.hidden
-              } : null,
-              settings: section?.settings ? {
-                id: String(section.settings.id || ''),
-                visible: section.settings.visible !== false,
-                rows: Array.isArray(section.settings.rows)
-                  ? section.settings.rows.map((row) => ({
-                      id: String(row?.id || ''),
-                      label: String(row?.label || ''),
-                      valueMode: String(row?.valueMode || ''),
-                      hasHint: !!row?.hint
-                    }))
-                  : []
-              } : null
-            }))
-          : []
-      });
-    };
-    const paths = [
-      ['scale', 'available'],
-      ['rotation', 'available'],
-      ['pathAppearance', 'available'],
-      ['pathAppearance', 'layerOpacity', 'available'],
-      ['pathAppearance', 'scale', 'available'],
-      ['pathAppearance', 'textureOffset', 'available'],
-      ['pathAppearance', 'tension', 'available'],
-      ['pathAppearance', 'freehandSimplify', 'available'],
-      ['pathAppearance', 'showWidthTangents', 'available'],
-      ['pathShadow', 'available'],
-      ['pathFeather', 'available'],
-      ['opacityFeather', 'available'],
-      ['dropShadowControls', 'available'],
-      ['dropShadow', 'available'],
-      ['flip', 'available'],
-      ['placeAs', 'naming', 'available'],
-      ['shapeStacking', 'available']
-    ];
-    const valueAtPath = (state, path) => {
-      let cursor = state;
-      for (const segment of path) {
-        if (!cursor || typeof cursor !== 'object') return undefined;
-        cursor = cursor[segment];
-      }
-      return typeof cursor === 'boolean' ? cursor : !!cursor;
-    };
-    return paths.some((path) => {
-      const previous = valueAtPath(previousState, path);
-      const next = valueAtPath(nextState, path);
-      return !previous && !!next;
-    }) || (
-      buildPortalLayoutSignature(previousState?.doorControls, 'door')
-      !== buildPortalLayoutSignature(nextState?.doorControls, 'door')
-    ) || (
-      buildPortalLayoutSignature(previousState?.windowControls, 'window')
-      !== buildPortalLayoutSignature(nextState?.windowControls, 'window')
-    );
+    return shouldForceToolOptionsRenderForStateChange(previousState, nextState, {
+      preparePortalControl: (control, id) => this._prepareDeclarativePortalControl(control, id)
+    });
   }
 
   setActiveToolOptions(options = {}, { suppressRender = false } = {}) {
@@ -216,32 +81,7 @@ class ToolOptionsWindowRenderMethods {
     const forceRender = suppressRender && this.rendered && this._shouldForceRenderForStateChange(previousState, nextState);
     this._toolOptionState = nextState;
     if (this.rendered && (!suppressRender || forceRender)) this.render(false);
-    else if (this.rendered) {
-      this._syncGridSnapControl();
-      this._syncDropShadowControl();
-      this._syncDropShadowControls();
-      this._syncDeclarativeSegmentedControls();
-      this._syncEditorActions();
-      this._syncDeclarativeToggleControls();
-      this._syncDeclarativeRangeControls();
-      this._syncDeclarativeRangePairControls();
-      this._syncDeclarativeAxisPairControls();
-      this._syncDeclarativeScalarRandomizedControls();
-      this._syncDeclarativeStackOrderControls();
-      this._syncPathAppearanceControls();
-      this._syncCustomToggles();
-      this._syncPlacementControls();
-      this._syncFlipControls();
-      this._syncScaleControls();
-      this._syncRotationControls();
-      this._syncPathShadowControls();
-      this._syncPathFeatherControls();
-      this._syncOpacityFeatherControls();
-      this._syncShortcutsControls();
-      this._syncPlaceAsControls();
-      this._syncPortalControls();
-      this._syncDynamicSections();
-    }
+    else if (this.rendered) syncToolOptionsWindowInPlace(this);
   }
 
   _resolveWindowTitle() {
@@ -653,14 +493,21 @@ class ToolOptionsWindowRenderMethods {
     }
 
     const headerSections = preparedSections.filter((section) => section.region === 'header');
-    const bodySections = preparedSections.filter((section) => section.region !== 'header' && section.region !== 'footer');
+    const bodySections = preparedSections.filter((section) => !['header', 'footer', 'footer-snap'].includes(section.region));
     const footerSections = preparedSections.filter((section) => section.region === 'footer');
+    const footerSnapControls = preparedSections
+      .filter((section) => section.region === 'footer-snap')
+      .flatMap((section) => section.controls);
+    const hasModeRail = preparedSections.some((section) => section.controls.some(
+      (control) => control?.type === 'segmented' && control?.variant === 'mode-rail'
+    ));
     const placeAs = normalized?.legacyState?.placeAs && typeof normalized.legacyState.placeAs === 'object'
       ? normalized.legacyState.placeAs
       : null;
 
     return {
       isDeclarative: true,
+      footerSnapControls,
       hasActiveTool: !!tool,
       activeToolId: tool?.id ?? null,
       activeToolLabel: tool?.label ?? '',
@@ -670,6 +517,7 @@ class ToolOptionsWindowRenderMethods {
       help,
       placeAs: placeAs || { available: false },
       declarative: {
+        hasModeRail,
         hasHeaderSections: headerSections.length > 0,
         hasBodySections: bodySections.length > 0,
         hasFooterSections: footerSections.length > 0,
@@ -719,7 +567,8 @@ class ToolOptionsWindowRenderMethods {
       offLabel: typeof toggle?.offLabel === 'string' ? toggle.offLabel : '',
       enabled: !!toggle?.enabled,
       disabled: !!toggle?.disabled,
-      icon: typeof toggle?.icon === 'string' ? toggle.icon : ''
+      icon: typeof toggle?.icon === 'string' ? toggle.icon : '',
+      tone: typeof toggle?.tone === 'string' ? toggle.tone : ''
     });
     const mapAction = (action) => ({
       id: String(action?.id || ''),
@@ -768,6 +617,7 @@ class ToolOptionsWindowRenderMethods {
         id,
         type,
         handlerId: typeof control.handlerId === 'string' ? control.handlerId : '',
+        previewHandlerId: typeof control.previewHandlerId === 'string' ? control.previewHandlerId : '',
         actions
       };
     }
@@ -951,6 +801,36 @@ class ToolOptionsWindowRenderMethods {
       };
     }
 
+    if (type === 'scalar') {
+      const variant = control.variant === 'rotation' ? 'rotation' : 'scale';
+      const state = variant === 'rotation'
+        ? prepareRotationContext(control.state)
+        : prepareScaleContext(control.state);
+      if (!state.available) return null;
+      return {
+        ...control,
+        id,
+        type,
+        variant,
+        wrap: variant === 'rotation' && control.state?.wrap === true,
+        label: typeof control.label === 'string' && control.label.trim().length
+          ? control.label.trim()
+          : (variant === 'rotation' ? 'Rotation' : 'Scale'),
+        ariaLabel: typeof control.ariaLabel === 'string' && control.ariaLabel.trim().length
+          ? control.ariaLabel.trim()
+          : (variant === 'rotation' ? 'Rotation' : 'Scale'),
+        handlerId: typeof control.handlerId === 'string' ? control.handlerId : '',
+        hint: typeof control.hint === 'string' ? control.hint : '',
+        min: state.min,
+        max: state.max,
+        step: state.step,
+        value: state.value,
+        display: state.display,
+        disabled: !!state.disabled,
+        defaultValue: state.defaultValue
+      };
+    }
+
     if (type === 'scalar-randomized') {
       const variant = control.variant === 'rotation' ? 'rotation' : 'scale';
       const state = variant === 'rotation'
@@ -1023,14 +903,24 @@ class ToolOptionsWindowRenderMethods {
         orderLabel: state.orderLabel,
         elevationLabel: state.elevationLabel,
         hint: state.hint,
+        raiseLabel: typeof control.raiseLabel === 'string' && control.raiseLabel.trim().length
+          ? control.raiseLabel.trim()
+          : 'Move Above',
+        lowerLabel: typeof control.lowerLabel === 'string' && control.lowerLabel.trim().length
+          ? control.lowerLabel.trim()
+          : 'Move Below',
         pushTopLabel: typeof control.pushTopLabel === 'string' && control.pushTopLabel.trim().length
           ? control.pushTopLabel.trim()
           : 'Push to Top',
         pushBottomLabel: typeof control.pushBottomLabel === 'string' && control.pushBottomLabel.trim().length
           ? control.pushBottomLabel.trim()
           : 'Push to Bottom',
+        raiseHandlerId: typeof control.raiseHandlerId === 'string' ? control.raiseHandlerId : '',
+        lowerHandlerId: typeof control.lowerHandlerId === 'string' ? control.lowerHandlerId : '',
         pushTopHandlerId: typeof control.pushTopHandlerId === 'string' ? control.pushTopHandlerId : '',
         pushBottomHandlerId: typeof control.pushBottomHandlerId === 'string' ? control.pushBottomHandlerId : '',
+        raiseDisabled: !!state.raiseDisabled,
+        lowerDisabled: !!state.lowerDisabled,
         pushTopDisabled: !!state.pushTopDisabled,
         pushBottomDisabled: !!state.pushBottomDisabled
       };
@@ -1322,930 +1212,9 @@ class ToolOptionsWindowRenderMethods {
   }
 
   _prepareDeclarativePortalControl(control, id) {
-    const inferredVariant = (() => {
-      if (control?.variant === 'door' || control?.type === 'door-controls') return 'door';
-      if (control?.variant === 'window' || control?.type === 'window-controls') return 'window';
-      return '';
-    })();
-    if (!inferredVariant) return null;
-    const raw = control?.state && typeof control.state === 'object' ? control.state : null;
-    if (!raw?.available) return null;
-
-    const coerceString = (value, fallback = '') => {
-      if (value === undefined || value === null) return fallback;
-      const text = String(value);
-      return text.length ? text : fallback;
-    };
-    const coerceNumber = (value, fallback = 0) => {
-      const numeric = Number(value);
-      return Number.isFinite(numeric) ? numeric : fallback;
-    };
-    const disabled = !!raw.disabled;
-
-    const makeOptions = (entries = [], fallbackValue) => {
-      const list = Array.isArray(entries) ? entries : [];
-      return list.map((entry, index) => {
-        const data = entry && typeof entry === 'object' ? entry : {};
-        const fallback = typeof fallbackValue === 'function' ? fallbackValue(data, index) : index;
-        const value = data.value ?? data.id ?? fallback;
-        return {
-          value: String(value),
-          label: coerceString(data.label, String(index + 1)),
-          selected: !!data.selected
-        };
-      });
-    };
-
-    const makeAction = ({
-      id: actionId,
-      handlerId,
-      title = '',
-      icon = '',
-      label = '',
-      disabled: actionDisabled = false,
-      primary = false
-    } = {}) => ({
-      id: String(actionId || ''),
-      handlerId: String(handlerId || ''),
-      title: coerceString(title, ''),
-      icon: coerceString(icon, ''),
-      label: coerceString(label, ''),
-      disabled: !!actionDisabled,
-      primary: !!primary
+    return prepareDeclarativePortalControl(control, id, {
+      isSectionCollapsed: (sectionId) => !!this._isPortalSectionCollapsed?.(id, sectionId)
     });
-
-    const makeToggle = ({ id: toggleId, label, title = '', checked = false, disabled: toggleDisabled = false, handlerId } = {}) => ({
-      id: String(toggleId || ''),
-      label: coerceString(label, ''),
-      title: coerceString(title, ''),
-      checked: !!checked,
-      disabled: !!toggleDisabled,
-      handlerId: String(handlerId || '')
-    });
-
-    const makeSelect = ({
-      id: selectId,
-      label,
-      handlerId,
-      value,
-      options = [],
-      disabled: selectDisabled = false,
-      valueMode = 'string'
-    } = {}) => {
-      const selectedValue = String(value ?? '');
-      return {
-        id: String(selectId || ''),
-        label: coerceString(label, ''),
-        handlerId: String(handlerId || ''),
-        value: selectedValue,
-        disabled: !!selectDisabled,
-        valueMode,
-        options: (Array.isArray(options) ? options : []).map((option) => ({
-          value: String(option?.value ?? ''),
-          label: coerceString(option?.label, ''),
-          selected: String(option?.value ?? '') === selectedValue || !!option?.selected
-        }))
-      };
-    };
-
-    const makeRow = ({
-      id: rowId,
-      label,
-      handlerId,
-      min,
-      max,
-      step,
-      value,
-      defaultValue,
-      display = '',
-      disabled: rowDisabled = false,
-      hint = ''
-    } = {}) => ({
-      id: String(rowId || ''),
-      label: coerceString(label, ''),
-      handlerId: String(handlerId || ''),
-      min: coerceNumber(min, 0),
-      max: coerceNumber(max, 0),
-      step: coerceNumber(step, 1),
-      value: coerceNumber(value, 0),
-      defaultValue: defaultValue === undefined ? undefined : coerceNumber(defaultValue, 0),
-      display: coerceString(display, ''),
-      disabled: !!rowDisabled,
-      hint: coerceString(hint, ''),
-      valueMode: 'number'
-    });
-
-    const makeColorTarget = ({
-      id: targetId,
-      handlerId,
-      groupName,
-      visible = true,
-      items = []
-    } = {}) => ({
-      id: String(targetId || ''),
-      handlerId: String(handlerId || ''),
-      groupName: coerceString(groupName, ''),
-      visible: visible !== false,
-      items: (Array.isArray(items) ? items : []).map((item) => ({
-        id: String(item?.id || ''),
-        groupName: coerceString(groupName, ''),
-        label: coerceString(item?.label, ''),
-        title: coerceString(item?.tooltip ?? item?.title, ''),
-        enabled: !!item?.enabled,
-        disabled: !!item?.disabled
-      }))
-    });
-
-    const makePickerActions = ({
-      id: pickerId,
-      icon,
-      label,
-      pickHandlerId,
-      clearHandlerId,
-      title = '',
-      clearTitle = 'Clear',
-      hidden = false
-    } = {}) => {
-      const pickId = `${pickerId}-pick`;
-      const clearId = `${pickerId}-clear`;
-      return {
-        visible: !hidden,
-        pickAction: makeAction({
-          id: pickId,
-          handlerId: pickHandlerId,
-          title,
-          icon,
-          label,
-          disabled
-        }),
-        clearAction: makeAction({
-          id: clearId,
-          handlerId: clearHandlerId,
-          title: clearTitle,
-          label: 'Clear',
-          disabled
-        })
-      };
-    };
-
-    const actionMap = Object.create(null);
-    const toggleMap = Object.create(null);
-    const selectMap = Object.create(null);
-    const settingMap = Object.create(null);
-    const toggleGroupMap = Object.create(null);
-    const selectGroupMap = Object.create(null);
-    const sectionMap = Object.create(null);
-
-    const registerAction = (action) => {
-      if (action?.id) actionMap[action.id] = action;
-      return action;
-    };
-    const registerToggleGroup = (group) => {
-      if (group?.id) toggleGroupMap[group.id] = group;
-      for (const item of Array.isArray(group?.items) ? group.items : []) {
-        if (item?.id) toggleMap[item.id] = item;
-      }
-      return group;
-    };
-    const registerSelectGroup = (group) => {
-      if (group?.id) selectGroupMap[group.id] = group;
-      for (const item of Array.isArray(group?.items) ? group.items : []) {
-        if (item?.id) selectMap[item.id] = item;
-      }
-      return group;
-    };
-    const registerSettingRows = (rows) => {
-      for (const row of Array.isArray(rows) ? rows : []) {
-        if (row?.id) settingMap[row.id] = row;
-      }
-    };
-    const registerSection = (section) => {
-      if (section?.id) sectionMap[section.id] = section;
-      if (section?.picker?.pickAction) registerAction(section.picker.pickAction);
-      if (section?.picker?.clearAction) registerAction(section.picker.clearAction);
-      registerSettingRows(section?.settings?.rows);
-      return section;
-    };
-
-    const selectionLabel = coerceString(raw.selectionLabel, '');
-    const selectionDisabled = disabled || !raw.hasSelection;
-    const normalizePortalTextureFlip = (source = {}) => {
-      const flip = source?.textureFlip && typeof source.textureFlip === 'object' ? source.textureFlip : {};
-      return {
-        horizontal: Object.prototype.hasOwnProperty.call(flip, 'horizontal')
-          ? !!flip.horizontal
-          : !!(source?.flipHorizontal ?? source?.flipX),
-        vertical: Object.prototype.hasOwnProperty.call(flip, 'vertical')
-          ? !!flip.vertical
-          : !!source?.flip
-      };
-    };
-
-    if (inferredVariant === 'door') {
-      const animations = makeOptions(raw.animations, (_, index) => index);
-      const directions = makeOptions(raw.directions, (_, index) => (index === 0 ? -1 : 1));
-      const selectedAnimation = coerceString(
-        raw.selectedAnimation,
-        animations.find((option) => option.selected)?.value || ''
-      );
-      const selectedDirection = String(coerceNumber(raw.direction, 1) === -1 ? -1 : 1);
-      const frame = raw.frameSettings && typeof raw.frameSettings === 'object' ? raw.frameSettings : null;
-      const colorTarget = raw.colorTarget && typeof raw.colorTarget === 'object' ? raw.colorTarget : null;
-      const hsbc = raw.hsbc && typeof raw.hsbc === 'object' ? raw.hsbc : null;
-      const textureFlip = normalizePortalTextureFlip(raw);
-
-      const headerActions = [
-        registerAction(makeAction({
-          id: 'apply-selected-to-defaults',
-          handlerId: 'applyDoorDefaults',
-          title: 'Use the selected door as the default for new placements',
-          icon: 'fas fa-arrow-up-right-dots',
-          label: 'Use Selected as Defaults',
-          disabled: selectionDisabled
-        })),
-        registerAction(makeAction({
-          id: 'apply-defaults-to-selected',
-          handlerId: 'applyDoorDefaultsToSelected',
-          title: 'Apply the current door defaults to the selected door',
-          icon: 'fas fa-file-import',
-          label: 'Apply Defaults to Selected',
-          disabled: selectionDisabled,
-          primary: true
-        })),
-        registerAction(makeAction({
-          id: 'clear-selection',
-          handlerId: 'clearPortalSelection',
-          title: 'Clear current portal selection',
-          icon: 'fas fa-times',
-          label: 'Clear Selection',
-          disabled: selectionDisabled
-        }))
-      ];
-
-      const toggleGroups = [
-        registerToggleGroup({
-          id: 'primary',
-          visible: true,
-          items: [
-            makeToggle({
-              id: 'flip-horizontal',
-              label: 'Flip Horizontal',
-              title: 'Mirror the selected door texture along the portal width',
-              disabled,
-              checked: !!textureFlip.horizontal,
-              handlerId: 'setDoorFlipHorizontal'
-            }),
-            makeToggle({
-              id: 'flip-vertical',
-              label: 'Flip Vertical',
-              title: 'Mirror the selected door texture across the wall thickness',
-              checked: !!textureFlip.vertical,
-              disabled,
-              handlerId: 'setDoorFlipVertical'
-            }),
-            makeToggle({
-              id: 'double',
-              label: 'Double Door',
-              title: 'Spawn a paired door leaf',
-              checked: !!raw.double,
-              disabled,
-              handlerId: 'setDoorDouble'
-            }),
-            makeToggle({
-              id: 'direction-flip',
-              label: 'Flip Hinge',
-              title: 'Swap door endpoints (hinge flip)',
-              checked: !!raw.directionFlip,
-              disabled,
-              handlerId: 'setDoorDirectionFlip'
-            })
-          ]
-        })
-      ];
-
-      const selectGroups = [
-        registerSelectGroup({
-          id: 'primary',
-          visible: true,
-          items: [
-            makeSelect({
-              id: 'animation',
-              label: 'Animation',
-              handlerId: 'setDoorAnimation',
-              value: selectedAnimation,
-              options: animations,
-              disabled
-            }),
-            makeSelect({
-              id: 'direction',
-              label: 'Open Direction',
-              handlerId: 'setDoorDirection',
-              value: selectedDirection,
-              options: directions,
-              disabled,
-              valueMode: 'door-direction'
-            })
-          ]
-        })
-      ];
-
-      const sections = [
-        registerSection({
-          id: 'door-texture',
-          label: 'Door Texture',
-          visible: !raw.hideTexturePickers,
-          collapsed: !!this._isPortalSectionCollapsed?.(id, 'door-texture'),
-          summary: coerceString(raw.textureLabel, 'None'),
-          picker: makePickerActions({
-            id: 'door-texture',
-            icon: 'fas fa-door-closed',
-            label: coerceString(raw.textureLabel, 'Pick Door Texture'),
-            pickHandlerId: 'pickDoorTexture',
-            clearHandlerId: 'clearDoorTexture',
-            hidden: !!raw.hideTexturePickers
-          }),
-          settings: null
-        }),
-        registerSection({
-          id: 'door-frame',
-          label: 'Door Frame',
-          visible: !raw.hideTexturePickers || !!frame,
-          collapsed: !!this._isPortalSectionCollapsed?.(id, 'door-frame'),
-          summary: coerceString(raw.frameLabel, 'None'),
-          picker: makePickerActions({
-            id: 'door-frame',
-            icon: 'fas fa-border-all',
-            label: coerceString(raw.frameLabel, 'Pick Door Frame'),
-            pickHandlerId: 'pickDoorFrameTexture',
-            clearHandlerId: 'clearDoorFrameTexture',
-            hidden: !!raw.hideTexturePickers
-          }),
-          settings: {
-            id: 'door-frame',
-            visible: !!frame,
-            rows: frame ? [
-              makeRow({
-                id: 'door-frame-scale',
-                label: 'Scale',
-                handlerId: 'setDoorFrameScale',
-                min: frame.scaleMin,
-                max: frame.scaleMax,
-                step: frame.scaleStep,
-                value: frame.scale,
-                defaultValue: frame.scaleDefault,
-                display: frame.scaleDisplay,
-                disabled
-              }),
-              makeRow({
-                id: 'door-frame-offset-x',
-                label: 'Offset X',
-                handlerId: 'setDoorFrameOffsetX',
-                min: frame.offsetMin,
-                max: frame.offsetMax,
-                step: frame.offsetStep,
-                value: frame.offsetX,
-                defaultValue: frame.offsetXDefault,
-                display: frame.offsetXDisplay,
-                disabled
-              }),
-              makeRow({
-                id: 'door-frame-offset-y',
-                label: 'Offset Y',
-                handlerId: 'setDoorFrameOffsetY',
-                min: frame.offsetMin,
-                max: frame.offsetMax,
-                step: frame.offsetStep,
-                value: frame.offsetY,
-                defaultValue: frame.offsetYDefault,
-                display: frame.offsetYDisplay,
-                disabled
-              }),
-              makeRow({
-                id: 'door-frame-rotation',
-                label: 'Rotation',
-                handlerId: 'setDoorFrameRotation',
-                min: frame.rotationMin,
-                max: frame.rotationMax,
-                step: frame.rotationStep,
-                value: frame.rotation,
-                defaultValue: frame.rotationDefault,
-                display: frame.rotationDisplay,
-                disabled: disabled || !!frame.rotationDisabled,
-                hint: coerceString(frame.rotationHint, '')
-              })
-            ] : []
-          }
-        })
-      ];
-
-      const colorSection = registerSection({
-        id: 'color',
-        label: 'Color',
-        visible: !!(colorTarget?.available && hsbc?.available),
-        collapsed: !!this._isPortalSectionCollapsed?.(id, 'color'),
-        picker: null,
-        settings: null
-      });
-
-      const color = {
-        ...colorSection,
-        label: 'Color',
-        hint: coerceString(hsbc?.hint, ''),
-        target: makeColorTarget({
-          id: 'door-color-target',
-          handlerId: 'setDoorHsbcTarget',
-          groupName: `fa-nexus-portal-color-${id}`,
-          visible: !!colorTarget?.available,
-          items: Array.isArray(colorTarget?.options) ? colorTarget.options : []
-        }),
-        rows: hsbc?.available ? [
-          makeRow({
-            id: 'door-hsbc-hue',
-            label: 'Hue',
-            handlerId: 'setDoorHsbcHue',
-            min: hsbc?.hue?.min,
-            max: hsbc?.hue?.max,
-            step: hsbc?.hue?.step,
-            value: hsbc?.hue?.value,
-            defaultValue: hsbc?.hue?.defaultValue,
-            display: hsbc?.hue?.display,
-            disabled: disabled || !!hsbc?.hue?.disabled,
-            hint: coerceString(hsbc?.hue?.tooltip || hsbc?.hint, '')
-          }),
-          makeRow({
-            id: 'door-hsbc-saturation',
-            label: 'Saturation',
-            handlerId: 'setDoorHsbcSaturation',
-            min: hsbc?.saturation?.min,
-            max: hsbc?.saturation?.max,
-            step: hsbc?.saturation?.step,
-            value: hsbc?.saturation?.value,
-            defaultValue: hsbc?.saturation?.defaultValue,
-            display: hsbc?.saturation?.display,
-            disabled: disabled || !!hsbc?.saturation?.disabled,
-            hint: coerceString(hsbc?.saturation?.tooltip || hsbc?.hint, '')
-          }),
-          makeRow({
-            id: 'door-hsbc-brightness',
-            label: 'Brightness',
-            handlerId: 'setDoorHsbcBrightness',
-            min: hsbc?.brightness?.min,
-            max: hsbc?.brightness?.max,
-            step: hsbc?.brightness?.step,
-            value: hsbc?.brightness?.value,
-            defaultValue: hsbc?.brightness?.defaultValue,
-            display: hsbc?.brightness?.display,
-            disabled: disabled || !!hsbc?.brightness?.disabled,
-            hint: coerceString(hsbc?.brightness?.tooltip || hsbc?.hint, '')
-          }),
-          makeRow({
-            id: 'door-hsbc-contrast',
-            label: 'Contrast',
-            handlerId: 'setDoorHsbcContrast',
-            min: hsbc?.contrast?.min,
-            max: hsbc?.contrast?.max,
-            step: hsbc?.contrast?.step,
-            value: hsbc?.contrast?.value,
-            defaultValue: hsbc?.contrast?.defaultValue,
-            display: hsbc?.contrast?.display,
-            disabled: disabled || !!hsbc?.contrast?.disabled,
-            hint: coerceString(hsbc?.contrast?.tooltip || hsbc?.hint, '')
-          })
-        ] : []
-      };
-      registerSettingRows(color.rows);
-
-      return {
-        ...control,
-        id,
-        type: 'portal-controls',
-        variant: inferredVariant,
-        title: 'Door Options',
-        selectionLabel,
-        selectionHint: coerceString(raw.selectionHint, ''),
-        headerActions,
-        toggleGroups,
-        selectGroups,
-        color,
-        sections,
-        actionMap,
-        toggleMap,
-        selectMap,
-        settingMap,
-        toggleGroupMap,
-        selectGroupMap,
-        sectionMap
-      };
-    }
-
-    const animations = makeOptions(raw.animations, (_, index) => index);
-    const directions = makeOptions(raw.directions, (_, index) => (index === 0 ? -1 : 1));
-    const selectedAnimation = coerceString(
-      raw.selectedAnimation,
-      animations.find((option) => option.selected)?.value || ''
-    );
-    const selectedDirection = String(coerceNumber(raw.direction, 1) === -1 ? -1 : 1);
-    const sill = raw.sillSettings && typeof raw.sillSettings === 'object' ? raw.sillSettings : null;
-    const texture = raw.textureSettings && typeof raw.textureSettings === 'object' ? raw.textureSettings : null;
-    const frame = raw.frameSettings && typeof raw.frameSettings === 'object' ? raw.frameSettings : null;
-    const colorTarget = raw.colorTarget && typeof raw.colorTarget === 'object' ? raw.colorTarget : null;
-    const hsbc = raw.hsbc && typeof raw.hsbc === 'object' ? raw.hsbc : null;
-    const textureFlip = normalizePortalTextureFlip(raw);
-
-    const headerActions = [
-      registerAction(makeAction({
-        id: 'apply-selected-to-defaults',
-        handlerId: 'applyWindowDefaults',
-        title: 'Use the selected window as the default for new placements',
-        icon: 'fas fa-arrow-up-right-dots',
-        label: 'Use Selected as Defaults',
-        disabled: selectionDisabled
-      })),
-      registerAction(makeAction({
-        id: 'apply-defaults-to-selected',
-        handlerId: 'applyWindowDefaultsToSelected',
-        title: 'Apply the current window defaults to the selected window',
-        icon: 'fas fa-file-import',
-        label: 'Apply Defaults to Selected',
-        disabled: selectionDisabled,
-        primary: true
-      })),
-      registerAction(makeAction({
-        id: 'clear-selection',
-        handlerId: 'clearPortalSelection',
-        title: 'Clear current portal selection',
-        icon: 'fas fa-times',
-        label: 'Clear Selection',
-        disabled: selectionDisabled
-      }))
-    ];
-
-    const toggleGroups = [
-      registerToggleGroup({
-        id: 'primary',
-        visible: true,
-        items: [
-          makeToggle({
-            id: 'animated',
-            label: 'Animated Window',
-            title: 'Use Foundry animated window instead of static texture',
-            checked: !!raw.animated,
-            disabled,
-            handlerId: 'setWindowAnimated'
-          }),
-          makeToggle({
-            id: 'flip-horizontal',
-            label: 'Flip Horizontal',
-            title: 'Mirror window glass texture along the portal width',
-            checked: !!textureFlip.horizontal,
-            disabled,
-            handlerId: 'setWindowFlipHorizontal'
-          }),
-          makeToggle({
-            id: 'flip-vertical',
-            label: 'Flip Vertical',
-            title: 'Mirror window glass texture across the wall thickness',
-            checked: !!textureFlip.vertical,
-            disabled,
-            handlerId: 'setWindowFlipVertical'
-          })
-        ]
-      }),
-      registerToggleGroup({
-        id: 'animated-secondary',
-        visible: !!raw.animated,
-        items: [
-          makeToggle({
-            id: 'double',
-            label: 'Double',
-            title: 'Animate both panes',
-            checked: !!raw.double,
-            disabled,
-            handlerId: 'setWindowDouble'
-          }),
-          makeToggle({
-            id: 'direction-flip',
-            label: 'Flip Hinge',
-            title: 'Swap window endpoints (hinge flip)',
-            checked: !!raw.directionFlip,
-            disabled,
-            handlerId: 'setWindowDirectionFlip'
-          })
-        ]
-      })
-    ];
-
-    const selectGroups = [
-      registerSelectGroup({
-        id: 'animated',
-        visible: !!raw.animated,
-        items: [
-          makeSelect({
-            id: 'animation',
-            label: 'Animation',
-            handlerId: 'setWindowAnimation',
-            value: selectedAnimation,
-            options: animations,
-            disabled
-          }),
-          makeSelect({
-            id: 'direction',
-            label: 'Open Direction',
-            handlerId: 'setWindowDirection',
-            value: selectedDirection,
-            options: directions,
-            disabled,
-            valueMode: 'number'
-          })
-        ]
-      })
-    ];
-
-    const sections = [
-      registerSection({
-        id: 'window-sill',
-        label: 'Window Sill',
-        visible: !raw.hideTexturePickers || !!sill,
-        collapsed: !!this._isPortalSectionCollapsed?.(id, 'window-sill'),
-        summary: coerceString(raw.sillLabel, 'None'),
-        picker: makePickerActions({
-          id: 'window-sill',
-          icon: 'fas fa-layer-group',
-          label: coerceString(raw.sillLabel, 'Pick Sill'),
-          pickHandlerId: 'pickWindowSillTexture',
-          clearHandlerId: 'clearWindowSillTexture',
-          hidden: !!raw.hideTexturePickers
-        }),
-        settings: {
-          id: 'window-sill',
-          visible: !!sill,
-          rows: sill ? [
-            makeRow({
-              id: 'window-sill-scale',
-              label: 'Scale',
-              handlerId: 'setWindowSillScale',
-              min: sill.scaleMin,
-              max: sill.scaleMax,
-              step: sill.scaleStep,
-              value: sill.scale,
-              defaultValue: sill.scaleDefault,
-              display: sill.scaleDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-sill-offset-x',
-              label: 'Offset X',
-              handlerId: 'setWindowSillOffsetX',
-              min: sill.offsetMin,
-              max: sill.offsetMax,
-              step: sill.offsetStep,
-              value: sill.offsetX,
-              defaultValue: sill.offsetXDefault,
-              display: sill.offsetXDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-sill-offset-y',
-              label: 'Offset Y',
-              handlerId: 'setWindowSillOffsetY',
-              min: sill.offsetMin,
-              max: sill.offsetMax,
-              step: sill.offsetStep,
-              value: sill.offsetY,
-              defaultValue: sill.offsetYDefault,
-              display: sill.offsetYDisplay,
-              disabled
-            })
-          ] : []
-        }
-      }),
-      registerSection({
-        id: 'window-texture',
-        label: 'Window Texture',
-        visible: !raw.hideTexturePickers || (!raw.animated && !!texture),
-        collapsed: !!this._isPortalSectionCollapsed?.(id, 'window-texture'),
-        summary: coerceString(raw.textureLabel, 'None'),
-        picker: makePickerActions({
-          id: 'window-texture',
-          icon: 'fas fa-border-all',
-          label: coerceString(raw.textureLabel, 'Pick Window Texture'),
-          pickHandlerId: 'pickWindowTexture',
-          clearHandlerId: 'clearWindowTexture',
-          hidden: !!raw.hideTexturePickers
-        }),
-        settings: {
-          id: 'window-texture',
-          visible: !raw.animated && !!texture,
-          rows: texture ? [
-            makeRow({
-              id: 'window-texture-scale',
-              label: 'Scale',
-              handlerId: 'setWindowTextureScale',
-              min: texture.scaleMin,
-              max: texture.scaleMax,
-              step: texture.scaleStep,
-              value: texture.scale,
-              defaultValue: texture.scaleDefault,
-              display: texture.scaleDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-texture-offset-x',
-              label: 'Offset X',
-              handlerId: 'setWindowTextureOffsetX',
-              min: texture.offsetMin,
-              max: texture.offsetMax,
-              step: texture.offsetStep,
-              value: texture.offsetX,
-              defaultValue: texture.offsetXDefault,
-              display: texture.offsetXDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-texture-offset-y',
-              label: 'Offset Y',
-              handlerId: 'setWindowTextureOffsetY',
-              min: texture.offsetMin,
-              max: texture.offsetMax,
-              step: texture.offsetStep,
-              value: texture.offsetY,
-              defaultValue: texture.offsetYDefault,
-              display: texture.offsetYDisplay,
-              disabled
-            })
-          ] : []
-        }
-      }),
-      registerSection({
-        id: 'window-frame',
-        label: 'Window Frame',
-        visible: !raw.hideTexturePickers || !!frame,
-        collapsed: !!this._isPortalSectionCollapsed?.(id, 'window-frame'),
-        summary: coerceString(raw.frameLabel, 'None'),
-        picker: makePickerActions({
-          id: 'window-frame',
-          icon: 'fas fa-columns',
-          label: coerceString(raw.frameLabel, 'Pick Window Frame'),
-          pickHandlerId: 'pickWindowFrameTexture',
-          clearHandlerId: 'clearWindowFrameTexture',
-          hidden: !!raw.hideTexturePickers
-        }),
-        settings: {
-          id: 'window-frame',
-          visible: !!frame,
-          rows: frame ? [
-            makeRow({
-              id: 'window-frame-scale',
-              label: 'Scale',
-              handlerId: 'setWindowFrameScale',
-              min: frame.scaleMin,
-              max: frame.scaleMax,
-              step: frame.scaleStep,
-              value: frame.scale,
-              defaultValue: frame.scaleDefault,
-              display: frame.scaleDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-frame-offset-x',
-              label: 'Offset X',
-              handlerId: 'setWindowFrameOffsetX',
-              min: frame.offsetMin,
-              max: frame.offsetMax,
-              step: frame.offsetStep,
-              value: frame.offsetX,
-              defaultValue: frame.offsetXDefault,
-              display: frame.offsetXDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-frame-offset-y',
-              label: 'Offset Y',
-              handlerId: 'setWindowFrameOffsetY',
-              min: frame.offsetMin,
-              max: frame.offsetMax,
-              step: frame.offsetStep,
-              value: frame.offsetY,
-              defaultValue: frame.offsetYDefault,
-              display: frame.offsetYDisplay,
-              disabled
-            }),
-            makeRow({
-              id: 'window-frame-rotation',
-              label: 'Rotation',
-              handlerId: 'setWindowFrameRotation',
-              min: frame.rotationMin,
-              max: frame.rotationMax,
-              step: frame.rotationStep,
-              value: frame.rotation,
-              defaultValue: frame.rotationDefault,
-              display: frame.rotationDisplay,
-              disabled: disabled || !!frame.rotationDisabled,
-              hint: coerceString(frame.rotationHint, '')
-            })
-          ] : []
-        }
-      })
-    ];
-
-    const colorSection = registerSection({
-      id: 'color',
-      label: 'Color',
-      visible: !!(colorTarget?.available && hsbc?.available),
-      collapsed: !!this._isPortalSectionCollapsed?.(id, 'color'),
-      picker: null,
-      settings: null
-    });
-
-    const color = {
-      ...colorSection,
-      label: 'Color',
-      hint: coerceString(hsbc?.hint, ''),
-      target: makeColorTarget({
-        id: 'window-color-target',
-        handlerId: 'setWindowHsbcTarget',
-        groupName: `fa-nexus-portal-color-${id}`,
-        visible: !!colorTarget?.available,
-        items: Array.isArray(colorTarget?.options) ? colorTarget.options : []
-      }),
-      rows: hsbc?.available ? [
-        makeRow({
-          id: 'window-hsbc-hue',
-          label: 'Hue',
-          handlerId: 'setWindowHsbcHue',
-          min: hsbc?.hue?.min,
-          max: hsbc?.hue?.max,
-          step: hsbc?.hue?.step,
-          value: hsbc?.hue?.value,
-          defaultValue: hsbc?.hue?.defaultValue,
-          display: hsbc?.hue?.display,
-          disabled: disabled || !!hsbc?.hue?.disabled,
-          hint: coerceString(hsbc?.hue?.tooltip || hsbc?.hint, '')
-        }),
-        makeRow({
-          id: 'window-hsbc-saturation',
-          label: 'Saturation',
-          handlerId: 'setWindowHsbcSaturation',
-          min: hsbc?.saturation?.min,
-          max: hsbc?.saturation?.max,
-          step: hsbc?.saturation?.step,
-          value: hsbc?.saturation?.value,
-          defaultValue: hsbc?.saturation?.defaultValue,
-          display: hsbc?.saturation?.display,
-          disabled: disabled || !!hsbc?.saturation?.disabled,
-          hint: coerceString(hsbc?.saturation?.tooltip || hsbc?.hint, '')
-        }),
-        makeRow({
-          id: 'window-hsbc-brightness',
-          label: 'Brightness',
-          handlerId: 'setWindowHsbcBrightness',
-          min: hsbc?.brightness?.min,
-          max: hsbc?.brightness?.max,
-          step: hsbc?.brightness?.step,
-          value: hsbc?.brightness?.value,
-          defaultValue: hsbc?.brightness?.defaultValue,
-          display: hsbc?.brightness?.display,
-          disabled: disabled || !!hsbc?.brightness?.disabled,
-          hint: coerceString(hsbc?.brightness?.tooltip || hsbc?.hint, '')
-        }),
-        makeRow({
-          id: 'window-hsbc-contrast',
-          label: 'Contrast',
-          handlerId: 'setWindowHsbcContrast',
-          min: hsbc?.contrast?.min,
-          max: hsbc?.contrast?.max,
-          step: hsbc?.contrast?.step,
-          value: hsbc?.contrast?.value,
-          defaultValue: hsbc?.contrast?.defaultValue,
-          display: hsbc?.contrast?.display,
-          disabled: disabled || !!hsbc?.contrast?.disabled,
-          hint: coerceString(hsbc?.contrast?.tooltip || hsbc?.hint, '')
-        })
-      ] : []
-    };
-    registerSettingRows(color.rows);
-
-    return {
-      ...control,
-      id,
-      type: 'portal-controls',
-      variant: inferredVariant,
-      title: 'Window Options',
-      selectionLabel,
-      selectionHint: coerceString(raw.selectionHint, ''),
-      headerActions,
-      toggleGroups,
-      selectGroups,
-      color,
-      sections,
-      actionMap,
-      toggleMap,
-      selectMap,
-      settingMap,
-      toggleGroupMap,
-      selectGroupMap,
-      sectionMap
-    };
   }
 
 }

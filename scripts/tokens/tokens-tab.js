@@ -1,20 +1,35 @@
+import { createFolderSelectionPredicate } from '../content/content-sources/content-sources-utils.js';
 import { GridBrowseTab } from '../core/ui/grid-browse-tab.js';
+import { applyGridDensityStyles } from '../core/ui/grid-density-styles.js';
 import {
   collectLocalInventory,
   formatOperationalError,
-  getEnabledFolders,
-  mergeLocalAndCloudRecords
+  getEnabledFolders
 } from '../content/nexus-content-service.js';
 import { abortError, formatCatalogLoaderText, isAbortError, loadAndMergeCloudRecords } from '../content/catalog-pipeline.js';
+import { readFaNexusCloudEnabledSetting } from '../core/cloud-enabled-settings.js';
 import { normalizeTokenInventoryRecord } from '../content/inventory-utils.js';
+import {
+  contentDimensions,
+  contentFilename,
+  contentFolder,
+  contentGrid,
+  contentPath,
+  inventoryItemKey
+} from '../content/cloud-inventory-v2.js';
 import { TokenDataService } from './token-data-service.js';
 import { TokenPreviewManager } from './token-preview-manager.js';
 import { FaNexusTokensFolderSelectionDialog } from './tokens-content-sources-dialog.js';
 import { TokenDragDropManager } from './token-dragdrop-manager.js';
 import { TokenPlacementManager } from './token-placement-manager.js';
 import { TokenSelectionHelper } from './token-selection-helper.js';
+import { mergeTokenLocalAndCloudRecords } from './token-cloud-local-merge-policy.js';
+import { buildTokenPlacementEntryFromRecord } from './token-placement-entry.js';
+import { applyTokenCardCachedState } from './token-card-cache-state.js';
+import { TokensTabProbeHelper } from './tokens-probe-helper.js';
+import { TokensColorVariantPanelRuntime } from './tokens-color-variant-panel-runtime.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import { forgeIntegration } from '../core/forge-integration.js';
+import { hasContentProductAccess, lockedPremiumContentMessage } from '../premium/patreon-auth-contract.js';
 import {
   applyFolderBrowserSelectionChange,
   computeFolderBrowserStats,
@@ -24,33 +39,6 @@ import {
 } from '../core/folder-browser-state.js';
 import { normalizeFolderPath as normalizeSharedFolderPath } from '../storage/path-utils.js';
 import { getFolderPathInfo as getSharedFolderPathInfo } from '../storage/folder-path-info.js';
-
-function getHostTheme(hostDocument = null) {
-  const doc = hostDocument || (typeof document !== 'undefined' ? document : null);
-  const body = doc?.body;
-  if (!body) return 'dark';
-  const isDark = body.classList.contains('theme-dark');
-  return isDark ? 'dark' : 'light';
-}
-function applyThemeToElement(el) {
-  if (!el) return;
-  const theme = getHostTheme(el.ownerDocument || null);
-  el.classList.toggle('fa-theme-dark', theme === 'dark');
-  el.classList.toggle('fa-theme-light', theme !== 'dark');
-}
-
-function createFaIcon(iconClass, hostDocument = null) {
-  const doc = hostDocument || (typeof document !== 'undefined' ? document : null);
-  const icon = doc.createElement('i');
-  icon.className = `fas ${iconClass}`;
-  icon.setAttribute('aria-hidden', 'true');
-  return icon;
-}
-
-function setIconOnlyContent(element, iconClass) {
-  if (!element) return;
-  element.replaceChildren(createFaIcon(iconClass, element.ownerDocument || null));
-}
 
 export class TokensTab extends GridBrowseTab {
   /**
@@ -63,16 +51,11 @@ export class TokensTab extends GridBrowseTab {
     this._tokenData = new TokenDataService();
     this._dragDrop = null;
     this._boundSettingsChange = null;
-    this._variantPanelEl = null;
-    this._variantCleanup = null;
-    this._activeVariantBase = null;
-    this._boundContextMenu = null;
-    this._variantThemeObserver = null;
     this._indexingLocks = 0;
     this._placement = new TokenPlacementManager(app);
     this._selection = new TokenSelectionHelper(this);
-    // Deferred cache-state probing (run when scrolling stops)
-    this._probeLoader = null;
+    this._probe = new TokensTabProbeHelper(this);
+    this._colorVariants = new TokensColorVariantPanelRuntime(this);
     this._activeFolderSelection = { type: 'all', includePaths: [], includePathLowers: [] };
     this._folderStats = createEmptyFolderBrowserStats();
     this._deferredActivationTimeout = null;
@@ -128,6 +111,7 @@ export class TokensTab extends GridBrowseTab {
       supportsUnassigned: true,
       logger: Logger,
       loggerLabel: 'TokensTab.selection.normalize',
+      getSelection: () => this._activeFolderSelection,
       setSelection: (nextSelection) => {
         this._activeFolderSelection = nextSelection;
       },
@@ -298,11 +282,7 @@ export class TokensTab extends GridBrowseTab {
       }
     } catch (_) {}
     try {
-      const grid = this.getGridContainer();
-      if (grid && this._boundContextMenu) {
-        grid.removeEventListener('contextmenu', this._boundContextMenu);
-        this._boundContextMenu = null;
-      }
+      this._colorVariants?.uninstallContext?.();
     } catch (_) {}
     try { this._dragDrop?.destroy?.(); } catch (_) {}
     this._dragDrop = null;
@@ -320,6 +300,8 @@ export class TokensTab extends GridBrowseTab {
     try { this.onDeactivate(); } catch (_) {}
     try { this._placement?.destroy?.(); } catch (_) {}
     this._placement = null;
+    try { this._colorVariants?.destroy?.(); } catch (_) {}
+    this._colorVariants = null;
     try { this._dragDrop?.destroy?.(); } catch (_) {}
     this._dragDrop = null;
     try { this._tokenPreview?.destroy?.(); } catch (_) {}
@@ -355,7 +337,10 @@ export class TokensTab extends GridBrowseTab {
     try {
       const mainOnly = game.settings.get('fa-nexus', 'mainColorOnly');
       if (mainOnly) {
-        filtered = filtered.filter((it) => !it.has_color_variant || it.is_main_color_variant || (String(it.color_variant || '') === '01'));
+        filtered = filtered.filter((it) => {
+          const variant = String(it?.color?.variant ?? '').trim();
+          return !variant || !!it?.color?.main || variant === '01';
+        });
       }
     } catch (_) {}
 
@@ -372,10 +357,11 @@ export class TokensTab extends GridBrowseTab {
           const isLockedToken = token.source === 'cloud' && token.tier === 'premium' && !authed;
           if (!isLockedToken) return true;
           try {
-            if (token.filename && this.app?._downloadManager) {
+            if (this.app?._downloadManager) {
               const localPath = this.app._downloadManager.getLocalPath('tokens', {
-                filename: token.filename,
-                file_path: token.file_path || token.path || ''
+                id: inventoryItemKey(token),
+                selected_source: token.selected_source || { ext: '.webp' },
+                tier: token.tier || 'free'
               });
               return !!localPath;
             }
@@ -385,60 +371,9 @@ export class TokensTab extends GridBrowseTab {
       }
     } catch (_) {}
 
-    const selection = this._activeFolderSelection || { type: 'all', includePaths: [], includePathLowers: [] };
-    if (selection.type === 'folder') {
-      const target = String(selection.pathLower || selection.path || '').toLowerCase();
-      if (target) {
-        filtered = filtered.filter((token) => {
-          const folderPath = this._getNormalizedFolderPath(token);
-          if (!folderPath) return false;
-          if (folderPath === target) return true;
-          return folderPath.startsWith(`${target}/`);
-        });
-      }
-    } else if (selection.type === 'folders') {
-      const lowers = Array.isArray(selection.pathLowers) ? selection.pathLowers : [];
-      const normalized = lowers.length ? lowers : (Array.isArray(selection.paths) ? selection.paths.map((p) => this._normalizeFolderPath(p)) : []);
-      const targets = Array.from(new Set(normalized.filter(Boolean).map((p) => String(p).toLowerCase())));
-      if (targets.length) {
-        filtered = filtered.filter((token) => {
-          const folderPath = this._getNormalizedFolderPath(token);
-          if (!folderPath) return false;
-          for (const target of targets) {
-            if (folderPath === target || folderPath.startsWith(`${target}/`)) return true;
-          }
-          return false;
-        });
-      } else {
-        filtered = [];
-      }
-    } else if (selection.type === 'unassigned') {
-      filtered = filtered.filter((token) => !this._getNormalizedFolderPath(token));
-    }
-
-    const excludeTargets = new Set();
-    if (Array.isArray(selection.excludePathLowers)) {
-      for (const lower of selection.excludePathLowers) {
-        const key = String(lower || '').toLowerCase();
-        if (key) excludeTargets.add(key);
-      }
-    }
-    if (!excludeTargets.size && Array.isArray(selection.excludePaths)) {
-      for (const path of selection.excludePaths) {
-        const lower = this._normalizeFolderPath(path)?.toLowerCase();
-        if (lower) excludeTargets.add(lower);
-      }
-    }
-
-    if (excludeTargets.size) {
-      filtered = filtered.filter((token) => {
-        const folderPath = this._getNormalizedFolderPath(token);
-        if (!folderPath) return true;
-        for (const target of excludeTargets) {
-          if (folderPath === target || folderPath.startsWith(`${target}/`)) return false;
-        }
-        return true;
-      });
+    if (!this.app._collections?.active) {
+      const matchesFolder = createFolderSelectionPredicate(this._activeFolderSelection);
+      filtered = filtered.filter((token) => matchesFolder(this._getNormalizedFolderPath(token)));
     }
 
     return filtered;
@@ -641,13 +576,13 @@ export class TokensTab extends GridBrowseTab {
           const total = Number.isFinite(totalCount) && totalCount > 0 ? Math.max(0, Math.floor(totalCount)) : null;
           return {
             indexing: !hasIndex,
-            label: hasIndex ? 'Loading cloud tokens…' : 'Indexing cloud tokens…',
+            label: hasIndex ? 'Loading cloud tokens…' : 'Preparing cloud token index...',
             count: null,
             total
           };
         }
         const latest = await svc.getLatest?.('tokens');
-        return { indexing: !latest, label: latest ? 'Loading cloud tokens…' : 'Indexing cloud tokens…', count: null, total: null };
+        return { indexing: !latest, label: latest ? 'Loading cloud tokens…' : 'Preparing cloud token index...', count: null, total: null };
       } catch (_) { return { indexing: false, label: 'Loading cloud tokens…', count: null, total: null }; }
     };
     const startCloudLoader = async () => {
@@ -655,7 +590,10 @@ export class TokensTab extends GridBrowseTab {
       showGridLoader(formatCatalogLoaderText(state?.label, state?.count, state?.total, 'Loading cloud tokens...'));
       return {
         state,
-        update: (count, total) => {
+        update: (count, total, phase = null) => {
+          if (phase === 'waiting') state.label = 'Waiting for cloud token index...';
+          else if (phase === 'download') state.label = 'Downloading cloud token index...';
+          else if (phase === 'replaceAll') state.label = 'Indexing cloud tokens...';
           if (Number.isFinite(total) && total > 0) state.total = Math.max(0, Math.floor(total));
           if (Number.isFinite(count) && count >= 0) state.count = Math.max(0, Math.floor(count));
           updateGridLoader(formatCatalogLoaderText(state?.label, state?.count, state?.total, 'Loading cloud tokens...'));
@@ -687,7 +625,7 @@ export class TokensTab extends GridBrowseTab {
             if (isCancelled()) throw abortError();
             const result = await this._loadAndMergeCloud(false, {
               signal,
-              onProgress: (count, total) => cloudLoader?.update?.(count, total),
+              onProgress: (count, total, phase) => cloudLoader?.update?.(count, total, phase),
               onTotal: (total) => {
                 const count = Number.isFinite(cloudLoader?.state?.count) && cloudLoader.state.count > 0
                   ? cloudLoader.state.count
@@ -742,7 +680,7 @@ export class TokensTab extends GridBrowseTab {
         streamFolder: (folder, onBatch, options) => this._tokenData.streamLocalTokens(folder, onBatch, options),
         streamOptions: { batchSize: 1500, sleepMs: 8 },
         isCancelled,
-        keySelector: (rec) => String(rec?.file_path || rec?.path || rec?.url || ''),
+        keySelector: (rec) => inventoryItemKey(rec) || contentPath(rec) || '',
         onCachedReady: (cachedItems) => {
           if (isCancelled()) return;
           this._items = cachedItems;
@@ -778,7 +716,7 @@ export class TokensTab extends GridBrowseTab {
           if (isCancelled()) throw abortError();
           const result = await this._loadAndMergeCloud(true, {
             signal,
-            onProgress: (count, total) => cloudLoader?.update?.(count, total),
+            onProgress: (count, total, phase) => cloudLoader?.update?.(count, total, phase),
             onTotal: (total) => {
               const count = Number.isFinite(cloudLoader?.state?.count) && cloudLoader.state.count > 0
                 ? cloudLoader.state.count
@@ -861,9 +799,9 @@ export class TokensTab extends GridBrowseTab {
     try {
       await svc.sync('tokens', {
         signal,
-        onManifestProgress: ({ count, total }) => {
+        onManifestProgress: ({ phase, count, total }) => {
           if (signal?.aborted) return;
-          try { onProgress?.(count, total); } catch (_) {}
+          try { onProgress?.(count, total, phase); } catch (_) {}
         },
         progressBatch: 500
       });
@@ -902,24 +840,11 @@ export class TokensTab extends GridBrowseTab {
     const downloadManager = this.app?._downloadManager;
     const out = [];
     for (const item of items) {
-      const filePath = String(item?.file_path || item?.path || '');
-      if (!filePath) continue;
-      const filename = String(item?.filename || filePath.split('/').pop() || '');
-      let folderPath = String(item?.path || '');
-      if (folderPath && filename && folderPath.endsWith(`/${filename}`)) {
-        folderPath = folderPath.slice(0, folderPath.length - (filename.length + 1));
-      } else if (!folderPath) {
-        const lastSlash = filePath.lastIndexOf('/');
-        folderPath = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
-      }
-      const record = normalizeTokenInventoryRecord({
+      const record = {
         ...item,
-        filename,
-        file_path: filePath,
-        path: folderPath,
         source: 'cloud',
         tier: item?.tier === 'premium' || item?.tier === 'free' ? item.tier : 'free'
-      });
+      };
       try {
         const local = downloadManager?.getLocalPath?.('tokens', record);
         if (local) record.cachedLocalPath = local;
@@ -940,24 +865,6 @@ export class TokensTab extends GridBrowseTab {
     const collectedLocal = includeLocal ? (Array.isArray(this._items) ? this._items.slice() : []) : [];
     const signal = options.signal || null;
     const svc = this.app?._contentService;
-    const normalizePathKey = (value) => String(value || '')
-      .trim()
-      .replace(/\\/g, '/')
-      .replace(/\/+/g, '/')
-      .replace(/^\/+/, '');
-    const tokenMatchKey = (rec) => {
-      const base = String(rec?.base_name_no_variant || '').trim().toLowerCase();
-      const color = String(rec?.color_variant ?? '').trim().toLowerCase();
-      if (base) return `${base}::${color || 'default'}`;
-      const fallback = String(rec?.filename || rec?.file_path || '').trim();
-      if (!fallback) return '';
-      return fallback.replace(/\.[^/.]+$/, '').toLowerCase();
-    };
-    const pathKey = (rec) => {
-      const raw = normalizePathKey(rec?.file_path || rec?.path || '');
-      if (!raw) return '';
-      return raw.replace(/\.[^/.]+$/, '').toLowerCase();
-    };
     return loadAndMergeCloudRecords({
       cloudEnabled: this._isCloudEnabled(),
       localItems: collectedLocal,
@@ -971,90 +878,11 @@ export class TokensTab extends GridBrowseTab {
         Logger.warn('TokensTab.cloud.load.error', cloudError);
       },
       mergeItems: ({ localItems: nextLocalItems, cloudItems }) => {
-        const localMatchCounts = new Map();
-        for (const rec of nextLocalItems) {
-          const match = tokenMatchKey(rec);
-          if (!match) continue;
-          localMatchCounts.set(match, (localMatchCounts.get(match) || 0) + 1);
-        }
-        const cloudMatchCounts = new Map();
-        for (const rec of cloudItems) {
-          const match = tokenMatchKey(rec);
-          if (!match) continue;
-          cloudMatchCounts.set(match, (cloudMatchCounts.get(match) || 0) + 1);
-        }
-        const sharedLocalCloudKey = (rec) => {
-          const match = tokenMatchKey(rec);
-          if (!match) return '';
-          if ((localMatchCounts.get(match) || 0) !== 1) return '';
-          if ((cloudMatchCounts.get(match) || 0) !== 1) return '';
-          return `match:${match}`;
-        };
-
-        return mergeLocalAndCloudRecords({
-          kind: 'tokens',
-          local: nextLocalItems,
-          cloud: cloudItems,
-          keySelector: (rec) => {
-            const source = String(rec?.source || '').toLowerCase();
-            const sharedKey = sharedLocalCloudKey(rec);
-            const pKey = pathKey(rec);
-            const match = tokenMatchKey(rec);
-            if (source === 'local') {
-              if (sharedKey) return sharedKey;
-              if (pKey) return `local:${pKey}`;
-              return match ? `local:${match}` : '';
-            }
-            if (sharedKey) return sharedKey;
-            if (pKey) return `cloud:${pKey}`;
-            return match ? `cloud:${match}` : '';
-          },
-          choosePreferred: (existing, incoming) => {
-            const rank = (it) => {
-              if (!it) return 0;
-              if (String(it.source || '').toLowerCase() === 'local') return 3;
-              if (String(it.source || '').toLowerCase() === 'cloud' && it.cachedLocalPath) return 2;
-              return 1;
-            };
-            const extRank = (name) => {
-              const lower = String(name || '').toLowerCase();
-              if (lower.endsWith('.webp')) return 3;
-              if (lower.endsWith('.png')) return 2;
-              if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 1;
-              return 0;
-            };
-            const rExisting = rank(existing);
-            const rIncoming = rank(incoming);
-            if (rIncoming > rExisting) return incoming;
-            if (rIncoming < rExisting) return existing;
-            const eExisting = extRank(existing?.filename);
-            const eIncoming = extRank(incoming?.filename);
-            if (eIncoming > eExisting) return incoming;
-            if (eIncoming < eExisting) return existing;
-            const lmExisting = Date.parse(existing?.last_modified || '') || 0;
-            const lmIncoming = Date.parse(incoming?.last_modified || '') || 0;
-            return lmIncoming >= lmExisting ? incoming : existing;
-          },
-          onEnhanceLocal: ({ localRecord, cloudRecord }) => {
-            if (!svc || !cloudRecord?.filename) return null;
-            try {
-              const thumb = svc.getThumbnailURL?.('tokens', cloudRecord);
-              if (!thumb) return null;
-              if (String(localRecord.thumbnail_url || localRecord.file_path || '').includes(thumb)) return null;
-              return {
-                ...localRecord,
-                original_thumbnail: localRecord.file_path || localRecord.thumbnail_url,
-                thumbnail_url: thumb,
-                enhanced_thumbnail: true,
-                cloud_tier: cloudRecord.tier
-              };
-            } catch (_) { return null; }
-          },
-          onStats: ({ collisions, preferLocal, preferCloud, enhanced, localCount, cloudCount, mergedCount }) => {
-            try {
-              Logger.info('TokensTab.merge', { collisions, preferLocal, preferCloud, enhanced, local: localCount, cloud: cloudCount, merged: mergedCount });
-            } catch (_) {}
-          }
+        return mergeTokenLocalAndCloudRecords({
+          localItems: nextLocalItems,
+          cloudItems,
+          contentService: svc,
+          logger: Logger
         });
       },
       onResult: (result, detail) => {
@@ -1115,12 +943,18 @@ export class TokensTab extends GridBrowseTab {
   }
 
 
-  _isCloudEnabled() {
-    try { return !!game.settings.get('fa-nexus', 'cloudTokensEnabled'); }
-    catch (error) {
-      Logger.warn('TokensTab.cloudEnabled.readFailed', { error: String(error?.message || error) });
-      return true;
+  describeEmptyState() {
+    if (!this._isCloudEnabled() && !getEnabledFolders('tokenFolders').length) {
+      return 'No token source is enabled. Enable FA Cloud Tokens or a local folder in Configure Settings, FA Nexus, Token Sources.';
     }
+    return super.describeEmptyState();
+  }
+
+  _isCloudEnabled() {
+    return readFaNexusCloudEnabledSetting({
+      setting: 'cloudTokensEnabled',
+      warningKey: 'TokensTab.cloudEnabled.readFailed'
+    });
   }
 
   _createTokenCard(item) {
@@ -1146,33 +980,36 @@ export class TokensTab extends GridBrowseTab {
       }
     } catch (_) {}
     if (item && typeof item === 'object') {
-      const filename = item.filename || '';
-      const folderPath = item.path || '';
-      let filePath = item.file_path || '';
-      if (!filePath && folderPath && filename) {
-        const trimmed = String(folderPath).replace(/\/+$/, '');
-        filePath = trimmed ? `${trimmed}/${filename}` : filename;
-      }
+      const filename = contentFilename(item);
+      const folderPath = contentFolder(item);
+      const filePath = contentPath(item);
+      const [gridWidth, gridHeight] = contentGrid(item);
+      const dims = contentDimensions(item);
+      const fileSize = Number(item?.selected_source?.size || 0);
+      cardElement.setAttribute('data-content-id', inventoryItemKey(item));
+      cardElement.setAttribute('data-content-path', filePath);
+      cardElement.setAttribute('data-folder', folderPath);
+      cardElement.setAttribute('data-name', item.name || filename || '');
       if (filename) cardElement.setAttribute('data-filename', filename);
-      if (filePath) {
-        cardElement.setAttribute('data-file-path', filePath);
-        cardElement.setAttribute('data-url', filePath);
-      } else if (item.file_path) {
-        cardElement.setAttribute('data-url', item.file_path);
-      }
+      if (filePath) cardElement.setAttribute('data-file-path', filePath);
       if (folderPath) cardElement.setAttribute('data-path', folderPath);
-      if (item.grid_width != null) cardElement.setAttribute('data-grid-w', String(item.grid_width));
-      if (item.grid_height != null) cardElement.setAttribute('data-grid-h', String(item.grid_height));
-      if (item.width != null) cardElement.setAttribute('data-width', String(item.width));
-      if (item.height != null) cardElement.setAttribute('data-height', String(item.height));
+      if (item.name) cardElement.setAttribute('data-display-name', item.name);
+      if (filePath) {
+        cardElement.setAttribute('data-url', filePath);
+      }
+      cardElement.setAttribute('data-grid-w', String(gridWidth));
+      cardElement.setAttribute('data-grid-h', String(gridHeight));
+      cardElement.setAttribute('data-width', String(dims.width));
+      cardElement.setAttribute('data-height', String(dims.height));
       if (item.scale != null) cardElement.setAttribute('data-scale', String(item.scale));
-      if (item.file_size != null) cardElement.setAttribute('data-file-size', String(item.file_size));
+      if (fileSize > 0) cardElement.setAttribute('data-file-size', String(fileSize));
       if (item.size) cardElement.setAttribute('data-size', item.size);
       if (item.creature_type) cardElement.setAttribute('data-ctype', item.creature_type);
       if (item.variant) cardElement.setAttribute('data-variant', item.variant);
+      if (item.color?.variant) cardElement.setAttribute('data-color-variant', String(item.color.variant));
+      if (item.color?.group) cardElement.setAttribute('data-color-group', String(item.color.group));
       if (item.source) cardElement.setAttribute('data-source', item.source);
       if (item.tier) cardElement.setAttribute('data-tier', item.tier);
-      if (item.display_name) cardElement.setAttribute('data-display-name', item.display_name);
       try {
         const key = this._computeItemKey?.(item);
         if (key) cardElement.setAttribute('data-key', key);
@@ -1185,6 +1022,7 @@ export class TokensTab extends GridBrowseTab {
 
   _mountTokenCard(cardElement, item) {
     try {
+      try { cardElement._assetItem = item; } catch (_) {}
       const img = cardElement.querySelector('img');
       const label = cardElement.querySelector('.label');
       const sizeEl = cardElement.querySelector('.token-size');
@@ -1192,7 +1030,30 @@ export class TokensTab extends GridBrowseTab {
       const ctypeEl = cardElement.querySelector('.token-creature-type');
       const statusIcon = cardElement.querySelector('.fa-nexus-status-icon');
       const variantTag = cardElement.querySelector('.fa-nexus-variant-tag');
-      if (label) label.textContent = item.display_name || '';
+      const filename = contentFilename(item);
+      const filePath = contentPath(item);
+      const folderPath = contentFolder(item);
+      const [gridWidth, gridHeight] = contentGrid(item);
+      const dims = contentDimensions(item);
+      const colorVariant = item?.color?.variant ?? null;
+      const colorGroup = item?.color?.group || '';
+      try {
+        cardElement.setAttribute('data-content-id', inventoryItemKey(item));
+        cardElement.setAttribute('data-content-path', filePath);
+        cardElement.setAttribute('data-folder', folderPath);
+        cardElement.setAttribute('data-name', item.name || filename || '');
+        if (filename) cardElement.setAttribute('data-filename', filename);
+        if (filePath) cardElement.setAttribute('data-file-path', filePath);
+        if (folderPath) cardElement.setAttribute('data-path', folderPath);
+        cardElement.setAttribute('data-grid-w', String(gridWidth));
+        cardElement.setAttribute('data-grid-h', String(gridHeight));
+        cardElement.setAttribute('data-width', String(dims.width));
+        cardElement.setAttribute('data-height', String(dims.height));
+        if (item.name) cardElement.setAttribute('data-display-name', item.name);
+        if (colorVariant != null) cardElement.setAttribute('data-color-variant', String(colorVariant));
+        if (colorGroup) cardElement.setAttribute('data-color-group', colorGroup);
+      } catch (_) {}
+      if (label) label.textContent = item.name || '';
       if (sizeEl) sizeEl.textContent = item.size || '';
       if (scaleEl) {
         const s = Number(item.scale);
@@ -1231,32 +1092,18 @@ export class TokensTab extends GridBrowseTab {
         statusIcon.innerHTML = `<i class=\"fas ${icon}\"></i>`;
       }
       if (variantTag) {
-        const v = item.variant || '';
+        const v = item.variant || colorVariant || '';
         variantTag.textContent = v;
         variantTag.style.display = v ? 'inline-flex' : 'none';
       }
       // If this is a cloud token, check if it has already been downloaded and cached
       try {
-        if (String(item.source||'') === 'cloud' && item.filename) {
+        if (String(item.source||'') === 'cloud') {
           const dl = this.app?._downloadManager;
           if (dl && typeof dl.getLocalPath === 'function') {
-            const localPath = dl.getLocalPath('tokens', {
-              filename: item.filename,
-              file_path: item.file_path || item.path || ''
-            });
+            const localPath = dl.getLocalPath('tokens', item);
             if (localPath) {
-              try { cardElement.setAttribute('data-url', localPath); } catch (_) {}
-              try { cardElement.setAttribute('data-cached', 'true'); } catch (_) {}
-              // Do not enable native drag; queued drag handles all sources
-              cardElement._resolvedLocalPath = localPath;
-              // Update status icon to indicate cached/local
-              if (statusIcon) {
-                cardElement.classList.remove('locked-token');
-                statusIcon.classList.remove('cloud-plus', 'cloud', 'premium');
-                statusIcon.classList.add('cloud','cached');
-                statusIcon.title = 'Downloaded';
-                statusIcon.innerHTML = '<i class=\"fas fa-cloud-check\"></i>';
-              }
+              applyTokenCardCachedState(cardElement, localPath, { iconSelector: '.fa-nexus-status-icon' });
             } else {
               // Not present in quick inventory: enqueue a deferred probe to avoid spamming during fast scroll
               try { this._enqueueCacheProbe(cardElement, item); } catch (_) {}
@@ -1268,7 +1115,7 @@ export class TokensTab extends GridBrowseTab {
       if (img) {
         const thumb = cardElement.querySelector('.thumb');
         try { thumb?.classList?.add('fa-nexus-thumb-placeholder'); } catch (_) {}
-        let src = item.file_path || cardElement.getAttribute('data-url') || cardElement.getAttribute('data-file-path') || '';
+        let src = filePath || cardElement.getAttribute('data-url') || cardElement.getAttribute('data-file-path') || '';
         try {
           if (String(item.source||'') === 'cloud') {
             const svc = this.app?._contentService;
@@ -1308,7 +1155,7 @@ export class TokensTab extends GridBrowseTab {
         const authed = this._hasPremiumAuth();
         const randomColorEnabled = this._isRandomColorPlacementEnabled();
         if (this._isTokenLocked(item, cardElement, { authed })) {
-          ui.notifications?.error?.('Authentication required for premium tokens. Please connect Patreon.');
+          ui.notifications?.error?.(this._lockedPremiumTokenMessage());
           try { helper?.selectedKeys?.delete?.(key); } catch (_) {}
           if (helper) helper.lastClickedIndex = -1;
           try { this._refreshSelectionUIInView(); } catch (_) {}
@@ -1341,28 +1188,25 @@ export class TokensTab extends GridBrowseTab {
           this._refreshSelectionUIInView();
         } catch (_) {}
 
-          if (randomColorEnabled) {
-            try {
-              const entries = helper?.preparePlacementEntries?.({
-                expandColorVariants: true,
-                resolveVariants: (entryInfo) => this._resolveRandomColorVariants(entryInfo)
-              }) || [];
-              if (entries.length) {
-                await this._placement?.startPlacementFromEntries?.(entries, {
-                  sticky: shift,
-                  pointerEvent: event,
-                  forceRandom: true
-                });
-                return;
-              }
-            } catch (error) {
-              Logger.warn('TokensTab.place.randomColor.failed', { error: String(error?.message || error) });
-            }
-          }
-
+        if (randomColorEnabled) {
           try {
-            await this._placement?.startPlacementFromCard?.(cardElement, { sticky: shift, pointerEvent: event });
+            const entries = this._buildRandomColorPlacementEntries(item, cardElement);
+            if (entries.length > 1) {
+              await this._placement?.startPlacementFromEntries?.(entries, {
+                sticky: shift,
+                pointerEvent: event,
+                forceRandom: true
+              });
+              return;
+            }
           } catch (error) {
+            Logger.warn('TokensTab.place.randomColor.failed', { error: String(error?.message || error) });
+          }
+        }
+
+        try {
+          await this._placement?.startPlacementFromCard?.(cardElement, { sticky: shift, pointerEvent: event });
+        } catch (error) {
           Logger.warn('TokensTab.place.card.failed', { error: String(error?.message || error) });
         }
       };
@@ -1375,7 +1219,7 @@ export class TokensTab extends GridBrowseTab {
 
   _unmountTokenCard(cardElement) {
     try { const img = cardElement.querySelector('img'); if (img) { this._cancelImageLoad?.(cardElement); img.onload = img.onerror = null; img.src = ''; } } catch(_) {}
-    try { if (cardElement?._probeJob) { cardElement._probeJob.cancelled = true; delete cardElement._probeJob; } } catch (_) {}
+    this._probe?.cancelCard?.(cardElement);
     if (cardElement?._faNexusTokenPlacementClick) {
       try { cardElement.removeEventListener('click', cardElement._faNexusTokenPlacementClick); } catch (_) {}
       delete cardElement._faNexusTokenPlacementClick;
@@ -1490,14 +1334,14 @@ export class TokensTab extends GridBrowseTab {
   _resolveRandomColorVariants(entry) {
     const baseItem = entry?.source_item || entry?.item || entry;
     if (!baseItem) return [];
-    const baseName = baseItem.base_name_no_variant || this._extractVariantBase(baseItem.filename || '');
+    const baseName = baseItem.color?.group || entry?.variant_group || this._extractVariantBase(contentFilename(baseItem));
     if (!baseName) return [];
     const items = Array.isArray(this._items) ? this._items : [];
     return items.filter((candidate) => {
       if (!candidate) return false;
-      const candidateName = candidate.base_name_no_variant || this._extractVariantBase(candidate.filename || '');
+      const candidateName = candidate.color?.group || this._extractVariantBase(contentFilename(candidate));
       if (candidateName !== baseName) return false;
-      if (String(candidate.filename || '') === String(baseItem.filename || '')) return false;
+      if (inventoryItemKey(candidate) === inventoryItemKey(baseItem)) return false;
       return true;
     });
   }
@@ -1512,10 +1356,8 @@ export class TokensTab extends GridBrowseTab {
     const downloadManager = this.app?._downloadManager || null;
     const computeKey = (item) => {
       if (helper?.computeItemKey) return helper.computeItemKey(item);
-      const filePath = String(item?.file_path || item?.path || '');
+      const filePath = contentPath(item);
       if (filePath) return filePath.toLowerCase();
-      const filename = String(item?.filename || '');
-      if (filename) return filename.toLowerCase();
       return '';
     };
     for (let index = 0; index < list.length; index++) {
@@ -1525,43 +1367,38 @@ export class TokensTab extends GridBrowseTab {
       if (!key || seen.has(key)) continue;
       const card = (index === 0 && primaryCard) ? primaryCard : null;
       if (this._isTokenLocked(record, card, { authed })) continue;
-      let cachedLocalPath = record.cachedLocalPath || '';
-      if (!cachedLocalPath && downloadManager && record.filename) {
-        try {
-          const local = downloadManager.getLocalPath('tokens', {
-            filename: record.filename,
-            file_path: record.file_path || record.path || ''
-          });
-          if (local) cachedLocalPath = local;
-        } catch (_) {}
-      }
-      // For local tokens, file_path is always available - use it as cachedLocalPath
-      if (!cachedLocalPath && String(record.source || '').toLowerCase() === 'local' && record.file_path) {
-        cachedLocalPath = record.file_path;
-      }
-      const entry = {
-        source: record.source || 'local',
-        tier: record.tier || 'free',
-        filename: record.filename || '',
-        file_path: record.file_path || '',
-        path: record.path || '',
-        cachedLocalPath,
-        display_name: record.display_name || '',
-        grid_width: Number(record.grid_width || 1) || 1,
-        grid_height: Number(record.grid_height || 1) || 1,
-        scale: (typeof record.scale === 'string' && record.scale.endsWith('x')) ? (Number(record.scale.replace('x', '')) || 1) : (Number(record.scale) || 1),
-        color_variant: record.color_variant || null,
-        base_name_no_variant: record.base_name_no_variant || '',
-        has_color_variant: !!record.has_color_variant,
-        variant_group: record.base_name_no_variant || record.display_name || '',
-        thumbnail_url: record.thumbnail_url || '',
-        source_item: record,
-        card
-      };
-      entries.push(entry);
+      const entry = buildTokenPlacementEntryFromRecord(record, { card, downloadManager });
+      if (entry) entries.push(entry);
       seen.add(key);
     }
     return entries;
+  }
+
+  _buildRandomColorPlacementEntries(item, cardElement = null) {
+    const baseItem = item || cardElement?._assetItem || null;
+    if (!baseItem) return [];
+    const variants = this._resolveRandomColorVariants({
+      item: baseItem,
+      source_item: baseItem,
+      variant_group: baseItem?.color?.group || cardElement?.getAttribute?.('data-color-group') || ''
+    });
+    return this._buildEntriesFromItems([baseItem, ...variants], { primaryCard: cardElement });
+  }
+
+  /** Whether the stored Patreon login's tier includes premium tokens (see patreon-auth-contract.js). */
+  _hasPremiumContentAccess() {
+    try {
+      return hasContentProductAccess(game.settings.get('fa-nexus', 'patreon_auth_data'), 'tokens');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** The message for a click on a locked premium token card. */
+  _lockedPremiumTokenMessage() {
+    let authData = null;
+    try { authData = game.settings.get('fa-nexus', 'patreon_auth_data'); } catch (_) {}
+    return lockedPremiumContentMessage(authData, 'premium tokens');
   }
 
   _isTokenLocked(item, cardElement = null, { authed = null } = {}) {
@@ -1571,7 +1408,7 @@ export class TokensTab extends GridBrowseTab {
       const isPremium = tier === 'premium';
       if (!isCloud || !isPremium) return false;
       const effectiveAuthed = authed != null ? !!authed : this._hasPremiumAuth();
-      if (effectiveAuthed) return false;
+      if (effectiveAuthed && this._hasPremiumContentAccess()) return false;
 
       const cachedAttr = cardElement?.getAttribute?.('data-cached') === 'true';
       const hasLocalPath = !!(item?.cachedLocalPath);
@@ -1579,11 +1416,8 @@ export class TokensTab extends GridBrowseTab {
 
       try {
         const dl = this.app?._downloadManager;
-        if (dl && item?.filename) {
-          const local = dl.getLocalPath('tokens', {
-            filename: item.filename,
-            file_path: item.file_path || item.path || ''
-          });
+        if (dl) {
+          const local = dl.getLocalPath('tokens', item);
           if (local) {
             item.cachedLocalPath = local;
             return false;
@@ -1599,470 +1433,51 @@ export class TokensTab extends GridBrowseTab {
 
   // ======== Deferred cache probing (after scroll settles) ========
   _ensureProbeLoader() {
-    if (forgeIntegration.isRunningOnForge()) return;
-    if (this._probeLoader) return;
-    this._probeLoader = { idleDelay: 120, timer: null, queue: new Set(), running: false };
+    return this._probe?.ensureLoader?.();
   }
 
   _resetProbeLoader() {
-    const L = this._probeLoader; if (!L) return;
-    try { if (L.timer) { clearTimeout(L.timer); L.timer = null; } } catch (_) {}
-    try { L.queue.clear(); } catch (_) {}
-    this._probeLoader = null;
+    this._probe?.dispose?.();
   }
 
   _installProbeScrollHandler() {
-    const grid = this.getGridContainer(); if (!grid) return;
-    const onScroll = () => { this._scheduleProbeVisibleCards(); };
-    grid.addEventListener('scroll', onScroll, { passive: true });
-    this._probeScrollHandler = onScroll;
+    this._probe?.installScrollHandler?.();
   }
 
   _uninstallProbeScrollHandler() {
-    const grid = this.getGridContainer(); if (!grid || !this._probeScrollHandler) return;
-    try { grid.removeEventListener('scroll', this._probeScrollHandler); } catch (_) {}
-    this._probeScrollHandler = null;
+    this._probe?.uninstallScrollHandler?.();
   }
 
   _scheduleProbeVisibleCards() {
-    if (forgeIntegration.isRunningOnForge()) return;
-    this._ensureProbeLoader(); const L = this._probeLoader; if (!L) return;
-    try { if (L.timer) { clearTimeout(L.timer); } } catch (_) {}
-    L.timer = setTimeout(() => { this._runProbeVisibleCards(); }, L.idleDelay);
+    this._probe?.scheduleVisibleCards?.();
   }
 
   _runProbeVisibleCards() {
-    if (forgeIntegration.isRunningOnForge()) return;
-    const L = this._probeLoader; if (!L) return;
-    try { if (L.timer) { clearTimeout(L.timer); L.timer = null; } } catch (_) {}
-    const grid = this.getGridContainer(); if (!grid) return;
-    const cards = grid.querySelectorAll('.fa-nexus-card[data-source="cloud"]:not([data-cached="true"])');
-    L.queue.clear();
-    for (const c of cards) L.queue.add(c);
-    this._drainProbeQueue();
+    this._probe?.runVisibleCards?.();
   }
 
   _enqueueCacheProbe(cardElement, item) {
-    if (forgeIntegration.isRunningOnForge()) return;
-    this._ensureProbeLoader(); const L = this._probeLoader; if (!L) return;
-    L.queue.add(cardElement);
-    cardElement._probeJob = { cancelled: false, item };
-    this._scheduleProbeVisibleCards();
+    this._probe?.queueCard?.(cardElement, item);
   }
 
   _drainProbeQueue() {
-    const L = this._probeLoader; if (!L || L.running) return;
-    const next = L.queue.values().next();
-    if (next.done) return;
-    const card = next.value; L.queue.delete(card); L.running = true;
-    try {
-      const item = card._assetItem || null;
-      const dl = this.app?._downloadManager;
-      const filename = card.getAttribute('data-filename') || item?.filename || '';
-      const filePathAttr = card.getAttribute('data-file-path') || '';
-      const folderPathAttr = card.getAttribute('data-path') || '';
-      const resolvedPath = filePathAttr || (folderPathAttr && filename ? `${folderPathAttr.replace(/\/+$/, '')}/${filename}` : '');
-      if (!dl || typeof dl.probeLocal !== 'function' || !filename) { L.running = false; this._drainProbeQueue(); return; }
-      const job = card._probeJob || { cancelled: false, item };
-      card._probeJob = job;
-      dl.probeLocal('tokens', { filename, file_path: resolvedPath, path: folderPathAttr }).then((found) => {
-        if (job.cancelled || !found || !card.isConnected) return;
-        try { card.setAttribute('data-url', found); } catch (_) {}
-        try { card.setAttribute('data-cached', 'true'); } catch (_) {}
-        const statusIcon = card.querySelector('.fa-nexus-status-icon');
-        if (statusIcon) { card.classList.remove('locked-token'); statusIcon.classList.remove('cloud-plus','cloud','premium'); statusIcon.classList.add('cloud','cached'); statusIcon.title = 'Downloaded'; statusIcon.innerHTML = '<i class=\"fas fa-cloud-check\"></i>'; }
-      }).catch((error) => {
-        Logger.debug('TokensTab.probe.error', {
-          filename,
-          file_path: resolvedPath,
-          path: folderPathAttr,
-          error: String(error?.message || error)
-        });
-      }).finally(() => { L.running = false; this._drainProbeQueue(); });
-    } catch (_) { L.running = false; this._drainProbeQueue(); }
+    this._probe?.runQueue?.();
   }
 
   _installColorVariantContext() {
-    const grid = this.app.element.querySelector('#fa-nexus-grid');
-    if (!grid) return;
-    const onContext = (event) => {
-      try { if (!game.settings.get('fa-nexus', 'mainColorOnly')) return; } catch (_) {}
-      const card = event.target.closest('.fa-nexus-card');
-      if (!card || !grid.contains(card)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const filename = card.getAttribute('data-filename') || '';
-      if (!filename) return;
-      const all = Array.isArray(this._items) ? this._items : [];
-      const base = (filename.replace(/\.[^/.]+$/, '').match(/^(.+)_\d+$/) || [null, filename.replace(/\.[^/.]+$/, '')])[1];
-      if (this._activeVariantBase && this._activeVariantBase === base) { this._hideColorVariantsPanel(); return; }
-      const variants = all.filter(it => {
-        const noExt = String(it.filename || '').replace(/\.[^/.]+$/, '');
-        const m = noExt.match(/^(.+)_\d+$/);
-        return m && m[1] === base;
-      });
-      if (!variants.length || variants.length === 1) return;
-      
-      // Sort variants by their variant number to ensure proper order (01, 02, 03, etc.)
-      variants.sort((a, b) => {
-        const aNoExt = String(a.filename || '').replace(/\.[^/.]+$/, '');
-        const bNoExt = String(b.filename || '').replace(/\.[^/.]+$/, '');
-        const aMatch = aNoExt.match(/^(.+)_(\d+)$/);
-        const bMatch = bNoExt.match(/^(.+)_(\d+)$/);
-        if (!aMatch || !bMatch) return 0;
-        const aNum = parseInt(aMatch[2], 10) || 0;
-        const bNum = parseInt(bMatch[2], 10) || 0;
-        return aNum - bNum;
-      });
-      
-      this._showColorVariantsPanel(card, base, variants);
-    };
-    if (this._boundContextMenu) try { grid.removeEventListener('contextmenu', this._boundContextMenu); } catch (_) {}
-    grid.addEventListener('contextmenu', onContext);
-    this._boundContextMenu = onContext;
-    // Expose hide method for drag manager compatibility
-    this.app._hideColorVariantsPanel = () => { try { this._hideColorVariantsPanel(); } catch (_) {} };
+    this._colorVariants?.installContext?.();
   }
 
   _hideColorVariantsPanel() {
-    if (this._variantPanelEl) { try { this._variantPanelEl.remove(); } catch (_) {} this._variantPanelEl = null; }
-    if (this._variantCleanup) { try { this._variantCleanup(); } catch (_) {} this._variantCleanup = null; }
-    try { this._variantThemeObserver?.disconnect?.(); } catch (_) {}
-    this._variantThemeObserver = null;
-    this._activeVariantBase = null;
+    this._colorVariants?.hide?.();
   }
 
   _notifyPremiumTokenLocked(context = 'color-variant', details = null) {
-    try { ui.notifications?.error?.('Authentication required for premium tokens. Please connect Patreon.'); } catch (_) {}
-    try {
-      const payload = details && typeof details === 'object' ? { context, ...details } : { context };
-      Logger.info('TokensTab.premium.locked', payload);
-    } catch (_) {}
+    this._colorVariants?.notifyPremiumTokenLocked?.(context, details);
   }
 
   _showColorVariantsPanel(anchorCard, baseName, variants) {
-    this._hideColorVariantsPanel();
-    try { this._tokenPreview?.hidePreview?.(); } catch (_) {}
-    const doc = anchorCard?.ownerDocument || this.app?.element?.ownerDocument || (typeof document !== 'undefined' ? document : null);
-    const hostWindow = doc?.defaultView || (typeof window !== 'undefined' ? window : null);
-    if (!doc?.body) {
-      Logger.debug('TokensTab.colorVariants.noHostDocument', {
-        baseName: String(baseName ?? ''),
-        variants: Array.isArray(variants) ? variants.length : 0
-      });
-      return;
-    }
-    const createElement = (tag) => doc.createElement(tag);
-    const requestFrame = typeof hostWindow?.requestAnimationFrame === 'function'
-      ? hostWindow.requestAnimationFrame.bind(hostWindow)
-      : (typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (callback) => setTimeout(callback, 16));
-
-    const panel = createElement('div');
-    panel.className = 'fa-nexus-color-variants-panel  application';
-    try { applyThemeToElement(panel); } catch (_) {}
-    try {
-      const MutationObserverCtor = hostWindow?.MutationObserver || (typeof MutationObserver !== 'undefined' ? MutationObserver : null);
-      if (!MutationObserverCtor) throw new Error('MutationObserver unavailable');
-      this._variantThemeObserver = new MutationObserverCtor(() => {
-        try { applyThemeToElement(panel); } catch (_) {}
-      });
-      this._variantThemeObserver.observe(doc.body, { attributes: true, attributeFilter: ['class'] });
-    } catch (_) {}
-    const header = createElement('div');
-    header.className = 'fa-nexus-variant-header';
-    const title = createElement('span');
-    title.className = 'fa-nexus-variant-title';
-    title.textContent = String(baseName ?? '');
-    const closeButton = createElement('button');
-    closeButton.type = 'button';
-    closeButton.className = 'fa-nexus-variant-close';
-    closeButton.title = 'Close';
-    closeButton.textContent = '×';
-    header.append(title, closeButton);
-    const grid = createElement('div');
-    grid.className = 'fa-nexus-variant-grid';
-    panel.replaceChildren(header, grid);
-    for (const it of variants) {
-      const item = createElement('div');
-      item.className = 'fa-nexus-variant-item';
-      item._variantRecord = it;
-      item.setAttribute('data-filename', it.filename || '');
-      item.setAttribute('data-path', it.path || '');
-      if (it.file_path) item.setAttribute('data-file-path', it.file_path);
-      item.setAttribute('data-url', it.file_path || '');
-      item.setAttribute('data-source', it.source || 'local');
-      item.setAttribute('data-file-size', it.file_size || '');
-      if (it.display_name) item.setAttribute('data-display-name', it.display_name);
-      if (it.width != null) item.setAttribute('data-width', String(it.width));
-      if (it.height != null) item.setAttribute('data-height', String(it.height));
-      if (it.tier) item.setAttribute('data-tier', it.tier);
-      if (it.grid_width != null) item.setAttribute('data-grid-w', String(it.grid_width));
-      if (it.grid_height != null) item.setAttribute('data-grid-h', String(it.grid_height));
-      if (it.scale != null) item.setAttribute('data-scale', String(it.scale));
-
-      // Resolve auth and cached state for correct status icon
-      let authed = false; let cachedLocalPath = '';
-      try { const auth = game.settings.get('fa-nexus', 'patreon_auth_data'); authed = !!(auth && auth.authenticated && auth.state); } catch (_) {}
-      try {
-        if (String(it.source||'') === 'cloud' && it.filename) {
-          const dl = this.app?._downloadManager;
-          if (dl) cachedLocalPath = dl.getLocalPath('tokens', { filename: it.filename, file_path: it.file_path || it.path || '' }) || '';
-        }
-      } catch (_) {}
-      Logger.info('TokensTab._showColorVariantsPanel', { cachedLocalPath });
-      if (cachedLocalPath) { try { item.setAttribute('data-url', cachedLocalPath); } catch(_) {} try { item.setAttribute('data-cached', 'true'); } catch(_) {} }
-      const isLocal = String(it.source||'').toLowerCase() === 'local';
-      const isCloud = String(it.source||'').toLowerCase() === 'cloud';
-      const isPremium = it.tier === 'premium';
-      const iconClass = (() => {
-        if (isLocal) return 'fa-folder';
-        if (isCloud) {
-          if (cachedLocalPath) return 'fa-cloud-check';
-          if (isPremium && !authed) return 'fa-lock';
-          if (isPremium) return 'fa-cloud-plus';
-          return 'fa-cloud';
-        }
-        return 'fa-cloud';
-      })();
-      const cv = (it.color_variant || '').toString().padStart(2,'0');
-      const thumb = createElement('div');
-      thumb.className = 'thumb';
-      const img = createElement('img');
-      img.alt = String(it.filename || '');
-      thumb.appendChild(img);
-      const variantNumber = createElement('div');
-      variantNumber.className = 'fa-nexus-variant-number';
-      variantNumber.textContent = cv;
-      const statusIcon = createElement('div');
-      statusIcon.className = 'fa-nexus-token-status-icon';
-      statusIcon.title = isLocal ? 'Local storage' : (isPremium ? (authed || cachedLocalPath ? 'Premium (unlocked)' : 'Premium (locked)') : (cachedLocalPath ? 'Downloaded' : 'Cloud'));
-      setIconOnlyContent(statusIcon, iconClass);
-      item.replaceChildren(thumb, variantNumber, statusIcon);
-      try {
-        const iconEl = item.querySelector('.fa-nexus-token-status-icon');
-        if (iconEl) {
-          iconEl.classList.remove('local','cloud','premium','cached', 'cloud-plus');
-          if (isLocal) iconEl.classList.add('local');
-          else if (isCloud) {
-            if (isPremium && !(authed || cachedLocalPath)) {
-              iconEl.classList.add('premium');
-              item.classList.add('locked-token');
-            }
-            if (isPremium) iconEl.classList.add('cloud-plus');
-            else iconEl.classList.add('cloud');
-            if (cachedLocalPath) {
-              iconEl.classList.remove('cloud-plus', 'cloud', 'premium');
-              iconEl.classList.add('cloud','cached');
-            }
-          }
-        }
-      } catch(_) {}
-
-      const isVariantLocked = () => {
-        try {
-          const sourceAttr = (item.getAttribute('data-source') || '').toLowerCase();
-          if (sourceAttr !== 'cloud') return false;
-          const tierAttr = (item.getAttribute('data-tier') || '').toLowerCase();
-          if (tierAttr !== 'premium') return false;
-          if (item.getAttribute('data-cached') === 'true') return false;
-          let authedNow = false;
-          try {
-            const auth = game.settings.get('fa-nexus', 'patreon_auth_data');
-            authedNow = !!(auth && auth.authenticated && auth.state);
-          } catch (_) {}
-          return !authedNow;
-        } catch (_) {
-          return false;
-        }
-      };
-
-      const reportLockedVariant = (context) => {
-        const now = Date.now();
-        const last = Number(item._faLockWarned || 0);
-        if (!Number.isFinite(last) || (now - last) > 600) {
-          this._notifyPremiumTokenLocked('color-variant', {
-            context,
-            base: baseName,
-            filename: it?.filename || '',
-            variant: it?.color_variant || ''
-          });
-        }
-        item._faLockWarned = now;
-      };
-
-      const ensureVariantUnlocked = (context) => {
-        if (!isVariantLocked()) return true;
-        reportLockedVariant(context);
-        return false;
-      };
-
-      // Set thumbnail for cloud via CDN/signed, enhanced thumbnails for local, else local path
-      try {
-        const imgEl = item.querySelector('img');
-        if (imgEl) {
-          if (String(it.source||'') === 'cloud') {
-            const svc = this.app?._contentService;
-            if (svc) imgEl.src = svc.getThumbnailURL('tokens', it);
-          }
-          else if (it.enhanced_thumbnail && it.thumbnail_url) {
-            // Use enhanced cloud thumbnail for local tokens when available
-            imgEl.src = it.thumbnail_url;
-          }
-          else {
-            imgEl.src = it.file_path || '';
-          }
-        }
-      } catch (_) {}
-
-      // Hover preview (skip for locked premium cloud variants that are not cached)
-      item.addEventListener('mouseover', () => {
-        try {
-          Logger.info('TokensTab._showColorVariantsPanel-Mouseover', { isHoverSuppressed: TokenDragDropManager?.isHoverSuppressed?.(), item });
-          try { if (TokenDragDropManager?.isHoverSuppressed?.()) return; } catch (_) {}
-          const source = item.getAttribute('data-source') || '';
-          const tier = item.getAttribute('data-tier') || '';
-          let authed = false; try { const auth = game.settings.get('fa-nexus', 'patreon_auth_data'); authed = !!(auth && auth.authenticated && auth.state); } catch(_) {}
-          const hasLocal = !!item.getAttribute('data-url');
-          if (source === 'cloud' && tier === 'premium' && !authed && !hasLocal) return;
-          const img = item.querySelector('img'); this._tokenPreview?.showPreviewWithDelay?.(img, item, 300);
-        } catch (_) {}
-      });
-      item.addEventListener('mouseout', (event) => { try { const to = event.relatedTarget; if (to && item.contains(to)) return; this._tokenPreview?.hidePreview?.(); } catch (_) {} });
-
-      // Unified queued drag: disable native drag and use mousedown-based flow
-      try { item.setAttribute('draggable', 'false'); } catch(_) {}
-      item.addEventListener('mousedown', async (ev) => {
-        Logger.info('TokensTab._showColorVariantsPanel-Mousedown', { ev });
-        if (ev.button !== 0) return;
-        const source = item.getAttribute('data-source') || '';
-        const tier = item.getAttribute('data-tier') || '';
-        let authed = false; try { const auth = game.settings.get('fa-nexus', 'patreon_auth_data'); authed = !!(auth && auth.authenticated && auth.state); } catch(_) {}
-        const cachedFlag = item.getAttribute('data-cached') === 'true';
-        Logger.info('TokensTab._showColorVariantsPanel', { tier, authed, cachedLocalPath, cachedFlag });
-        if (!ensureVariantUnlocked('variant-mousedown')) return;
-        if (source === 'cloud') {
-          try {
-            await this._dragDrop?._prepareCloudForDrag?.(item);
-            if (item._ensureLocalPromise && !cachedLocalPath) {
-              const isMainVariant = !!(it.is_main_color_variant || String(it.color_variant||'') === '01');
-              item._ensureLocalPromise.then((localPath) => {
-                try {
-                  if (localPath) {
-                    item.setAttribute('data-url', localPath);
-                    // Only mark as cached if actually downloaded (not using direct CDN URL)
-                    const isDirectUrl = /^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(localPath);
-                    if (!isDirectUrl) {
-                      item.setAttribute('data-cached', 'true');
-                      cachedLocalPath = cachedLocalPath || localPath;
-                      const iconEl = item.querySelector('.fa-nexus-token-status-icon');
-                      if (iconEl) { iconEl.classList.remove('premium','cloud-plus'); iconEl.classList.add('cloud','cached'); iconEl.title = 'Downloaded'; iconEl.innerHTML = '<i class="fas fa-cloud-check"></i>'; }
-                      if (isMainVariant && anchorCard) {
-                        try { anchorCard.setAttribute('data-url', localPath); } catch (_) {}
-                        try { anchorCard.setAttribute('data-cached', 'true'); } catch (_) {}
-                        const statusIcon = anchorCard.querySelector('.fa-nexus-status-icon');
-                        if (statusIcon) { statusIcon.classList.add('cloud','cached'); statusIcon.title = 'Downloaded'; statusIcon.innerHTML = '<i class="fas fa-cloud-check"></i>'; }
-                      }
-                    }
-                  }
-                } catch (_) {}
-              }).catch(() => {});
-            }
-          } catch(_) {}
-        }
-        const startX = ev.clientX, startY = ev.clientY; const threshold = 4;
-        item._faVariantDragging = false;
-        const listenerDocument = item.ownerDocument || doc;
-        const defer = typeof hostWindow?.setTimeout === 'function'
-          ? hostWindow.setTimeout.bind(hostWindow)
-          : setTimeout;
-        const move = (e) => {
-          const dx = Math.abs((e.clientX||0) - startX); const dy = Math.abs((e.clientY||0) - startY);
-          if (dx + dy > threshold) {
-            listenerDocument.removeEventListener('mousemove', move, true);
-            listenerDocument.removeEventListener('mouseup', up, true);
-            item._faVariantDragging = true;
-            try { 
-              TokenDragDropManager.setHoverSuppressed(true);
-              this._dragDrop?._startQueuedDrag?.(item, e.clientX, e.clientY); 
-            } catch(_) {}
-          }
-        };
-        const up = () => {
-          listenerDocument.removeEventListener('mousemove', move, true);
-          listenerDocument.removeEventListener('mouseup', up, true);
-          defer(() => { item._faVariantDragging = false; }, 0);
-        };
-        listenerDocument.addEventListener('mousemove', move, true);
-        listenerDocument.addEventListener('mouseup', up, true);
-      }, { capture: true });
-
-      item.addEventListener('click', (ev) => {
-        if (ev.button !== 0) return;
-        if (item._faVariantDragging) { item._faVariantDragging = false; return; }
-        ev.preventDefault();
-        ev.stopPropagation();
-        const variantRecord = item._variantRecord || null;
-        const source = item.getAttribute('data-source') || '';
-        const tier = item.getAttribute('data-tier') || '';
-        let authed = false; try { const auth = game.settings.get('fa-nexus', 'patreon_auth_data'); authed = !!(auth && auth.authenticated && auth.state); } catch(_) {}
-        const cached = item.getAttribute('data-cached') === 'true';
-        if (!cached && source === 'cloud' && tier === 'premium' && !authed) {
-          ensureVariantUnlocked('variant-click');
-          return;
-        }
-        try { TokenDragDropManager.setHoverSuppressed(true); } catch (_) {}
-        this._hideColorVariantsPanel();
-        const randomColorEnabled = this._isRandomColorPlacementEnabled();
-        let placementPromise = null;
-        if (randomColorEnabled && variantRecord) {
-          const variantItems = [variantRecord, ...variants.filter((v) => v && v !== variantRecord)];
-          const entries = this._buildEntriesFromItems(variantItems, { primaryCard: item });
-          if (entries.length > 0) {
-            placementPromise = this._placement?.startPlacementFromEntries?.(entries, {
-              sticky: ev.shiftKey,
-              pointerEvent: ev,
-              forceRandom: true
-            });
-          }
-        }
-        if (!placementPromise) {
-          placementPromise = this._placement?.startPlacementFromCard?.(item, { sticky: ev.shiftKey, pointerEvent: ev });
-        }
-        Promise.resolve(placementPromise)
-          .catch(() => {})
-          .finally(() => {
-            if (!this._placement?.isPlacementActive) {
-              try { TokenDragDropManager.setHoverSuppressed(false); } catch (_) {}
-            }
-          });
-      });
-
-      grid.appendChild(item);
-    }
-    doc.body.appendChild(panel);
-    const panelRect = () => panel.getBoundingClientRect();
-    const cardRect = anchorCard.getBoundingClientRect();
-    let left = cardRect.right + 10; let top = cardRect.top;
-    requestFrame(() => {
-      const pr = panelRect(); const vw = hostWindow?.innerWidth || 1920; const vh = hostWindow?.innerHeight || 1080;
-      if (left + pr.width > vw) left = Math.max(8, cardRect.left - pr.width - 10);
-      if (top + pr.height > vh) top = Math.max(8, vh - pr.height - 8);
-      panel.style.left = `${left}px`; panel.style.top = `${top}px`; panel.classList.add('visible');
-    });
-    const closeBtn = panel.querySelector('.fa-nexus-variant-close');
-    const onCloseBtn = (e) => { e.preventDefault(); e.stopPropagation(); this._hideColorVariantsPanel(); };
-    const onOutside = (e) => { if (!panel.contains(e.target)) this._hideColorVariantsPanel(); };
-    const onResize = () => { this._hideColorVariantsPanel(); };
-    doc.addEventListener('click', onOutside, true);
-    hostWindow?.addEventListener?.('resize', onResize);
-    closeBtn?.addEventListener('click', onCloseBtn);
-    this._variantCleanup = () => {
-      doc.removeEventListener('click', onOutside, true);
-      hostWindow?.removeEventListener?.('resize', onResize);
-      closeBtn?.removeEventListener('click', onCloseBtn);
-    };
-    this._variantPanelEl = panel;
-    this._activeVariantBase = baseName;
+    this._colorVariants?.show?.(anchorCard, baseName, variants);
   }
 
   /**
@@ -2107,12 +1522,11 @@ export class TokensTab extends GridBrowseTab {
       const baseFooter = 29 + (40 - 29) * t;
       const h = Math.round((clamped / 140) * (180 - baseFooter)) + baseFooter;
       try { app._grid.setCardSize(clamped, h); } catch (_) {}
-      if (gridContainer) {
-        gridContainer.style.setProperty('--fa-nexus-card-pad', `${2 + (6 - 2) * t}px`);
-        gridContainer.style.setProperty('--fa-nexus-title-size', `${0.72 + (0.85 - 0.72) * t}rem`);
-        gridContainer.style.setProperty('--fa-nexus-details-size', `${0.60 + (0.75 - 0.60) * t}rem`);
-        gridContainer.style.setProperty('--fa-nexus-footer-pt', `${0 + (6 - 0) * t}px`);
-      }
+      applyGridDensityStyles(gridContainer, t, {
+        titleSize: [0.72, 0.85, 'rem'],
+        detailsSize: [0.60, 0.75, 'rem'],
+        footerPaddingTop: [0, 6, 'px']
+      });
       try { this.app?.updateGridPlaceholderSize?.({ tab: this.id, width: clamped, height: h, gap: this.getGridOptions?.()?.card?.gap ?? 5 }); } catch (_) {}
       try { this._updateFooterStats(); } catch (_) {}
     };

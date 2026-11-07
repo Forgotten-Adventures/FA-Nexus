@@ -1,4 +1,6 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { isKeyEventForTextEntry } from '../core/keyboard-text-entry.js';
+import { isSessionExitQuestionOpen } from '../premium/session-host/cancel-session-dialog.js';
 import { requestSelectionFilterRefresh } from './selection-filter-refresh.js';
 import { normalizeGroundBandDocumentSort } from './elevation-band-utils.js';
 
@@ -95,17 +97,7 @@ function computeNextSortAtElevation(elevation = 0, { scene = canvas?.scene } = {
   try {
     const elev = Number(elevation || 0) || 0;
     let maxSort = 0;
-    const tiles = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
-    for (const tile of tiles) {
-      const doc = tile?.document;
-      if (!doc) continue;
-      if (!sameElevation(doc.elevation, elev)) continue;
-      const sort = normalizeTileDocumentSortForPlacement(doc, {
-        elevation: doc.elevation,
-        sort: doc.sort,
-        scene,
-        source: 'computeNextSortAtElevation'
-      }).sort;
+    for (const { sort } of getSceneTileSortEntriesAtElevation(elev, scene)) {
       if (sort > maxSort) maxSort = sort;
     }
     return maxSort + SORT_STEP;
@@ -161,8 +153,11 @@ function resolvePlacementTileDocument(anchorTile = null, anchorTileId = null, sc
   return null;
 }
 
-function getSceneTileSortEntriesAtElevation(elevation = 0, scene = canvas?.scene) {
+function getSceneTileSortEntriesAtElevation(elevation = 0, scene = canvas?.scene, excludeTileIds = []) {
   const targetElevation = Number(elevation || 0) || 0;
+  const excludedIds = new Set((Array.isArray(excludeTileIds) ? excludeTileIds : [excludeTileIds])
+    .map((id) => String(id || '').trim())
+    .filter(Boolean));
   const docs = [];
   try {
     const collection = scene?.tiles;
@@ -183,7 +178,7 @@ function getSceneTileSortEntriesAtElevation(elevation = 0, scene = canvas?.scene
     }
   }
   return docs
-    .filter((doc) => sameElevation(doc?.elevation, targetElevation))
+    .filter((doc) => sameElevation(doc?.elevation, targetElevation) && !excludedIds.has(String(doc?.id || '').trim()))
     .map((doc) => {
       const rawSort = Number(doc?.sort || 0) || 0;
       const normalized = normalizeTileDocumentSortForPlacement(doc, {
@@ -207,6 +202,57 @@ function sortTileSortEntries(left, right) {
   const rightSort = Number(right?.sort || 0) || 0;
   if (leftSort === rightSort) return String(left?.id || '').localeCompare(String(right?.id || ''));
   return leftSort - rightSort;
+}
+
+function resolveAdjacentPlacementSortAnchor(elevation = 0, {
+  anchorTileId = null,
+  sortBefore = false,
+  direction = 0,
+  currentSort = null,
+  currentTileId = null,
+  excludeTileIds = [],
+  scene = canvas?.scene
+} = {}) {
+  const normalizedDirection = Math.sign(Number(direction) || 0);
+  if (!normalizedDirection) return null;
+  const entries = getSceneTileSortEntriesAtElevation(elevation, scene, excludeTileIds)
+    .sort(sortTileSortEntries);
+  if (!entries.length) return null;
+
+  const normalizedAnchorId = String(anchorTileId || '').trim();
+  const anchorIndex = entries.findIndex((entry) => entry.id === normalizedAnchorId);
+  const hasCurrentSort = currentSort !== null
+    && currentSort !== undefined
+    && Number.isFinite(Number(currentSort));
+  let insertionIndex = -1;
+  if (anchorIndex >= 0) {
+    insertionIndex = anchorIndex + (sortBefore === true ? 0 : 1);
+  } else if (hasCurrentSort) {
+    const normalizedCurrentSort = Number(currentSort);
+    const normalizedCurrentId = String(currentTileId || '').trim();
+    insertionIndex = entries.findIndex((entry) => (
+      entry.sort > normalizedCurrentSort
+      || (entry.sort === normalizedCurrentSort && entry.id.localeCompare(normalizedCurrentId) > 0)
+    ));
+    if (insertionIndex < 0) insertionIndex = entries.length;
+  } else {
+    insertionIndex = entries.length;
+  }
+
+  const nextInsertionIndex = Math.max(0, Math.min(entries.length, insertionIndex + normalizedDirection));
+  if (nextInsertionIndex === insertionIndex) return null;
+  if (nextInsertionIndex === 0) {
+    return {
+      anchorTileId: entries[0].id,
+      sortBefore: true,
+      insertionIndex: nextInsertionIndex
+    };
+  }
+  return {
+    anchorTileId: entries[nextInsertionIndex - 1].id,
+    sortBefore: false,
+    insertionIndex: nextInsertionIndex
+  };
 }
 
 function resolveCurrentOrderPlacementSorts({
@@ -234,7 +280,9 @@ function resolveCurrentOrderPlacementSorts({
 }
 
 function resolveCompactPlacementSorts(siblingEntries = [], anchorEntry = null, placementCount = 1, sortBefore = false) {
-  const entries = Array.isArray(siblingEntries) ? siblingEntries.slice().sort(sortTileSortEntries) : [];
+  const entries = Array.isArray(siblingEntries)
+    ? siblingEntries.map((entry) => ({ ...entry })).sort(sortTileSortEntries)
+    : [];
   const anchorIndex = entries.findIndex((entry) => entry?.id === anchorEntry?.id);
   if (anchorIndex < 0) return null;
   const insertionIndex = anchorIndex + (sortBefore === true ? 0 : 1);
@@ -251,8 +299,9 @@ function resolveCompactPlacementSorts(siblingEntries = [], anchorEntry = null, p
     nextSort,
     placementCount
   });
-  const requiredGap = (placementCount + 1) * SORT_STEP;
   let startSort = null;
+  let placementStep = SORT_STEP;
+  let suffixShift = 0;
 
   if (hasPrevious && !hasNext) {
     startSort = previousSort + SORT_STEP;
@@ -260,24 +309,35 @@ function resolveCompactPlacementSorts(siblingEntries = [], anchorEntry = null, p
     startSort = nextSort - (placementCount * SORT_STEP);
   } else if (!hasPrevious && !hasNext) {
     startSort = SORT_STEP;
-  } else if ((nextSort - previousSort) >= requiredGap) {
-    startSort = previousSort + SORT_STEP;
+  } else {
+    const gap = nextSort - previousSort;
+    const spacedGap = (placementCount + 1) * SORT_STEP;
+    if (gap >= spacedGap) {
+      startSort = previousSort + SORT_STEP;
+    } else {
+      placementStep = 1;
+      startSort = previousSort + 1;
+      if (gap <= placementCount) {
+        const lastPlacementSort = startSort + (placementCount - 1);
+        suffixShift = (lastPlacementSort - nextSort) + 1;
+      }
+    }
   }
-
-  const orderedEntries = entries.slice();
-  orderedEntries.splice(insertionIndex, 0, ...syntheticEntries);
 
   if (Number.isFinite(startSort)) {
     for (let index = 0; index < syntheticEntries.length; index += 1) {
-      syntheticEntries[index].sort = startSort + (index * SORT_STEP);
+      syntheticEntries[index].sort = startSort + (index * placementStep);
     }
-    return { orderedEntries, syntheticEntries, previewSorts, reindexed: false };
+    if (suffixShift > 0) {
+      for (let index = insertionIndex; index < entries.length; index += 1) {
+        entries[index].sort = Number(entries[index].sort) + suffixShift;
+      }
+    }
+    const orderedEntries = entries.slice();
+    orderedEntries.splice(insertionIndex, 0, ...syntheticEntries);
+    return { orderedEntries, syntheticEntries, previewSorts, reindexed: suffixShift > 0 };
   }
-
-  for (let index = 0; index < orderedEntries.length; index += 1) {
-    orderedEntries[index].sort = (index + 1) * SORT_STEP;
-  }
-  return { orderedEntries, syntheticEntries, previewSorts, reindexed: true };
+  return null;
 }
 
 function resolvePlacementSortAtElevation(elevation = 0, {
@@ -285,7 +345,8 @@ function resolvePlacementSortAtElevation(elevation = 0, {
   anchorTile = null,
   scene = canvas?.scene,
   count = 1,
-  sortBefore = false
+  sortBefore = false,
+  excludeTileIds = []
 } = {}) {
   const targetElevation = Number(elevation);
   const normalizedElevation = Number.isFinite(targetElevation) ? targetElevation : 0;
@@ -322,7 +383,7 @@ function resolvePlacementSortAtElevation(elevation = 0, {
   }
 
   try {
-    const siblingEntries = getSceneTileSortEntriesAtElevation(normalizedElevation, scene);
+    const siblingEntries = getSceneTileSortEntriesAtElevation(normalizedElevation, scene, excludeTileIds);
     const anchorEntry = siblingEntries.find((entry) => entry.id === anchorDoc.id) || null;
     if (!anchorEntry) return fallback({ reason: 'anchor-not-in-scene' });
     const originalSorts = new Map(siblingEntries.map((entry) => [entry.id, entry.rawSort]));
@@ -379,6 +440,12 @@ function resolvePlacementSortAtElevation(elevation = 0, {
 function announceChange(type, message, { throttleMs = 600, level = 'info' } = {}) {
   try {
     if (!message) return;
+    // Only text can be announced. A caller that reports an event with a data record instead (the
+    // Path editor does when a path ends) would otherwise show the user "[object Object]".
+    if (typeof message !== 'string') {
+      Logger.warn('CanvasInteractionController.announce.nonText', { type, level, received: typeof message });
+      return;
+    }
     const key = `${type}:${level}`;
     const now = Date.now();
     const last = ANNOUNCE_THROTTLE.get(key) || 0;
@@ -448,15 +515,28 @@ function lockLayerInteractivity(layerName = 'tiles') {
     const key = (requested in canvasRef) ? requested : requested.toLowerCase();
     const layer = canvasRef[key];
     if (!layer) return null;
-    try { layer.activate?.(); } catch (_) { /* no-op */ }
+    try { layer.activate?.(); } catch (error) {
+      Logger.error('CanvasInteractionController.layerLock.activate.failed', {
+        layer: key,
+        error: String(error?.message || error)
+      });
+    }
     const state = {
       interactiveChildren: ('interactiveChildren' in layer) ? layer.interactiveChildren : undefined,
       eventMode: ('eventMode' in layer) ? layer.eventMode : undefined,
       placeables: []
     };
+    let list = [];
     try {
-      const list = Array.isArray(layer.placeables) ? layer.placeables : [];
-      for (const obj of list) {
+      list = Array.isArray(layer.placeables) ? layer.placeables : [];
+    } catch (error) {
+      Logger.error('CanvasInteractionController.layerLock.placeables.lookupFailed', {
+        layer: key,
+        error: String(error?.message || error)
+      });
+    }
+    for (const obj of list) {
+      try {
         state.placeables.push({
           obj,
           interactive: ('interactive' in obj) ? obj.interactive : undefined,
@@ -464,13 +544,33 @@ function lockLayerInteractivity(layerName = 'tiles') {
         });
         if ('eventMode' in obj) obj.eventMode = 'none';
         if ('interactive' in obj) obj.interactive = false;
+      } catch (error) {
+        Logger.error('CanvasInteractionController.layerLock.placeable.blockFailed', {
+          layer: key,
+          id: obj?.document?.id || obj?.id || null,
+          error: String(error?.message || error)
+        });
       }
-    } catch (_) { /* ignore */ }
+    }
     if ('interactiveChildren' in layer && state.interactiveChildren !== undefined) {
-      layer.interactiveChildren = false;
+      try {
+        layer.interactiveChildren = false;
+      } catch (error) {
+        Logger.error('CanvasInteractionController.layerLock.layerChildren.blockFailed', {
+          layer: key,
+          error: String(error?.message || error)
+        });
+      }
     }
     if ('eventMode' in layer && state.eventMode !== undefined) {
-      layer.eventMode = 'passive';
+      try {
+        layer.eventMode = 'passive';
+      } catch (error) {
+        Logger.error('CanvasInteractionController.layerLock.layerMode.blockFailed', {
+          layer: key,
+          error: String(error?.message || error)
+        });
+      }
     }
     let released = false;
     return {
@@ -522,13 +622,290 @@ function lockLayerInteractivity(layerName = 'tiles') {
         }
       }
     };
-  } catch (_) {
+  } catch (error) {
+    Logger.error('CanvasInteractionController.layerLock.acquire.failed', {
+      layer: String(layerName ?? ''),
+      error: String(error?.message || error)
+    });
     return null;
   }
 }
 
 function lockTileInteractivity() {
   return lockLayerInteractivity('tiles');
+}
+
+function getPlaceableLayers(canvasRef) {
+  let layers = [];
+  try {
+    layers = Array.isArray(canvasRef?.layers) ? canvasRef.layers : [];
+  } catch (error) {
+    Logger.error('CanvasInteractionController.placeableLock.layers.lookupFailed', {
+      error: String(error?.message || error)
+    });
+    return [];
+  }
+  const PlaceablesLayer = globalThis?.foundry?.canvas?.layers?.PlaceablesLayer;
+  // V14's TemplateLayer is a compatibility facade over Regions. Reading its
+  // placeables accesses deprecated Scene.templates and locks the same objects twice.
+  layers = layers.filter(layer => layer?.constructor?.documentName !== 'MeasuredTemplate');
+  if (typeof PlaceablesLayer === 'function') {
+    return layers.filter((layer) => layer instanceof PlaceablesLayer);
+  }
+  return layers.filter((layer) => Array.isArray(layer?.placeables) && 'hover' in layer);
+}
+
+function clearPlaceableHover(layer) {
+  const hovered = layer?.hover;
+  if (!hovered) return;
+  try {
+    hovered._onHoverOut?.({ buttons: 0 });
+  } catch (error) {
+    Logger.error('CanvasInteractionController.placeableLock.hover.clearFailed', {
+      layer: layer?.name || layer?.constructor?.name || 'unknown',
+      id: hovered?.document?.id || hovered?.id || null,
+      error: String(error?.message || error)
+    });
+  }
+}
+
+function lockPlaceableInteractivity() {
+  try {
+    const canvasRef = canvas || null;
+    if (!canvasRef) return null;
+    const layers = getPlaceableLayers(canvasRef);
+    const states = [];
+
+    try { globalThis?.game?.keyboard?.releaseKeys?.({ force: true }); }
+    catch (error) {
+      Logger.error('CanvasInteractionController.placeableLock.keyboard.releaseFailed', {
+        error: String(error?.message || error)
+      });
+    }
+    try { canvasRef.highlightObjects?.(false); }
+    catch (error) {
+      Logger.error('CanvasInteractionController.placeableLock.highlight.clearFailed', {
+        error: String(error?.message || error)
+      });
+    }
+
+    for (const layer of layers) {
+      const state = {
+        layer,
+        active: (typeof layer?.active === 'boolean') ? layer.active : undefined,
+        interactiveChildren: ('interactiveChildren' in layer) ? layer.interactiveChildren : undefined,
+        eventMode: ('eventMode' in layer) ? layer.eventMode : undefined,
+        placeables: []
+      };
+      clearPlaceableHover(layer);
+      let placeables = [];
+      try {
+        placeables = Array.isArray(layer.placeables) ? layer.placeables : [];
+      } catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.placeables.lookupFailed', {
+          layer: layer?.name || layer?.constructor?.name || 'unknown',
+          error: String(error?.message || error)
+        });
+      }
+      for (const obj of placeables) {
+        try {
+          state.placeables.push({
+            obj,
+            interactive: ('interactive' in obj) ? obj.interactive : undefined,
+            eventMode: ('eventMode' in obj) ? obj.eventMode : undefined
+          });
+          if ('eventMode' in obj) obj.eventMode = 'none';
+          if ('interactive' in obj) obj.interactive = false;
+        } catch (error) {
+          Logger.error('CanvasInteractionController.placeableLock.placeable.blockFailed', {
+            layer: layer?.name || layer?.constructor?.name || 'unknown',
+            id: obj?.document?.id || obj?.id || null,
+            error: String(error?.message || error)
+          });
+        }
+      }
+      try {
+        if (state.interactiveChildren !== undefined) layer.interactiveChildren = false;
+        if (state.eventMode !== undefined) layer.eventMode = 'passive';
+      } catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.layer.blockFailed', {
+          layer: layer?.name || layer?.constructor?.name || 'unknown',
+          error: String(error?.message || error)
+        });
+      }
+      states.push(state);
+    }
+
+    const statesByLayer = new Map(states.map((state) => [state.layer, state]));
+    const hookRegistrations = [];
+    let released = false;
+
+    const suppressPlaceable = (obj, layer) => {
+      if (released || !obj || !statesByLayer.has(layer)) return;
+      try {
+        if ('eventMode' in obj) obj.eventMode = 'none';
+        if ('interactive' in obj) obj.interactive = false;
+      } catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.placeable.relockFailed', {
+          layer: layer?.name || layer?.constructor?.name || 'unknown',
+          id: obj?.document?.id || obj?.id || null,
+          error: String(error?.message || error)
+        });
+      }
+    };
+
+    const suppressLayer = (layer) => {
+      if (released || !statesByLayer.has(layer)) return;
+      clearPlaceableHover(layer);
+      let placeables = [];
+      try { placeables = Array.isArray(layer.placeables) ? layer.placeables : []; }
+      catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.layer.relockLookupFailed', {
+          layer: layer?.name || layer?.constructor?.name || 'unknown',
+          error: String(error?.message || error)
+        });
+      }
+      for (const obj of placeables) suppressPlaceable(obj, layer);
+      try {
+        if ('interactiveChildren' in layer) layer.interactiveChildren = false;
+        if ('eventMode' in layer) layer.eventMode = 'passive';
+      } catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.layer.relockFailed', {
+          layer: layer?.name || layer?.constructor?.name || 'unknown',
+          error: String(error?.message || error)
+        });
+      }
+    };
+
+    const captureAndSuppressLayerLifecycle = (layer) => {
+      if (released) return;
+      const state = statesByLayer.get(layer);
+      if (!state) return;
+      try {
+        if (typeof layer?.active === 'boolean') state.active = layer.active;
+        if ('interactiveChildren' in layer) state.interactiveChildren = layer.interactiveChildren;
+        if ('eventMode' in layer) state.eventMode = layer.eventMode;
+      } catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.layer.lifecycleCaptureFailed', {
+          layer: layer?.name || layer?.constructor?.name || 'unknown',
+          error: String(error?.message || error)
+        });
+      }
+      suppressLayer(layer);
+    };
+
+    const hooksRef = globalThis?.Hooks;
+    const registerHook = (name, listener) => {
+      if (!hooksRef?.on || !hooksRef?.off) return;
+      try {
+        const id = hooksRef.on(name, listener);
+        hookRegistrations.push({ name, id });
+      } catch (error) {
+        Logger.error('CanvasInteractionController.placeableLock.hook.registerFailed', {
+          hook: name,
+          error: String(error?.message || error)
+        });
+      }
+    };
+
+    registerHook('activateCanvasLayer', captureAndSuppressLayerLifecycle);
+    const layerHookNames = new Set(states.map((state) => state.layer?.hookName).filter(Boolean));
+    for (const hookName of layerHookNames) {
+      // Foundry has a generic activation hook, but deactivation is emitted only
+      // as deactivate<LayerHookName>. NotesLayer uses that tail to restore its
+      // inactive display-toggle interactivity, so suppress after the exact hook.
+      registerHook(`deactivate${hookName}`, captureAndSuppressLayerLifecycle);
+    }
+    const documentNames = new Set(states.map((state) => (
+      state.layer?.constructor?.documentName
+      || state.layer?.documentName
+      || state.placeables[0]?.obj?.document?.documentName
+      || null
+    )).filter(Boolean));
+    for (const documentName of documentNames) {
+      const suppressRefreshedPlaceable = (obj) => suppressPlaceable(obj, obj?.layer);
+      registerHook(`draw${documentName}`, (obj) => {
+        suppressRefreshedPlaceable(obj);
+        // Foundry calls draw<Type> immediately before activateListeners(). Re-lock
+        // once that synchronous draw tail completes so a new placeable never
+        // escapes during the active editor session.
+        try { queueMicrotask(() => suppressRefreshedPlaceable(obj)); }
+        catch (error) {
+          Logger.error('CanvasInteractionController.placeableLock.drawRelock.scheduleFailed', {
+            documentName,
+            error: String(error?.message || error)
+          });
+        }
+      });
+      registerHook(`refresh${documentName}`, suppressRefreshedPlaceable);
+    }
+
+    return {
+      release() {
+        if (released) return;
+        released = true;
+        for (const { name, id } of hookRegistrations.splice(0)) {
+          try { hooksRef?.off?.(name, id); }
+          catch (error) {
+            Logger.error('CanvasInteractionController.placeableLock.hook.releaseFailed', {
+              hook: name,
+              error: String(error?.message || error)
+            });
+          }
+        }
+        for (const state of states) {
+          const layer = state.layer;
+          if (!layer) continue;
+          try {
+            if (state.interactiveChildren !== undefined && 'interactiveChildren' in layer) {
+              layer.interactiveChildren = state.interactiveChildren;
+            }
+            if (state.eventMode !== undefined && 'eventMode' in layer) {
+              layer.eventMode = state.eventMode;
+            }
+            for (const saved of state.placeables) {
+              const obj = saved.obj;
+              if (!obj) continue;
+              if (saved.eventMode !== undefined && 'eventMode' in obj) obj.eventMode = saved.eventMode;
+              if (saved.interactive !== undefined && 'interactive' in obj) obj.interactive = saved.interactive;
+            }
+            const existingPlaceables = new Set(state.placeables.map(({ obj }) => obj));
+            const currentPlaceables = Array.isArray(layer.placeables) ? layer.placeables : [];
+            for (const obj of currentPlaceables) {
+              if (!obj || existingPlaceables.has(obj)) continue;
+              obj.activateListeners?.();
+            }
+            layer.setAllRenderFlags?.({ refreshState: true });
+          } catch (error) {
+            Logger.error('CanvasInteractionController.placeableLock.release.restoreFailed', {
+              layer: layer?.name || layer?.constructor?.name || 'unknown',
+              error: String(error?.message || error)
+            });
+          }
+        }
+        try {
+          const mouseManager = globalThis?.foundry?.canvas?.interaction?.MouseInteractionManager
+            || globalThis?.MouseInteractionManager;
+          mouseManager?.emulateMoveEvent?.();
+        } catch (error) {
+          Logger.error('CanvasInteractionController.placeableLock.release.emulateMoveFailed', {
+            error: String(error?.message || error)
+          });
+        }
+        if (states.some(({ layer }) => isTilesLayer(layer))) {
+          requestSelectionFilterRefresh({
+            reason: 'placeable-lock-release',
+            source: 'canvas-interaction-controller'
+          });
+        }
+      }
+    };
+  } catch (error) {
+    Logger.error('CanvasInteractionController.placeableLock.acquire.failed', {
+      error: String(error?.message || error)
+    });
+    return null;
+  }
 }
 
 class CanvasInteractionSession {
@@ -540,6 +917,9 @@ class CanvasInteractionSession {
     this._options = Object.assign({
       lockTileInteractivity: false,
       lockCanvasLayer: null,
+      lockPlaceableInteractivity: false,
+      exclusiveInput: false,
+      coalescePointerMove: false,
       onCanvasTearDown: null,
       onStop: null
     }, options);
@@ -556,24 +936,35 @@ class CanvasInteractionSession {
       ? this._options.lockCanvasLayer.trim()
       : null;
     const layerName = requestedLayer || (this._options.lockTileInteractivity ? 'tiles' : null);
-    this._layerLock = layerName ? lockLayerInteractivity(layerName) : null;
+    this._layerLock = this._options.lockPlaceableInteractivity
+      ? lockPlaceableInteractivity()
+      : (layerName ? lockLayerInteractivity(layerName) : null);
   }
 
   get eventTypes() {
     return this._eventTypes;
   }
 
+  get exclusiveInput() {
+    return this._options.exclusiveInput === true;
+  }
+
+  get coalescePointerMove() {
+    return this._options.coalescePointerMove === true;
+  }
+
   dispatch(type, event, context) {
-    if (this._stopped) return;
+    if (this._stopped) return false;
     const handler = this._handlers[type];
-    if (!handler) return;
+    if (!handler) return false;
     try {
-      handler(event, context);
+      return handler(event, context) === true;
     } catch (err) {
       Logger.error('CanvasInteractionSession.handler.failed', {
         type,
         error: err
       });
+      return false;
     }
   }
 
@@ -626,6 +1017,9 @@ class CanvasInteractionControllerImpl {
       screen: null,
       world: null
     };
+    this._coalescedPointerOwner = null;
+    this._pendingPointerMove = null;
+    this._pendingPointerMoveFrame = null;
     this._onCanvasTearDown = this._onCanvasTearDown.bind(this);
     try {
       const hooks = globalThis?.Hooks;
@@ -664,6 +1058,10 @@ class CanvasInteractionControllerImpl {
     return resolvePlacementSortAtElevation(elevation, options);
   }
 
+  resolveAdjacentPlacementSortAnchor(elevation, options) {
+    return resolveAdjacentPlacementSortAnchor(elevation, options);
+  }
+
   announceChange(type, message, options) {
     announceChange(type, message, options);
   }
@@ -683,6 +1081,7 @@ class CanvasInteractionControllerImpl {
   }
 
   _removeSession(session) {
+    if (this._coalescedPointerOwner?.session === session) this._clearCoalescedPointerMove();
     this._sessions.delete(session);
     this._refreshEventBindings();
   }
@@ -694,6 +1093,7 @@ class CanvasInteractionControllerImpl {
       catch (_) { /* no-op */ }
     }
     this._pointerState = { screen: null, world: null };
+    this._clearCoalescedPointerMove();
   }
 
   _refreshEventBindings() {
@@ -729,7 +1129,108 @@ class CanvasInteractionControllerImpl {
     this._activeEvents.delete(type);
   }
 
+  _clearCoalescedPointerMove() {
+    if (this._pendingPointerMoveFrame != null && typeof globalThis.cancelAnimationFrame === 'function') {
+      globalThis.cancelAnimationFrame(this._pendingPointerMoveFrame);
+    }
+    this._pendingPointerMoveFrame = null;
+    this._pendingPointerMove = null;
+    this._coalescedPointerOwner = null;
+  }
+
+  _matchesCoalescedPointer(event) {
+    const owner = this._coalescedPointerOwner;
+    if (!owner) return false;
+    const eventPointerId = event?.pointerId == null ? null : Number(event.pointerId);
+    return owner.pointerId == null || eventPointerId == null || eventPointerId === owner.pointerId;
+  }
+
+  _snapshotPointerMove(event) {
+    return {
+      type: 'pointermove',
+      pointerId: event?.pointerId == null ? null : Number(event.pointerId),
+      pointerType: String(event?.pointerType || 'mouse'),
+      clientX: Number(event?.clientX),
+      clientY: Number(event?.clientY),
+      button: event?.button == null ? -1 : Number(event.button),
+      buttons: event?.buttons == null ? 0 : Number(event.buttons),
+      isPrimary: event?.isPrimary !== false,
+      isTrusted: event?.isTrusted !== false,
+      altKey: event?.altKey === true,
+      ctrlKey: event?.ctrlKey === true,
+      metaKey: event?.metaKey === true,
+      shiftKey: event?.shiftKey === true,
+      detail: Number(event?.detail || 0),
+      timeStamp: Number(event?.timeStamp || 0),
+      preventDefault() {},
+      stopImmediatePropagation() {},
+      stopPropagation() {}
+    };
+  }
+
+  _queueCoalescedPointerMove(event) {
+    this._pendingPointerMove = this._snapshotPointerMove(event);
+    event?.preventDefault?.();
+    event?.stopImmediatePropagation?.();
+    event?.stopPropagation?.();
+    if (this._pendingPointerMoveFrame != null) return;
+    const flush = () => {
+      this._pendingPointerMoveFrame = null;
+      const latest = this._pendingPointerMove;
+      this._pendingPointerMove = null;
+      if (latest && this._coalescedPointerOwner) this._dispatchEvent('pointermove', latest);
+    };
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+      this._pendingPointerMoveFrame = globalThis.requestAnimationFrame(flush);
+    } else {
+      this._pendingPointerMoveFrame = globalThis.setTimeout?.(flush, 0) ?? null;
+    }
+  }
+
+  _flushCoalescedPointerMove() {
+    if (this._pendingPointerMoveFrame != null && typeof globalThis.cancelAnimationFrame === 'function') {
+      globalThis.cancelAnimationFrame(this._pendingPointerMoveFrame);
+    }
+    this._pendingPointerMoveFrame = null;
+    const latest = this._pendingPointerMove;
+    this._pendingPointerMove = null;
+    if (latest && this._coalescedPointerOwner) this._dispatchEvent('pointermove', latest);
+  }
+
+  _discardCoalescedPointerMove() {
+    if (this._pendingPointerMoveFrame != null) {
+      if (typeof globalThis.cancelAnimationFrame === 'function') {
+        globalThis.cancelAnimationFrame(this._pendingPointerMoveFrame);
+      } else if (typeof globalThis.clearTimeout === 'function') {
+        globalThis.clearTimeout(this._pendingPointerMoveFrame);
+      }
+    }
+    this._pendingPointerMoveFrame = null;
+    this._pendingPointerMove = null;
+  }
+
   _handleEvent(type, event) {
+    // Typed into a text box, a key is not a tool shortcut: Escape in a search box must not
+    // cancel the session behind it.
+    if ((type === 'keydown' || type === 'keyup') && isKeyEventForTextEntry(event)) return;
+    // A key pressed while the leave question is open belongs to that question (Escape = Continue Editing).
+    if ((type === 'keydown' || type === 'keyup') && isSessionExitQuestionOpen()) return;
+    if (type === 'pointermove' && this._matchesCoalescedPointer(event)) {
+      this._queueCoalescedPointerMove(event);
+      return;
+    }
+    const closesCoalescedPointer = (type === 'pointerup' || type === 'pointercancel')
+      && this._matchesCoalescedPointer(event);
+    // A queued pointermove is older than the terminal event. Dispatching it
+    // immediately before release can start stale work after the delegate has
+    // chosen its final state. Drop it; the delegate decides whether release
+    // freezes its last visible preview or consumes the terminal coordinate.
+    if (closesCoalescedPointer) this._discardCoalescedPointerMove();
+    this._dispatchEvent(type, event);
+    if (closesCoalescedPointer) this._clearCoalescedPointerMove();
+  }
+
+  _dispatchEvent(type, event) {
     if (POINTER_EVENT_TYPES.has(type)) {
       this._updatePointerFromEvent(event);
     }
@@ -740,8 +1241,18 @@ class CanvasInteractionControllerImpl {
       overCanvas: CanvasInteractionControllerImpl._isEventOverCanvas(event, this._pointerState)
     };
 
-    for (const session of this._sessions) {
-      session.dispatch(type, event, context);
+    const sessions = Array.from(this._sessions).sort((left, right) => (
+      Number(right.exclusiveInput) - Number(left.exclusiveInput)
+    ));
+    for (const session of sessions) {
+      const claimed = session.dispatch(type, event, context);
+      if (type === 'pointerdown' && claimed && session.exclusiveInput && session.coalescePointerMove) {
+        this._coalescedPointerOwner = {
+          session,
+          pointerId: event?.pointerId == null ? null : Number(event.pointerId)
+        };
+      }
+      if (claimed && session.exclusiveInput) break;
     }
   }
 
@@ -796,7 +1307,9 @@ export {
   normalizeTileDocumentSortForPlacement,
   computeNextSortAtElevation,
   computeLowestSortAtElevation,
+  sameElevation,
   resolvePlacementSortAtElevation,
+  resolveAdjacentPlacementSortAnchor,
   announceChange,
   getGridScaleFactor,
   getCanvasElement

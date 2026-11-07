@@ -108,7 +108,10 @@ function validateFlattenMetadata(metadata) {
   if (Number(metadata.version) !== 1) {
     throw new Error(`Unsupported flatten metadata version: ${metadata.version ?? 'missing'}.`);
   }
-  if (!Array.isArray(metadata.tiles) || metadata.tiles.length === 0) {
+  const composition = metadata.composition;
+  const compositionArchive = composition?.version === 1 && typeof composition.ownerUuid === 'string'
+    && (composition.snapshot?.documents?.length > 0 || Number(metadata.originalTileCount) === 0);
+  if ((!Array.isArray(metadata.tiles) || metadata.tiles.length === 0) && !compositionArchive) {
     throw new Error('Flatten WebP metadata does not contain deconstruction tile data.');
   }
   if (metadata.chunked && (!Array.isArray(metadata.chunks) || metadata.chunks.length === 0)) {

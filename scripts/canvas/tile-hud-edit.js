@@ -1,11 +1,15 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { isProTierRefusal, proTierMessage } from '../premium/session-host/auth-state.js';
 import { TileFlattenManager } from '../flatten/flatten-manager.js';
 import { getFaNexusTileCapabilities } from './tile-capabilities.js';
 import { getTileExplicitPlacementLevelId } from './tile-band-utils.js';
 import { resolveTileDocument as resolveSharedTileDocument } from './tile-targets.js';
 import { hasStandardMaskCustomBaseSource } from '../textures/standard-mask-custom-base.js';
+import { resolveBuildingGeneratedDocumentOwner, createBuildingGeneratedDocumentEditorOptions,
+  formatBuildingGeneratedDocumentOwnershipExplanation } from '../buildings/building-generated-document-runtime.js';
 
 const BUTTON_ACTION = 'fa-nexus-edit';
+const FLATTENED_PICTURE_EDIT_REFUSAL = 'A flattened picture has no editor of its own. Use Apply Mask to hide parts of it, or Deconstruct to get its layers back.';
 const MASK_BUTTON_ACTION = 'fa-nexus-mask';
 const FLATTEN_ACTION = 'fa-nexus-flatten';
 const DECONSTRUCT_ACTION = 'fa-nexus-deconstruct';
@@ -41,8 +45,27 @@ function getEditorButtonLabel(mode, { canLaunch = true } = {}) {
 }
 
 function getTileEditorState(doc) {
-  const capabilities = getFaNexusTileCapabilities(doc);
+  const ownership = resolveBuildingGeneratedDocumentOwner({ scene: doc?.parent, document: doc });
+  const capabilities = getFaNexusTileCapabilities(ownership?.ownerDocument || doc);
+  if (ownership && !ownership.ownerDocument) return {
+    mode: 'buildings', canLaunch: false, capabilities,
+    label: getEditorButtonLabel('buildings'),
+    tooltip: formatBuildingGeneratedDocumentOwnershipExplanation(ownership),
+    errorMessage: `${formatBuildingGeneratedDocumentOwnershipExplanation(ownership)} The owning Tile is unavailable.`,
+    reasonCode: 'building-owner-missing'
+  };
   const mode = capabilities?.editMode || null;
+  if (!mode && capabilities?.hasFlattened) {
+    return {
+      mode: null,
+      canLaunch: false,
+      capabilities,
+      label: null,
+      tooltip: null,
+      errorMessage: FLATTENED_PICTURE_EDIT_REFUSAL,
+      reasonCode: 'flattened-picture'
+    };
+  }
   if (!mode) {
     return {
       mode: null,
@@ -82,6 +105,12 @@ function getTileEditorState(doc) {
 export function getFaNexusTileEditMode(doc) {
   const state = getTileEditorState(doc);
   return state.canLaunch ? state.mode : null;
+}
+
+/** Why "Nexus Edit" is not offered for a Tile that the user may well expect to edit, or null. For menus. */
+export function getFaNexusTileEditRefusal(doc) {
+  const state = getTileEditorState(doc);
+  return state.reasonCode === 'flattened-picture' ? { reasonCode: state.reasonCode, message: state.errorMessage } : null;
 }
 
 function resolveHudElement(hud, payload) {
@@ -128,6 +157,7 @@ export function canLaunchFaNexusTileMask(doc) {
   try {
     if (!STANDARD_TILE_MASK_HUD_ENABLED) return false;
     if (!doc) return false;
+    if (resolveBuildingGeneratedDocumentOwner({ scene: doc.parent, document: doc })) return false;
     const capabilities = getFaNexusTileCapabilities(doc);
     if (capabilities.hasMaskedTiling) return false;
     if (capabilities.hasVideoTexture) return false;
@@ -349,7 +379,19 @@ async function waitForViewedParentLevel(levelId, { scene = canvas?.scene, timeou
 }
 
 async function ensureTileParentLevelViewed(doc, { mode = null, source = null } = {}) {
-  const parentLevelId = getTileExplicitPlacementLevelId(doc);
+  let parentLevelId = getTileExplicitPlacementLevelId(doc);
+  const building = doc?.flags?.['fa-nexus']?.building;
+  const nativeBuilding = mode === 'buildings' && [4, 5].includes(Number(building?.schemaVersion));
+  if (nativeBuilding) {
+    const { readBuildingV2NativeWallLevelIds } = await import('../buildings/v2/building-v2-existing-edit-runtime.js');
+    const levels = readBuildingV2NativeWallLevelIds(doc);
+    const viewed = getCurrentViewedLevelId(doc.parent);
+    if (levels.length === 1) parentLevelId = levels[0];
+    else if (!levels.length || levels.includes(viewed)) parentLevelId = viewed;
+    else if (!levels.includes(parentLevelId)) {
+      throw new Error('View one of the Building native Wall Levels before opening Edit.');
+    }
+  }
   if (!parentLevelId) {
     Logger.debug?.('TileHud.parentLevelSwitch.skippedNoParentLevel', {
       tileId: doc?.id || null,
@@ -383,7 +425,8 @@ async function ensureTileParentLevelViewed(doc, { mode = null, source = null } =
       mode,
       source
     });
-    throw new Error(`Tile Parent Level "${parentLevelId}" was not found in this scene.`);
+    // The id is in the log line above; the reader of the notification needs to know what to do.
+    throw new Error('The Level this layer was made on no longer exists. In the Layer Manager, drag its row onto an Elevation of another Level, then edit it.');
   }
 
   const currentLevelId = getCurrentViewedLevelId(scene);
@@ -431,7 +474,7 @@ async function ensureTileParentLevelViewed(doc, { mode = null, source = null } =
     mode,
     source
   });
-  ui?.notifications?.info?.(`Switching to Parent Level: ${levelName}`);
+  ui?.notifications?.info?.(`Switching to ${nativeBuilding ? 'Building Wall' : 'Parent'} Level: ${levelName}`);
   await scene.view({ level: parentLevelId });
   await waitForViewedParentLevel(parentLevelId, { scene });
   Logger.info('TileHud.parentLevelSwitch.complete', {
@@ -491,19 +534,52 @@ async function ensureAppReady(app) {
   return app;
 }
 
+export async function ensureTileHudTabServices(tab, tabId) {
+  if (!tab?._controller?.ensureServices) return false;
+  try {
+    await tab._controller.ensureServices();
+    return true;
+  } catch (error) {
+    Logger.error('TileHud.ensureServices.failed', {
+      tab: tabId,
+      error: String(error?.message || error)
+    });
+    throw error;
+  }
+}
+
 async function openTab(app, tabId) {
   const tabManager = app?._tabManager;
   if (!tabManager) throw new Error('FA Nexus tab manager unavailable');
-  await tabManager.switchToTab(tabId);
+  if (tabManager.getActiveTabId() !== tabId) {
+    await tabManager.switchToTab(tabId);
+  }
   tabManager.initializeTabs();
   const tabs = tabManager.getTabs();
   const tab = tabs?.[tabId];
   if (!tab) throw new Error(`FA Nexus tab missing: ${tabId}`);
-  if (tab?._controller?.ensureServices) {
-    try { await tab._controller.ensureServices(); }
-    catch (error) { Logger.warn('TileHud.ensureServices.failed', { tab: tabId, error: String(error?.message || error) }); }
-  }
+  await ensureTileHudTabServices(tab, tabId);
   return tab;
+}
+
+async function stopEmptyExistingEditorSession(mode) {
+  const existing = foundry?.applications?.instances?.get?.('fa-nexus-app') || null;
+  const tabs = existing?._tabManager?.getTabs?.() || null;
+  const manager = mode === 'buildings'
+    ? (tabs?.buildings?.buildingManager || tabs?.buildings?._buildingManager || null)
+    : null;
+  if (!manager?.isActive) return true;
+  // Tracer-specific: its stop routes through the tracer's own exit prompt. A LIVE bundle
+  // session keeps the fail-closed path below (changed sessions refuse HUD re-entry).
+  if (manager.isCurrentBuildingEditTracerActive) {
+    const outcome = await Promise.resolve(manager.stop?.({ reason: 'opening another Building' }));
+    return !manager.isActive && !['continued', 'blocked'].includes(outcome?.kind);
+  }
+  if (manager.hasSessionChanges?.()) {
+    throw new Error('Finish or cancel the active FA Nexus session before editing another Tile.');
+  }
+  await Promise.resolve(manager.stop?.({ reason: 'tile-hud-edit-reentry' }));
+  return !manager.isActive;
 }
 
 function resolveBuildingModeFromTile(doc) {
@@ -520,11 +596,16 @@ function resolveBuildingModeFromTile(doc) {
 
 async function launchEditor(doc, mode, options = {}) {
   if (!doc) throw new Error('Tile document not available');
+  if (mode === 'buildings') {
+    const { waitForSceneGroupOverlayTransformSettlement } = await import('../composition/scene-group-overlay-runtime.js');
+    await waitForSceneGroupOverlayTransformSettlement();
+  }
   const editorState = getTileEditorState(doc);
   if (mode === 'paths' && !editorState.canLaunch) {
     throw new Error(editorState.errorMessage || 'This tile cannot be edited in FA Nexus.');
   }
   const launchOptions = { ...(options && typeof options === 'object' ? options : {}) };
+  if (!await stopEmptyExistingEditorSession(mode)) return { kind: 'continued' };
   const parentLevelContext = await ensureTileParentLevelViewed(doc, {
     mode,
     source: launchOptions.source || 'tile-hud'
@@ -565,16 +646,23 @@ async function launchEditor(doc, mode, options = {}) {
     await manager.editStandardTile(doc, launchOptions);
     return;
   }
-  await manager.editTile(doc, launchOptions);
+  const sessionView = await manager.editTile(doc, launchOptions);
+  if (mode === 'buildings' && typeof tab?.syncFillSelectionFromSession === 'function') {
+    tab.syncFillSelectionFromSession(sessionView);
+  }
+  if (mode === 'buildings' && manager.isActive) {
+    tab?._attachEscapeListener?.();
+  }
 }
 
 export async function openFaNexusTileEditor(doc, options = {}) {
   const editorState = getTileEditorState(doc);
   if (!editorState.mode) {
     Logger.error('TileHud.openEditor.unsupportedTile', {
-      tileId: doc?.id || null
+      tileId: doc?.id || null,
+      reasonCode: editorState.reasonCode || null
     });
-    throw new Error('This tile does not support FA Nexus editing.');
+    throw new Error(editorState.errorMessage || 'This tile does not support FA Nexus editing.');
   }
   if (!editorState.canLaunch) {
     Logger.error('TileHud.openEditor.launchBlocked', {
@@ -585,7 +673,60 @@ export async function openFaNexusTileEditor(doc, options = {}) {
     });
     throw new Error(editorState.errorMessage || 'This tile cannot be edited in FA Nexus.');
   }
-  return launchEditor(doc, editorState.mode, options);
+  const ownership = resolveBuildingGeneratedDocumentOwner({ scene: doc?.parent, document: doc });
+  const launchOptions = ownership ? {
+    ...createBuildingGeneratedDocumentEditorOptions(doc, { source: options?.source || 'tile-hud' }),
+    ...options
+  } : options;
+  try {
+    return await launchEditor(ownership?.ownerDocument || doc, editorState.mode, launchOptions);
+  } catch (error) {
+    throw explainEditorAccessRefusal(error, editorState.mode);
+  }
+}
+
+const PRO_TOOL_LABELS = Object.freeze({ buildings: 'The Building Tool', paths: 'Paths', textures: 'Texture Painting' });
+
+/**
+ * Nexus Edit without a Patreon login, or on a tier without the Pro tools, is a refusal the user can act on: give it
+ * a sentence they understand (userMessage) instead of the entitlement service's code-level text.
+ */
+function explainEditorAccessRefusal(error, mode) {
+  const label = PRO_TOOL_LABELS[mode] || 'This editor';
+  const code = String(error?.code || '').toUpperCase();
+  if (code === 'STATE_MISSING') error.userMessage = `${label} is a Pro tool. Connect Patreon to edit this layer.`;
+  else if (isProTierRefusal(error)) error.userMessage = proTierMessage(label);
+  else if (mode === 'buildings') {
+    const sentence = v053RefusalSentence(error);
+    if (sentence) error.userMessage = sentence;
+  }
+  return error;
+}
+
+// A Building made with Nexus 0.5.3 opens in the new Building Tool only when it can be rebuilt exactly; the premium
+// editor refuses the rest with a coded preflight result (error.code, error.preflight). Those codes and their facts
+// get a sentence the user can act on; the technical message stays in the log.
+const V053_FACT_SENTENCES = Object.freeze({
+  'linked-walls-missing': 'its Foundry Walls are no longer there',
+  'linked-inner-wall-missing': 'some of its inner Walls are no longer there',
+  'native-portal-missing': 'some of its doors or windows are no longer there',
+  'scene-group-transform-history-ambiguous': 'it is in a Scene Group, so Nexus cannot tell how the group moved it'
+});
+function v053RefusalSentence(error) {
+  const code = String(error?.code || '');
+  // Missing or ambiguous facts carry the fact's own code (for example linked-walls-missing), so the preflight result
+  // attached to the error is what marks a 0.5.3 refusal.
+  if (!code.startsWith('building-v053-preflight') && !error?.preflight?.preflight) return null;
+  const lead = 'This Building was made with Nexus 0.5.3 and the new Building Tool cannot open it safely';
+  if (code === 'building-v053-preflight-unsupported-rotation') return `${lead}: it has been rotated. Turn it back to 0° to edit it.`;
+  if (code === 'building-v053-preflight-unsupported-scale') return `${lead}: it has been resized. Set its scale back to 100% to edit it.`;
+  if (code === 'building-v053-preflight-unsupported-editor-version' || code === 'building-v053-preflight-unsupported-schema') {
+    return 'This Building was made with an older Building Tool than the one in Nexus 0.5.3, and the new Building Tool cannot open it.';
+  }
+  const facts = error?.preflight?.preflight?.facts || {};
+  const factCodes = [code, ...[...(facts.missing || []), ...(facts.ambiguous || [])].map((fact) => String(fact?.code || ''))];
+  const reasons = [...new Set(factCodes.map((factCode) => V053_FACT_SENTENCES[factCode]).filter(Boolean))];
+  return reasons.length ? `${lead}: ${reasons.join(', and ')}.` : `${lead}. It still draws and works as it is.`;
 }
 
 export async function openFaNexusTileMaskEditor(doc, options = {}) {
@@ -692,28 +833,30 @@ Hooks.on('renderTileHUD', (hud, html) => {
 
     const editorState = getTileEditorState(doc);
     if (!editorState.mode) {
+      // No editor: no pen. The Mask button is decided on its own below (a flattened picture can be masked).
       const existing = root.querySelector(`button[data-action="${BUTTON_ACTION}"]`);
       if (existing) existing.remove();
-      const maskExisting = root.querySelector(`button[data-action="${MASK_BUTTON_ACTION}"]`);
-      if (maskExisting) maskExisting.remove();
-      return;
+    } else {
+      const button = ensureButton(root, editorState);
+      if (!button) return;
+      if (button._faNexusHandler) {
+        button.removeEventListener('click', button._faNexusHandler);
+        delete button._faNexusHandler;
+      }
+      const handler = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const launch = openFaNexusTileEditor(doc, { source: 'tile-hud' });
+        button._faNexusLaunchPromise = launch;
+        launch.catch((error) => {
+          Logger.warn('TileHud.launchEditor.failed', { error: String(error?.message || error) });
+          if (error?.userMessage) ui?.notifications?.warn?.(error.userMessage);
+          else ui?.notifications?.error?.(`Failed to open FA Nexus editor: ${error?.message || error}`);
+        });
+      };
+      button._faNexusHandler = handler;
+      button.addEventListener('click', handler);
     }
-    const button = ensureButton(root, editorState);
-    if (!button) return;
-    if (button._faNexusHandler) {
-      button.removeEventListener('click', button._faNexusHandler);
-      delete button._faNexusHandler;
-    }
-    const handler = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openFaNexusTileEditor(doc, { source: 'tile-hud' }).catch((error) => {
-        Logger.warn('TileHud.launchEditor.failed', { error: String(error?.message || error) });
-        ui?.notifications?.error?.(`Failed to open FA Nexus editor: ${error?.message || error}`);
-      });
-    };
-    button._faNexusHandler = handler;
-    button.addEventListener('click', handler);
 
     const maskButton = ensureStandardMaskButton(root, doc);
     if (!maskButton) return;

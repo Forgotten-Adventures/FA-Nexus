@@ -1,17 +1,27 @@
 export function getMatchingElevationGroupKeys(viewState = null) {
   const state = viewState || null;
   if (!state) return [];
-  if (state?.nestedGrouping) {
-    const visibleKeys = state?.matchingGroupHierarchy?.visibleKeys;
-    if (visibleKeys instanceof Set) {
-      return Array.from(visibleKeys).filter((key) => String(key || '').trim().length);
+  const keys = new Set();
+  const visibleKeys = state?.matchingGroupHierarchy?.visibleKeys;
+  if (visibleKeys instanceof Set) {
+    for (const key of visibleKeys) {
+      if (String(key || '').trim()) keys.add(key);
     }
   }
   const map = state?.matchingTileIdsByElevation;
   if (map instanceof Map) {
-    return Array.from(map.keys()).filter((key) => String(key || '').trim().length);
+    for (const key of map.keys()) {
+      if (String(key || '').trim()) keys.add(key);
+    }
   }
-  return [];
+  const sections = state?.matchingTileIdsBySection;
+  if (sections instanceof Map) {
+    for (const sectionId of sections.keys()) {
+      const id = String(sectionId || '').trim();
+      if (id) keys.add(`section:${id}`);
+    }
+  }
+  return Array.from(keys);
 }
 
 export function getMatchingElevationDocs(viewState, elevationKey, { resolveDocumentById = null } = {}) {
@@ -115,10 +125,6 @@ export function expandElevationGroupsForDocs({
     if (!doc) continue;
     const exactKey = String(resolveDocumentGroupKey?.(doc) || elevationGroupKey(doc?.elevation ?? 0)).trim();
     if (!exactKey) continue;
-    if (!usesNestedGrouping(viewState)) {
-      keysToExpand.add(exactKey);
-      continue;
-    }
     let node = getFullGroupNode(viewState, exactKey);
     if (!node) {
       keysToExpand.add(exactKey);

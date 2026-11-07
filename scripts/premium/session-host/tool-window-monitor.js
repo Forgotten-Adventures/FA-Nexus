@@ -1,4 +1,4 @@
-import { toolOptionsController } from '../../core/tool-options-controller.js';
+import { toolOptionsController } from '../../core/tool-options/tool-options-controller.js';
 import { syncHostedToolOptionsOnMonitorTick } from './tool-options-sync.js';
 
 function scheduleMonitorTick(token, callback, timeoutMs) {
@@ -157,6 +157,27 @@ export function startHostedToolWindowMonitor({
       })
       : null
   });
+}
+
+export function beginHostedToolWindowMonitor(owner, options = {}) {
+  cancelHostedToolWindowMonitor(owner);
+  if (!options?.delegate) return null;
+
+  const assignMonitorToken = options.assignMonitorToken;
+  owner._toolMonitor = startHostedToolWindowMonitor({
+    ...options,
+    cancelMonitor: () => cancelHostedToolWindowMonitor(owner),
+    assignMonitorToken: (nextToken) => {
+      owner._toolMonitor = nextToken;
+      assignMonitorToken?.(nextToken);
+    }
+  });
+  return owner._toolMonitor;
+}
+
+export function cancelHostedToolWindowMonitor(owner) {
+  owner._toolMonitor = cancelToolWindowMonitor(owner._toolMonitor);
+  return owner._toolMonitor;
 }
 
 export function cancelToolWindowMonitor(token) {

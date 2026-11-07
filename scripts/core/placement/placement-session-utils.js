@@ -1,6 +1,6 @@
 import { createCanvasGestureSession } from '../../canvas/canvas-gesture-session.js';
 import { NexusLogger as Logger } from '../nexus-logger.js';
-import { toolOptionsController } from '../tool-options-controller.js';
+import { toolOptionsController } from '../tool-options/tool-options-controller.js';
 
 export function activatePlacementToolOptions({
   label = '',

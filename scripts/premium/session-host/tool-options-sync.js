@@ -1,5 +1,7 @@
 import { NexusLogger as Logger } from '../../core/nexus-logger.js';
-import { toolOptionsController } from '../../core/tool-options-controller.js';
+import { toolOptionsController } from '../../core/tool-options/tool-options-controller.js';
+
+const PREVIEW_LAYER_HOOK = 'fa-nexus-preview-layers-changed';
 
 function stringifyError(error) {
   return String(error?.message || error);
@@ -72,6 +74,29 @@ export function syncHostedToolOptionsOnMonitorTick({
     return true;
   } catch (error) {
     Logger.warn?.(`${loggerPrefix}.toolOptions.monitorSyncFailed`, {
+      error: stringifyError(error)
+    });
+    return false;
+  }
+}
+
+export function notifyHostedPreviewLayerChangeIfNeeded({
+  previewState = null,
+  source = 'premium-preview',
+  force = false,
+  lastSignature = null,
+  setLastSignature = null,
+  loggerPrefix = 'PremiumSessionHost'
+} = {}) {
+  const signature = JSON.stringify(previewState || {});
+  if (!force && signature === lastSignature) return false;
+  setLastSignature?.(signature);
+  try {
+    Hooks?.callAll?.(PREVIEW_LAYER_HOOK, { source, previewState });
+    return true;
+  } catch (error) {
+    Logger.error?.(`${loggerPrefix}.previewLayerHook.failed`, {
+      source,
       error: stringifyError(error)
     });
     return false;

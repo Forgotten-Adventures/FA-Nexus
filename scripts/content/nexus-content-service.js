@@ -1,6 +1,20 @@
 // NexusContentService — unified cloud content service for tokens/assets
 import { CloudDB } from './cloud-db.js';
+import {
+  buildContentKindPublicUrl,
+  encodeCloudPath,
+  getContentKindDescriptor
+} from './content-kind-descriptors.js';
+import {
+  contentPath,
+  isCloudManifestV2Payload,
+  toInventoryV2Items
+} from './cloud-inventory-v2.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { isStateMismatchResponse } from '../premium/session-host/auth-state.js';
+import { PREMIUM_DOWNLOAD_TIER_MESSAGE } from '../premium/patreon-auth-contract.js';
+
+const SYNC_SLOTS_BY_KIND = new Map();
 
 /**
  * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryListResult} FaNexusInventoryListResult
@@ -129,18 +143,33 @@ export class UrlCache {
    * @param {number} [ttlMs] - Time-to-live for entries in milliseconds
    */
   constructor(ttlMs = 10 * 60 * 1000) { this.ttlMs = ttlMs; this._m = new Map(); }
+
+  _pruneExpired(now = Date.now()) {
+    for (const [key, value] of this._m) {
+      if (!value || !(now < value.exp)) this._m.delete(key);
+    }
+  }
+
   /**
    * Retrieve a cached URL
    * @param {string} key
    * @returns {string|null}
    */
-  get(key) { const v = this._m.get(key); return v && Date.now() < v.exp ? v.url : null; }
+  get(key) {
+    this._pruneExpired();
+    const v = this._m.get(key);
+    return v ? v.url : null;
+  }
   /**
    * Cache a URL value
    * @param {string} key
    * @param {string} url
    */
-  set(key, url) { this._m.set(key, { url, exp: Date.now() + this.ttlMs }); }
+  set(key, url) {
+    const now = Date.now();
+    this._m.set(key, { url, exp: now + this.ttlMs });
+    this._pruneExpired(now);
+  }
   /** Clear all cached entries */
   clear() { this._m.clear(); }
 }
@@ -155,8 +184,8 @@ export class NexusContentService {
     this.settingsNamespace = options.settingsNamespace || 'fa-nexus';
     this.base = options.base || 'https://n8n.forgotten-adventures.net/webhook';
     // Separate DBs per kind
-    this._dbTokens = options.dbTokens || new CloudDB('fa-nexus-cloud-tokens-v1');
-    this._dbAssets = options.dbAssets || new CloudDB('fa-nexus-cloud-assets-v1');
+    this._dbTokens = options.dbTokens || new CloudDB(getContentKindDescriptor('tokens').dbName);
+    this._dbAssets = options.dbAssets || new CloudDB(getContentKindDescriptor('assets').dbName);
     this.urlCache = options.urlCache || new UrlCache();
     this.progressEmitter = options.progressEmitter || new ProgressEmitter();
     this._authApp = null;
@@ -176,19 +205,21 @@ export class NexusContentService {
    * @returns {CloudDB}
    * @private
    */
-  _dbFor(kind) { return kind === 'assets' ? this._dbAssets : this._dbTokens; }
+  _dbFor(kind) {
+    return getContentKindDescriptor(kind).kind === 'assets' ? this._dbAssets : this._dbTokens;
+  }
 
   /** Build update endpoint URL for kind */
   _updateEndpoint(kind) {
-    return `${this.base}/foundry-nexus-${kind}-update`;
+    return `${this.base}/${getContentKindDescriptor(kind).updateEndpointPath}`;
   }
 
   /** Build download endpoint URL for kind and file */
   _downloadEndpoint(kind, file_path, state) {
+    const descriptor = getContentKindDescriptor(kind);
     const q = new URLSearchParams({ state });
-    if (kind === 'tokens') q.set('token_path', file_path);
-    else q.set('asset_path', file_path);
-    return `${this.base}/foundry-nexus-download?${q}`;
+    q.set(descriptor.downloadQueryParam, file_path);
+    return `${this.base}/${descriptor.downloadEndpointPath}?${q}`;
   }
 
   /**
@@ -199,49 +230,156 @@ export class NexusContentService {
    * @returns {Promise<string>} latest hash
    */
   async sync(kind, options = {}) {
+    const onManifestProgress = typeof options.onManifestProgress === 'function' ? options.onManifestProgress : null;
+    const releaseSyncSlot = await this._acquireSyncSlot(kind, options.signal || null, onManifestProgress);
+    try {
+      return await this._syncNow(kind, options);
+    } finally {
+      releaseSyncSlot();
+    }
+  }
+
+  async _acquireSyncSlot(kind, signal = null, onManifestProgress = null) {
+    const slotKey = getContentKindDescriptor(kind).kind;
+    const previous = SYNC_SLOTS_BY_KIND.get(slotKey) || null;
+    const waitForPrevious = previous?.catch?.(() => undefined) || Promise.resolve();
+    let release;
+    const current = new Promise(resolve => { release = resolve; });
+    const slot = waitForPrevious.then(() => current);
+    SYNC_SLOTS_BY_KIND.set(slotKey, slot);
+
+    const releaseCurrent = () => {
+      release();
+      slot.finally(() => {
+        if (SYNC_SLOTS_BY_KIND.get(slotKey) === slot) {
+          SYNC_SLOTS_BY_KIND.delete(slotKey);
+        }
+      });
+    };
+
+    try {
+      if (signal?.aborted) throw new DOMException('Operation aborted', 'AbortError');
+      if (previous) {
+        try { onManifestProgress?.({ phase: 'waiting', count: 0, total: 0 }); } catch (_) {}
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const done = () => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener?.('abort', onAbort);
+            resolve();
+          };
+          const onAbort = () => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener?.('abort', onAbort);
+            reject(new DOMException('Operation aborted', 'AbortError'));
+          };
+          signal?.addEventListener?.('abort', onAbort, { once: true });
+          waitForPrevious.then(done, done);
+        });
+      }
+      if (signal?.aborted) throw new DOMException('Operation aborted', 'AbortError');
+    } catch (error) {
+      releaseCurrent();
+      throw error;
+    }
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseCurrent();
+    };
+  }
+
+  async _syncNow(kind, options = {}) {
     const db = this._dbFor(kind);
     const signal = options.signal || null;
+    const forceFull = options.forceFull === true;
     const onManifestProgress = typeof options.onManifestProgress === 'function' ? options.onManifestProgress : null;
+    const fetchJsonOptions = () => {
+      const requestOptions = { headers: { 'Accept': 'application/json' }, signal };
+      if (forceFull) requestOptions.cache = 'no-store';
+      return requestOptions;
+    };
     const emitProgress = (phase, count, total) => {
       if (!onManifestProgress || signal?.aborted) return;
       try { onManifestProgress({ phase, count, total }); } catch (_) {}
     };
-    const scheduleChunkRebuild = (expectedLatest, expectedCount, expectedBuiltAt) => {
-      if (!expectedLatest) return;
+    const scheduleChunkRebuild = async (expectedLatest, expectedCount, expectedBuiltAt) => {
+      if (!expectedLatest) return false;
+      let rebuild;
       try {
-        db.rebuildChunks(kind).then(async (ok) => {
-          if (!ok) return;
-          try {
-            const meta = await db.getMeta(kind);
-            if (!meta || meta.latest !== expectedLatest) return;
-            const count = Number.isFinite(meta.count) ? Number(meta.count) : (Number(expectedCount) || 0);
-            const builtAt = meta.builtAt || expectedBuiltAt || new Date().toISOString();
-            await db.setMeta(kind, {
-              id: 'meta',
-              latest: meta.latest,
-              count,
-              builtAt,
-              chunksLatest: meta.latest,
-              chunksBuiltAt: new Date().toISOString()
-            });
-          } catch (_) {}
-        }).catch(() => {});
-      } catch (_) {}
+        rebuild = db.rebuildChunks(kind);
+      } catch (error) {
+        Logger.warn('ContentService.sync:chunkRebuild.startFailed', {
+          kind,
+          latest: expectedLatest,
+          error: String(error?.message || error)
+        });
+        return false;
+      }
+
+      let ok = false;
+      try {
+        ok = await rebuild;
+      } catch (error) {
+        Logger.warn('ContentService.sync:chunkRebuild.failed', {
+          kind,
+          latest: expectedLatest,
+          error: String(error?.message || error)
+        });
+        return false;
+      }
+      if (!ok) {
+        Logger.warn('ContentService.sync:chunkRebuild.failed', {
+          kind,
+          latest: expectedLatest,
+          reason: 'rebuild-returned-false'
+        });
+        return false;
+      }
+      try {
+        const meta = await db.getMeta(kind);
+        if (!meta || meta.latest !== expectedLatest) return false;
+        const count = Number.isFinite(meta.count) ? Number(meta.count) : (Number(expectedCount) || 0);
+        const builtAt = meta.builtAt || expectedBuiltAt || new Date().toISOString();
+        await db.setMeta(kind, {
+          id: 'meta',
+          latest: meta.latest,
+          count,
+          builtAt,
+          schemaVersion: meta.schemaVersion || 2,
+          recordShape: meta.recordShape || 'cloud-inventory-v2',
+          chunksLatest: meta.latest,
+          chunksBuiltAt: new Date().toISOString()
+        });
+        return true;
+      } catch (error) {
+        Logger.warn('ContentService.sync:chunkMetaUpdate.failed', {
+          kind,
+          latest: expectedLatest,
+          error: String(error?.message || error)
+        });
+        return false;
+      }
     };
 
     // Emit sync start event
     this.progressEmitter.emit('sync:start', { kind });
 
     try {
-      const latestLocal = await db.getLatest(kind);
-      Logger.info('ContentService.sync:start', { kind, from: latestLocal || null });
+      const metaLocal = await db.getMeta(kind);
+      const latestLocal = forceFull ? null : (metaLocal?.latest || null);
+      Logger.info('ContentService.sync:start', { kind, from: latestLocal || null, forceFull });
       const url = latestLocal ? `${this._updateEndpoint(kind)}?from=${encodeURIComponent(latestLocal)}` : this._updateEndpoint(kind);
 
       // Use retry logic for the initial manifest fetch
       const plan = await retryWithBackoff(
         async () => {
           this.progressEmitter.emit('sync:fetch', { kind, url });
-          const res = await fetch(url, { headers: { 'Accept': 'application/json' }, signal });
+          const res = await fetch(url, fetchJsonOptions());
           if (!res.ok) throw new Error(`Update request failed (${res.status})`);
           return res.json();
         },
@@ -257,19 +395,18 @@ export class NexusContentService {
         }
       );
       // Short‑circuit: if server reports we're already at latest, skip any full/delta work.
-      const upToDate = plan && plan.latest && plan.latest === latestLocal && (
+      const localIsV2 = Number(metaLocal?.schemaVersion) === 2 && metaLocal?.recordShape === 'cloud-inventory-v2';
+      const upToDate = !forceFull && localIsV2 && plan && plan.latest && plan.latest === latestLocal && (
         (plan.mode === 'full') || (plan.mode === 'deltas' && (!Array.isArray(plan.deltas) || plan.deltas.length === 0))
       );
       if (upToDate) {
         Logger.info('ContentService.sync:noop', { kind, latest: plan.latest, mode: plan.mode });
-        try {
-          const meta = await db.getMeta(kind);
-          const latest = meta?.latest || plan.latest || null;
-          const chunksLatest = meta?.chunksLatest || null;
-          if (latest && chunksLatest !== latest) {
-            scheduleChunkRebuild(latest, meta?.count, meta?.builtAt);
-          }
-        } catch (_) {}
+        const meta = await db.getMeta(kind);
+        const latest = meta?.latest || plan.latest || null;
+        const chunksLatest = meta?.chunksLatest || null;
+        if (latest && chunksLatest !== latest) {
+          await scheduleChunkRebuild(latest, meta?.count, meta?.builtAt);
+        }
         this.progressEmitter.emit('sync:complete', { kind, mode: plan.mode, latest: plan.latest, upToDate: true });
         return plan.latest;
       }
@@ -278,10 +415,11 @@ export class NexusContentService {
         Logger.time(`ContentService.full:${kind}`);
         try {
           this.progressEmitter.emit('sync:phase', { kind, phase: 'full', url: plan.full.url });
+          emitProgress('download', 0, 0);
 
           const items = await retryWithBackoff(
             async () => {
-              const fullRes = await fetch(plan.full.url, { headers: { 'Accept': 'application/json' }, signal });
+              const fullRes = await fetch(plan.full.url, fetchJsonOptions());
               if (!fullRes.ok) throw new Error(`Full manifest fetch failed (${fullRes.status})`);
               return fullRes.json();
             },
@@ -296,7 +434,12 @@ export class NexusContentService {
             }
           );
 
-          await db.replaceAll(kind, items, {
+          if (!isCloudManifestV2Payload(items, plan)) {
+            throw new Error(`Unexpected ${kind} cloud inventory response; manifests_v2 payload required.`);
+          }
+          const normalizedItems = toInventoryV2Items(kind, items, 'cloud');
+
+          await db.replaceAll(kind, normalizedItems, {
             onProgress: (count, total) => emitProgress('replaceAll', count, total),
             progressBatch: options.progressBatch,
             signal
@@ -305,14 +448,16 @@ export class NexusContentService {
           await db.setMeta(kind, {
             id: 'meta',
             latest: plan.latest,
-            count: items.length,
+            count: normalizedItems.length,
             builtAt,
+            schemaVersion: 2,
+            recordShape: 'cloud-inventory-v2',
             chunksLatest: plan.latest,
             chunksBuiltAt: builtAt
           });
-          emitProgress('meta', items.length, items.length);
-          Logger.info('ContentService.sync:done', { kind, mode: 'full', latest: plan.latest, count: items.length });
-          this.progressEmitter.emit('sync:complete', { kind, mode: 'full', latest: plan.latest, count: items.length });
+          emitProgress('meta', normalizedItems.length, normalizedItems.length);
+          Logger.info('ContentService.sync:done', { kind, mode: 'full', latest: plan.latest, count: normalizedItems.length });
+          this.progressEmitter.emit('sync:complete', { kind, mode: 'full', latest: plan.latest, count: normalizedItems.length });
           return plan.latest;
         } finally {
           Logger.timeEnd(`ContentService.full:${kind}`);
@@ -328,7 +473,7 @@ export class NexusContentService {
             await retryWithBackoff(
               async () => {
                 this.progressEmitter.emit('sync:delta', { kind, index, total: plan.deltas.length, url: d.url });
-                const res = await fetch(d.url, { headers: { 'Accept': 'application/json' }, signal });
+                const res = await fetch(d.url, fetchJsonOptions());
                 if (!res.ok) throw new Error(`Delta fetch failed (${res.status})`);
                 const t = await res.text();
                 for (const line of t.split('\n')) {
@@ -351,8 +496,7 @@ export class NexusContentService {
 
           const count = await db.count(kind);
           const builtAt = new Date().toISOString();
-          let prevMeta = null;
-          try { prevMeta = await db.getMeta(kind); } catch (_) {}
+          const prevMeta = await db.getMeta(kind);
           const prevChunksLatest = prevMeta?.chunksLatest ?? prevMeta?.latest ?? null;
           const prevChunksBuiltAt = prevMeta?.chunksBuiltAt ?? null;
           await db.setMeta(kind, {
@@ -360,11 +504,13 @@ export class NexusContentService {
             latest: plan.latest,
             count,
             builtAt,
+            schemaVersion: 2,
+            recordShape: 'cloud-inventory-v2',
             chunksLatest: prevChunksLatest,
             chunksBuiltAt: prevChunksBuiltAt
           });
-          // Rebuild chunked index asynchronously so unfiltered list stays sorted by file_path
-          scheduleChunkRebuild(plan.latest, count, builtAt);
+          // Rebuild chunked index before releasing the same-kind sync slot.
+          await scheduleChunkRebuild(plan.latest, count, builtAt);
           emitProgress('meta', count, count);
           Logger.info('ContentService.sync:done', { kind, mode: 'deltas', latest: plan.latest, count });
           this.progressEmitter.emit('sync:complete', { kind, mode: 'deltas', latest: plan.latest, count });
@@ -390,7 +536,7 @@ export class NexusContentService {
   /**
    * List items for a kind with optional simple filters
    * @param {'tokens'|'assets'} kind
-   * @param {{text?:string,tier?:string,pathPrefix?:string,offset?:number,limit?:number}} [opts]
+   * @param {{text?:string,tier?:string,pathPrefix?:string,assetClass?:string,offset?:number,limit?:number}} [opts]
    * @returns {Promise<FaNexusInventoryListResult>}
    */
   async list(kind, opts = {}) { return this._dbFor(kind).query(kind, opts); }
@@ -398,35 +544,33 @@ export class NexusContentService {
   /**
    * Get a public thumbnail URL for an item
    * @param {'tokens'|'assets'} kind
-   * @param {{file_path:string}} item
+   * @param {{id?:string,selected_source?:object}} item
    * @returns {string}
    */
   getThumbnailURL(kind, item) {
-    const p = item?.file_path || '';
-    const enc = String(p).split('/').map(encodeURIComponent).join('/');
-    if (kind === 'tokens') return `https://r2-public.forgotten-adventures.net/tokens/thumbnails/${enc}`;
-    return `https://r2-public.forgotten-adventures.net/assets/thumbnails/${enc}`;
+    return buildContentKindPublicUrl(kind, 'thumbnail', contentPath(item));
   }
 
   /**
    * Resolve a full download URL for an item, using signed URLs for premium content.
    * Results are cached in-memory by `urlCache`.
    * @param {'tokens'|'assets'} kind
-   * @param {{file_path:string,filename?:string,tier?:'free'|'premium'}} item
+   * @param {{id?:string,selected_source?:object,tier?:'free'|'premium'}} item
    * @param {string} [state] - OAuth state used for premium signed URLs
+   * @param {{notifyTierRefusal?: boolean}} [options] - hover previews pass false: a refusal there stays silent
    * @returns {Promise<string>} Full URL or local path
    */
-  async getFullURL(kind, item, state) {
+  async getFullURL(kind, item, state, { notifyTierRefusal = true } = {}) {
     if (!item) throw new Error('Missing item');
-    const pRaw = item.file_path;
-    const p = String(pRaw).split('/').map(encodeURIComponent).join('/');
+    getContentKindDescriptor(kind);
+    const pRaw = contentPath(item);
+    if (!pRaw) throw new Error('Missing item content path');
+    const p = encodeCloudPath(pRaw);
 
     this.progressEmitter.emit('url:resolve', { kind, file_path: pRaw, tier: item.tier });
 
     if (item.tier === 'free') {
-      const url = kind === 'tokens'
-        ? `https://r2-public.forgotten-adventures.net/tokens/free_tokens/${p}`
-        : `https://r2-public.forgotten-adventures.net/assets/free_assets/${p}`;
+      const url = buildContentKindPublicUrl(kind, 'free', pRaw);
       this.progressEmitter.emit('url:resolved', { kind, file_path: pRaw, tier: 'free', url });
       return url;
     }
@@ -456,19 +600,26 @@ export class NexusContentService {
     }
 
     try {
-      const looksLikeAuthFailure = (status, payload, rawText) => {
-        if (status === 401 || status === 403) return true;
-        if (status !== 400) return false;
-        const hint = `${payload?.error || ''} ${payload?.message || ''} ${rawText || ''}`.trim();
-        if (!hint) return false;
-        return /auth|state|oauth|patreon|expired|mismatch|unauthor/i.test(hint);
-      };
-      const isAuthError = (error) => {
-        if (!error) return false;
-        const code = String(error?.code || error?.name || '').toUpperCase();
-        if (code && code.includes('AUTH')) return true;
-        const message = String(error?.message || error);
-        return message === 'AUTH' || /auth/i.test(message);
+      // Since the 2026-10-26 tier split the download gate answers 401 for a tier without premium downloads and 403
+      // for a missing or non-premium file. Only a 400 state/IP mismatch means the login expired (auth-state.js).
+      const refusal = (status, payload, rawText) => {
+        if (isStateMismatchResponse(status, payload?.error, payload?.message, rawText)) {
+          return Object.assign(new Error('AUTH'), { code: 'STATE_INVALID', status, noRetry: true });
+        }
+        if (status === 401) {
+          return createOperationalError(`Patreon tier refused for ${pRaw}`, {
+            code: 'PATREON_TIER_REQUIRED', kind, source: 'getFullURL:fetch', operation: 'download',
+            userMessage: PREMIUM_DOWNLOAD_TIER_MESSAGE, details: { status, message: payload?.message || null }
+          });
+        }
+        if (status === 403) {
+          return Object.assign(createOperationalError(`Premium file not available: ${pRaw} (403)`, {
+            code: 'FA_NEXUS_CLOUD_FILE_UNAVAILABLE', kind, source: 'getFullURL:fetch', operation: 'download',
+            userMessage: `This premium file isn't available for download: ${item.filename || pRaw} (403).`,
+            details: { status, message: payload?.message || null }
+          }), { status, faNexusCloudFileMissing: true });
+        }
+        return null;
       };
       const dl = this._downloadEndpoint(kind, p, state);
       const body = await retryWithBackoff(
@@ -480,7 +631,8 @@ export class NexusContentService {
           if (rawText) {
             try { payload = JSON.parse(rawText); } catch (_) {}
           }
-          if (looksLikeAuthFailure(res.status, payload, rawText)) throw new Error('AUTH');
+          const refused = refusal(res.status, payload, rawText);
+          if (refused) throw Object.assign(refused, { noRetry: true });
           if (!res.ok) throw new Error(`Signed URL fetch failed (${res.status})`);
           return payload;
         },
@@ -488,7 +640,7 @@ export class NexusContentService {
           maxRetries: 2,
           initialDelay: 1000,
           maxDelay: 8000,
-          shouldRetry: (error) => !isAuthError(error),
+          shouldRetry: (error) => !error?.noRetry,
           onRetry: ({ attempt, maxRetries, delay }) => {
             this.progressEmitter.emit('url:retry', { kind, file_path: pRaw, attempt, maxRetries, delay });
             Logger.info('ContentService.url.retry', { kind, file_path: pRaw, attempt, maxRetries, delay });
@@ -505,6 +657,7 @@ export class NexusContentService {
       return body.download_url;
     } catch (error) {
       const errorMsg = error?.message === 'AUTH' ? 'AUTH' : String(error?.message || error);
+      if (error?.code === 'PATREON_TIER_REQUIRED' && notifyTierRefusal) this._notifyTierRefusal(error);
       if (errorMsg === 'AUTH') {
         try {
           await this._handleAuthFailure({
@@ -515,7 +668,8 @@ export class NexusContentService {
           });
         } catch (_) {}
       }
-      const logUrlError = errorMsg === 'AUTH' ? Logger.warn.bind(Logger) : Logger.error.bind(Logger);
+      // A refusal the server answered on purpose (expired login, tier, missing file) is not a client error.
+      const logUrlError = (errorMsg === 'AUTH' || error?.noRetry) ? Logger.warn.bind(Logger) : Logger.error.bind(Logger);
       logUrlError('ContentService.url:error', { kind, file_path: pRaw, error: errorMsg });
       this.progressEmitter.emit('url:error', { kind, file_path: pRaw, error: errorMsg });
       throw error instanceof Error ? error : new Error(errorMsg);
@@ -585,6 +739,19 @@ export class NexusContentService {
     }
   }
 
+  /**
+   * A signed-in member whose tier has no premium downloads stays connected. One message per burst of refusals: a
+   * multi-select download asks once per file.
+   */
+  _notifyTierRefusal(error) {
+    error.faNexusNotified = true;
+    const now = Date.now();
+    if (this._lastTierRefusalAt && (now - this._lastTierRefusalAt) < 5000) return;
+    this._lastTierRefusalAt = now;
+    Logger.warn('ContentService.download.tierRefused', { kind: error.kind, message: error.details?.message || null });
+    ui?.notifications?.warn?.(error.userMessage);
+  }
+
   /** Handle premium auth failures by clearing cache and disconnecting */
   async _handleAuthFailure({ reason = 'AUTH', kind = null, source = null, message = null, notify = true } = {}) {
     if (this._authDisconnectInFlight) return;
@@ -634,6 +801,15 @@ export class NexusContentService {
   destroy() {
     this.urlCache.clear();
     this.progressEmitter.clear();
+    for (const db of [this._dbTokens, this._dbAssets]) {
+      try { db?.close?.(); }
+      catch (error) {
+        Logger.warn('ContentService.destroy.dbCloseFailed', {
+          db: db?.dbName || null,
+          error: String(error?.message || error)
+        });
+      }
+    }
   }
 }
 
@@ -798,7 +974,7 @@ export function getEnabledFolders(settingKey) {
 
 const defaultKeySelector = (rec) => {
   if (!rec) return '';
-  return String(rec.file_path || rec.path || rec.url || rec.id || '').trim();
+  return String(rec.id || rec.url || '').trim();
 };
 
 /**

@@ -5,7 +5,8 @@ import {
   getFilePickerClass,
   normalizePickedFolderPath,
   prepareFolderPickerContext
-} from '../../core/file-picker-folder-browser.js';
+} from '../../storage/file-picker-folder-browser.js';
+import { readFaNexusCloudEnabledSetting } from '../../core/cloud-enabled-settings.js';
 import { ContentSourcesIndexer } from './content-sources-indexer.js';
 import {
   normalizeContentSourcePath,
@@ -13,6 +14,9 @@ import {
   parseContentSourcesSetting,
   serializeContentSourcesSetting
 } from './content-sources-service.js';
+import { getContentKindDescriptor } from '../content-kind-descriptors.js';
+
+const CONTENT_SOURCES_TEMPLATE = 'modules/fa-nexus/templates/content/content-sources-dialog.hbs';
 
 function createFaIcon(iconClass) {
   const icon = document.createElement('i');
@@ -33,6 +37,55 @@ function setIconTextContent(element, iconClass, text) {
   element.replaceChildren(createFaIcon(iconClass), document.createTextNode(' '), label);
 }
 
+export function createContentSourcesLocalIndexer({
+  dataService,
+  streamMethod,
+  saveMethod,
+  batchSize = 220,
+  sleepMs = 8
+} = {}) {
+  if (!dataService || typeof dataService[streamMethod] !== 'function') {
+    throw new TypeError(`Invalid content sources stream method: ${String(streamMethod || '')}`);
+  }
+  if (typeof dataService[saveMethod] !== 'function') {
+    throw new TypeError(`Invalid content sources save method: ${String(saveMethod || '')}`);
+  }
+  return async (folder, { onProgress, signal } = {}) => {
+    if (!folder) return { count: 0 };
+    const abortError = () => {
+      try { return new DOMException(signal?.reason || 'Cancelled', 'AbortError'); }
+      catch (_) {
+        const err = new Error(signal?.reason || 'Cancelled');
+        err.name = 'AbortError';
+        return err;
+      }
+    };
+    const checkAbort = () => { if (signal?.aborted) throw abortError(); };
+    const emit = (info) => {
+      if (typeof onProgress !== 'function') return;
+      try {
+        onProgress(info);
+      } catch (error) {
+        Logger.warn('ContentSources.index.progress-listener-failed', {
+          folder,
+          error: String(error?.message || error)
+        });
+      }
+    };
+    emit({ folder, count: 0, batchCount: 0 });
+    const records = [];
+    checkAbort();
+    await dataService[streamMethod](folder, async (batch) => {
+      if (!Array.isArray(batch) || !batch.length) return;
+      records.push(...batch);
+      emit({ folder, count: records.length, batchCount: batch.length });
+    }, { batchSize, sleepMs, signal });
+    checkAbort();
+    await dataService[saveMethod](folder, records);
+    return { count: records.length };
+  };
+}
+
 /**
  * BaseContentSourcesDialog
  * - Generic multi-folder selector with enable/disable, edit, remove, and custom label support
@@ -49,14 +102,14 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
    * @param {string} options.id - application id
    * @param {string} options.title - window title
    * @param {string} options.settingsKey - settings key under 'fa-nexus' namespace
-   * @param {string} options.template - handlebars template path
+   * @param {{pluralNoun:string,emptyState:string}} options.presentation - feature-specific UI language
    */
-  constructor({ id, title, settingsKey, template, cacheType = null, indexer = null } = {}) {
+  constructor({ id, title, settingsKey, presentation, cacheType = null, indexer = null, cloudConfig = null } = {}) {
     super({ id, window: { title: title || 'Folder Selection' } });
     this.folders = [];
     this._handlers = {};
     this._settingsKey = settingsKey;
-    this._template = template;
+    this._presentation = presentation;
     this._cacheType = cacheType;
     this._cacheDb = null;
     this._indexRunner = typeof indexer === 'function' ? indexer : null;
@@ -75,28 +128,21 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
     this._cacheNeedsRefresh = !!cacheType;
     this._cacheFetchPromise = null;
     this._cacheFetchToken = 0;
+    this._cloudConfig = this._normalizeCloudConfig(cloudConfig);
     this._cloudContext = null;
-    this._cloudCacheMeta = this._cloudCacheMeta || { count: 0, folder: 'cloud' };
-    this._cloudEnabledSetting = this._cloudEnabledSetting || null;
+    this._cloudCacheMeta = this._buildCloudCacheMeta(this._cloudConfig);
+    this._cloudEnabledSetting = this._cloudConfig?.setting || null;
     this._cloudToggleId = `${this.id}-cloud-toggle`;
     this._cloudInitialEnabled = null;
     this._cloudPendingEnabled = null;
-    // Ensure template PARTS are set before first render
-    BaseContentSourcesDialog.setupTemplateOn(this);
+    this._indexControllers = new Map();
     this._beginInitialization();
+    if (this._cloudConfig) void this._loadCloudMeta();
   }
 
   static PARTS = {
-    form: { template: null }
+    form: { template: CONTENT_SOURCES_TEMPLATE }
   };
-
-  /** Resolve template path from constructor */
-  static setupTemplateOn(instance) {
-    if (!instance || !instance._template) return;
-    const parts = Object.assign({}, BaseContentSourcesDialog.PARTS);
-    parts.form = { template: instance._template };
-    instance.constructor.PARTS = parts;
-  }
 
   _beginInitialization() {
     this._initializationError = null;
@@ -207,6 +253,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
     const cloud = await this._buildCloudContext();
 
     return {
+      presentation: this._presentation,
       cloud,
       hasCloud: !!cloud,
       folders,
@@ -228,6 +275,7 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
 
   /** Attach DOM event listeners for UI widgets */
   _bindEvents() {
+    this._unbindEvents();
     const root = this.element; if (!root) return;
     this._handlers = { checkboxes: [], labels: [], removes: [], edits: [], clears: [], orphanClears: [], indexes: [], cloudToggle: null, cloudClear: null };
 
@@ -457,6 +505,42 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
     return contentSourceKey(path);
   }
 
+  _normalizeCloudConfig(config) {
+    if (!config) return null;
+    const requestedKind = config.kind || config.store || null;
+    const descriptor = requestedKind ? getContentKindDescriptor(requestedKind) : null;
+    const kind = descriptor?.kind || requestedKind || null;
+    const store = config.store || kind;
+    const progressBatch = Number.isFinite(config.progressBatch) ? Number(config.progressBatch) : 500;
+    return Object.assign({}, config, {
+      kind,
+      store,
+      db: config.db || descriptor?.dbName || null,
+      metaFolder: config.metaFolder || config.id || 'cloud',
+      progressBatch
+    });
+  }
+
+  _buildCloudCacheMeta(config, meta = {}) {
+    return {
+      count: Number(meta.count) || 0,
+      folder: meta.folder || config?.metaFolder || config?.id || 'cloud',
+      latest: meta.latest || null
+    };
+  }
+
+  _updateCloudCacheMeta(config, meta = {}) {
+    this._cloudCacheMeta = this._buildCloudCacheMeta(config, meta);
+    this._applyCloudCacheMetaToContext();
+  }
+
+  _applyCloudCacheMetaToContext() {
+    if (!this._cloudContext) return;
+    this._cloudContext.cacheCount = this._cloudCacheMeta.count;
+    this._cloudContext.hasCache = this._cloudCacheMeta.count > 0;
+    this._cloudContext.version = this._cloudCacheMeta.latest || this._cloudContext.version || null;
+  }
+
   _pathsEqual(a, b) {
     return this._normalizePath(a) === this._normalizePath(b);
   }
@@ -614,6 +698,10 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   }
 
   async _handleIndexFolder(folder, button) {
+    const cloudConfig = this._getCloudConfig();
+    if (cloudConfig && this._pathsEqual(folder, cloudConfig.id)) {
+      return this._handleIndexCloud(button);
+    }
     if (!this._indexRunner || !this._indexManager || !folder) return;
     if (button) button.disabled = true;
     this._captureScrollPosition();
@@ -639,9 +727,84 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
     }
   }
 
+  async _handleIndexCloud(button) {
+    const cloudConfig = this._getCloudConfig();
+    if (!cloudConfig?.store) return;
+
+    const folder = cloudConfig.id || 'cloud';
+    const normalized = this._normalizePath(folder);
+    if (this._indexControllers.has(normalized)) return;
+
+    const controller = new AbortController();
+    this._indexControllers.set(normalized, controller);
+
+    this._captureScrollPosition();
+    this._renderIndexState(folder, { status: 'running', phase: 'preparing', count: 0, error: null, startedAt: Date.now() });
+
+    const emitProgress = (info = {}) => {
+      const count = Number.isFinite(info?.count) ? Number(info.count) : 0;
+      this._renderIndexState(folder, {
+        status: 'running',
+        phase: info?.phase || null,
+        count: Math.max(0, count),
+        updatedAt: Date.now()
+      });
+    };
+
+    try {
+      await this._beforeCloudIndex?.(cloudConfig);
+      const svc = await this._createCloudContentService();
+      await svc.sync(cloudConfig.store, {
+        forceFull: true,
+        signal: controller.signal,
+        onManifestProgress: emitProgress,
+        progressBatch: cloudConfig.progressBatch
+      });
+
+      const meta = await svc.getMeta(cloudConfig.store);
+      const finalCount = Number(meta?.count) || 0;
+      if (meta) {
+        this._updateCloudCacheMeta(cloudConfig, {
+          count: finalCount,
+          folder: cloudConfig.metaFolder,
+          latest: meta.latest || null
+        });
+        this._renderCloudRow();
+      }
+
+      this._renderIndexState(folder, { status: 'done', count: finalCount, finishedAt: Date.now(), error: null });
+      await this._afterCloudIndexed?.(cloudConfig);
+      this._markCacheDirty();
+      this._captureScrollPosition();
+      this._requestRender({ immediate: true, preserveScroll: true });
+      const itemLabel = cloudConfig.itemLabel || 'item';
+      if (ui?.notifications?.info) ui.notifications.info(`Indexed ${finalCount} cloud ${itemLabel}(s)`);
+    } catch (error) {
+      if (controller.signal.aborted || error?.name === 'AbortError') {
+        this._renderIndexState(folder, { status: 'cancelled', finishedAt: Date.now() });
+      } else {
+        Logger.error('Folders.cloud.index:failed', error);
+        this._renderIndexState(folder, { status: 'error', error: error?.message || String(error), finishedAt: Date.now() });
+        const message = cloudConfig.indexFailureMessage || 'Failed to index cloud content.';
+        if (ui?.notifications?.error) ui.notifications.error(message);
+      }
+      this._captureScrollPosition();
+      this._requestRender({ immediate: true, preserveScroll: true });
+    } finally {
+      this._indexControllers.delete(normalized);
+      if (button && button.isConnected) button.disabled = false;
+    }
+  }
+
   async _handleCancelIndex(folder, button) {
-    if (!this._indexManager || !folder) return;
+    if (!folder) return;
     if (button) button.disabled = true;
+    const controller = this._indexControllers?.get?.(this._normalizePath(folder));
+    if (controller) {
+      controller.abort('user-cancelled');
+      return;
+    }
+    if (!this._indexManager) return;
     this._indexManager.cancel(folder, 'user-cancelled');
   }
 
@@ -663,7 +826,11 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
     let css = '';
     if (status === 'running') {
       icon = 'fa-spinner fa-spin';
-      text = `Indexing… ${count}`;
+      if (state.phase === 'preparing') text = 'Preparing cloud index…';
+      else if (state.phase === 'waiting') text = 'Waiting for current cloud index…';
+      else if (state.phase === 'download') text = 'Downloading cloud index…';
+      else if (state.phase === 'replaceAll' && count === 0) text = 'Preparing cloud index…';
+      else text = `Indexing… ${count}`;
       css = 'is-running';
     } else if (status === 'done') {
       icon = 'fa-check';
@@ -686,8 +853,10 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   }
 
   _cancelAllIndexing(reason = 'cancelled') {
-    if (!this._indexManager) return;
-    this._indexManager.cancelAll(reason);
+    for (const controller of this._indexControllers.values()) {
+      if (!controller.signal.aborted) controller.abort(reason);
+    }
+    this._indexManager?.cancelAll(reason);
   }
 
   _cancelIndexFor(folder, reason = 'cancelled') {
@@ -779,16 +948,52 @@ export class BaseContentSourcesDialog extends HandlebarsApplicationMixin(Applica
   }
 
   _getCloudConfig() {
-    return null;
+    if (!this._cloudConfig) return null;
+    return Object.assign({}, this._cloudConfig, {
+      cacheCount: this._cloudCacheMeta?.count ?? this._cloudConfig.cacheCount ?? 0,
+      version: this._cloudCacheMeta?.latest || this._cloudConfig.version || null
+    });
+  }
+
+  async _createCloudContentService() {
+    const { NexusContentService } = await import('../nexus-content-service.js');
+    const app = foundry?.applications?.instances?.get?.('fa-nexus-app') || null;
+    const authProvider = (app && typeof app._getAuthService === 'function') ? () => app._getAuthService() : undefined;
+    return new NexusContentService({ app, authService: authProvider });
+  }
+
+  async _loadCloudMeta() {
+    const config = this._getCloudConfig();
+    if (!config?.store) return;
+    try {
+      const svc = await this._createCloudContentService();
+      const meta = await svc.getMeta(config.store);
+      if (!meta) return;
+      this._updateCloudCacheMeta(config, {
+        count: Number(meta.count) || 0,
+        folder: config.metaFolder,
+        latest: meta.latest || null
+      });
+      if (this.rendered) this._renderCloudRow();
+    } catch (error) {
+      Logger.warn(config.metaFailureLogTag || 'ContentSources.cloudMeta.loadFailed', {
+        setting: config.setting,
+        store: config.store,
+        error: String(error?.message || error)
+      });
+    }
   }
 
   _getCloudEnabled(config) {
-    if (!config?.setting) return true;
-    try {
-      const value = game.settings.get('fa-nexus', config.setting);
-      if (typeof value === 'boolean') return value;
-    } catch (_) {}
-    return true;
+    return readFaNexusCloudEnabledSetting({
+      setting: config?.setting,
+      warningKey: 'ContentSources.cloudEnabled.readFailed',
+      context: {
+        setting: config?.setting,
+        kind: config?.kind,
+        store: config?.store
+      }
+    });
   }
 
   async _setCloudEnabled(enabled) {

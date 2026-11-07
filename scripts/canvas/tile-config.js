@@ -10,19 +10,32 @@ import { applyTileHsbcToMesh } from '../textures/texture-blend-runtime.js';
 import { AssetShadowManager, getAssetShadowManager } from '../assets/asset-shadow-manager.js';
 import { applyAssetScatterTile } from '../assets/asset-scatter-geometry.js';
 import { applyPathTile, computePathShadowPoints } from '../paths/path-geometry.js';
-import { applyBuildingTile } from '../buildings/building-tiles.js';
 import {
+  applyBuildingTile,
+  applyBuildingTileHsbcToExistingRenderer
+} from '../buildings/building-tiles.js';
+import {
+  applyMaskedTilingToTile,
   applyStandardTileMaskToTile,
   clearStandardTileMask
 } from '../textures/texture-render.js';
 import { getSceneLevelElevationRanges } from './elevation-band-utils.js';
 import { getFaNexusTileCapabilities } from './tile-capabilities.js';
+import { isBuildingManagedSillsDocument } from '../buildings/building-generated-document-runtime.js';
 import {
   analyzeTileBandState,
   FA_NEXUS_TILE_PLACEMENT_LEVEL_FLAG,
   getTileExplicitPlacementLevelId,
   resolveTilePlacementLevelId
 } from './tile-band-utils.js';
+import {
+  bindTileConfigShadowOffsetControl,
+  queueTileConfigShadowOffsetLayoutSync,
+  syncTileConfigShadowOffsetHandle,
+  updateTileConfigShadowOffsetHeaderDisplay,
+  updateTileConfigShadowOffsetInputs
+} from './tile-config-shadow-offset-control.js';
+import { TileConfigSubmitWorkflow } from './tile-config-submit-workflow.js';
 
 const MODULE_ID = 'fa-nexus';
 const TAB_ID = 'fa-nexus';
@@ -61,7 +74,6 @@ const BUILDING_SHADOW_DILATION_DEFAULT = 10;
 const SHADOW_DILATION_MAX = 20;
 const SHADOW_VALUE_EPSILON = 0.0005;
 let tilePaletteFaNexusDetailsOpen = false;
-let tilePaletteOverheadPatchWarned = false;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -812,7 +824,7 @@ function getTileConfigTabRoot(app) {
 
 function supportsTileShadowControls(target) {
   const capabilities = getFaNexusTileCapabilities(target);
-  return !capabilities?.hasMaskedTiling;
+  return !capabilities?.hasMaskedTiling && !isBuildingManagedSillsDocument(capabilities?.document);
 }
 
 function getShadowPreviewManager(app) {
@@ -922,9 +934,22 @@ function buildBandStatus(doc, scene) {
     };
   }
   if (analysis?.inSpecialBand) {
+    // The tile lies next to the floor or ceiling of a Level that is not its Parent Level (or it has none): it is
+    // drawn like an ordinary tile. Say which Level that is, which Parent Level the tile has, and what to change.
+    const nameOf = (range, fallback) => String(range?.levelName || range?.levelId || fallback).trim() || fallback;
+    const candidates = Array.isArray(analysis.candidates) ? analysis.candidates : [];
+    const bandLevels = [...new Set(candidates.map((candidate) => nameOf(candidate?.placementRange, 'a Level')))];
+    const bands = [...new Set(candidates.map((candidate) => (
+      `${candidate?.kind === 'foreground' ? 'foreground band' : 'ground band'} of ${nameOf(candidate?.placementRange, 'a Level')}`
+    )))].join(' and the ');
+    const parentId = explicitPlacementLevelId || resolvedPlacement?.levelId || null;
+    const parentName = parentId ? String(scene?.levels?.get?.(parentId)?.name || '').trim() : '';
+    const choose = bandLevels.length === 1 ? `Choose ${bandLevels[0]} as Parent Level` : `Choose one of ${bandLevels.join(', ')} as Parent Level`;
     return {
       tone: 'warn',
-      text: 'This tile is inside an FA special band, but band rendering is disabled until Parent Level is resolved.'
+      text: parentName
+        ? `This tile lies in the ${bands}, but its Parent Level is ${parentName}, so it is drawn like an ordinary tile. ${choose} to have it drawn in that band, or give the tile an elevation of ${parentName}.`
+        : `This tile lies in the ${bands} and has no Parent Level, so it is drawn like an ordinary tile. ${choose} to have it drawn in that band.`
     };
   }
   if (explicitPlacementLevelId || resolvedPlacement?.levelId) {
@@ -1080,10 +1105,29 @@ function buildShadowOffsetHtml(shadow, offsetMax) {
   return buildRadialShadowOffsetHtml(shadow, offsetMax);
 }
 
+// Quick HSBC is a control of the whole Tile: saving it gives every path of the Tile the values of the panel. On a
+// Tile with several paths the panel says so, and says when the paths have colours of their own that it does not show.
+function describePathHsbcScope(doc) {
+  const paths = readModuleFlagRaw(doc, 'pathsV2')?.paths;
+  if (!Array.isArray(paths)) return null;
+  const drawn = paths.filter((entry) => entry && Array.isArray(entry.controlPoints));
+  if (drawn.length < 2) return null;
+  const tileHsbc = readDocumentHsbc(doc, { nullIfMissing: false, nullIfNeutral: false }) || createNeutralHsbc();
+  const colours = new Set(drawn.map((entry) => JSON.stringify(normalizeHsbc(entry.hsbc ?? tileHsbc))));
+  return {
+    count: drawn.length,
+    mixed: colours.size > 1,
+    text: colours.size > 1
+      ? `The ${drawn.length} paths of this tile have colour adjustments of their own that differ. They are not shown here, and saving Quick HSBC replaces them all with the values below. To change one path, use Nexus Edit.`
+      : `Applies to all ${drawn.length} paths of this tile.`
+  };
+}
+
 function buildTabHtml(app, doc, scene) {
   const capabilities = getFaNexusTileCapabilities(doc);
   const hsbc = readDocumentHsbc(doc, { nullIfMissing: false, nullIfNeutral: false }) || createNeutralHsbc();
   const hsbcEnabled = !isNeutralHsbc(hsbc);
+  const pathHsbcScope = describePathHsbcScope(doc);
   const supportsShadowControls = supportsTileShadowControls(doc);
   const shadowEnabled = readFlagBoolean(doc, 'shadow', false);
   const shadow = getTileConfigShadowState(doc, app);
@@ -1097,9 +1141,6 @@ function buildTabHtml(app, doc, scene) {
       : '#666';
   const shadowOffsetMax = readShadowOffsetUiMax();
   const pathShadowIsBuilding = shadow.offsetMode === 'path-scalar' && !!capabilities?.hasBuilding;
-  const shadowHint = shadow.offsetMode === 'path-scalar'
-    ? 'These controls match the path-style shadow controls used by the editor. Offset follows the same scalar path control.'
-    : 'Opacity and blur follow the whole elevation band. Dilation and offset stay on this tile. Right-click the offset ring to reset.';
 
   const renderLevelOptions = levelOptions
     .map((option) => {
@@ -1140,54 +1181,7 @@ function buildTabHtml(app, doc, scene) {
   const pathShadowDefaultAlpha = pathShadowIsBuilding ? BUILDING_SHADOW_ALPHA_DEFAULT : PATH_SHADOW_ALPHA_DEFAULT;
   const pathShadowDefaultBlur = pathShadowIsBuilding ? BUILDING_SHADOW_BLUR_DEFAULT : PATH_SHADOW_BLUR_DEFAULT;
   const pathShadowDefaultDilation = pathShadowIsBuilding ? BUILDING_SHADOW_DILATION_DEFAULT : PATH_SHADOW_DILATION_DEFAULT;
-  const shadowControls = [
-    ...(shadow.offsetMode === 'path-scalar'
-      ? [{
-        key: null,
-        label: 'Scale',
-        min: shadow.scaleMin,
-        max: shadow.scaleMax,
-        step: shadow.scaleStep,
-        value: shadow.scalePercent,
-        defaultValue: shadow.scaleDefault,
-        displayKey: 'scale',
-        dataAttributes: `data-fa-nexus-shadow-path-scale data-initial-value="${escapeHtml(shadow.scalePercent)}"`
-      }]
-      : []),
-    {
-      key: 'shadowAlpha',
-      label: 'Opacity',
-      min: 0,
-      max: 1,
-      step: 0.01,
-      value: roundNumber(shadow.alpha, 2),
-      defaultValue: shadow.offsetMode === 'path-scalar' ? roundNumber(pathShadowDefaultAlpha, 2) : DEFAULT_SHADOW_SETTINGS.alpha,
-      displayKey: 'alpha',
-      dataAttributes: 'data-fa-nexus-shadow-field="alpha"'
-    },
-    {
-      key: 'shadowDilation',
-      label: 'Dilation',
-      min: 0,
-      max: SHADOW_DILATION_MAX,
-      step: 0.1,
-      value: roundNumber(shadow.dilation, 2),
-      defaultValue: shadow.offsetMode === 'path-scalar' ? roundNumber(pathShadowDefaultDilation, 2) : DEFAULT_SHADOW_SETTINGS.dilation,
-      displayKey: 'dilation',
-      dataAttributes: 'data-fa-nexus-shadow-field="dilation"'
-    },
-    {
-      key: 'shadowBlur',
-      label: 'Blur',
-      min: 0,
-      max: shadow.blurMax,
-      step: 0.1,
-      value: roundNumber(shadow.blur, 2),
-      defaultValue: shadow.offsetMode === 'path-scalar' ? roundNumber(pathShadowDefaultBlur, 2) : DEFAULT_SHADOW_SETTINGS.blur,
-      displayKey: 'blur',
-      dataAttributes: 'data-fa-nexus-shadow-field="blur"'
-    }
-  ].map((control) => `
+  const renderShadowControls = (controls) => controls.map((control) => `
     <div class="form-group slim">
       <label>${escapeHtml(control.label)}</label>
       <div class="form-fields">
@@ -1205,6 +1199,56 @@ function buildTabHtml(app, doc, scene) {
       </div>
     </div>
   `).join('');
+  const tileShadowControls = renderShadowControls([
+    ...(shadow.offsetMode === 'path-scalar'
+      ? [{
+        key: null,
+        label: 'Scale',
+        min: shadow.scaleMin,
+        max: shadow.scaleMax,
+        step: shadow.scaleStep,
+        value: shadow.scalePercent,
+        defaultValue: shadow.scaleDefault,
+        displayKey: 'scale',
+        dataAttributes: `data-fa-nexus-shadow-path-scale data-initial-value="${escapeHtml(shadow.scalePercent)}"`
+      }]
+      : []),
+    {
+      key: 'shadowDilation',
+      label: 'Dilation',
+      min: 0,
+      max: SHADOW_DILATION_MAX,
+      step: 0.1,
+      value: roundNumber(shadow.dilation, 2),
+      defaultValue: shadow.offsetMode === 'path-scalar' ? roundNumber(pathShadowDefaultDilation, 2) : DEFAULT_SHADOW_SETTINGS.dilation,
+      displayKey: 'dilation',
+      dataAttributes: 'data-fa-nexus-shadow-field="dilation"'
+    }
+  ]);
+  const elevationShadowControls = renderShadowControls([
+    {
+      key: 'shadowAlpha',
+      label: 'Opacity',
+      min: 0,
+      max: 1,
+      step: 0.01,
+      value: roundNumber(shadow.alpha, 2),
+      defaultValue: shadow.offsetMode === 'path-scalar' ? roundNumber(pathShadowDefaultAlpha, 2) : DEFAULT_SHADOW_SETTINGS.alpha,
+      displayKey: 'alpha',
+      dataAttributes: 'data-fa-nexus-shadow-field="alpha"'
+    },
+    {
+      key: 'shadowBlur',
+      label: 'Blur',
+      min: 0,
+      max: shadow.blurMax,
+      step: 0.1,
+      value: roundNumber(shadow.blur, 2),
+      defaultValue: shadow.offsetMode === 'path-scalar' ? roundNumber(pathShadowDefaultBlur, 2) : DEFAULT_SHADOW_SETTINGS.blur,
+      displayKey: 'blur',
+      dataAttributes: 'data-fa-nexus-shadow-field="blur"'
+    }
+  ]);
 
   return `
     <div class="tab scrollable" data-group="sheet" data-tab="${TAB_ID}" data-fa-nexus-tile-config-tab>
@@ -1219,7 +1263,7 @@ function buildTabHtml(app, doc, scene) {
               ${renderLevelOptions}
             </select>
           </div>
-          <p class="hint">Used for FA band rendering. Separate from visible Levels[] membership.</p>
+          <p class="hint">The Level this tile is drawn with when it lies next to that Level's floor or ceiling. It does not change which Levels show the tile; that is the tile's own Levels field.</p>
           <p class="hint" data-fa-nexus-band-status style="color: ${escapeHtml(statusColor)};">${escapeHtml(bandStatus.text)}</p>
         </div>
       </fieldset>
@@ -1234,6 +1278,7 @@ function buildTabHtml(app, doc, scene) {
               Enable quick HSBC
             </label>
           </div>
+          ${pathHsbcScope ? `<p class="hint" data-fa-nexus-hsbc-scope>${escapeHtml(pathHsbcScope.text)}</p>` : ''}
         </div>
         <div data-fa-nexus-hsbc-panel>
           ${hsbcControls}
@@ -1270,11 +1315,14 @@ function buildTabHtml(app, doc, scene) {
                   Enable tile shadow
                 </label>
               </div>
-              <p class="hint">${escapeHtml(shadowHint)}</p>
             </div>
             <div data-fa-nexus-shadow-panel>
-              ${shadowControls}
+              ${tileShadowControls}
               ${buildShadowOffsetHtml(shadow, shadowOffsetMax)}
+              <div class="fa-nexus-shadow-scope-group">
+                <div class="fa-nexus-shadow-scope-heading" data-fa-nexus-shadow-scope-heading>Elevation Shared</div>
+                ${elevationShadowControls}
+              </div>
             </div>
           </fieldset>
         `
@@ -1312,58 +1360,11 @@ function buildTilePaletteFaNexusHtml(app) {
               ${renderLevelOptions}
             </select>
           </div>
-          <p class="hint">Used for FA band rendering. Separate from visible Levels[] membership.</p>
+          <p class="hint">The Level this tile is drawn with when it lies next to that Level's floor or ceiling. It does not change which Levels show the tile; that is the tile's own Levels field.</p>
         </div>
       </fieldset>
     </details>
   `;
-}
-
-function resolveTilePaletteClass(appClass = null) {
-  return appClass
-    || canvas?.tiles?.constructor?.paletteClass
-    || foundry?.applications?.sheets?.palette?.TilePalette
-    || null;
-}
-
-function ensureTilePaletteOverheadContextPatch(appClass = null) {
-  const PaletteClass = resolveTilePaletteClass(appClass);
-  const prototype = PaletteClass?.prototype;
-  if (!prototype) {
-    if (!tilePaletteOverheadPatchWarned) {
-      tilePaletteOverheadPatchWarned = true;
-      Logger.error('TilePalette.overhead.patch.missingPaletteClass', {
-        appClassName: appClass?.name || null
-      });
-    }
-    return false;
-  }
-  if (prototype._faNexusOverheadContextPatched) return true;
-  const originalPrepareContext = prototype._prepareContext;
-  if (typeof originalPrepareContext !== 'function') {
-    Logger.error('TilePalette.overhead.patch.missingPrepareContext', {
-      paletteClassName: PaletteClass?.name || null
-    });
-    return false;
-  }
-  Object.defineProperty(prototype, '_prepareContext', {
-    configurable: true,
-    writable: true,
-    value: async function _faNexusTilePalettePrepareContext(...args) {
-      const context = await originalPrepareContext.apply(this, args);
-      if (context && typeof context === 'object') context.isForeground = true;
-      return context;
-    }
-  });
-  Object.defineProperty(prototype, '_faNexusOverheadContextPatched', {
-    configurable: true,
-    writable: false,
-    value: true
-  });
-  Logger.info('TilePalette.overhead.patch.applied', {
-    paletteClassName: PaletteClass?.name || null
-  });
-  return true;
 }
 
 function getTilePaletteControlledParentLevelValues(app) {
@@ -1530,11 +1531,23 @@ function syncPathShadowScaleControl(root, source, options = {}) {
   return value;
 }
 
+function getShadowOffsetControlRuntime() {
+  return {
+    defaultSettings: DEFAULT_SHADOW_SETTINGS,
+    offsetMaxCeiling: SHADOW_OFFSET_MAX_CEILING,
+    normalizeNumber,
+    clampNumber,
+    normalizeAngle,
+    computeShadowOffsetVector,
+    formatShadowDisplay,
+    readShadowOffsetUiMax,
+    getAppState,
+    schedulePreviewSync
+  };
+}
+
 function updateShadowOffsetHeaderDisplay(root, { distance, angle } = {}) {
-  const distanceDisplay = root.querySelector('[data-fa-nexus-shadow-offset-distance-display]');
-  const angleDisplay = root.querySelector('[data-fa-nexus-shadow-offset-angle-display]');
-  if (distanceDisplay) distanceDisplay.textContent = formatShadowDisplay('offsetDistance', distance);
-  if (angleDisplay) angleDisplay.textContent = formatShadowDisplay('offsetAngle', angle);
+  return updateTileConfigShadowOffsetHeaderDisplay(root, { distance, angle }, getShadowOffsetControlRuntime());
 }
 
 function syncPanelState(panel, enabled, { opacity = '0.6' } = {}) {
@@ -1558,6 +1571,10 @@ function createPreviewTileDocumentProxy(tile, doc) {
       return Reflect.set(target, property, value, receiver);
     }
   });
+}
+
+function getPreviewTileForApp(app, previewDoc) {
+  return previewDoc?.object || getLiveTileForDocument(app?.document) || app?.document?.object || null;
 }
 
 function buildPreviewSubmitData(app) {
@@ -1601,7 +1618,7 @@ function updateBandStatus(root, app) {
 
 function applyPreviewHsbc(app) {
   const previewDoc = getPreviewDocument(app);
-  const previewTile = previewDoc?.object || null;
+  const previewTile = getPreviewTileForApp(app, previewDoc);
   if (!previewDoc || !previewTile) return;
   const state = getAppState(app);
   state.hsbcPreviewSequence = Number(state.hsbcPreviewSequence || 0) + 1;
@@ -1609,6 +1626,15 @@ function applyPreviewHsbc(app) {
   const previewRenderTile = createPreviewTileDocumentProxy(previewTile, previewDoc);
   const capabilities = getFaNexusTileCapabilities(previewDoc);
   const rendererJobs = [];
+  const needsDeferredMaskHsbc = !!(capabilities?.hasMaskedTiling || capabilities?.hasStandardTileMask);
+  const applyPreviewMaskHsbc = () => {
+    try { applyTileHsbcToMesh(previewRenderTile, previewTile.mesh); } catch (error) {
+      Logger.warn('TileConfig.preview.hsbc.maskedApply.failed', {
+        tileId: app?.document?.id || null,
+        error: String(error?.message || error)
+      });
+    }
+  };
   const queueRendererJob = (label, promiseFactory) => {
     const job = Promise.resolve()
       .then(promiseFactory)
@@ -1626,8 +1652,16 @@ function applyPreviewHsbc(app) {
   if (capabilities?.hasPathV2 || capabilities?.hasPathsV2) {
     queueRendererJob('pathApply', () => applyPathTile(previewRenderTile));
   }
+  if (capabilities?.hasMaskedTiling) {
+    queueRendererJob('maskedApply', () => applyMaskedTilingToTile(previewRenderTile));
+  }
   if (capabilities?.hasBuilding) {
-    queueRendererJob('buildingApply', () => applyBuildingTile(previewRenderTile));
+    try { applyBuildingTileHsbcToExistingRenderer(previewRenderTile); } catch (error) {
+      Logger.warn('TileConfig.preview.hsbc.buildingPreview.failed', {
+        tileId: app?.document?.id || null,
+        error: String(error?.message || error)
+      });
+    }
   }
   if (capabilities?.hasStandardTileMask) {
     Promise.allSettled(rendererJobs)
@@ -1635,8 +1669,10 @@ function applyPreviewHsbc(app) {
         if (getAppState(app).hsbcPreviewSequence !== previewSequence) return;
         await applyStandardTileMaskToTile(previewRenderTile);
         if (getAppState(app).hsbcPreviewSequence !== previewSequence) {
-          schedulePreviewSync(app, getTileConfigTabRoot(app));
+          schedulePreviewSync(app, getTileConfigTabRoot(app), { hsbc: true, shadow: false });
+          return;
         }
+        applyPreviewMaskHsbc();
       })
       .catch((error) => {
         Logger.warn('TileConfig.preview.hsbc.standardMaskApply.failed', {
@@ -1644,6 +1680,11 @@ function applyPreviewHsbc(app) {
           error: String(error?.message || error)
         });
       });
+  } else if (capabilities?.hasMaskedTiling) {
+    Promise.allSettled(rendererJobs).then(() => {
+      if (getAppState(app).hsbcPreviewSequence !== previewSequence) return;
+      applyPreviewMaskHsbc();
+    });
   }
   try { applyTileHsbc(previewDoc); } catch (error) {
     Logger.warn('TileConfig.preview.hsbc.apply.failed', {
@@ -1651,8 +1692,16 @@ function applyPreviewHsbc(app) {
       error: String(error?.message || error)
     });
   }
-  try { applyTileHsbcToMesh(previewRenderTile, previewTile.mesh); } catch (error) {
-    Logger.warn('TileConfig.preview.hsbc.maskedApply.failed', {
+  if (!needsDeferredMaskHsbc) applyPreviewMaskHsbc();
+}
+
+function applyImmediateBuildingPreviewHsbc(app) {
+  const previewDoc = getPreviewDocument(app);
+  const previewTile = getPreviewTileForApp(app, previewDoc);
+  if (!previewDoc || !previewTile || !getFaNexusTileCapabilities(previewDoc)?.hasBuilding) return;
+  const previewRenderTile = createPreviewTileDocumentProxy(previewTile, previewDoc);
+  try { applyBuildingTileHsbcToExistingRenderer(previewRenderTile); } catch (error) {
+    Logger.warn('TileConfig.preview.hsbc.buildingImmediate.failed', {
       tileId: app?.document?.id || null,
       error: String(error?.message || error)
     });
@@ -1670,91 +1719,35 @@ function getLiveTileForDocument(doc) {
   return null;
 }
 
+const tileConfigSubmitWorkflow = new TileConfigSubmitWorkflow({
+  Logger,
+  getFaNexusTileCapabilities,
+  getLiveTileForDocument,
+  createPreviewTileDocumentProxy,
+  applyAssetScatterTile,
+  applyPathTile,
+  applyBuildingTile,
+  applyMaskedTilingToTile,
+  applyStandardTileMaskToTile,
+  applyTileHsbc,
+  applyTileHsbcToMesh,
+  applyCustomRendererHsbcSubmit,
+  applyPathShadowOffsetSubmit,
+  applyBuildingPathShadowSubmit,
+  supportsTileShadowControls,
+  buildElevationShadowSubmit,
+  stripElevationShadowSubmit,
+  getShadowPreviewManager,
+  getDocumentElevation,
+  shouldApplyElevationShadowSettings
+});
+
 async function refreshCustomRenderedTileDocument(doc, { reason = 'tile-config-close' } = {}) {
-  const capabilities = getFaNexusTileCapabilities(doc);
-  const needsCustomRefresh = !!(
-    capabilities?.hasAssetScatter
-    || capabilities?.hasPathV2
-    || capabilities?.hasPathsV2
-    || capabilities?.hasBuilding
-    || capabilities?.hasStandardTileMask
-  );
-  if (!needsCustomRefresh) return;
-  const tile = getLiveTileForDocument(doc);
-  if (!tile) {
-    Logger.warn('TileConfig.customRenderer.refresh.missingTile', {
-      tileId: doc?.id || null,
-      reason
-    });
-    return;
-  }
-  const renderTile = createPreviewTileDocumentProxy(tile, doc);
-  const jobs = [];
-  const queueRendererJob = (label, promiseFactory) => {
-    jobs.push(Promise.resolve()
-      .then(promiseFactory)
-      .catch((error) => {
-        Logger.warn(`TileConfig.customRenderer.refresh.${label}.failed`, {
-          tileId: doc?.id || null,
-          reason,
-          error: String(error?.message || error)
-        });
-      }));
-  };
-  if (capabilities?.hasAssetScatter) {
-    queueRendererJob('scatterApply', () => applyAssetScatterTile(renderTile));
-  }
-  if (capabilities?.hasPathV2 || capabilities?.hasPathsV2) {
-    queueRendererJob('pathApply', () => applyPathTile(renderTile));
-  }
-  if (capabilities?.hasBuilding) {
-    queueRendererJob('buildingApply', () => applyBuildingTile(renderTile));
-  }
-  await Promise.allSettled(jobs);
-  if (capabilities?.hasStandardTileMask) {
-    try {
-      await applyStandardTileMaskToTile(renderTile);
-    } catch (error) {
-      Logger.warn('TileConfig.customRenderer.refresh.standardMaskApply.failed', {
-        tileId: doc?.id || null,
-        reason,
-        error: String(error?.message || error)
-      });
-    }
-  }
-  try { applyTileHsbc(doc); } catch (error) {
-    Logger.warn('TileConfig.customRenderer.refresh.hsbcApply.failed', {
-      tileId: doc?.id || null,
-      reason,
-      error: String(error?.message || error)
-    });
-  }
-  try { applyTileHsbcToMesh(renderTile, tile.mesh); } catch (error) {
-    Logger.warn('TileConfig.customRenderer.refresh.maskedHsbcApply.failed', {
-      tileId: doc?.id || null,
-      reason,
-      error: String(error?.message || error)
-    });
-  }
+  return tileConfigSubmitWorkflow.refreshCustomRenderedTileDocument(doc, { reason });
 }
 
 function scheduleCustomRendererRefreshAfterClose(app, { reason = 'tile-config-close' } = {}) {
-  const doc = app?.document || null;
-  if (!doc) return;
-  const run = () => {
-    refreshCustomRenderedTileDocument(doc, { reason }).catch((error) => {
-      Logger.warn('TileConfig.customRenderer.refresh.failed', {
-        tileId: doc?.id || null,
-        reason,
-        error: String(error?.message || error)
-      });
-    });
-  };
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => setTimeout(run, 0));
-    return;
-  }
-  setTimeout(run, 0);
+  return tileConfigSubmitWorkflow.scheduleCustomRendererRefreshAfterClose(app, { reason });
 }
 
 function cleanupPreviewShadow(app) {
@@ -1772,11 +1765,35 @@ function cleanupPreviewShadow(app) {
   state.shadow.pointerCleanup = null;
   state.shadow.layoutObserver = null;
   const manager = getShadowPreviewManager(app);
-  try { manager?.clearTilePreviewShadowOverride?.(app?.document, { immediate: true }); } catch (_) {}
+  try { manager?.clearTilePreviewShadowOverride?.(app?.document, { immediate: false }); } catch (_) {}
   if (Number.isFinite(state.shadow.previewElevation)) {
-    try { manager?.clearElevationPreviewShadowOverride?.(state.shadow.previewElevation, { immediate: true }); } catch (_) {}
+    try { manager?.clearElevationPreviewShadowOverride?.(state.shadow.previewElevation, { immediate: false }); } catch (_) {}
   }
   state.shadow.previewElevation = null;
+}
+
+function cleanupPreviewHsbc(app) {
+  const doc = app?.document || null;
+  if (!doc) return;
+  const tile = getLiveTileForDocument(doc) || doc.object || null;
+  try { applyTileHsbc(doc); } catch (error) {
+    Logger.warn('TileConfig.preview.hsbc.cleanupApply.failed', {
+      tileId: doc?.id || null,
+      error: String(error?.message || error)
+    });
+  }
+  try { applyTileHsbcToMesh(tile || doc, tile?.mesh); } catch (error) {
+    Logger.warn('TileConfig.preview.hsbc.cleanupMeshApply.failed', {
+      tileId: doc?.id || null,
+      error: String(error?.message || error)
+    });
+  }
+  try { applyBuildingTileHsbcToExistingRenderer(tile); } catch (error) {
+    Logger.warn('TileConfig.preview.hsbc.buildingCleanup.failed', {
+      tileId: doc?.id || null,
+      error: String(error?.message || error)
+    });
+  }
 }
 
 function applyPreviewShadow(app, root = null) {
@@ -1788,7 +1805,7 @@ function applyPreviewShadow(app, root = null) {
   if (!supportsTileShadowControls(doc)) {
     manager.clearTilePreviewShadowOverride?.(doc, { immediate: true });
     if (Number.isFinite(state.shadow.previewElevation)) {
-      manager.clearElevationPreviewShadowOverride?.(state.shadow.previewElevation, { immediate: true });
+      manager.clearElevationPreviewShadowOverride?.(state.shadow.previewElevation, { immediate: false });
       state.shadow.previewElevation = null;
     }
     return;
@@ -1817,11 +1834,11 @@ function applyPreviewShadow(app, root = null) {
   };
   try {
     if (Number.isFinite(state.shadow.previewElevation) && state.shadow.previewElevation !== elevation) {
-      manager.clearElevationPreviewShadowOverride?.(state.shadow.previewElevation, { immediate: true });
+      manager.clearElevationPreviewShadowOverride?.(state.shadow.previewElevation, { immediate: false });
       state.shadow.previewElevation = null;
     }
-    manager.setTilePreviewShadowOverride?.(doc, tileOverride, { immediate: true });
-    manager.setElevationPreviewShadowOverride?.(elevation, elevationOverride, { immediate: true });
+    manager.setTilePreviewShadowOverride?.(doc, tileOverride, { immediate: false });
+    manager.setElevationPreviewShadowOverride?.(elevation, elevationOverride, { immediate: false });
     state.shadow.previewElevation = elevation;
   } catch (error) {
     Logger.warn('TileConfig.preview.shadow.apply.failed', {
@@ -1831,11 +1848,20 @@ function applyPreviewShadow(app, root = null) {
   }
 }
 
-function finalizePreviewSync(app, root) {
+function normalizePreviewSyncOptions(options = {}) {
+  return {
+    bandStatus: options?.bandStatus !== false,
+    hsbc: options?.hsbc !== false,
+    shadow: options?.shadow !== false
+  };
+}
+
+function finalizePreviewSync(app, root, options = {}) {
+  const syncOptions = normalizePreviewSyncOptions(options);
   try {
-    updateBandStatus(root, app);
-    applyPreviewHsbc(app);
-    applyPreviewShadow(app, root);
+    if (syncOptions.bandStatus) updateBandStatus(root, app);
+    if (syncOptions.hsbc) applyPreviewHsbc(app);
+    if (syncOptions.shadow) applyPreviewShadow(app, root);
   } catch (error) {
     Logger.warn('TileConfig.preview.finalize.failed', {
       tileId: app?.document?.id || null,
@@ -1844,182 +1870,38 @@ function finalizePreviewSync(app, root) {
   }
 }
 
-function schedulePreviewSync(app, root = null) {
+function schedulePreviewSync(app, root = null, options = {}) {
   const state = getAppState(app);
   const targetRoot = root || getTileConfigTabRoot(app);
+  const syncOptions = normalizePreviewSyncOptions(options);
   syncPreviewDocumentFromForm(app);
+  if (syncOptions.hsbc) applyImmediateBuildingPreviewHsbc(app);
   if (state.syncFrame) {
     try { cancelAnimationFrame(state.syncFrame); } catch (_) {}
   }
   state.syncFrame = requestAnimationFrame(() => {
     state.syncFrame = 0;
-    finalizePreviewSync(app, targetRoot);
+    finalizePreviewSync(app, targetRoot, syncOptions);
   });
 }
 
 function syncShadowOffsetHandle(root) {
-  const control = root.querySelector('[data-fa-nexus-shadow-offset-control]');
-  const circle = root.querySelector('[data-fa-nexus-shadow-offset-circle]');
-  const handle = root.querySelector('[data-fa-nexus-shadow-offset-handle]');
-  const maxInput = root.querySelector('[data-fa-nexus-shadow-offset-max]');
-  const distanceInput = root.querySelector('[data-fa-nexus-shadow-field="offsetDistance"]');
-  const angleInput = root.querySelector('[data-fa-nexus-shadow-field="offsetAngle"]');
-  if (!control || !circle || !handle || !maxInput || !distanceInput || !angleInput) return;
-
-  const maxDistance = clampNumber(maxInput.value, 1, SHADOW_OFFSET_MAX_CEILING, readShadowOffsetUiMax());
-  control.dataset.maxDistance = String(maxDistance);
-  const distance = clampNumber(distanceInput.value, 0, Number.MAX_SAFE_INTEGER, DEFAULT_SHADOW_SETTINGS.offsetDistance);
-  const angle = normalizeAngle(angleInput.value, DEFAULT_SHADOW_SETTINGS.offsetAngle);
-  updateShadowOffsetHeaderDisplay(root, { distance, angle });
-  const diameter = Math.min(circle.clientWidth, circle.clientHeight);
-  if (!Number.isFinite(diameter) || diameter < 2) return;
-  const radius = diameter / 2;
-  const ratio = maxDistance > 0 ? Math.min(1, distance / maxDistance) : 0;
-  const theta = angle * (Math.PI / 180);
-  const offsetX = Math.cos(theta) * radius * ratio;
-  const offsetY = Math.sin(theta) * radius * ratio;
-  handle.style.setProperty('--fa-nexus-drop-shadow-offset-x', `${offsetX}px`);
-  handle.style.setProperty('--fa-nexus-drop-shadow-offset-y', `${offsetY}px`);
+  return syncTileConfigShadowOffsetHandle(root, getShadowOffsetControlRuntime());
 }
 
 function queueShadowOffsetLayoutSync(app, root) {
-  const state = getAppState(app);
-  if (state.shadow.layoutSyncFrame) {
-    try { cancelAnimationFrame(state.shadow.layoutSyncFrame); } catch (_) {}
-  }
-  state.shadow.layoutSyncFrame = requestAnimationFrame(() => {
-    state.shadow.layoutSyncFrame = 0;
-    syncShadowOffsetHandle(root);
-  });
+  return queueTileConfigShadowOffsetLayoutSync(app, root, getShadowOffsetControlRuntime());
 }
 
 function updateShadowOffsetInputs(root, {
   distance = DEFAULT_SHADOW_SETTINGS.offsetDistance,
   angle = DEFAULT_SHADOW_SETTINGS.offsetAngle
 } = {}) {
-  const distanceInput = root.querySelector('[data-fa-nexus-shadow-field="offsetDistance"]');
-  const angleInput = root.querySelector('[data-fa-nexus-shadow-field="offsetAngle"]');
-  const offsetXInput = root.querySelector('[data-fa-nexus-shadow-field="offsetX"]');
-  const offsetYInput = root.querySelector('[data-fa-nexus-shadow-field="offsetY"]');
-  if (!distanceInput || !angleInput || !offsetXInput || !offsetYInput) return false;
-  const nextDistance = Math.max(0, normalizeNumber(distance, DEFAULT_SHADOW_SETTINGS.offsetDistance));
-  const nextAngle = normalizeAngle(angle, DEFAULT_SHADOW_SETTINGS.offsetAngle);
-  const nextOffset = computeShadowOffsetVector(nextDistance, nextAngle);
-  distanceInput.value = String(nextDistance);
-  angleInput.value = String(Math.round(nextAngle));
-  offsetXInput.value = String(nextOffset.x);
-  offsetYInput.value = String(nextOffset.y);
-  distanceInput.dispatchEvent(new Event('input', { bubbles: true }));
-  distanceInput.dispatchEvent(new Event('change', { bubbles: true }));
-  angleInput.dispatchEvent(new Event('input', { bubbles: true }));
-  angleInput.dispatchEvent(new Event('change', { bubbles: true }));
-  syncShadowOffsetHandle(root);
-  return true;
+  return updateTileConfigShadowOffsetInputs(root, { distance, angle }, getShadowOffsetControlRuntime());
 }
 
 function bindShadowOffsetControl(app, root) {
-  const control = root.querySelector('[data-fa-nexus-shadow-offset-control]');
-  const circle = root.querySelector('[data-fa-nexus-shadow-offset-circle]');
-  const maxInput = root.querySelector('[data-fa-nexus-shadow-offset-max]');
-  const distanceInput = root.querySelector('[data-fa-nexus-shadow-field="offsetDistance"]');
-  const angleInput = root.querySelector('[data-fa-nexus-shadow-field="offsetAngle"]');
-  const shadowToggle = root.querySelector('[data-fa-nexus-shadow-enabled]');
-  if (!control || !circle || !maxInput || !distanceInput || !angleInput || !shadowToggle) return;
-
-  const state = getAppState(app);
-  const dragState = {
-    active: false
-  };
-
-  const applyMouse = (event) => {
-    const rect = circle.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const dx = event.clientX - centerX;
-    const dy = event.clientY - centerY;
-    const radius = Math.max(1, Math.min(rect.width, rect.height) / 2);
-    const radial = Math.min(1, Math.sqrt(dx * dx + dy * dy) / radius);
-    const maxDistance = clampNumber(maxInput.value, 1, SHADOW_OFFSET_MAX_CEILING, readShadowOffsetUiMax());
-    const distance = Math.round(radial * maxDistance);
-    let angle = Math.atan2(dy, dx) * (180 / Math.PI);
-    if (!Number.isFinite(angle)) angle = DEFAULT_SHADOW_SETTINGS.offsetAngle;
-    angle = normalizeAngle(angle, DEFAULT_SHADOW_SETTINGS.offsetAngle);
-    updateShadowOffsetInputs(root, { distance, angle });
-    schedulePreviewSync(app, root);
-  };
-
-  const releaseDrag = () => {
-    if (!dragState.active) return;
-    dragState.active = false;
-    window.removeEventListener('mousemove', onMouseMove, false);
-    window.removeEventListener('mouseup', onMouseUp, false);
-  };
-
-  const onMouseMove = (event) => {
-    if (!dragState.active) return;
-    event.preventDefault();
-    applyMouse(event);
-  };
-
-  const onMouseUp = (event) => {
-    if (!dragState.active) return;
-    event.preventDefault();
-    applyMouse(event);
-    releaseDrag();
-  };
-
-  control.addEventListener('mousedown', (event) => {
-    if (event.button !== 0) return;
-    if (!shadowToggle.checked) return;
-    dragState.active = true;
-    window.addEventListener('mousemove', onMouseMove, { passive: false });
-    window.addEventListener('mouseup', onMouseUp, { passive: false });
-    event.preventDefault();
-    applyMouse(event);
-  });
-
-  control.addEventListener('contextmenu', (event) => {
-    event.preventDefault();
-    updateShadowOffsetInputs(root, {
-      distance: DEFAULT_SHADOW_SETTINGS.offsetDistance,
-      angle: DEFAULT_SHADOW_SETTINGS.offsetAngle
-    });
-    schedulePreviewSync(app, root);
-  });
-
-  maxInput.addEventListener('input', () => {
-    syncShadowOffsetHandle(root);
-  });
-
-  maxInput.addEventListener('change', () => {
-    syncShadowOffsetHandle(root);
-  });
-
-  shadowToggle.addEventListener('change', () => {
-    control.dataset.disabled = shadowToggle.checked ? 'false' : 'true';
-    control.classList.toggle('is-disabled', !shadowToggle.checked);
-    syncShadowOffsetHandle(root);
-  });
-
-  if (state.shadow.pointerCleanup) {
-    try { state.shadow.pointerCleanup(); } catch (_) {}
-  }
-  try { state.shadow.layoutObserver?.disconnect?.(); } catch (_) {}
-  state.shadow.pointerCleanup = releaseDrag;
-  control.dataset.disabled = shadowToggle.checked ? 'false' : 'true';
-  control.classList.toggle('is-disabled', !shadowToggle.checked);
-  if (typeof ResizeObserver === 'function') {
-    const observer = new ResizeObserver(() => {
-      queueShadowOffsetLayoutSync(app, root);
-    });
-    observer.observe(circle);
-    state.shadow.layoutObserver = observer;
-  } else {
-    state.shadow.layoutObserver = null;
-  }
-  syncShadowOffsetHandle(root);
-  queueShadowOffsetLayoutSync(app, root);
+  return bindTileConfigShadowOffsetControl(app, root, getShadowOffsetControlRuntime());
 }
 
 function bindTab(root, app) {
@@ -2080,7 +1962,7 @@ function bindTab(root, app) {
       }
     }
     syncHsbcPanel();
-    schedulePreviewSync(app, root);
+    schedulePreviewSync(app, root, { hsbc: true, shadow: false });
   });
 
   for (const field of ['hue', 'saturation', 'brightness', 'contrast']) {
@@ -2088,13 +1970,13 @@ function bindTab(root, app) {
       input.addEventListener('input', (event) => {
         hsbcToggle.dataset.touched = 'true';
         if (syncHsbcControl(root, field, event.currentTarget, { commit: false }) !== null) {
-          schedulePreviewSync(app, root);
+          schedulePreviewSync(app, root, { hsbc: true, shadow: false });
         }
       });
       input.addEventListener('change', (event) => {
         hsbcToggle.dataset.touched = 'true';
         if (syncHsbcControl(root, field, event.currentTarget, { commit: true }) !== null) {
-          schedulePreviewSync(app, root);
+          schedulePreviewSync(app, root, { hsbc: true, shadow: false });
         }
       });
     }
@@ -2108,19 +1990,19 @@ function bindTab(root, app) {
   if (shadowToggle && shadowPanel) {
     shadowToggle.addEventListener('change', () => {
       syncShadowPanel();
-      schedulePreviewSync(app, root);
+      schedulePreviewSync(app, root, { hsbc: false, shadow: true });
     });
 
     for (const field of ['alpha', 'dilation', 'blur']) {
       for (const input of root.querySelectorAll(`[data-fa-nexus-shadow-field="${field}"]`)) {
         input.addEventListener('input', (event) => {
           if (syncShadowControl(root, field, event.currentTarget, { commit: false }) !== null) {
-            schedulePreviewSync(app, root);
+            schedulePreviewSync(app, root, { hsbc: false, shadow: true });
           }
         });
         input.addEventListener('change', (event) => {
           if (syncShadowControl(root, field, event.currentTarget, { commit: true }) !== null) {
-            schedulePreviewSync(app, root);
+            schedulePreviewSync(app, root, { hsbc: false, shadow: true });
           }
         });
       }
@@ -2131,14 +2013,12 @@ function bindTab(root, app) {
     for (const input of root.querySelectorAll('[data-fa-nexus-shadow-path-offset]')) {
       input.addEventListener('input', (event) => {
         if (syncPathShadowOffsetControl(root, event.currentTarget, { commit: false }) !== null) {
-          applyPreviewShadow(app, root);
-          schedulePreviewSync(app, root);
+          schedulePreviewSync(app, root, { hsbc: false, shadow: true });
         }
       });
       input.addEventListener('change', (event) => {
         if (syncPathShadowOffsetControl(root, event.currentTarget, { commit: true }) !== null) {
-          applyPreviewShadow(app, root);
-          schedulePreviewSync(app, root);
+          schedulePreviewSync(app, root, { hsbc: false, shadow: true });
         }
       });
     }
@@ -2148,14 +2028,12 @@ function bindTab(root, app) {
     for (const input of root.querySelectorAll('[data-fa-nexus-shadow-path-scale]')) {
       input.addEventListener('input', (event) => {
         if (syncPathShadowScaleControl(root, event.currentTarget, { commit: false }) !== null) {
-          applyPreviewShadow(app, root);
-          schedulePreviewSync(app, root);
+          schedulePreviewSync(app, root, { hsbc: false, shadow: true });
         }
       });
       input.addEventListener('change', (event) => {
         if (syncPathShadowScaleControl(root, event.currentTarget, { commit: true }) !== null) {
-          applyPreviewShadow(app, root);
-          schedulePreviewSync(app, root);
+          schedulePreviewSync(app, root, { hsbc: false, shadow: true });
         }
       });
     }
@@ -2191,21 +2069,108 @@ function bindTab(root, app) {
     }
   });
 
-  const form = app?.form || root.closest('form');
-  if (form) {
-    const queueSync = () => schedulePreviewSync(app, root);
-    form.addEventListener('input', queueSync);
-    form.addEventListener('change', queueSync);
-  }
+  const parentLevelSelect = root.querySelector(`select[name="${TILE_PALETTE_PARENT_LEVEL_FIELD}"]`);
+  parentLevelSelect?.addEventListener('change', () => {
+    schedulePreviewSync(app, root, { hsbc: false, shadow: false });
+  });
 
   syncHsbcPanel();
   syncShadowPanel();
   updateBandStatus(root, app);
-  schedulePreviewSync(app, root);
+}
+
+// Fields whose values only make sense together are kept or dropped together.
+const UNTOUCHED_FIELD_GROUPS = Object.freeze([
+  ['shadowAlpha', 'shadowBlur'],
+  ['shadowOffsetDistance', 'shadowOffsetAngle', 'shadowOffsetX', 'shadowOffsetY']
+].map((keys) => keys.map((key) => `flags.${MODULE_ID}.${key}`)));
+
+function readControlValue(element) {
+  return element.type === 'checkbox' || element.type === 'radio'
+    ? `${element.value}:${element.checked}`
+    : String(element.value);
+}
+
+function readNexusFieldValues(form) {
+  const values = new Map();
+  for (const element of form?.querySelectorAll?.(`[name^="flags.${MODULE_ID}."]`) || []) {
+    const value = readControlValue(element);
+    values.set(element.name, values.has(element.name) ? `${values.get(element.name)}|${value}` : value);
+  }
+  return values;
+}
+
+// Every control of the FA Nexus tab, named or not (the Path scale and offset sliders are not).
+function readNexusTabSignature(form) {
+  const root = form?.querySelector?.(TAB_SELECTOR) || null;
+  return JSON.stringify(Array.from(root?.querySelectorAll?.('input, select, textarea') || [], readControlValue));
+}
+
+function captureInitialNexusFieldValues(app, host) {
+  const state = getAppState(app);
+  state.initialFieldValues = readNexusFieldValues(host);
+  state.initialTabSignature = readNexusTabSignature(host);
+}
+
+// Removing a nested field (`hsbc.hue`) must not leave its emptied parent behind: an empty
+// object would be written where the Tile had none.
+function dropEmptiedNexusContainers(submitData) {
+  const prune = (container) => {
+    for (const [key, value] of Object.entries(container)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null) continue;
+      prune(value);
+      if (!Object.keys(value).length) delete container[key];
+    }
+  };
+  const flags = submitData?.flags;
+  if (!flags || typeof flags !== 'object' || !flags[MODULE_ID] || typeof flags[MODULE_ID] !== 'object') return;
+  prune(flags[MODULE_ID]);
+  if (!Object.keys(flags[MODULE_ID]).length) delete flags[MODULE_ID];
+  if (!Object.keys(flags).length) delete submitData.flags;
+}
+
+// A control the user did not touch must not write. A range input snaps the stored value to
+// its step, the hidden offset inputs are re-derived (a zero-length offset loses its angle) and
+// submit as strings, Opacity and Blur show the elevation band's shared values rather than the
+// Tile's own, and the Path and Building shadow steps rewrite their data from whatever the form
+// holds. Saving the form unchanged used to rewrite all of them, on this Tile and on every
+// other shadowed Tile at its elevation.
+//
+// Returns false when nothing in the FA Nexus tab was changed: every Nexus field is then removed
+// from the submission and the Nexus submit steps are skipped. Otherwise only the grouped
+// fields are removed, and only when their whole group was left alone.
+function pruneUntouchedNexusFields(app, form, submitData) {
+  const state = getAppState(app);
+  const initial = state.initialFieldValues;
+  if (!(initial instanceof Map) || !form || !submitData || typeof submitData !== 'object') return true;
+  const current = readNexusFieldValues(form);
+  const untouched = (name) => initial.has(name) && current.get(name) === initial.get(name);
+  if (readNexusTabSignature(form) === state.initialTabSignature && [...current.keys()].every(untouched)) {
+    for (const name of current.keys()) deleteSubmitDataValue(submitData, name);
+    dropEmptiedNexusContainers(submitData);
+    return false;
+  }
+  for (const group of UNTOUCHED_FIELD_GROUPS) {
+    const present = group.filter((name) => current.has(name));
+    if (present.length && present.every(untouched)) {
+      for (const name of present) deleteSubmitDataValue(submitData, name);
+    }
+  }
+  dropEmptiedNexusContainers(submitData);
+  return true;
+}
+
+function hasSubmitDataValue(formData, key) {
+  return readSubmitDataValue(formData, key, undefined) !== undefined;
 }
 
 function buildElevationShadowSubmit(app, formData) {
   const doc = app?.document || null;
+  // Opacity and Blur belong to the whole elevation band. Left untouched, neither is applied.
+  if (!hasSubmitDataValue(formData, `flags.${MODULE_ID}.shadowAlpha`)
+    && !hasSubmitDataValue(formData, `flags.${MODULE_ID}.shadowBlur`)) return null;
   return {
     alpha: clampNumber(
       readSubmitDataValue(formData, `flags.${MODULE_ID}.shadowAlpha`, readFlagNumber(doc, 'shadowAlpha', DEFAULT_SHADOW_SETTINGS.alpha)),
@@ -2473,6 +2438,12 @@ function ensureCleanupWrapper(app) {
         error: String(error?.message || error)
       });
     }
+    try { cleanupPreviewHsbc(this); } catch (error) {
+      Logger.warn('TileConfig.preview.hsbc.cleanup.failed', {
+        tileId: this?.document?.id || null,
+        error: String(error?.message || error)
+      });
+    }
     requestLayerManagerSelectionSync({
       tileId: this?.document?.id || null,
       allowAutoExpand: false,
@@ -2488,70 +2459,21 @@ function ensureUpdateWrapper(app) {
   const state = getAppState(app);
   if (state.updateWrapped) return;
   state.updateWrapped = true;
-  const wrapElevationShadowSubmit = async (appInstance, submitData, runSubmit) => {
-    const doc = appInstance?.document || app?.document || null;
-    const shouldManageElevationShadow = !!doc && supportsTileShadowControls(doc);
-    const nextSubmitData = foundry?.utils?.deepClone?.(submitData) || { ...(submitData || {}) };
-    try { applyCustomRendererHsbcSubmit(appInstance, nextSubmitData); } catch (error) {
-      Logger.error('TileConfig.hsbc.submit.failed', {
-        tileId: doc?.id || null,
-        error: String(error?.message || error)
-      });
-      throw error;
-    }
-    try { applyPathShadowOffsetSubmit(appInstance, nextSubmitData); } catch (error) {
-      Logger.error('TileConfig.pathShadow.submit.failed', {
-        tileId: doc?.id || null,
-        error: String(error?.message || error)
-      });
-      throw error;
-    }
-    try { applyBuildingPathShadowSubmit(appInstance, nextSubmitData); } catch (error) {
-      Logger.error('TileConfig.buildingShadow.submit.failed', {
-        tileId: doc?.id || null,
-        error: String(error?.message || error)
-      });
-      throw error;
-    }
-    const elevationShadowSettings = shouldManageElevationShadow ? buildElevationShadowSubmit(appInstance, nextSubmitData) : null;
-    if (shouldManageElevationShadow) stripElevationShadowSubmit(nextSubmitData);
-
-    const result = await runSubmit(nextSubmitData);
-    if (!shouldManageElevationShadow) return result;
-
-    const manager = getShadowPreviewManager(appInstance);
-    const targetDoc = appInstance?.document || doc || null;
-    const elevation = getDocumentElevation(targetDoc, getDocumentElevation(doc));
-    if (!manager?.applyElevationSettings) {
-      Logger.error('TileConfig.shadowElevation.submit.missingManager', {
-        tileId: targetDoc?.id || doc?.id || null,
-        elevation
-      });
-      ui?.notifications?.error?.('Tile updated, but elevation shadow blur/opacity did not apply. Check FA Nexus shadow manager availability.');
-      return result;
-    }
-
-    const elevationSnapshot = manager.getElevationSettings?.(elevation) || null;
-    if (!elevationSnapshot?.hasTiles) return result;
-    if (!shouldApplyElevationShadowSettings(manager, elevation, elevationShadowSettings)) return result;
-
-    const applied = await manager.applyElevationSettings(elevation, elevationShadowSettings);
-    if (!applied) {
-      Logger.error('TileConfig.shadowElevation.submit.notApplied', {
-        tileId: targetDoc?.id || doc?.id || null,
-        elevation,
-        settings: elevationShadowSettings
-      });
-      ui?.notifications?.error?.('Tile updated, but elevation shadow blur/opacity did not apply to this band.');
-      return result;
-    }
-    return result;
-  };
-
   const originalProcessSubmitData = typeof app?._processSubmitData === 'function' ? app._processSubmitData.bind(app) : null;
   if (originalProcessSubmitData) {
     app._processSubmitData = async function _faNexusTileConfigProcessSubmitData(event, form, submitData, options = {}) {
-      return wrapElevationShadowSubmit(this, submitData, (nextSubmitData) => originalProcessSubmitData(event, form, nextSubmitData, options));
+      if (!pruneUntouchedNexusFields(app, form, submitData)) {
+        return originalProcessSubmitData(event, form, submitData, { ...options, faNexusTileConfigSubmit: true });
+      }
+      return tileConfigSubmitWorkflow.wrapElevationShadowSubmit(
+        this,
+        submitData,
+        (nextSubmitData) => originalProcessSubmitData(event, form, nextSubmitData, {
+          ...options,
+          faNexusTileConfigSubmit: true
+        }),
+        { app }
+      );
     };
     return;
   }
@@ -2559,7 +2481,14 @@ function ensureUpdateWrapper(app) {
   const originalUpdateObject = typeof app?._updateObject === 'function' ? app._updateObject.bind(app) : null;
   if (!originalUpdateObject) return;
   app._updateObject = async function _faNexusTileConfigUpdateObject(event, formData) {
-    return wrapElevationShadowSubmit(this, formData, (nextFormData) => originalUpdateObject(event, nextFormData));
+    return tileConfigSubmitWorkflow.wrapElevationShadowSubmit(
+      this,
+      formData,
+      (nextFormData) => originalUpdateObject(event, nextFormData, {
+        faNexusTileConfigSubmit: true
+      }),
+      { app }
+    );
   };
 }
 
@@ -2592,21 +2521,22 @@ function injectTileConfigTab(app, element) {
   const root = host.querySelector(TAB_SELECTOR);
   if (!root) return;
   bindTab(root, app);
+  captureInitialNexusFieldValues(app, host);
   requestLayerManagerSelectionSync({
     tileId: doc?.id || null,
     allowAutoExpand: false,
     allowScrollToTile: false
   });
 
+  // Show the sheet's current tab, which may be the FA Nexus tab added above. Not through app.changeTab: while the
+  // sheet is still rendering Foundry 14 defers that call, and when the sheet closes first (Submit) the deferred call
+  // reads the closed sheet and throws an uncaught error. The tab group state is already this tab; only the classes
+  // of the injected and native tabs need to agree with it.
   const activeTab = String(app?.tabGroups?.sheet || 'position').trim() || 'position';
-  try {
-    app.changeTab(activeTab, 'sheet', { force: true, updatePosition: false });
-  } catch (error) {
-    Logger.warn('TileConfig.tab.activate.failed', {
-      tileId: doc.id || null,
-      activeTab,
-      error: String(error?.message || error)
-    });
+  for (const tab of host.querySelectorAll('.tabs [data-group="sheet"][data-tab], .tab[data-group="sheet"][data-tab]')) {
+    const active = tab.dataset.tab === activeTab;
+    tab.classList.toggle('active', active);
+    if (tab.matches('.tabs [data-tab]') && tab.tagName === 'BUTTON') tab.ariaPressed = String(active);
   }
 }
 
@@ -2655,10 +2585,6 @@ function injectTilePaletteFaNexusSection(app, element) {
 }
 
 try {
-  Hooks.once('init', () => {
-    ensureTilePaletteOverheadContextPatch();
-  });
-
   Hooks.on('renderTileConfig', (app, element) => {
     try {
       injectTileConfigTab(app, element);
@@ -2672,7 +2598,6 @@ try {
 
   Hooks.on('renderTilePalette', (app, element) => {
     try {
-      ensureTilePaletteOverheadContextPatch(app?.constructor || null);
       injectTilePaletteFaNexusSection(app, element);
     } catch (error) {
       Logger.error('TilePalette.render.inject.failed', {

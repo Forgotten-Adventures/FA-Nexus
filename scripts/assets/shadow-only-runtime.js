@@ -1,4 +1,5 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { resolveCanvasTilePlaceable } from '../canvas/tile-targets.js';
 import {
   ensureMeshTransparent,
   ensureTileMesh,
@@ -156,16 +157,6 @@ export function cleanupAllShadowOnlyTiles() {
   }
 }
 
-function findTileForDocument(doc) {
-  try {
-    const id = doc?.id || doc?._id || null;
-    if (!id) return null;
-    return canvas?.tiles?.placeables?.find?.((tile) => tile?.document?.id === id) || null;
-  } catch (_) {
-    return null;
-  }
-}
-
 try {
   Hooks.on('canvasReady', () => {
     rehydrateAllShadowOnlyTiles();
@@ -174,15 +165,15 @@ try {
     void applyShadowOnlyTile(tile);
   });
   Hooks.on('createTile', (doc) => {
-    const tile = findTileForDocument(doc);
+    const tile = resolveCanvasTilePlaceable(doc);
     if (tile) void applyShadowOnlyTile(tile);
   });
   Hooks.on('updateTile', (doc) => {
-    const tile = findTileForDocument(doc);
+    const tile = resolveCanvasTilePlaceable(doc);
     if (tile) void applyShadowOnlyTile(tile);
   });
   Hooks.on('deleteTile', (doc) => {
-    const tile = findTileForDocument(doc);
+    const tile = resolveCanvasTilePlaceable(doc);
     if (tile) cleanupShadowOnlyTile(tile);
   });
   Hooks.on('canvasTearDown', () => {

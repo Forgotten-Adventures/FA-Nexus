@@ -1,5 +1,13 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { GridSelectionHelper } from '../core/placement/grid-selection-helper.js';
+import {
+  contentDimensions,
+  contentFilename,
+  contentFolder,
+  contentGrid,
+  contentPath,
+  inventoryItemKey
+} from '../content/cloud-inventory-v2.js';
 
 export class AssetsTabSelectionHelper extends GridSelectionHelper {
   constructor(tab) {
@@ -19,13 +27,7 @@ export class AssetsTabSelectionHelper extends GridSelectionHelper {
       computeItemKey: (item) => {
         if (!item) return '';
         try {
-          const filePath = String(item.file_path || '') || '';
-          if (filePath) return filePath;
-          const folder = tab._resolveFolderPath?.(item) || '';
-          const filename = String(item.filename || '');
-          if (folder && filename) return `${folder}/${filename}`;
-          if (!folder && filename) return filename;
-          return folder || '';
+          return inventoryItemKey(item) || contentPath(item) || '';
         } catch (_) {
           return '';
         }
@@ -35,13 +37,9 @@ export class AssetsTabSelectionHelper extends GridSelectionHelper {
         try {
           const key = cardElement.getAttribute('data-key');
           if (key) return key;
-          const fp = cardElement.getAttribute('data-file-path');
+          const fp = cardElement.getAttribute('data-content-id') || cardElement.getAttribute('data-content-path');
           if (fp) return fp;
-          const path = cardElement.getAttribute('data-path') || '';
-          const filename = cardElement.getAttribute('data-filename') || '';
-          if (path && filename) return `${path}/${filename}`;
-          if (!path && filename) return filename;
-          return path || '';
+          return cardElement.getAttribute('data-folder') || '';
         } catch (_) {
           return '';
         }
@@ -102,20 +100,24 @@ export class AssetsTabSelectionHelper extends GridSelectionHelper {
       const isCloud = (String(item.source || '').toLowerCase() === 'cloud');
       const filePath = tab._resolveFilePath(item);
       const folderPath = tab._resolveFolderPath(item);
-      const gridWidthVal = Number(item?.grid_width || 1) || 1;
-      const gridHeightVal = Number(item?.grid_height || 1) || 1;
-      const widthPx = Number(item?.width || (gridWidthVal * 200)) || (gridWidthVal * 200);
-      const heightPx = Number(item?.height || (gridHeightVal * 200)) || (gridHeightVal * 200);
+      const [gridWidthVal, gridHeightVal] = contentGrid(item);
+      const dims = contentDimensions(item);
+      const widthPx = Number(item?.actual_width || dims.width) || dims.width;
+      const heightPx = Number(item?.actual_height || dims.height) || dims.height;
       const localOrPath = item?.cachedLocalPath || filePath || folderPath;
       const url = localOrPath || '';
       prepared.push({
+        id: inventoryItemKey(item),
+        item,
         source: item?.source || (isCloud ? 'cloud' : 'local'),
         tier: item?.tier || 'free',
         file_path: filePath,
         path: localOrPath || filePath || folderPath || '',
+        folder_path: contentFolder(item) || folderPath,
         cachedLocalPath: item?.cachedLocalPath || '',
-        filename: item?.filename || '',
+        filename: contentFilename(item),
         url,
+        grid: [gridWidthVal, gridHeightVal],
         grid_width: gridWidthVal,
         grid_height: gridHeightVal,
         width: widthPx,
@@ -139,12 +141,26 @@ export class AssetsTabSelectionHelper extends GridSelectionHelper {
       try {
         const updated = await placement.updatePlacementAssets(prepared);
         if (updated) return;
-      } catch (_) {}
+      } catch (error) {
+        this.tab._reportAssetPlacementFailure?.('AssetsTab.place.selection.updateFailed', error, { total: prepared.length });
+        throw error;
+      }
     }
     try {
-      placement?.startPlacementRandom?.(prepared, true);
-    } catch (_) {
-      placement?.startPlacement?.(prepared[0], true);
+      if (prepared.length > 1) {
+        if (typeof placement?.startPlacementRandom !== 'function') {
+          throw new Error('Asset placement manager cannot start random placement.');
+        }
+        placement.startPlacementRandom(prepared, true);
+      } else {
+        if (typeof placement?.startPlacement !== 'function') {
+          throw new Error('Asset placement manager is unavailable.');
+        }
+        placement.startPlacement(prepared[0], true);
+      }
+    } catch (error) {
+      this.tab._reportAssetPlacementFailure?.('AssetsTab.place.selection.startFailed', error, { total: prepared.length });
+      throw error;
     }
   }
 }

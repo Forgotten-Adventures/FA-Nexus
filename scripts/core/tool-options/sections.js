@@ -2,7 +2,7 @@ import {
   DEFAULT_TOOL_OPTION_SECTION_ORDER,
   inferToolOptionSectionsFromState,
   TOOL_OPTIONS_RENDERER_MODE
-} from '../tool-options-descriptor.js';
+} from './tool-options-descriptor.js';
 import { getToolSectionLabel } from './shared.js';
 
 export function buildCollapsedSectionState(raw) {

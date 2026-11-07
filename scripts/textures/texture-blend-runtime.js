@@ -1,9 +1,10 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { isNativeAdjustmentEnabled } from '../core/native-adjustments.js';
 import {
   applyHsbcToDisplayObject,
   readDocumentHsbc
 } from '../core/hsbc.js';
-import { getMaxTextureSize } from './texture-runtime-core.js';
+import { getMaxTextureSize } from './texture-render-limits.js';
 
 const MASKED_TILING_FLAG = 'maskedTiling';
 const MASKED_TEXTURE_BLEND_FILTER_KEY = Symbol('faNexusMaskedTextureBlendFilter');
@@ -743,11 +744,15 @@ function syncMaskedTextureBlendFilter(displayObject, resolved, {
     if (managedFilter) {
       updateManagedMaskedTextureBlendFilter(managedFilter, resolved);
     } else if (resolved.customMode) {
-      managedFilter = createAdvancedMaskedTextureBlendFilter(resolved, backdropTexture);
-      if (!managedFilter) {
-        logger?.error?.('TextureRender.maskedTiling.blendMode.filterCreateFailed', {
-          value: resolved.id
-        });
+      // "Overlay and Soft Light blend modes" off in the settings: the renderer is left alone and the Texture is
+      // drawn with normal blending.
+      if (isNativeAdjustmentEnabled('textureBlendFilter')) {
+        managedFilter = createAdvancedMaskedTextureBlendFilter(resolved, backdropTexture);
+        if (!managedFilter) {
+          logger?.error?.('TextureRender.maskedTiling.blendMode.filterCreateFailed', {
+            value: resolved.id
+          });
+        }
       }
     } else {
       managedFilter = createPassThroughMaskedTextureBlendFilter(resolved.mode);

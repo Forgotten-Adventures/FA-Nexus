@@ -7,6 +7,7 @@ import {
   getSurfaceTileOcclusionModes,
   normalizeTileOcclusionForV14
 } from './tile-occlusion.js';
+import { resolveNewLayerLevels } from './new-layer-levels.js';
 
 export const LEVEL_POLICY_INHERIT_CURRENT = 'inherit-current';
 export const LEVEL_POLICY_PRESERVE = 'preserve';
@@ -27,6 +28,12 @@ export function normalizeTileRestrictionsForV14(restrictions, { roof = false } =
   };
   if (!normalized.light && !normalized.weather) return undefined;
   return normalized;
+}
+
+/** The placement Level a create payload names, written either as nested flags or as a dotted key. */
+function readPayloadPlacementLevelId(payload) {
+  const value = payload?.flags?.['fa-nexus']?.placementLevelId ?? payload?.['flags.fa-nexus.placementLevelId'] ?? null;
+  return String(value || '').trim() || null;
 }
 
 function clonePayloadValue(value) {
@@ -91,22 +98,30 @@ function preserveDocumentOverhead(doc, payload) {
   if (alphaThreshold !== undefined) setPayloadValue(payload, 'texture.alphaThreshold', alphaThreshold);
 }
 
+export function getFaNexusPlacementOcclusionDefaults(occlusion = null) {
+  const normalized = normalizeTileOcclusionForV14(occlusion);
+  return {
+    ...normalized,
+    modes: getSurfaceTileOcclusionModes()
+  };
+}
+
+/** A layer made by a Nexus tool restricts light: a light below it does not light it or what is drawn above it. */
+export function getFaNexusPlacementRestrictionDefaults(restrictions = null) {
+  return {
+    light: true,
+    weather: !!restrictions?.weather
+  };
+}
+
 function applyFaNexusPlacementCreateDefaults(payload) {
   if (!payload || (typeof payload !== 'object')) return;
 
-  const occlusion = normalizeTileOcclusionForV14(payload.occlusion);
-  payload.occlusion = {
-    ...occlusion,
-    modes: getSurfaceTileOcclusionModes()
-  };
+  payload.occlusion = getFaNexusPlacementOcclusionDefaults(payload.occlusion);
 
-  const restrictions = normalizeTileRestrictionsForV14(payload.restrictions, {
+  payload.restrictions = getFaNexusPlacementRestrictionDefaults(normalizeTileRestrictionsForV14(payload.restrictions, {
     roof: payload.roof === true
-  }) || {};
-  payload.restrictions = {
-    light: true,
-    weather: !!restrictions.weather
-  };
+  }));
 }
 
 export function preserveTileDocumentCustomSettingsForUpdate(doc, payload, {
@@ -184,9 +199,14 @@ export function normalizeTileCreatePayloadForV14(data, options = {}) {
       else delete normalized.levels;
       break;
     case LEVEL_POLICY_UNSCOPED:
-    default:
-      delete normalized.levels;
+    default: {
+      // "Every Level" (the default): no membership. "Only their own Level": the Level the layer is placed on,
+      // or the viewed Level of the given Scene when the payload names none yet.
+      const ownLevels = resolveNewLayerLevels({ placementLevelId: readPayloadPlacementLevelId(normalized), scene });
+      if (ownLevels.length) normalized.levels = ownLevels;
+      else delete normalized.levels;
       break;
+    }
   }
 
   normalized.occlusion = normalizeTileOcclusionForV14(normalized.occlusion);

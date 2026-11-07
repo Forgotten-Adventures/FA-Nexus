@@ -11,6 +11,7 @@ import {
   readRegisteredGeneratedFlattenRoots
 } from './generated-output-policy.js';
 import { sanitizeStorageTargetPath, sanitizeStoragePathSegments } from './path-utils.js';
+import { isPrefabArtifactPath } from './prefab-paths.js';
 
 const MODULE_ID = 'fa-nexus';
 
@@ -74,6 +75,7 @@ export function extractGeneratedFlattenRootFromPath(path, {
 } = {}) {
   const normalizedPath = trimTrailingSlashes(sanitizeStorageTargetPath(path));
   if (!normalizedPath) return '';
+  if (isPrefabArtifactPath(normalizedPath)) return '';
 
   const detected = detectGeneratedOutputPath(normalizedPath, {
     assetsDir,
@@ -116,6 +118,7 @@ export async function ensureGeneratedFlattenRootsRegistered(roots, {
   const requestedRoots = Array.from(new Set((Array.isArray(roots) ? roots : [roots])
     .map((value) => normalizeGeneratedFlattenRoot(value, { assetsDir }))
     .filter(Boolean)));
+  if (requestedRoots.some(isPrefabArtifactPath)) throw new Error('Shared Prefab artwork cannot be registered for generated cleanup.');
   const current = readRegisteredGeneratedFlattenRoots({ moduleId, assetsDir });
   const existingRoots = requestedRoots.filter((root) => current.includes(root));
   const registeredRoots = requestedRoots.filter((root) => !current.includes(root));

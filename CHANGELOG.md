@@ -2,6 +2,193 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2] - 2026-11-07
+
+Compared with 0.5.3.
+
+### Added
+- **Rebuilt Building Tool:**
+    - The Building Tool has been rebuilt.
+    - Tool Options are organized into workspaces: Outer Walls, Inner Walls, Portals, Fill Textures, and Edit Geometry.
+    - With Staged placement switched on (Shift+E), a new outer shape is held before it is accepted, so it can be moved, resized, rotated, or point-edited first. With the new Room Construction switch on, a shape added onto the Building keeps a wall along its edge and becomes a room of its own instead of merging into the existing outline; "Inner Only" adds room walls inside the outline without enlarging it, and Subtract trims the inner walls it cuts.
+    - Inner Walls and the new Fill Dividers can be drawn as smooth splines as well as poly-lines, and can be split, joined, and converted between straight and curved segments. Sticky Joints keep connected walls together while one of them is reshaped.
+    - Fill is managed per room: each enclosed room can take its own texture, scale, rotation, offset, opacity, and color, or follow the Building's Fill.
+    - Portals add Seamless Secret Doors, which look like the wall they are cut from, alongside Doors, Windows, and Openings. A portal can be converted to another kind, fitted to its artwork's width, and given its own behavior, sound, timing, and initial state.
+    - Wall behavior can be set with the Solid, Terrain, Invisible, and Ethereal presets or a custom combination, for the whole Building, one wall path, or single segments.
+    - Edit Shapes is now Edit Geometry, which moves the vertices and curve handles of the committed shape.
+    - Commit writes the Walls, Fill, and Sills as separate named Tiles (for example "Ground Floor - Building 1 - Walls") instead of 0.5.3's combined foreground and background Tiles. A Commit that fails leaves the Building as it was and says why.
+    - Closing FA Nexus or opening another tab while a Building has unsaved changes asks: Commit, Discard, or Continue Editing. When a staged shape or a Commit in progress stops the way out, a message says why.
+    - Buildings made with 0.5.3 open in the new editor. They are left untouched until a change is committed, which upgrades them. A 0.5.3 Building the new editor cannot rebuild exactly (rotated, resized, missing its Walls, or in a Scene Group) is left as it is, and Nexus Edit says why in plain words.
+
+- **Moving, Rotating, and Scaling Every Nexus Layer:**
+    - Every FA Nexus layer (Buildings, Paths, Scatter, Textures, and flattened sections) can now be moved, rotated, and scaled with Foundry's own Tile tools and in Scene Groups, and keeps working afterwards: Nexus Edit reopens a moved, rotated, or scaled Building, Path, Texture, or Scatter where it now is. 0.5.3 hid the rotate and resize handles for Buildings, Paths, Scatter, and masked flattened sections, and moving a Building moved only its Tile.
+    - A Building moved or rotated with Foundry's tools, a 0.5.3 Building included, takes its Fill, door and window frames, Inner Walls, Foundry Walls, and Region with it; in 0.5.3 only its Tile moved. It stays on the grid: it snaps by its walls and turns about the nearest grid corner or square center, so a quarter turn keeps its walls on grid lines.
+    - A Path takes its texture, shadows, and Foundry Walls with it. It snaps by the points it was drawn with and turns about the nearest grid corner or square center.
+    - Scatter Tiles keep their instances, shadows, and color adjustments, also after a reload and in Nexus Edit.
+    - A Building's Tile sheet no longer changes Scale X/Y or Image; it says where to do it instead (Scene Groups' Flip Horizontally / Flip Vertically, or Outer Walls in the Building editor).
+    - A Building, Path, or flattened section is saved in steps after a move or turn. A new move or turn started before that has finished is refused with a message ("This Building is still saving its last change. Try again in a moment."); on a slow host such as The Forge, quick edits one after another could leave a Building broken until it settled.
+
+- **Scene Groups:**
+    - Added a dedicated Scene Groups window for creating live groups from selected Tiles, Walls, Lights, Sounds, and Regions.
+    - Groups can be renamed, nested, reparented, collapsed, hidden, locked, ungrouped, or deleted while normal Foundry interaction remains available for individual members.
+    - Selected groups can be moved, rotated, and uniformly scaled directly on the canvas with a live preview, snapping, an adjustable pivot, and one Undo step for each change.
+    - Layer Manager rows can select either an individual member, its direct group, or its root group.
+    - Scene Groups can be switched off with the world setting "Enable Scene Groups". Switched off, the Scene Groups window, its button and the selection mode are gone, every layer is selected on its own, and Prefabs are off as well. Groups already in a Scene are kept. Copy and paste of Buildings and Paths keeps working.
+
+- **Prefabs (Experimental):**
+    - Prefabs are marked experimental (a note in their tab) and can be switched off with the world setting "Enable Prefabs (Experimental)". They need Scene Groups.
+    - Added a Prefabs tab and a local Prefab library that is shared by every world of the installation. One or more Scene Groups are saved as a Prefab by dragging them into the tab or with "Save as Prefab…" in the group's menu.
+    - A Prefab keeps its Tiles, Walls, Lights, Sounds, and Regions together with their grouping. Buildings, Paths, Textures, and Scatter inside it stay editable after it is placed.
+    - Clicking a Prefab stages it on the canvas, where it can be moved, resized, rotated, and mirrored, with grid snapping and a choice between its original pixel size and the size that matches the Scene's grid. Accept creates everything as one Undo step; Cancel writes nothing.
+    - Prefabs can be placed into Scenes with another grid size and onto another Level, renamed, deleted, and exchanged as files with Export Prefab and Import Prefab. "Prepare required assets" fetches the artwork a Prefab needs before it is placed.
+    - Copy and paste and Duplicate for Scene Groups use the same staged placement, also across Levels and Scenes.
+    - The Prefab library, Import Prefab, and saving a group whose artwork FA Nexus generated (a flattened picture or a mask) also work with The Forge's Assets Library.
+
+- **Layer Manager Folders:**
+    - Added Folders inside elevation groups for organizing dense Tile stacks without changing any Tile's Elevation.
+    - Folders can wrap the current selection, contain nested folders, and be renamed, collapsed, reordered, hidden, locked, removed, flattened, or promoted to their own elevation.
+    - Preview rows of active Asset, Scatter, Path, Texture, and Building sessions can also be placed into folders before commit.
+
+- **Feature Area Controls:**
+    - Added separate world settings for enabling the Tokens and Mapmaking workspaces, including token-only and mapmaking-only setups. [Issue #52](https://github.com/Forgotten-Adventures/FA-Nexus/issues/52)
+    - A switched-off area does not load its tabs or canvas tools when the world starts.
+    - With Mapmaking switched off, a map made with the mapmaking tools is not drawn as it was saved. The setting says so, and the Gamemaster is told once for each Scene that has such layers. The Scene itself is not changed.
+
+- **Level Membership for New Layers:**
+    - Added a "New layers appear on" world setting. "Every Level" (the default) keeps the existing behavior: a layer made with the FA Nexus tools is shown from every Level, so an upper storey shows the storey below. "Only their own Level" gives new Assets, Scatter, Textures, Paths, and Buildings Foundry's own Level membership for the Level they are placed on, so they are drawn there only.
+    - The setting applies to new layers. Existing layers keep their membership until it is changed in their Tile configuration.
+    - The setting is listed in the Mapmaking section of the FA Nexus settings.
+    - When a layer is moved in the Layer Manager to an Elevation of another Level, a layer that belongs only to its own Level moves to that Level, and a layer shown on every Level stays on every Level.
+
+- **Path Wall Behavior:**
+    - Paths with "Foundry Walls" can now choose what those Walls block: Solid, Terrain, Invisible, or Ethereal, using the same presets as Building walls. An Invisible fence or railing blocks movement and lets sight, light, and sound through.
+    - The choice is saved with each Path and can be changed later through Nexus Edit.
+
+### Changed
+- **Flatten:**
+    - Flattening a selection now keeps ground, middle, and foreground apart, one picture each, as the split option of Flatten Level already could. Before, a selection became one Tile, which baked a Building's floor and walls together.
+    - Selecting any part of a Building or Path for Flatten includes all of it.
+    - A Scene Group selected with Direct Group or Root Group selection counts for Flatten: its visible Tiles, those of its nested groups included, are flattened. Its Walls and other non-Tile members are left as they are.
+    - Deconstruct now also works after a flattened Tile was rotated or resized; 0.5.3 asked to reset its size and rotation first. Everything comes back at the section's current position, rotation, and size, together with the Scene Groups and Layer Manager Folders it held. Flattened Tiles with a mask can now be resized too, and their masks follow.
+    - The pictures of a flattened section, with the Walls, doors, and Regions it keeps, move, rotate, and scale as one, and are deleted with one question and one Undo step. A section that holds Foundry Walls snaps by a wall end and turns about the nearest grid corner or square center.
+    - A resize or rotation a flattened Tile cannot follow exactly is refused before anything changes, with a message.
+    - The Deconstruct question now says how many pictures the section has, that their files stay on disk, and that Generated Cleanup lists flattened files no Scene uses any more.
+    - "Nexus Edit" is no longer offered for a flattened picture, which has no editor of its own; the menu says so and points to Apply Mask and Deconstruct.
+    - Flatten and export do not start while an editing session or a staged Prefab placement is open, and say so.
+    - Deleting a masked or flattened Tile now marks its generated files for Generated Cleanup.
+
+- **Cross-Level Door Proxies:**
+    - Door and window artwork from other Levels, which FA Nexus shows through openings, now takes elevated sight and opaque floors into account before it is drawn. It can be switched off with the world setting "Cross-Level Door Proxies (Experimental)" (on by default). [Issue #57](https://github.com/Forgotten-Adventures/FA-Nexus/issues/57)
+
+- **Foundry-Native Behavior:**
+    - Removed the FA Nexus Token Eye Level override, its Token Config control, and the world setting "Overwrite Token Eye Level"; token vision uses Foundry's own behavior. [Issue #56](https://github.com/Forgotten-Adventures/FA-Nexus/issues/56)
+    - FA Nexus no longer replaces Foundry's texture loading or its Region refresh.
+    - Picking Tiles on the canvas while the Layer Manager is in use follows Foundry's own Foreground switch again. 0.5.3 let background and foreground Tiles be picked together whatever that switch was set to.
+    - Configure Settings has a new section, "Changes to Foundry behaviour". It holds the existing switches for near-ground tiles under tokens and pixel-perfect tile selection, the new Cross-Level Door Proxies switch, and two new switches: "Wait for Nexus layers when a Scene is drawn" and "Overlay and Soft Light blend modes". All are on by default; switch one off if it gets in the way of a system or another module.
+
+- **Editor Sessions:**
+    - Closing the FA Nexus window during a Texture or Path session now saves the session; in 0.5.3 the work was lost. If the save fails, the window stays open and says why.
+    - Switching Scenes is refused while an editor session holds uncommitted work.
+    - Keys typed into a search box, name field, or number box, including Escape, are no longer passed to the active editor.
+    - Escape or Cancel in a Scatter session now asks the same question as the other editors ("Discard the current scatter edits?" with Discard and Keep Editing), and the button that saves an edited Scatter is called Commit, as in the other editors, instead of Apply.
+    - Cancel and Escape in the Path editor wait while a Commit is still saving ("This Path is still being saved. Wait until it has finished."); on a slow host they could remove the Path's Foundry Walls.
+
+- **Deleting Buildings and Paths:**
+    - Deleting a Building or Path, with the Delete key or from the Layer Manager, asks once and removes its generated parts with it; one Ctrl+Z brings all of it back.
+
+- **Asset Editing:**
+    - Nexus Edit on a placed Asset now updates its Tile in place instead of replacing it, keeping its Scene Group membership, opacity, hidden and locked state, and data from other modules, with a single Undo step.
+
+- **Premium Editors:**
+    - The Path, Texture, and Building editors now carry the number of the FA Nexus release they belong to (0.6.2) instead of their own numbers (0.5.3 used Path `0.0.101`, Texture `0.0.87`, and Building `0.0.111`). Building editor `0.0.111` is replaced by the rebuilt Building Tool.
+    - The rebuilt Building Tool drops these 0.5.3 controls: the disabled "Freehand Lasso (Coming soon)", Wall Tension, Show Width Tangents, and Fill scale/rotation randomization.
+
+- **Patreon Premium and Pro Tiers:**
+    - Follows Forgotten Adventures' Patreon split of 2026-10-26. The Premium tier unlocks premium Tokens and Assets; the Pro tier adds the Pro tools: Texture Painting, Tile Masking, Paths, and the Building Tool. Nexus now calls them Pro tools.
+    - Premium cards unlock only for an active (or payment-declined) paid tier. A connected Free member now sees them locked, and a click explains that the tier doesn't include premium downloads. Files already downloaded stay usable.
+    - A member whose tier doesn't include the Pro tools gets a clear Pro message when starting a tool, and the Textures, Paths, and Building tabs then show a notice with an upgrade link. A member who downgrades while an editor is open keeps the editor and stays connected. Nexus Edit on a Building, Path or Texture without the Pro tools says so in those words instead of reporting a missing Patreon state.
+
+### Fixed
+- **The Forge and Hosted Storage:**
+    - On The Forge, the Path, Texture, and Building editors now follow the Tool Options you see: Snap to Grid, snap density, F1 Help, Asset Shadows, mask reloading, and Layer Manager previews no longer act on a hidden second copy of FA Nexus.
+    - On The Forge, Flatten and Export no longer stop with "Unable to check existing outputs" when FA Nexus can't read your Forge account ID (EU servers); Forge storage is used directly. [Issue #60](https://github.com/Forgotten-Adventures/FA-Nexus/issues/60)
+    - A cloud Token or Asset that Foundry fails to store is no longer placed from a guessed path; FA Nexus says it could not store the file.
+    - On The Forge, Buildings and shadowed Assets no longer log a shadow error while their artwork is still loading from Forge's servers.
+
+- **Texture Painting & Tile Masking:**
+    - Resizing a masked Texture Tile with Foundry's handles now scales its texture with the Tile, as the resize preview shows; before, the texture went back to its old size inside the resized mask on release.
+    - Reopening a moved, rotated, or resized Texture or Mask Tile now keeps its position, size, rotation, flips, and texture scale, rotation, and offset.
+    - Painting or drawing a shape past the edge of an existing Texture layer or Tile mask now grows the mask instead of being cut off at its old edge.
+    - Copied and pasted masked Tiles now draw correctly in Foundry v14.
+    - Color adjustments on FA Nexus layers are no longer lost when a layer redraws.
+    - Saving a painted Texture or a Tile mask now shows one confirmation instead of also showing Foundry's upload message with the generated file name, and a mask upload that fails stops the save with an error.
+    - Redo after erasing part of a new Tile mask no longer hides the whole Tile and no longer saves an empty mask.
+    - A new Texture layer can no longer be committed before anything is painted; before, changing an option such as Elevation was enough, and Commit made an empty Tile the size of the Scene.
+    - After Nexus Edit on a Texture layer, clicks and the hiding of Tokens beneath it follow its new artwork at once; before, that needed a Scene reload.
+
+- **Paths:**
+    - Quick HSBC in the Tile sheet now says when a tile has several paths, and that saving it replaces the colour adjustments of the individual paths.
+    - A Path dragged with Foundry's Tiles tool now takes its Foundry Walls with it; before, the Walls stayed where the Path was drawn.
+    - Dragging Path points no longer stutters.
+    - Foundry Walls created by a Path now belong to the Level the Path is drawn on, so a fence on one floor no longer blocks the floors above and below.
+    - Editing a Path again now replaces its previous Walls instead of leaving them behind, and Undo no longer leaves a Path and its Walls out of step.
+    - Commit followed at once by a tab switch no longer saves a Path twice.
+    - Cancelling a Path edit in which a path was reshaped and then split or deleted no longer removes that Path's Foundry Walls.
+    - A Path's Tension set back to 0 in an edit is now saved; before, the path kept its previous Tension.
+    - Undo in the Path editor and splitting a path now keep the path's color adjustments.
+    - "Shadow only" set for one path of a Tile with several paths now hides that path's artwork after Commit.
+    - A closed Path no longer gets a tiny extra Wall at its first point, and a two-point Path with Close Loop on no longer gets Walls on top of each other.
+
+- **Asset Placement, Scatter & Shadows:**
+    - Editing an existing asset, Path or Texture with Nexus Edit no longer changes the settings for new ones: the next new layer started with the edited layer's scale, rotation, flips and shadow, whether the edit was committed or cancelled. Brush, density and spacing settings are still remembered.
+    - Placements made in quick succession no longer get in each other's way, and an Asset edit that fails leaves the Tile as it was.
+    - Flatten waits for Asset shadows to finish drawing, so the picture matches what is on screen.
+    - An Asset standing off the grid is no longer snapped to the grid when its edit is saved without moving it.
+    - Cancel now discards Scatter edits, and a stroke redone during a Scatter edit is kept when it is committed.
+    - Erasing every instance while editing a Scatter no longer deletes its Tile at once: Undo and Cancel keep working, and Commit deletes the Tile as a step Foundry's Undo can take back.
+    - A drop shadow switched on in the Tile configuration can be undone, and saving an unchanged Tile configuration no longer rewrites shadows.
+
+- **Layer Manager:**
+    - An Elevation range typed with the larger number first no longer makes every tile unselectable; the range lies between the two numbers.
+    - A preview row moved in the Layer Manager during Nexus Edit is now saved at its new place on Commit, also when nothing else was changed.
+    - Moving or reordering layers in the Layer Manager keeps the selection and the scroll position.
+    - Hiding a layer in the Layer Manager can be undone with Ctrl+Z.
+    - A Layer Manager menu action that fails now says why.
+
+- **Flatten, Deconstruct & Generated Cleanup:**
+    - Flatten, Deconstruct and Export now end with one message that counts what was done ("Flattened 4 layers into 2 pictures.", "Restored 4 layers.", "Level export complete. 2 pictures saved to <folder>.") instead of a Foundry upload message for every file.
+    - The Flatten / Export Level dialog now counts the tiles of the chosen scope. With "All scene levels" it names the visible layers that are in no picture, says what keeps each out (the Level that has its elevation does not show it, or is not its Parent Level) and what to change.
+    - Fixed freezes when opening the Flatten dialog and when opening or using the FA Nexus tab of the Tile sheet.
+    - A Deconstruct that fails partway now leaves the Scene as it was.
+    - Deconstructing a section flattened with an earlier version now links every Building part back to its own Building: door frames, windows, Fills, inner walls and the Building's Foundry Walls could point at another restored Tile.
+    - Flattened pictures are now written on the Scene's pixel grid, so they are no longer drawn slightly soft at 100% zoom.
+    - Deconstruct now says when a mask painted on a flattened picture will be discarded.
+
+- **Tokens:**
+    - Placing a one-square token as a Tiny or Small Actor (a compendium creature or an Actor of the world) no longer turns the Actor into a Medium creature.
+
+- **Window & Authentication State:**
+    - Minimizing the FA Nexus window through the Foundry header no longer saves the minimized dimensions as the next expanded window size.
+    - After connecting Patreon, the open tab unlocks its items at once, without switching tabs.
+    - A premium download your Patreon tier doesn't include no longer disconnects Patreon; only an expired or invalid login does, and a missing premium file now says it isn't available.
+    - Saving or closing a Tile's configuration right after it opens no longer shows an error in Foundry 14.370.
+    - Opening FA Nexus again while its window is still closing no longer leaves an empty window.
+
+- **Levels:**
+    - Switching Levels works again in Foundry 14.370; before, FA Nexus kept the Level already in view. Earlier v14 builds still wait for Nexus layers when a Level is switched. [Issue #61](https://github.com/Forgotten-Adventures/FA-Nexus/issues/61)
+
+- **Performance:**
+    - Custom Tile artwork that is off screen is no longer drawn, and painted masks and Tile outlines use much less GPU memory.
+    - Reduced per-frame work for shadows, wall occlusion, and Tile hover on Scenes with many custom Tiles.
+
+- **Interface:**
+    - A library tab with no source enabled now says so and names where sources are enabled, instead of "No results found".
+    - The FA Nexus tab of the Tile sheet now says which Level's band a tile lies in when its Parent Level is another Level, and what to change, instead of calling a chosen Parent Level unresolved.
+    - Tool Options section headings are readable with Foundry's light color scheme.
+    - Escape now closes the color-variant panel without closing the FA Nexus window.
+    - A search typed just before switching tabs is now kept for the tab it was typed in instead of being replaced by the other tab's search.
+    - The Layer Manager's sidebar button now reads "Layer Manager" instead of "FA-NEXUS.LayerManager", and its eye buttons and the source checkboxes have names for tooltips and screen readers.
+
 ## [0.5.3] - 2026-06-09
 
 ### Added

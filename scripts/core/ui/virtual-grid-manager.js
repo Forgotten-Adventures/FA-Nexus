@@ -8,6 +8,33 @@
  */
 import { NexusLogger as Logger } from '../nexus-logger.js';
 
+const CALLBACK_ITEM_CONTEXT_FIELDS = ['id', 'name', 'path', 'filename'];
+
+function safeLogValue(value) {
+  if (value == null) return null;
+  if (!['string', 'number', 'boolean'].includes(typeof value)) return null;
+  const text = String(value);
+  if (/^(?:data:|blob:)/i.test(text)) return null;
+  return text
+    .replace(/https?:\/\/\S+/gi, '[url]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
+    .replace(/\b(apiKey|api_key|jwt|token|secret|password|authorization)=([^&\s]+)/gi, '$1=[redacted]');
+}
+
+function warnCallbackFailure(key, index, item, error) {
+  const context = {
+    index,
+    error: safeLogValue(error?.message ?? error) || 'Unknown error'
+  };
+  if (item && typeof item === 'object') {
+    for (const field of CALLBACK_ITEM_CONTEXT_FIELDS) {
+      const value = safeLogValue(item[field]);
+      if (value != null) context[field] = value;
+    }
+  }
+  Logger.warn(key, context);
+}
+
 export class VirtualGridManager {
   /**
    * @param {HTMLElement} container - Scrollable container element
@@ -165,10 +192,7 @@ export class VirtualGridManager {
       try {
         if (typeof this.onMountItem === 'function') this.onMountItem(el, this.items[idx], idx);
       } catch (error) {
-        Logger.warn('VGrid.refreshMounted.itemFailed', {
-          index: idx,
-          error: String(error?.message || error)
-        });
+        warnCallbackFailure('VGrid.refreshMounted.itemFailed', idx, this.items[idx], error);
       }
     }
   }
@@ -208,7 +232,9 @@ export class VirtualGridManager {
       // Unmount outside range
       for (const [idx, el] of this._mounted) {
         if (idx < startIndex || idx > endIndex) {
-          try { if (typeof this.onUnmountItem === 'function') this.onUnmountItem(el, this.items[idx], idx); } catch (_) {}
+          try { if (typeof this.onUnmountItem === 'function') this.onUnmountItem(el, this.items[idx], idx); } catch (error) {
+            warnCallbackFailure('VGrid.unmountItem.failed', idx, this.items[idx], error);
+          }
           el.remove();
           this._mounted.delete(idx);
         }
@@ -229,7 +255,9 @@ export class VirtualGridManager {
           el.style.height = `${this.card.height}px`;
           this.container.appendChild(el);
           this._mounted.set(i, el);
-          try { if (typeof this.onMountItem === 'function') this.onMountItem(el, this.items[i], i); } catch (_) {}
+          try { if (typeof this.onMountItem === 'function') this.onMountItem(el, this.items[i], i); } catch (error) {
+            warnCallbackFailure('VGrid.mountItem.failed', i, this.items[i], error);
+          }
         } else {
           const el = this._mounted.get(i);
           el.style.top = `${top}px`;

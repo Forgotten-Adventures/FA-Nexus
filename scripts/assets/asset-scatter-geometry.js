@@ -10,13 +10,18 @@ import {
 } from '../canvas/custom-tile-overhead.js';
 import { cloneDisplayObjectForProxy } from '../canvas/display-object-proxy.js';
 import {
-  ensureTileMesh,
-  ensureMeshTransparent,
+  prepareCustomTileRendererMesh,
   getSharedTexture,
+  loadTexture,
   restoreMeshTexture
 } from '../textures/texture-runtime-core.js';
 import { syncStandardMaskCustomSourceSuppression } from '../textures/standard-mask-custom-base.js';
 import { syncShadowOnlyCustomContainer } from './shadow-only-runtime.js';
+import {
+  applyScatterInstanceTransformToSprite,
+  computeAffineScatterInstanceBounds,
+  resolveScatterInstanceAffine
+} from './asset-scatter-instance-transform.js';
 
 const SCATTER_FLAG_KEY = 'assetScatter';
 const SCATTER_VERSION = 1;
@@ -32,6 +37,7 @@ const SCATTER_VIEWPORT_KEY_GRANULARITY = 128;
 const SCATTER_VIEWPORT_MAX_LIVE_SPRITES = 8000;
 const SCATTER_CAPTURE_MAX_LIVE_SPRITES = 60000;
 const SCATTER_VIEWPORT_REFRESH_DELAY = 50;
+const SCATTER_APPLY_REQUEST_KEY = 'faNexusAssetScatterApplyRequest';
 const TEXTURE_CACHE = new Map();
 const SCATTER_RETRY_TIMERS = new Map();
 const SCATTER_REFRESH_TIMERS = new Map();
@@ -72,17 +78,21 @@ function normalizeInstances(raw = []) {
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((entry) => entry && typeof entry === 'object')
-    .map((entry) => ({
-      id: typeof entry.id === 'string' ? entry.id : null,
-      src: typeof entry.src === 'string' ? entry.src : '',
-      x: Number(entry.x) || 0,
-      y: Number(entry.y) || 0,
-      w: Math.max(1, Number(entry.w) || 0),
-      h: Math.max(1, Number(entry.h) || 0),
-      r: Number(entry.r) || 0,
-      flipH: !!entry.flipH,
-      flipV: !!entry.flipV
-    }))
+    .map((entry) => {
+      const normalized = {
+        id: typeof entry.id === 'string' ? entry.id : null,
+        src: typeof entry.src === 'string' ? entry.src : '',
+        x: Number(entry.x) || 0,
+        y: Number(entry.y) || 0,
+        w: Math.max(1, Number(entry.w) || 0),
+        h: Math.max(1, Number(entry.h) || 0),
+        r: Number(entry.r) || 0,
+        flipH: !!entry.flipH,
+        flipV: !!entry.flipV
+      };
+      if (entry.affine) normalized.affine = resolveScatterInstanceAffine(entry);
+      return normalized;
+    })
     .filter((entry) => entry.src);
 }
 
@@ -170,8 +180,11 @@ function bumpScatterContentVersion(container) {
   container.faNexusAssetScatterContentVersion = (Number(container.faNexusAssetScatterContentVersion) || 0) + 1;
 }
 
-function syncScatterContainerTransform(container, mesh, doc) {
+export function syncAssetScatterContainerTransform(container, mesh, doc, previewScale = null) {
   if (!container || container.destroyed || !mesh || mesh.destroyed) return;
+  // Composition previews preserve this local matrix while the native mesh
+  // transforms the original instances. Do not cancel its reflected axes.
+  if (container[Symbol.for('fa-nexus.scene-group-display-transform-preview')]) return;
   const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
   const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
   const rawSx = Number(mesh?.scale?.x ?? 1) || 1;
@@ -182,7 +195,9 @@ function syncScatterContainerTransform(container, mesh, doc) {
   const anchorY = Number(doc?.texture?.anchorY);
   const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
   const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
-  container.scale?.set?.(1 / sx, 1 / sy);
+  const scaleX = Number(previewScale?.scaleX) || 1;
+  const scaleY = Number(previewScale?.scaleY) || 1;
+  container.scale?.set?.(scaleX / sx, scaleY / sy);
   container.position?.set?.(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
 }
 
@@ -227,6 +242,7 @@ function resolveScatterCacheSize(doc) {
 }
 
 function computeScatterInstanceBounds(instance) {
+  if (instance?.affine) return computeAffineScatterInstanceBounds(instance);
   const width = Math.max(1, Number(instance?.w) || 0);
   const height = Math.max(1, Number(instance?.h) || 0);
   const cx = Number(instance?.x) || 0;
@@ -402,6 +418,13 @@ function scheduleScatterRetry(tile, attempt = 1) {
 
 function applySpriteSizing(sprite, instance) {
   if (!sprite || !instance) return;
+  if (instance.affine) {
+    sprite.rotation = 0;
+    sprite.skew?.set?.(0, 0);
+    sprite.scale?.set?.(1, 1);
+    applyScatterInstanceTransformToSprite(sprite, instance);
+    return;
+  }
   const width = Math.max(1, Number(instance.w) || 0);
   const height = Math.max(1, Number(instance.h) || 0);
   const baseScaleX = Number.isFinite(sprite.scale?.x) && sprite.scale.x !== 0 ? Math.abs(sprite.scale.x) : 1;
@@ -416,9 +439,11 @@ function applySpriteSizing(sprite, instance) {
 function createSprite(instance, texture, { onTextureReady = null } = {}) {
   const sprite = new PIXI.Sprite(texture);
   sprite.anchor.set(0.5);
-  sprite.position.set(instance.x, instance.y);
-  sprite.rotation = ((instance.r || 0) * Math.PI) / 180;
   applySpriteSizing(sprite, instance);
+  if (!instance.affine) {
+    sprite.position.set(instance.x, instance.y);
+    sprite.rotation = ((instance.r || 0) * Math.PI) / 180;
+  }
   const base = texture?.baseTexture;
   if (base && !base.valid && typeof texture?.once === 'function') {
     texture.once('update', () => {
@@ -944,19 +969,42 @@ function createScatterCanvasCaptureSprite(visibleEntries, bounds, resolution) {
     ctx.save();
     try {
       ctx.translate(drawX, drawY);
-      ctx.rotate(((Number(instance.r) || 0) * Math.PI) / 180);
-      ctx.scale(instance.flipH ? -1 : 1, instance.flipV ? -1 : 1);
-      ctx.drawImage(
-        sourceInfo.source,
-        frame.x,
-        frame.y,
-        frame.width,
-        frame.height,
-        -drawWidth / 2,
-        -drawHeight / 2,
-        drawWidth,
-        drawHeight
-      );
+      if (instance.affine) {
+        const affine = resolveScatterInstanceAffine(instance);
+        ctx.transform(
+          (affine.a * scale) / frame.width,
+          (affine.b * scale) / frame.width,
+          (affine.c * scale) / frame.height,
+          (affine.d * scale) / frame.height,
+          0,
+          0
+        );
+        ctx.drawImage(
+          sourceInfo.source,
+          frame.x,
+          frame.y,
+          frame.width,
+          frame.height,
+          -frame.width / 2,
+          -frame.height / 2,
+          frame.width,
+          frame.height
+        );
+      } else {
+        ctx.rotate(((Number(instance.r) || 0) * Math.PI) / 180);
+        ctx.scale(instance.flipH ? -1 : 1, instance.flipV ? -1 : 1);
+        ctx.drawImage(
+          sourceInfo.source,
+          frame.x,
+          frame.y,
+          frame.width,
+          frame.height,
+          -drawWidth / 2,
+          -drawHeight / 2,
+          drawWidth,
+          drawHeight
+        );
+      }
     } finally {
       ctx.restore();
     }
@@ -1335,6 +1383,7 @@ function populateScatterContainer(tile, container, instances) {
 export function cleanupAssetScatterOverlay(tile) {
   try {
     if (!tile) return;
+    tile[SCATTER_APPLY_REQUEST_KEY] = null;
     clearScatterRetry(tile);
     clearScatterRefresh(tile);
     const mesh = tile.mesh;
@@ -1358,23 +1407,66 @@ export function cleanupAssetScatterOverlay(tile) {
 export async function applyAssetScatterTile(tile, options = {}) {
   try {
     if (!tile || tile.destroyed) return;
+    if (tile[Symbol.for('fa-nexus.scene-group-display-transform-preview')]) return;
+    const request = Symbol('asset-scatter-apply');
+    tile[SCATTER_APPLY_REQUEST_KEY] = request;
     const doc = tile.document;
-    const payload = resolveScatterPayload(doc);
+    let payload = resolveScatterPayload(doc);
     if (!payload) {
       cleanupAssetScatterOverlay(tile);
       return;
     }
 
-    let mesh = tile.mesh;
-    if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
-    if (!mesh || mesh.destroyed) return;
+    const initialRenderKey = buildRenderKey(payload, doc);
+    const mesh = await prepareCustomTileRendererMesh(tile, {
+      originalTextureSlotKey: 'faNexusAssetScatterOriginalTexture'
+    });
+    if (!mesh || mesh.destroyed || tile[SCATTER_APPLY_REQUEST_KEY] !== request) return;
 
-    ensureMeshTransparent(mesh, 'faNexusAssetScatterOriginalTexture');
+    const textureSources = [...new Set(payload.instances.map((instance) => instance?.src).filter(Boolean))];
+    const textureResults = await Promise.allSettled(textureSources.map((src) => loadTexture(src)));
+    if (tile.destroyed || mesh.destroyed || tile[SCATTER_APPLY_REQUEST_KEY] !== request
+      || tile[Symbol.for('fa-nexus.scene-group-display-transform-preview')]) return;
+
+    const currentFlag = readScatterFlag(doc);
+    const currentInstances = normalizeInstances(currentFlag?.instances || []);
+    const currentPayload = currentInstances.length ? {
+      version: Number(currentFlag?.version || SCATTER_VERSION),
+      instances: currentInstances,
+      instanceKey: buildInstanceRenderKey(currentInstances)
+    } : null;
+    if (!currentPayload || buildRenderKey(currentPayload, doc) !== initialRenderKey) {
+      if (options?.throwOnError) await applyAssetScatterTile(tile, options);
+      else void applyAssetScatterTile(tile, options);
+      return;
+    }
+    payload = currentPayload;
+
+    const failedSources = new Set();
+    for (let index = 0; index < textureResults.length; index += 1) {
+      const result = textureResults[index];
+      if (result.status === 'fulfilled') continue;
+      const src = textureSources[index];
+      failedSources.add(src);
+      Logger.warn('AssetScatter.textureLoad.failed', {
+        tileId: doc?.id || null,
+        src,
+        error: String(result.reason?.message || result.reason)
+      });
+    }
+    const renderInstances = failedSources.size
+      ? payload.instances.filter((instance) => !failedSources.has(instance.src))
+      : payload.instances;
 
     const renderKey = buildRenderKey(payload, doc);
 
     let container = tile.faNexusAssetScatterContainer;
-    const reuse = !!(container && !container.destroyed && container.faNexusAssetScatterRenderKey === renderKey);
+    const hadMissingTextures = !!container?.faNexusAssetScatterMissingTextureSources?.length;
+    const reuse = !!(container
+      && !container.destroyed
+      && !hadMissingTextures
+      && !failedSources.size
+      && container.faNexusAssetScatterRenderKey === renderKey);
     if (!container || container.destroyed) {
       container = new PIXI.Container();
       container.eventMode = 'none';
@@ -1390,16 +1482,24 @@ export async function applyAssetScatterTile(tile, options = {}) {
     let hasPendingTexture = false;
     if (!reuse) {
       clearScatterChildren(container);
-      const result = populateScatterContainer(tile, container, payload.instances);
+      const result = populateScatterContainer(tile, container, renderInstances);
       hasPendingTexture = !!result?.hasPendingTexture;
       container.faNexusAssetScatterRenderKey = renderKey;
+      // Switch normalization together with the newly transformed instances.
+      delete container[Symbol.for('fa-nexus.scene-group-display-transform-preview')];
     }
+    container.faNexusAssetScatterMissingTextureSources = [...failedSources];
     mesh.faNexusAssetScatterContainer = container;
     const hsbc = readDocumentHsbc(doc, { nullIfMissing: true, nullIfNeutral: true });
     applyHsbcToDisplayObject(container, hsbc, { slot: 'asset-scatter' });
     syncShadowOnlyCustomContainer(tile, container);
 
-    syncScatterContainerTransform(container, mesh, doc);
+    syncAssetScatterContainerTransform(
+      container,
+      mesh,
+      doc,
+      tile.faNexusAssetScatterNativePreviewScale
+    );
     syncScatterViewportLayer(tile, container, { force: !reuse, reason: reuse ? 'reuse' : 'apply' });
     const overheadState = attachCustomTileOverhead(tile, {
       kind: 'scatter',
@@ -1407,7 +1507,12 @@ export async function applyAssetScatterTile(tile, options = {}) {
       proxyFactory: createScatterProxyFactory(container),
       filterMode: 'container',
       syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-        syncScatterContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        syncAssetScatterContainerTransform(
+          entry?.contentContainer,
+          currentMesh,
+          currentTile?.document,
+          currentTile?.faNexusAssetScatterNativePreviewScale
+        );
       }
     });
     try {
@@ -1424,13 +1529,14 @@ export async function applyAssetScatterTile(tile, options = {}) {
       || overheadState.proxyTexture.destroyed;
     container.faNexusAssetScatterOverheadKey = overheadKey;
     if (shouldRefreshOverhead) invalidateCustomTileOverhead(tile, 'scatter-refresh');
-    if (hasPendingTexture && !container.faNexusAssetScatterCached) {
+    if (failedSources.size || (hasPendingTexture && !container.faNexusAssetScatterCached)) {
       scheduleScatterRetry(tile, Number(options?.retryAttempt) || 1);
     } else {
       clearScatterRetry(tile);
     }
   } catch (error) {
     Logger.warn('AssetScatter.apply.failed', { error: String(error?.message || error), tileId: tile?.document?.id });
+    if (options?.throwOnError) throw error;
   }
 }
 
@@ -1490,6 +1596,7 @@ export function clearAssetScatterCache() {
   try {
     const tiles = canvas?.tiles?.placeables || [];
     for (const tile of tiles) {
+      if (tile) tile[SCATTER_APPLY_REQUEST_KEY] = null;
       const mesh = tile?.mesh;
       const container = tile?.faNexusAssetScatterContainer || mesh?.faNexusAssetScatterContainer;
       if (container) destroyScatterCache(container);

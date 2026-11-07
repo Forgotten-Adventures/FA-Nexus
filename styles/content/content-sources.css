@@ -1,0 +1,332 @@
+/* ===== Content sources dialog (prefixed) ===== */
+.fa-nexus-content-sources-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  height: 100%;
+}
+
+.fa-nexus-content-sources-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.fa-nexus-content-sources-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.fa-nexus-content-sources-list {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  background: var(--fa-nexus-surface, rgba(0, 0, 0, 0.2));
+}
+
+.fa-nexus-content-sources-list-header {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fa-nexus-folder-count {
+  font-weight: 600;
+}
+
+.fa-nexus-content-sources-items {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fa-nexus-folder-item {
+  display: flex;
+  gap: 10px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--fa-nexus-card-bg, rgba(0, 0, 0, 0.18));
+}
+
+.fa-nexus-folder-disabled {
+  opacity: 0.6;
+}
+
+.fa-nexus-folder-enable {
+  display: flex;
+  align-items: center;
+}
+
+.fa-nexus-folder-content {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.fa-nexus-folder-info {
+  min-width: 0;
+}
+
+.fa-nexus-folder-label {
+  font-weight: 600;
+  margin-bottom: 2px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.fa-nexus-folder-label-input {
+  width: 100%;
+}
+
+.fa-nexus-folder-path {
+  font-size: 12px;
+  opacity: 0.85;
+  word-break: break-all;
+}
+
+.fa-nexus-folder-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.fa-nexus-cache-summary {
+  font-size: 12px;
+  opacity: 0.8;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fa-nexus-cache-summary.has-cache {
+  color: var(--fa-nexus-accent, #4a90e2);
+  opacity: 1;
+}
+
+.fa-nexus-clear-cache-all-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fa-nexus-folder-cache {
+  margin-top: 6px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0.75;
+}
+
+.fa-nexus-folder-cache.is-present {
+  color: var(--fa-nexus-accent, #4a90e2);
+  opacity: 1;
+}
+
+.fa-nexus-folder-cache.is-empty {
+  opacity: 0.6;
+}
+
+.fa-nexus-folder-cache i {
+  font-size: 12px;
+}
+
+.fa-nexus-clear-cache-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fa-nexus-clear-cache-btn[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.fa-nexus-index-folder-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s ease, opacity 0.2s ease;
+}
+
+.fa-nexus-index-folder-btn.is-cancel {
+  color: var(--fa-error, #ff7676);
+}
+
+.fa-nexus-index-folder-btn.is-cancel:hover {
+  color: var(--fa-error, #ff7676);
+  opacity: 0.85;
+}
+
+.fa-nexus-index-folder-btn[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fa-nexus-folder-index-status {
+  margin-top: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0.75;
+}
+
+.fa-nexus-folder-index-status.is-running {
+  color: var(--fa-nexus-accent, #4a90e2);
+  opacity: 1;
+}
+
+.fa-nexus-folder-index-status.is-done,
+.fa-nexus-folder-index-status.is-complete {
+  color: var(--fa-success, #81c784);
+  opacity: 1;
+}
+
+.fa-nexus-folder-index-status.is-error {
+  color: var(--fa-error, #ff7676);
+  opacity: 1;
+}
+
+.fa-nexus-folder-index-status.is-cancelled {
+  opacity: 0.7;
+}
+
+.fa-nexus-folder-index-status i {
+  font-size: 12px;
+}
+
+.fa-nexus-cloud-row {
+  border: 1px dashed var(--fa-nexus-border, rgba(255, 255, 255, 0.2));
+  background: rgba(94, 136, 203, 0.12);
+}
+
+.fa-nexus-folder-description {
+  font-size: 11px;
+  opacity: 0.75;
+  margin-top: 4px;
+}
+
+.fa-nexus-cloud-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fa-nexus-cloud-actions button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fa-nexus-cloud-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 16px;
+  font-size: 11px;
+  background: var(--fa-nexus-accent, #4a90e2);
+  color: #fff;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.fa-nexus-cloud-badge i {
+  font-size: 11px;
+}
+
+.fa-nexus-cloud-row .fa-nexus-folder-enable input {
+  accent-color: var(--fa-nexus-accent, #4a90e2);
+}
+
+.fa-nexus-orphan-cache-list {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px dashed var(--fa-nexus-border, rgba(255, 255, 255, 0.2));
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.fa-nexus-orphan-cache-title {
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0.9;
+}
+
+.fa-nexus-orphan-cache-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  padding-top: 4px;
+}
+
+.fa-nexus-orphan-cache-row code {
+  flex: 1;
+  word-break: break-all;
+}
+
+.fa-nexus-orphan-cache-row button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.fa-nexus-content-sources-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  padding-top: 10px;
+}
+
+.fa-nexus-no-folders-message {
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  opacity: 0.85;
+  gap: 6px;
+}
+.fa-nexus-collections-browser[hidden], .fa-nexus-folder-shortcuts[hidden] { display:none !important; }
+.fa-nexus-collection-toolbar { display:flex; gap:4px; padding:4px; }
+.fa-nexus-collection-toolbar button { flex:1; font-size:12px; padding:3px; }
+.fa-nexus-collection-toolbar button.active,.fa-nexus-collection-all.active { background:#da9b3830; border-color:#d9b273; }
+.fa-nexus-collection-include { display:flex; align-items:center; gap:5px; padding:4px 7px; font-size:12px; }
+.fa-nexus-collection-all { width:calc(100% - 10px); margin:4px 5px; }
+.fa-nexus-collection-tree { max-height:420px; overflow:auto; }
+.fa-nexus-collection-tree p { padding:8px; font-size:12px; }
+.fa-nexus-collection-row { display:flex; align-items:center; padding-left:calc(var(--collection-depth) * 12px); min-height:28px; }
+.fa-nexus-collection-row.selected { background:#d99b3830; }
+.fa-nexus-collection-row button { border:0; background:transparent; text-align:left; padding:3px; margin:0; box-shadow:none; min-width:0; }
+.fa-nexus-collection-row button:first-child { flex:0 0 22px; font-size:10px; }
+.fa-nexus-collection-row button:last-child { display:flex; gap:7px; align-items:center; flex:1; overflow:hidden; }
+.fa-nexus-collection-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.fa-nexus-collection-selection { display:flex; flex-wrap:wrap; gap:5px; padding:7px; border-top:1px solid #ffffff25; }
+.fa-nexus-collection-selection span,.fa-nexus-collection-selection small { width:100%; }
+.fa-nexus-collection-selection button { flex:1; }
+.fa-nexus-card.fa-nexus-collection-selected { outline:2px solid #e9cb68; outline-offset:-2px; }

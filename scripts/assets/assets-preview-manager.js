@@ -1,4 +1,4 @@
-import { HoverPreviewManager } from '../core/hover-preview-manager.js';
+import { HoverPreviewManager } from '../core/ui/hover-preview-manager.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 
 /**
@@ -6,6 +6,8 @@ import { NexusLogger as Logger } from '../core/nexus-logger.js';
  * Specialises HoverPreviewManager with asset-specific metadata formatting,
  * cloud URL resolution, and dimension refinement for texture assets.
  */
+import { hasContentProductAccess } from '../premium/patreon-auth-contract.js';
+
 export class AssetPreviewManager extends HoverPreviewManager {
   /**
    * @param {import('../content/nexus-content-service.js').NexusContentService|null} [contentService]
@@ -24,11 +26,16 @@ export class AssetPreviewManager extends HoverPreviewManager {
   async resolveImageSource(cardEl, meta) {
     let url = meta.currentUrl || meta.filePathAttr || '';
     const svc = this._ensureContentService();
-    if (svc && meta.source === 'cloud' && !meta.downloaded) {
+    // A premium card this login's tier cannot download keeps its thumbnail: no signed-URL request on hover.
+    if (svc && meta.source === 'cloud' && !meta.downloaded && !this._premiumLocked(meta)) {
       try {
-        const item = { file_path: meta.filePathAttr || url || '', filename: meta.filename, tier: meta.tier };
+        const item = cardEl?._assetItem || {
+          id: String(meta.filePathAttr || url || '').replace(/\.[^/.]+$/, ''),
+          selected_source: { ext: '.webp' },
+          tier: meta.tier
+        };
         const authState = this._getAuthState();
-        const full = await svc.getFullURL?.('assets', item, authState);
+        const full = await svc.getFullURL?.('assets', item, authState, { notifyTierRefusal: false });
         if (full) url = full;
         Logger.debug('AssetPreview.resolveImageSource', { url, source: meta.source, tier: meta.tier, downloaded: meta.downloaded });
       } catch (e) {
@@ -78,7 +85,7 @@ export class AssetPreviewManager extends HoverPreviewManager {
       if (!svc || typeof svc.getFileSize !== 'function') return;
       const existing = cardEl.getAttribute('data-file-size') || meta.fileSizeAttr;
       if (existing && existing !== '0') return;
-      const url = cardEl.getAttribute('data-url') || cardEl.getAttribute('data-file-path');
+      const url = cardEl.getAttribute('data-url') || cardEl.getAttribute('data-content-path') || cardEl.getAttribute('data-file-path');
       if (!url) return;
       const size = await svc.getFileSize(url);
       if (Number.isFinite(size) && size > 0) {
@@ -107,6 +114,15 @@ export class AssetPreviewManager extends HoverPreviewManager {
     return this._contentService;
   }
 
+  _premiumLocked(meta) {
+    if (String(meta?.tier || '').toLowerCase() !== 'premium') return false;
+    try {
+      return !hasContentProductAccess(game.settings.get('fa-nexus', 'patreon_auth_data'), 'assets');
+    } catch (_) {
+      return true;
+    }
+  }
+
   _getAuthState() {
     try {
       const auth = game.settings.get('fa-nexus', 'patreon_auth_data');
@@ -121,8 +137,8 @@ export class AssetPreviewManager extends HoverPreviewManager {
       if (!resolvedMediaEl || !cardEl) return;
       this._updateGridBadge(cardEl);
       const item = cardEl._assetItem;
-      const filenameRaw = String(cardEl.getAttribute('data-filename') || '');
-      const pathRaw = String(cardEl.getAttribute('data-path') || '');
+      const filenameRaw = String(cardEl.getAttribute('data-name') || meta.filename || '');
+      const pathRaw = String(cardEl.getAttribute('data-folder') || meta.path || '');
       const should = this._shouldRefineDimensions(cardEl);
       const tokenMismatch = loadToken && resolvedMediaEl?.dataset?.previewLoadToken && resolvedMediaEl.dataset.previewLoadToken !== loadToken;
       Logger.debug('AssetPreview.dim.check', {
@@ -219,8 +235,7 @@ export class AssetPreviewManager extends HoverPreviewManager {
           item.height = naturalH;
           item.actual_width = naturalW;
           item.actual_height = naturalH;
-          item.grid_width = gridW;
-          item.grid_height = gridH;
+          item.grid = [gridW, gridH];
           item._dimsResolved = true;
         }
       } catch (_) {}
@@ -241,11 +256,11 @@ export class AssetPreviewManager extends HoverPreviewManager {
 
   _shouldRefineDimensions(cardEl) {
     try {
-      const filename = String(cardEl.getAttribute('data-filename') || '').toLowerCase();
+      const filename = String(cardEl.getAttribute('data-content-path') || cardEl.getAttribute('data-name') || '').toLowerCase();
       const withoutExt = filename.replace(/\.[^/.]+$/, '');
       const hasPattern = /(?:^|[_\-\s])\d+x\d+$/.test(withoutExt);
       const should = !hasPattern;
-      const path = String(cardEl.getAttribute('data-path') || '').toLowerCase();
+      const path = String(cardEl.getAttribute('data-folder') || '').toLowerCase();
       Logger.debug('AssetPreview.dim.should', { filename, path, hasPattern, should });
       return should;
     } catch (_) {

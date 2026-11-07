@@ -205,6 +205,7 @@ export function normalizeFolderSelection(selection, { normalizePath = identityPa
   const excludes = normalizeExcludeFilters(input, { normalizePath: normalize });
   if (excludes.excludePaths) normalized.excludePaths = excludes.excludePaths;
   if (excludes.excludePathLowers) normalized.excludePathLowers = excludes.excludePathLowers;
+  if (input.includeSubfolders === false) normalized.includeSubfolders = false;
 
   return normalized;
 }
@@ -242,12 +243,13 @@ export function enforceFolderSelectionAvailability(selection, {
 } = {}) {
   if (!selection) return normalizeFolderSelection(selection, { normalizePath, supportsUnassigned });
   const normalized = cloneSelectionArrays(selection);
+  const mode = normalized.includeSubfolders === false ? { includeSubfolders: false } : {};
   if (!availableLowers || !availableLowers.size) return normalized;
 
   if (normalized.type === 'folder') {
     const target = toPathLower(normalized.pathLower || normalized.path || '');
     if (!hasAvailableLower(target, availableLowers)) {
-      return { type: 'all', includePaths: [], includePathLowers: [] };
+      return { type: 'all', includePaths: [], includePathLowers: [], ...mode };
     }
   } else if (normalized.type === 'folders') {
     const paths = Array.isArray(normalized.paths) ? normalized.paths : [];
@@ -265,7 +267,7 @@ export function enforceFolderSelectionAvailability(selection, {
       nextLowers.push(lower);
     }
     if (!nextPaths.length) {
-      return { type: 'all', includePaths: [], includePathLowers: [] };
+      return { type: 'all', includePaths: [], includePathLowers: [], ...mode };
     }
     if (nextPaths.length === 1) {
       const folderPath = nextPaths[0];
@@ -275,7 +277,8 @@ export function enforceFolderSelectionAvailability(selection, {
         path: folderPath,
         pathLower: lower,
         includePaths: [folderPath],
-        includePathLowers: [lower]
+        includePathLowers: [lower],
+        ...mode
       };
     }
     normalized.paths = nextPaths;
@@ -283,7 +286,7 @@ export function enforceFolderSelectionAvailability(selection, {
     normalized.includePaths = nextPaths.slice();
     normalized.includePathLowers = nextLowers.slice();
   } else if (normalized.type === 'unassigned' && !supportsUnassigned) {
-    return { type: 'all', includePaths: [], includePathLowers: [] };
+    return { type: 'all', includePaths: [], includePathLowers: [], ...mode };
   }
 
   if (Array.isArray(normalized.excludePathLowers) || Array.isArray(normalized.excludePaths)) {
@@ -382,7 +385,29 @@ export function folderSelectionKey(selection) {
     if (normalized.length) base = `${base}|exclude:${normalized.join('|')}`;
   }
 
-  return base;
+  return selection.includeSubfolders === false ? `${base}|direct` : base;
+}
+
+/** Match normalized item folders consistently across every content browser.
+ * Exclusions continue to exclude a complete branch in either browsing mode.
+ */
+export function createFolderSelectionPredicate(selection = {}) {
+  selection ||= {};
+  const type = selection.type || 'all';
+  const includes = type === 'folder' ? [selection.pathLower || selection.path]
+    : (selection.pathLowers?.length ? selection.pathLowers : selection.paths) || [];
+  const targets = Array.from(new Set(includes.filter(Boolean).map(toPathLower)));
+  const excludes = (selection.excludePathLowers?.length ? selection.excludePathLowers : selection.excludePaths) || [];
+  const excluded = Array.from(new Set(excludes.filter(Boolean).map(toPathLower)));
+  const includeSubfolders = selection.includeSubfolders !== false;
+  return (folder) => {
+    const path = toPathLower(folder || '');
+    if (type === 'unassigned' && path) return false;
+    if (type === 'folders' || (type === 'folder' && targets.length)) {
+      if (!targets.some((target) => path === target || (includeSubfolders && path.startsWith(`${target}/`)))) return false;
+    }
+    return !excluded.some((target) => path === target || path.startsWith(`${target}/`));
+  };
 }
 
 export function logFolderSelection(label, selection, { logger = defaultLogger } = {}) {

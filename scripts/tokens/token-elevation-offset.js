@@ -1,3 +1,4 @@
+import { onFoundryBoot } from '../core/foundry-boot-hooks.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import {
   applyGroundBandToAllTiles,
@@ -5,47 +6,11 @@ import {
   restoreGroundBandFromAllTiles
 } from '../canvas/ground-band-converter.js';
 
-// --- Optional: preserve tile elevation when moving via keyboard ---------------
-// Foundry v13 floors placeable elevation during keyboard movement to the grid distance,
-// which destroys micro-elevations (e.g. 0.50 -> 0.00) when nudging tiles with WASD.
-// We restore the current tile document elevation when dz == 0.
-
-const PLACEABLE_SHIFTED_POS_PATCH = Symbol.for('fa-nexus.PlaceableObject.getShiftedPosition.patched');
-
 function logTokenElevationOffsetFailure(action, error, context = {}) {
   Logger.warn(`TokenElevationOffset.${action}.failed`, {
     ...context,
     error: String(error?.message || error)
   });
-}
-
-function patchTileKeyboardMoveElevation() {
-  try {
-    const PlaceableObject = foundry?.canvas?.placeables?.PlaceableObject ?? globalThis?.PlaceableObject;
-    const TileClass = foundry?.canvas?.placeables?.Tile ?? null;
-    if (!PlaceableObject?.prototype || PlaceableObject.prototype[PLACEABLE_SHIFTED_POS_PATCH]) return;
-    const original = PlaceableObject.prototype._getShiftedPosition;
-    if (typeof original !== 'function') return;
-
-    PlaceableObject.prototype._getShiftedPosition = function faNexusGetShiftedPosition(dx, dy, dz) {
-      const result = original.call(this, dx, dy, dz);
-      try {
-        if (dz) return result;
-        if (TileClass && !(this instanceof TileClass)) return result;
-        const currentElevation = Number(this?.document?.elevation);
-        if (Number.isFinite(currentElevation)) result.elevation = currentElevation;
-      } catch (error) {
-        logTokenElevationOffsetFailure('keyboardMoveRestore', error, {
-          documentId: this?.document?.id || null
-        });
-      }
-      return result;
-    };
-    PlaceableObject.prototype[PLACEABLE_SHIFTED_POS_PATCH] = true;
-    Logger.info('TileKeyboardMoveElevation.patched');
-  } catch (error) {
-    Logger.warn('TileKeyboardMoveElevation.patchFailed', String(error?.message || error));
-  }
 }
 
 // --- Hook wiring --------------------------------------------------------------
@@ -113,9 +78,8 @@ try {
     }
   });
 
-  Hooks.once('ready', () => {
+  onFoundryBoot('ready', () => {
     try {
-      patchTileKeyboardMoveElevation();
       // Apply once on initial ready if the canvas is already up.
       if (canvas?.ready) {
         applyGroundBandToAllTiles('ready', { force: true });

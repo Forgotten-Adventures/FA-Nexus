@@ -48,6 +48,7 @@ function saveSetting(key, value) {
 export class BuildingsTab extends AssetsTab {
   constructor(app) {
     super(app, { mode: 'assets' });
+    this._mode = 'buildings';
     this._tabId = 'buildings';
     this._activeSubtab = DEFAULT_SUBTAB;
     this._subtabSearch = this._loadSubtabSearch();
@@ -131,6 +132,11 @@ export class BuildingsTab extends AssetsTab {
     if (!this.app || this.app._activeTab !== this.id) return;
     this._setActiveSubtab(DEFAULT_SUBTAB, { silent: true });
     this._syncSearchField({ apply: false });
+  }
+
+  /** Asked before the user opens another Nexus tab: an open Building session commits, discards or stays. */
+  requestTabExit({ leaveLabel } = {}) {
+    return this._buildingManager?.requestSessionExit?.({ reason: 'tab-switch', leaveLabel }) ?? { proceed: true, kind: 'none' };
   }
 
   onDeactivate() {
@@ -248,8 +254,15 @@ export class BuildingsTab extends AssetsTab {
     this._boundButtonHandlers.clear();
   }
 
-  _setActiveSubtab(subtab, { silent = false } = {}) {
+  _setActiveSubtab(subtab, { silent = false, fromEditor = false } = {}) {
     if (!SUBTABS.includes(subtab)) subtab = DEFAULT_SUBTAB;
+    const portalState = this._buildingManager?.getPortalPanelState?.();
+    if (!fromEditor && portalState?.supportedKinds) {
+      const accepted = subtab === 'portals'
+        ? this._buildingManager.setPortalPanelKind(portalState.activeKind)
+        : portalState.portalMode ? this._buildingManager.setActiveTool('rectangle') : true;
+      if (accepted === false) return;
+    }
     const unchanged = this._activeSubtab === subtab;
 
     this._activeSubtab = subtab;
@@ -262,11 +275,12 @@ export class BuildingsTab extends AssetsTab {
     this._restoreSubtabSelections();
     this._applySubtabThumbSize();
 
-    if (this._buildingManager) {
+    if (this._buildingManager && !fromEditor) {
       if (subtab === 'portals') {
         this._buildingManager.setPortalMode(true);
+        const kind = this._buildingManager.getPortalPanelState()?.activeKind || GAP_KIND_DOOR;
         this._activePortalType = null;
-        this._setActivePortalType(GAP_KIND_DOOR);
+        this._setActivePortalType(kind);
       } else {
         this._buildingManager.setPortalMode(false);
         this._buildingManager.forceExitPortalEditing?.();
@@ -695,6 +709,7 @@ export class BuildingsTab extends AssetsTab {
   _getBuildingManager() {
     if (!this._buildingManager) {
       this._buildingManager = new BuildingManager(this.app);
+      this._registerPortalToolOptionsCallback();
     }
     return this._buildingManager;
   }

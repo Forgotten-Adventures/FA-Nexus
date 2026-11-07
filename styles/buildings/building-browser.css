@@ -1,0 +1,138 @@
+.fa-door-picker {
+  display: contents;
+}
+
+#fa-door-texture-picker .window-content,
+#fa-door-frame-texture-picker .window-content,
+#fa-window-sill-texture-picker .window-content,
+#fa-window-texture-picker .window-content,
+#fa-window-frame-texture-picker .window-content {
+  padding: 0;
+}
+
+#fa-door-texture-picker .fa-nexus-controls,
+#fa-door-frame-texture-picker .fa-nexus-controls,
+#fa-window-sill-texture-picker .fa-nexus-controls,
+#fa-window-texture-picker .fa-nexus-controls,
+#fa-window-frame-texture-picker .fa-nexus-controls {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(24, 28, 34, 0.92);
+}
+
+#fa-door-texture-picker .fa-nexus-main,
+#fa-door-frame-texture-picker .fa-nexus-main,
+#fa-window-sill-texture-picker .fa-nexus-main,
+#fa-window-texture-picker .fa-nexus-main,
+#fa-window-frame-texture-picker .fa-nexus-main {
+  background: rgba(255, 255, 255, 0.045);
+}
+
+#fa-door-texture-picker .fa-nexus-grid,
+#fa-door-frame-texture-picker .fa-nexus-grid,
+#fa-window-sill-texture-picker .fa-nexus-grid,
+#fa-window-texture-picker .fa-nexus-grid,
+#fa-window-frame-texture-picker .fa-nexus-grid {
+  margin: 0;
+  padding: 8px;
+}
+
+#fa-door-texture-picker .fa-nexus-grid .fa-nexus-card,
+#fa-door-frame-texture-picker .fa-nexus-grid .fa-nexus-card,
+#fa-window-sill-texture-picker .fa-nexus-grid .fa-nexus-card,
+#fa-window-texture-picker .fa-nexus-grid .fa-nexus-card,
+#fa-window-frame-texture-picker .fa-nexus-grid .fa-nexus-card {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+}
+
+#fa-door-texture-picker .fa-nexus-grid .fa-nexus-card:hover,
+#fa-door-frame-texture-picker .fa-nexus-grid .fa-nexus-card:hover,
+#fa-window-sill-texture-picker .fa-nexus-grid .fa-nexus-card:hover,
+#fa-window-texture-picker .fa-nexus-grid .fa-nexus-card:hover,
+#fa-window-frame-texture-picker .fa-nexus-grid .fa-nexus-card:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(90, 170, 255, 0.42);
+  box-shadow: 0 0 0 1px rgba(90, 170, 255, 0.28) inset, 0 4px 12px rgba(0, 0, 0, 0.24);
+}
+
+#fa-door-texture-picker .fa-nexus-grid .fa-nexus-card .thumb,
+#fa-door-frame-texture-picker .fa-nexus-grid .fa-nexus-card .thumb,
+#fa-window-sill-texture-picker .fa-nexus-grid .fa-nexus-card .thumb,
+#fa-window-texture-picker .fa-nexus-grid .fa-nexus-card .thumb,
+#fa-window-frame-texture-picker .fa-nexus-grid .fa-nexus-card .thumb {
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.045);
+}
+
+#fa-door-texture-picker .fa-nexus-footer,
+#fa-door-frame-texture-picker .fa-nexus-footer,
+#fa-window-sill-texture-picker .fa-nexus-footer,
+#fa-window-texture-picker .fa-nexus-footer,
+#fa-window-frame-texture-picker .fa-nexus-footer {
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(24, 28, 34, 0.92);
+}
+
+.fa-buildings-subtabs {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 4px;
+  border-bottom: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.1));
+  background: var(--fa-nexus-panel-bg, rgba(0, 0, 0, 0.1));
+}
+
+.fa-buildings-subtab {
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.fa-buildings-subtab:hover:not(.is-disabled) {
+  background: rgba(90, 170, 255, 0.12);
+  border-color: rgba(90, 170, 255, 0.25);
+}
+
+.fa-buildings-subtab.is-active {
+  background: rgba(90, 170, 255, 0.15);
+  border-color: rgba(90, 170, 255, 0.4);
+  color: #5aafff;
+}
+
+.fa-buildings-subtab.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fa-buildings-grid-wrapper {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.fa-buildings-grid-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.fa-buildings-grid-resizer {
+  position: relative;
+  cursor: row-resize;
+  border-top: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  border-bottom: 1px solid rgba(0, 0, 0, 0.25);
+}

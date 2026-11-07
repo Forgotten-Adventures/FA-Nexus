@@ -1,7 +1,7 @@
-import { BaseTab } from '../base-tab.js';
+import { BaseTab } from '../application/base-tab.js';
 import { VirtualGridManager } from './virtual-grid-manager.js';
 import { NexusLogger as Logger } from '../nexus-logger.js';
-import { NexusSearchManager } from '../search/search-manager.js';
+import { NexusSearchManager } from './search/search-manager.js';
 
 const GRID_SORT_MODE_CATEGORY = 'category';
 const GRID_SORT_MODE_NEWEST = 'newest';
@@ -251,7 +251,10 @@ export class GridBrowseTab extends BaseTab {
   }
 
   _getItemNewestTimestamp(item) {
-    const timestamp = parseInventoryTimestamp(item?.last_modified) || parseInventoryTimestamp(item?.lastModified);
+    const timestamp = parseInventoryTimestamp(item?.last_modified)
+      || parseInventoryTimestamp(item?.lastModified)
+      || parseInventoryTimestamp(item?.selected_source?.mtime)
+      || parseInventoryTimestamp(item?.updated);
     return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
@@ -293,6 +296,11 @@ export class GridBrowseTab extends BaseTab {
     if (!app._grid) {
       Logger.info(`${this.logTag}: creating grid`, { tab: this.id });
       const options = this.getGridOptions?.();
+      if (options && this.app._collections) {
+        const createRow = options.createRow, onMountItem = options.onMountItem;
+        options.createRow = item => { const card = createRow(item); this.app._collections.decorate(card, item, this.id); return card; };
+        options.onMountItem = (card, item, ...rest) => { const result = onMountItem?.(card, item, ...rest); this.app._collections.decorate(card, item, this.id); return result; };
+      }
       if (!options) return null;
       app._grid = new VirtualGridManager(container, options);
       try {
@@ -330,6 +338,12 @@ export class GridBrowseTab extends BaseTab {
     this._updateEmptyState();
   }
 
+  /** What the empty grid says. A tab whose content comes from sources says so when none of them is enabled. */
+  // eslint-disable-next-line class-methods-use-this
+  describeEmptyState() {
+    return 'No results found';
+  }
+
   /** Update empty state display when no results found */
   _updateEmptyState() {
     try {
@@ -342,15 +356,18 @@ export class GridBrowseTab extends BaseTab {
       if (!empty) {
         empty = document.createElement('div');
         empty.className = 'fa-nexus-empty-state';
-        empty.style.cssText = 'position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color: var(--color-text-light-6, #bbb); pointer-events:none; font-size: 14px;';
-        empty.textContent = 'No results found';
+        empty.style.cssText = 'position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color: var(--color-text-light-6, #bbb); pointer-events:none; font-size: 14px; text-align:center; padding:0 24px;';
         grid.parentElement?.appendChild(empty);
       }
+      empty.textContent = this.describeEmptyState();
     } catch (_) {}
   }
 
   async onActivate() {
     Logger.info(`${this.logTag}.onActivate`, { tab: this.id });
+    await this.app._collections?.initialize();
+    // The shared grid may have changed owners while initialization was pending.
+    if (this.app?._activeTab !== this.id) return;
     const gridContainer = this.getGridContainer();
     try { this._resetImageLoader(); } catch (_) {}
     if (gridContainer) this.ensureGrid(gridContainer);
@@ -358,7 +375,6 @@ export class GridBrowseTab extends BaseTab {
       const placeholderSize = this.getPlaceholderCardSize();
       this.app?.showGridPlaceholder?.({ tab: this.id, ...placeholderSize });
     } catch (_) {}
-    try { this.bindFooter?.(); } catch (_) {}
     try { this._bindThumbSizeSlider?.(); } catch (_) {}
     try { this._bindSortModeButton?.(); }
     catch (error) { Logger.error(`${this.logTag}.sortMode.bindFailed`, { error: String(error?.message || error) }); }
@@ -386,14 +402,14 @@ export class GridBrowseTab extends BaseTab {
 
   /** Default implementation uses NexusSearchManager filtering */
   filterItems(items, query) {
-    const source = Array.isArray(items) ? items : [];
+    const source = this.app._collections?.filter(Array.isArray(items) ? items : [], this.id) || (Array.isArray(items) ? items : []);
     if (!this._search || typeof this._search.filter !== 'function') return source;
     return this._search.filter(source, query || '');
   }
 
   applySearch(query) {
     const app = this.app;
-    if (!app?._grid) return;
+    if (!app?._grid || app._activeTab !== this.id) return;
     const q = query || '';
     this.beforeApplySearch(q);
     try { Logger.info(`${this.logTag}.applySearch`, { query: q }); } catch (_) {}
@@ -437,6 +453,7 @@ export class GridBrowseTab extends BaseTab {
 
     let hoveredCard = null;
     const onOver = (event) => {
+      if (this.app._collections?.organizing) return;
       const card = event.target?.closest?.('.fa-nexus-card');
       if (!card || !grid.contains(card)) return;
       if (hoveredCard === card) return;
@@ -499,7 +516,9 @@ export class GridBrowseTab extends BaseTab {
   // ======== Throttled image loading helpers (shared) ========
   _ensureImageLoader() {
     if (this._imgLoader) return;
-    this._imgLoader = { limit: 128, active: 0, q: [], running: new Set() };
+    // Dense grids can mount hundreds of cards in one scrollbar update. Keep
+    // request/cancellation bursts bounded on the shared thumbnail connection.
+    this._imgLoader = { limit: 16, active: 0, q: [], running: new Set(), scheduled: false };
   }
 
   _getElementDocument(element) {
@@ -566,13 +585,13 @@ export class GridBrowseTab extends BaseTab {
       return;
     }
     this._cancelImageLoad(cardEl);
-    const job = { imgEl, url: domUrl, rawUrl: fallbackUrl, onOk, onErr, cancelled: false, temp: null, running: false, cardEl };
+    const job = { imgEl, url: domUrl, rawUrl: fallbackUrl, onOk, onErr, cancelled: false, temp: null, running: false, cardEl, loader: this._imgLoader };
     cardEl._imgJob = job;
     imgEl.style.opacity = '0';
     try { imgEl.setAttribute('loading', 'lazy'); } catch (_) {}
     try { imgEl.setAttribute('fetchpriority', 'low'); } catch (_) {}
     this._imgLoader.q.push(job);
-    this._drainImageQueue();
+    this._scheduleImageQueue();
   }
 
   _cancelImageLoad(cardEl) {
@@ -580,18 +599,34 @@ export class GridBrowseTab extends BaseTab {
     if (!job) return;
     job.cancelled = true;
     try {
-      if (job.running) {
-        this._finalizeImageJob(job);
-      } else if (job.temp) {
+      // Releasing the slot alone leaves offscreen downloads competing with the
+      // new viewport. Abort the request before relinquishing ownership.
+      if (job.temp) {
         job.temp.onload = null; job.temp.onerror = null; job.temp.src = '';
       }
-    } catch (_) {}
+    } finally {
+      this._finalizeImageJob(job);
+    }
     cardEl._imgJob = null;
   }
 
   _drainImageQueue() {
     const L = this._imgLoader;
-    if (!L) return;
+    if (!L || L.active >= L.limit) return;
+    // All mounts/unmounts from this grid update have finished. Drop obsolete
+    // jobs, then serve visible cards before the virtual grid's overscan rows.
+    const bounds = new Map();
+    const priority = job => {
+      const card = job.cardEl, container = card?.parentElement;
+      if (!card?.getBoundingClientRect || !container?.getBoundingClientRect) return 0;
+      if (!bounds.has(container)) bounds.set(container, container.getBoundingClientRect());
+      const viewport = bounds.get(container), rect = card.getBoundingClientRect();
+      if (rect.bottom > viewport.top && rect.top < viewport.bottom) return 0;
+      return 1 + Math.max(viewport.top - rect.bottom, rect.top - viewport.bottom, 0);
+    };
+    L.q = L.q.filter(job => job && !job.cancelled && this._isElementConnected(job.imgEl))
+      .map(job => ({ job, priority: priority(job) }))
+      .sort((a, b) => b.priority - a.priority).map(entry => entry.job);
     while (L.active < L.limit && L.q.length) {
       const job = L.q.pop();
       if (!job || job.cancelled) continue;
@@ -619,6 +654,7 @@ export class GridBrowseTab extends BaseTab {
           if (job.cancelled) return;
           imgEl.src = url;
           try { await imgEl.decode?.(); } catch (_) {}
+          if (job.cancelled) return;
           imgEl.style.opacity = '1';
           try { job.onOk?.(); } catch (_) {}
         } finally {
@@ -652,6 +688,18 @@ export class GridBrowseTab extends BaseTab {
     }
   }
 
+  _scheduleImageQueue() {
+    const L = this._imgLoader;
+    if (!L || L.scheduled) return;
+    L.scheduled = true;
+    // Coalesce the whole DOM update. Draining inside an unmount callback can
+    // start a request for the next card that update is about to remove.
+    queueMicrotask(() => {
+      L.scheduled = false;
+      if (this._imgLoader === L) this._drainImageQueue();
+    });
+  }
+
   onHostDocumentChanged({ reason = 'host-document-changed' } = {}) {
     try { Logger.info(`${this.logTag}.hostDocumentChanged`, { reason, tab: this.id }); } catch (_) {}
     try { this.app?._grid?._syncHostWindow?.(); } catch (error) {
@@ -663,14 +711,16 @@ export class GridBrowseTab extends BaseTab {
     try { this.app?._grid?.refreshMounted?.(); } catch (error) {
       Logger.warn(`${this.logTag}.hostDocumentChanged.refreshMountedFailed`, { error: String(error?.message || error) });
     }
-    try { this._drainImageQueue(); } catch (error) {
+    try { this._scheduleImageQueue(); } catch (error) {
       Logger.warn(`${this.logTag}.hostDocumentChanged.imageDrainFailed`, { error: String(error?.message || error) });
     }
   }
 
   _finalizeImageJob(job) {
-    const L = this._imgLoader;
-    if (!L) return;
+    const L = job.loader;
+    // A cancelled decode can still settle later, including after tab re-entry.
+    // Only its own loader may release the slot, and only once.
+    if (!L || !job.running) return;
     try {
       if (job.temp) {
         job.temp.onload = null;
@@ -678,17 +728,16 @@ export class GridBrowseTab extends BaseTab {
         job.temp = null;
       }
     } catch (_) {}
-    if (job.running) {
-      job.running = false;
-      try { L.running.delete(job); } catch (_) {}
-    }
+    job.running = false;
+    L.running.delete(job);
     L.active = Math.max(0, L.active - 1);
-    this._drainImageQueue();
+    if (this._imgLoader === L) this._scheduleImageQueue();
   }
 
   _resetImageLoader() {
     const L = this._imgLoader;
     if (!L) { this._imgLoader = null; return; }
+    this._imgLoader = null;
     try {
       for (const job of L.q) {
         try {
@@ -712,10 +761,12 @@ export class GridBrowseTab extends BaseTab {
               job.temp.src = '';
               job.temp = null;
             }
+            job.running = false;
           } catch (_) {}
         }
         L.running.clear();
       }
+      L.active = 0;
     } catch (_) {}
     this._imgLoader = null;
   }

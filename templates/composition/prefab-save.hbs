@@ -1,0 +1,20 @@
+<div class="fa-nexus-library-dialog">
+  <div class="fa-nexus-library-modes">
+    <label><input type="radio" name="saveMode" value="new" checked> Create New</label>
+    <label><input type="radio" name="saveMode" value="replace"> Replace Existing</label>
+  </div>
+  <div data-new-prefab class="form-group"><label>Name</label><input name="prefabName" aria-label="Prefab name" value="{{name}}" required></div>
+  <div data-replace-prefab hidden>
+    <input type="search" name="targetSearch" placeholder="Find a prefab to replace…" aria-label="Find a prefab to replace">
+    <div class="fa-nexus-prefab-targets">
+      {{#each entries}}
+      <label data-prefab-target="{{id}}" data-name="{{name}}">
+        <input type="radio" name="prefabTarget" value="{{id}}" {{#if selected}}checked{{/if}}>
+        <img src="{{url}}" alt=""><span>{{name}}</span>
+      </label>
+      {{else}}<p>No local prefabs to replace yet.</p>{{/each}}
+    </div>
+    <p class="hint">Replaces the selected prefab’s contents and preview. Placed copies stay unchanged.</p>
+  </div>
+  <footer class="form-footer"><button type="button" data-action="accept">Save</button><button type="button" data-action="cancel">Cancel</button></footer>
+</div>

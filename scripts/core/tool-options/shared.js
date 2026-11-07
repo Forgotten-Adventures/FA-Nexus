@@ -1,8 +1,9 @@
-import { DEFAULT_TOOL_OPTION_SECTION_ORDER } from '../tool-options-descriptor.js';
+import { DEFAULT_TOOL_OPTION_SECTION_ORDER } from './tool-options-descriptor.js';
 
 export const MODULE_ID = 'fa-nexus';
 export const TOOL_WINDOW_SETTING_KEY = 'toolOptionsWindowPos';
 export const GRID_SNAP_SETTING_KEY = 'gridSnap';
+export const WALL_SNAP_SETTING_KEY = 'wallSnap';
 export const SHORTCUTS_SETTING_KEY = 'toolOptionsShortcuts';
 export const SECTIONS_SETTING_KEY = 'toolOptionsSections';
 export const DEFAULT_WINDOW_TITLE = 'Tool Options';

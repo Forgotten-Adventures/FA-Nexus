@@ -1,16 +1,30 @@
-import { NexusLogger as Logger } from '../../core/nexus-logger.js';
 import {
   GAP_KIND_DOOR,
   GAP_KIND_GAP,
+  GAP_KIND_SEAMLESS_SECRET_DOOR,
   GAP_KIND_WINDOW,
   PORTAL_TEXTURE_MISSING_RETRY_MS,
   PORTAL_TYPES
 } from './constants.js';
+import {
+  hasSmallPortalTextureToken,
+  isSmallPortalTexturePath,
+  parsePortalTextureGridWidth
+} from '../../portals/portal-texture-path.js';
+import { normalizePortalTextureWidthScale } from '../../portals/portal-texture-scale.js';
+import { applyHsbcToImageData, isNeutralHsbc } from '../../core/hsbc.js';
+import { positionBuildingV2DoorFramePillars } from '../v2/building-v2-door-frame.js';
 
-const VALID_PORTAL_TYPES = Object.freeze([GAP_KIND_GAP, GAP_KIND_DOOR, GAP_KIND_WINDOW]);
+const VALID_PORTAL_TYPES = Object.freeze([
+  'opening',
+  GAP_KIND_DOOR,
+  GAP_KIND_WINDOW,
+  GAP_KIND_SEAMLESS_SECRET_DOOR
+]);
 
 export const portalPanelMethods = {
   _updatePortalPanelVisibility(show) {
+    this._registerPortalToolOptionsCallback();
     if (show) {
       this._ensurePortalPanel();
       if (this._portalPanel) {
@@ -22,7 +36,6 @@ export const portalPanelMethods = {
       if (this._portalPanel) {
         this._portalPanel.classList.add('is-hidden');
       }
-      this._unregisterPortalToolOptionsCallback();
     }
   },
 
@@ -32,6 +45,12 @@ export const portalPanelMethods = {
     if (!manager || typeof manager.setToolOptionsChangeCallback !== 'function') return;
 
     this._portalToolOptionsCallback = (state) => {
+      this.syncFillSelectionFromToolOptions(state);
+      const portalState = this._getPortalPanelState();
+      if (portalState?.supportedKinds) {
+        const subtab = portalState.portalMode ? 'portals' : 'building';
+        if (this._activeSubtab !== subtab) this._setActiveSubtab(subtab, { fromEditor: true });
+      }
       if (this._activeSubtab !== 'portals' || !this._portalPanel) return;
       const canUsePortals = this._canUsePortals();
       if (this._portalPanelCanUse !== canUsePortals) {
@@ -41,9 +60,10 @@ export const portalPanelMethods = {
         if (canUsePortals) this._refreshPortalTextureThumbnails();
         return;
       }
-      const nextKind = this._resolvePortalKindFromState(state);
+      const nextKind = portalState?.activeKind || this._resolvePortalKindFromState(state);
       if (nextKind && nextKind !== this._activePortalType) {
-        this._setActivePortalType(nextKind);
+        this._activePortalType = nextKind;
+        this._updatePortalPanelState();
         return;
       }
       this._refreshPortalTextureThumbnails();
@@ -64,6 +84,10 @@ export const portalPanelMethods = {
     }
     this._portalToolOptionsCallbackDisposer = null;
     this._portalToolOptionsCallback = null;
+  },
+
+  _getPortalPanelState() {
+    return this._buildingManager?.getPortalPanelState?.() || null;
   },
 
   _ensurePortalPanel() {
@@ -108,17 +132,23 @@ export const portalPanelMethods = {
     if (!state || !state.portalMode) return null;
     if (state.doorControls) return GAP_KIND_DOOR;
     if (state.windowControls) return GAP_KIND_WINDOW;
+    if (state.seamlessSecretDoorControls) return GAP_KIND_SEAMLESS_SECRET_DOOR;
     return null;
   },
 
   _buildPortalPanelContent() {
-    const types = Object.values(PORTAL_TYPES);
+    const supportedKinds = this._getPortalPanelState()?.supportedKinds;
+    const types = supportedKinds ? [
+      ...Object.values(PORTAL_TYPES),
+      { id: 'opening', label: 'Opening', icon: 'fa-door-open', tooltip: 'Create an open passage with an optional frame' }
+    ] : Object.values(PORTAL_TYPES);
     const activeType = this._activePortalType || GAP_KIND_DOOR;
 
     const buttonsHtml = types.map((type) => `
       <button type="button"
               class="fa-portals-panel__type-btn${type.id === activeType ? ' is-active' : ''}"
               data-portal-type="${type.id}"
+              ${supportedKinds && !supportedKinds.includes(type.id) ? 'disabled aria-disabled="true"' : ''}
               title="${type.tooltip}"
               aria-pressed="${type.id === activeType}">
         <i class="fas ${type.icon}" aria-hidden="true"></i>
@@ -139,11 +169,24 @@ export const portalPanelMethods = {
   },
 
   _buildPortalTexturesHtml(portalType) {
-    if (portalType === GAP_KIND_GAP) {
+    if (portalType === GAP_KIND_GAP || portalType === 'opening') {
+      if (this._getPortalPanelState()?.supportedTexturePickers?.includes('opening-frame')) return `
+        <div class="fa-portals-panel__texture-group">
+          <span class="fa-portals-panel__texture-label">Opening Frame</span>
+          <div class="fa-portals-panel__thumb-wrap">
+            <button type="button" class="fa-portals-panel__texture-thumb" data-portal-picker="opening-frame" title="Select opening frame" aria-label="Select opening frame">
+              <i class="fas fa-border-all" aria-hidden="true"></i>
+            </button>
+            <button type="button" class="fa-portals-panel__texture-clear" data-portal-clear="opening-frame" title="Clear opening frame" aria-label="Clear opening frame">
+              <i class="fas fa-times" aria-hidden="true"></i>
+            </button>
+          </div>
+          <span class="fa-portals-panel__hint">Optional frame around an open passage.</span>
+        </div>`;
       return `
         <div class="fa-portals-panel__texture-hint">
           <i class="fas fa-info-circle" aria-hidden="true"></i>
-          <span>Gaps create empty spaces in walls without textures.</span>
+          <span>Openings create empty spaces in walls without textures.</span>
         </div>
       `;
     }
@@ -248,6 +291,25 @@ export const portalPanelMethods = {
       `;
     }
 
+    if (portalType === GAP_KIND_SEAMLESS_SECRET_DOOR) {
+      return `
+        <div class="fa-portals-panel__texture-hint fa-portals-panel__texture-hint--seamless">
+          <i class="fas fa-user-secret" aria-hidden="true"></i>
+          <span>Seamless Secret Door artwork matches the exact Wall span. Animation opens the concealed passage.</span>
+        </div>
+        ${this._getPortalPanelState()?.supportedTexturePickers?.includes('opening-frame') ? this._buildPortalTexturesHtml('opening').replaceAll('Opening Frame', 'Optional Frame').replaceAll('open passage', 'secret door') : ''}
+        <div class="fa-portals-panel__preview" data-portal-preview="seamlessSecretDoor">
+          <span class="fa-portals-panel__preview-label">Wall-derived preview</span>
+          <div class="fa-portals-panel__preview-frame">
+            <div class="fa-portals-panel__preview-placeholder">
+              <i class="fas fa-eye" aria-hidden="true"></i>
+              <span>Move over a straight wall span to preview</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     return '';
   },
 
@@ -306,17 +368,25 @@ export const portalPanelMethods = {
   },
 
   _setActivePortalType(type) {
+    const supported = this._getPortalPanelState()?.supportedKinds;
+    if (supported && !supported.includes(type)) return;
     if (!VALID_PORTAL_TYPES.includes(type)) type = GAP_KIND_DOOR;
-    if (this._activePortalType === type) return;
+    const manager = this._buildingManager;
+    const managerKind = manager?.isActive
+      ? this._getPortalPanelState()?.activeKind
+      : this._activePortalType;
+    if (!supported && this._activePortalType === type && managerKind === type) return;
 
+    const previousType = this._activePortalType;
     this._activePortalType = type;
     this._portalPreviewSignature = null;
 
-    const manager = this._buildingManager;
     if (manager?.isActive) {
-      try {
-        manager._delegate?._setGapEditMode?.(true, type);
-      } catch (_) {}
+      const delegateKind = manager.setPortalPanelKind?.(type);
+      if (delegateKind === false) this._activePortalType = previousType;
+      if (delegateKind && VALID_PORTAL_TYPES.includes(delegateKind)) {
+        this._activePortalType = delegateKind;
+      }
     }
 
     this._updatePortalPanelState();
@@ -347,18 +417,15 @@ export const portalPanelMethods = {
       this._portalPreviewSignature = null;
       panel.innerHTML = this._buildPortalPanelContent();
       this._bindPortalPanelHandlers();
-      return;
     }
 
     if (!canUsePortals) return;
 
     const manager = this._buildingManager;
     if (manager?.isActive) {
-      const delegateKind = manager._delegate?._gapEditKind;
+      const delegateKind = this._getPortalPanelState()?.activeKind;
       if (delegateKind && delegateKind !== this._activePortalType) {
-        if (delegateKind !== GAP_KIND_GAP) {
-          this._activePortalType = delegateKind;
-        }
+        if (VALID_PORTAL_TYPES.includes(delegateKind)) this._activePortalType = delegateKind;
       }
     }
 
@@ -374,6 +441,16 @@ export const portalPanelMethods = {
     if (texturesContainer) {
       this._portalPreviewSignature = null;
       texturesContainer.innerHTML = this._buildPortalTexturesHtml(this._activePortalType);
+      const portalState = this._getPortalPanelState();
+      if (portalState?.supportedTexturePickers) {
+        for (const button of texturesContainer.querySelectorAll('[data-portal-picker]')) {
+          if (!portalState.supportedTexturePickers.includes(button.dataset.portalPicker)) button.closest('.fa-portals-panel__texture-group')?.remove();
+        }
+        const clear = texturesContainer.querySelector('[data-portal-clear="door"]');
+        if (clear) clear.disabled = !portalState.canClearDoorTexture;
+        const clearFrame = texturesContainer.querySelector('[data-portal-clear="door-frame"]');
+        if (clearFrame && typeof portalState.canClearDoorFrame === 'boolean') clearFrame.disabled = !portalState.canClearDoorFrame;
+      }
       this._bindPortalPanelHandlers();
       this._refreshPortalTextureThumbnails();
     }
@@ -383,21 +460,14 @@ export const portalPanelMethods = {
     const panel = this._portalPanel;
     if (!panel) return;
 
-    const manager = this._buildingManager;
-    const delegate = manager?._delegate;
-    if (!delegate) return;
-    let doorConfig = delegate._doorDefaults || {};
-    let windowConfig = delegate._windowDefaults || {};
-    const selection = delegate._portalSelection || null;
-    if (selection?.gapId) {
-      const gap = typeof delegate._getGapById === 'function'
-        ? delegate._getGapById(selection.gapId)
-        : null;
-      if (gap) {
-        if (gap.kind === 'door' && gap.door) doorConfig = gap.door;
-        if (gap.kind === 'window' && gap.window) windowConfig = gap.window;
-      }
-    }
+    const portalState = this._getPortalPanelState();
+    if (!portalState) return;
+    const clear = panel.querySelector('[data-portal-clear="door"]');
+    if (clear && portalState.supportedKinds) clear.disabled = !portalState.canClearDoorTexture;
+    const clearFrame = panel.querySelector('[data-portal-clear="door-frame"]');
+    if (clearFrame && typeof portalState.canClearDoorFrame === 'boolean') clearFrame.disabled = !portalState.canClearDoorFrame;
+    const doorConfig = portalState.doorConfig || {};
+    const windowConfig = portalState.windowConfig || {};
 
     const signature = this._buildPortalPreviewSignature(doorConfig, windowConfig);
     if (signature === this._portalPreviewSignature) return;
@@ -405,6 +475,7 @@ export const portalPanelMethods = {
 
     this._updateTextureThumbnail(panel, 'door', doorConfig.textureLocal || doorConfig.textureKey);
     this._updateTextureThumbnail(panel, 'door-frame', doorConfig.frame?.textureLocal || doorConfig.frame?.textureKey);
+    this._updateTextureThumbnail(panel, 'opening-frame', doorConfig.frame?.textureLocal || doorConfig.frame?.textureKey);
     this._updateTextureThumbnail(panel, 'window-sill', windowConfig.sill?.textureLocal || windowConfig.sill?.textureKey);
     this._updateTextureThumbnail(panel, 'window-texture', windowConfig.texture?.textureLocal || windowConfig.texture?.textureKey);
     this._updateTextureThumbnail(panel, 'window-frame', windowConfig.frame?.textureLocal || windowConfig.frame?.textureKey);
@@ -484,15 +555,31 @@ export const portalPanelMethods = {
           : !!config?.flip
       };
     };
+    const normalizeHsbc = (value) => {
+      const hsbc = value && typeof value === 'object' ? value : {};
+      return {
+        hue: round(Number.isFinite(Number(hsbc.hue)) ? hsbc.hue : 0),
+        saturation: round(Number.isFinite(Number(hsbc.saturation)) ? hsbc.saturation : 1),
+        brightness: round(Number.isFinite(Number(hsbc.brightness)) ? hsbc.brightness : 1),
+        contrast: round(Number.isFinite(Number(hsbc.contrast)) ? hsbc.contrast : 1)
+      };
+    };
     const normalizeFrame = (frame) => {
       const cfg = frame && typeof frame === 'object' ? frame : {};
+      const opaqueBounds = cfg.opaqueBounds && typeof cfg.opaqueBounds === 'object'
+        ? Object.fromEntries(['minX', 'minY', 'maxX', 'maxY'].map(key => [key, round(cfg.opaqueBounds[key])]))
+        : null;
       return {
         texture: safeString(cfg.textureLocal || cfg.textureKey),
         mode: cfg.mode || 'split',
+        sourceWidth: round(cfg.sourceWidth),
+        sourceHeight: round(cfg.sourceHeight),
         scale: round(cfg.scale),
         offsetX: round(cfg.offsetX),
         offsetY: round(cfg.offsetY),
-        rotation: round(cfg.rotation)
+        rotation: round(cfg.rotation),
+        ...(opaqueBounds ? { opaqueBounds } : {}),
+        hsbc: normalizeHsbc(cfg.hsbc)
       };
     };
     const door = doorConfig && typeof doorConfig === 'object' ? doorConfig : {};
@@ -500,7 +587,9 @@ export const portalPanelMethods = {
     return JSON.stringify({
       door: {
         texture: safeString(door.textureLocal || door.textureKey),
+        widthScale: round(door.widthScale),
         textureFlip: normalizeFlip(door),
+        appearance: { hsbc: normalizeHsbc(door.appearance?.hsbc) },
         frame: normalizeFrame(door.frame)
       },
       window: {
@@ -545,6 +634,7 @@ export const portalPanelMethods = {
     const key = String(texturePath || '');
     if (!key) return false;
     this._markPortalTextureMissing(key);
+    if (this._getPortalPanelState()?.supportedKinds) return false;
     const cleared = this._clearPortalTexture(pickerType, { suppressNotice: true });
     if (cleared) this._portalPreviewMissingCache.delete(key);
     return cleared;
@@ -552,33 +642,24 @@ export const portalPanelMethods = {
 
   _clearPortalTexture(pickerType, { suppressNotice = false } = {}) {
     const manager = this._buildingManager;
-    const delegate = manager?._delegate;
-    if (!delegate) {
+    if (!manager?.canHandlePortalPanelActions?.()) {
       if (!suppressNotice) {
         ui?.notifications?.warn?.('Start a building session first.');
       }
       return false;
     }
 
-    const clearMap = {
-      door: '_handleDoorTextureSelected',
-      'door-frame': '_handleDoorFrameTextureSelected',
-      'window-sill': '_handleWindowSillTextureSelected',
-      'window-texture': '_handleWindowTextureSelected',
-      'window-frame': '_handleWindowFrameTextureSelected'
-    };
-    const method = clearMap[pickerType];
-    if (!method || typeof delegate[method] !== 'function') return false;
-
-    try {
-      delegate[method](null);
-    } catch (error) {
-      Logger.warn?.('BuildingsTab.clearPortalTexture.failed', { pickerType, error: String(error?.message || error) });
-      return false;
+    const result = manager.clearPortalTexture?.(pickerType);
+    if (result && typeof result.then === 'function') {
+      return result
+        .then((cleared) => {
+          if (cleared) this._refreshPortalTextureThumbnails();
+          return !!cleared;
+        });
     }
 
-    this._refreshPortalTextureThumbnails();
-    return true;
+    if (result) this._refreshPortalTextureThumbnails();
+    return !!result;
   },
 
   _updatePortalCompositePreview(panel, { doorConfig = {}, windowConfig = {} } = {}) {
@@ -616,6 +697,7 @@ export const portalPanelMethods = {
 
     const doorPath = isDoor ? String(data.textureLocal || data.textureKey || '') : '';
     const doorFlip = isDoor ? resolveTextureFlip(data) : { horizontal: false, vertical: false };
+    const doorAppearance = isDoor && data.appearance && typeof data.appearance === 'object' ? data.appearance : {};
     const frameConfig = data.frame && typeof data.frame === 'object' ? data.frame : {};
     const framePath = String(frameConfig.textureLocal || frameConfig.textureKey || '');
 
@@ -649,28 +731,6 @@ export const portalPanelMethods = {
       return Math.max(min, Math.min(max, numeric));
     };
 
-    const hasSmallPortalTextureToken = (path) => /(?:^|[\\/_\-\s.])small(?:$|[\\/_\-\s.])/.test(String(path || '').toLowerCase());
-    const parseExplicitPortalTextureGridWidth = (path) => {
-      const value = String(path || '').toLowerCase();
-      if (!value) return null;
-      const match = value.match(/(?:^|[^0-9])(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)(?=[^0-9]|$)/);
-      if (!match) return null;
-      const width = Number.parseFloat(String(match[1] || ''));
-      return Number.isFinite(width) && width > 0 ? width : null;
-    };
-    const isSmallPortalTexturePath = (path) => {
-      const explicitWidth = parseExplicitPortalTextureGridWidth(path);
-      if (Number.isFinite(explicitWidth) && explicitWidth > 1) return false;
-      return hasSmallPortalTextureToken(path);
-    };
-    const parsePortalTextureGridWidth = (path) => {
-      const explicitWidth = parseExplicitPortalTextureGridWidth(path);
-      if (Number.isFinite(explicitWidth) && explicitWidth > 0) {
-        return explicitWidth <= 1 && hasSmallPortalTextureToken(path) ? 0.5 : explicitWidth;
-      }
-      return hasSmallPortalTextureToken(path) ? 0.5 : null;
-    };
-
     const loadImage = (path) => {
       const key = String(path || '');
       if (!key) return Promise.resolve(null);
@@ -679,6 +739,8 @@ export const portalPanelMethods = {
       if (cached) return cached;
       const promise = new Promise((resolve) => {
         const img = new Image();
+        // HSBC reads pixels; request CORS access before loading remote artwork.
+        img.crossOrigin = 'anonymous';
         img.decoding = 'async';
         img.onload = () => {
           this._portalPreviewMissingCache.delete(key);
@@ -695,9 +757,9 @@ export const portalPanelMethods = {
     };
 
     const toCommandsForElement = ({ img, width, height, offsetX = 0, offsetY = 0, flipX = false, flipY = false, z = 0 }) => {
-      if (!img || !img.naturalWidth || !img.naturalHeight) return [];
-      const sw = img.naturalWidth;
-      const sh = img.naturalHeight;
+      const sw = img?.naturalWidth || img?.width || 0;
+      const sh = img?.naturalHeight || img?.height || 0;
+      if (!sw || !sh) return [];
       const scaleX = (width / sw) * (flipX ? -1 : 1);
       const scaleY = (height / sh) * (flipY ? -1 : 1);
       return [{
@@ -716,20 +778,27 @@ export const portalPanelMethods = {
     };
 
     const toCommandsForFrame = ({ img, frameCfg, gapLen, z = 10 }) => {
-      if (!img || !img.naturalWidth || !img.naturalHeight) return [];
-      const baseW = img.naturalWidth;
-      const baseH = img.naturalHeight;
+      const baseW = img?.naturalWidth || img?.width || 0;
+      const baseH = img?.naturalHeight || img?.height || 0;
+      if (!baseW || !baseH) return [];
       const mode = String(frameCfg?.mode || 'split').toLowerCase();
-      const userScale = clamp(frameCfg?.scale, 0.1, 3, 1);
+      const usesCapturedOpaqueBasis = mode === 'pillar' && !!frameCfg?.opaqueBounds;
+      const geometryW = usesCapturedOpaqueBasis && Number(frameCfg?.sourceWidth) > 0
+        ? Number(frameCfg.sourceWidth)
+        : baseW;
+      const geometryH = usesCapturedOpaqueBasis && Number(frameCfg?.sourceHeight) > 0
+        ? Number(frameCfg.sourceHeight)
+        : baseH;
+      const userScale = normalizePortalTextureWidthScale(frameCfg?.scale);
       const assetScale = BASE_ASSET_SCALE * userScale;
-      const heightScene = Math.max(1, baseH * assetScale);
+      const heightScene = Math.max(1, geometryH * assetScale);
       const offsetX = clamp(frameCfg?.offsetX, -1, 1, 0);
       const offsetY = clamp(frameCfg?.offsetY, -1, 1, 0);
       const rotationDeg = clamp(frameCfg?.rotation, -180, 180, 0);
       const rotationRad = (rotationDeg * Math.PI) / 180;
 
       const splitPillarWidthPx = Math.max(1, Math.min(baseH, Math.floor(baseW / 2)));
-      const pillarWidthPx = mode === 'pillar' ? baseW : splitPillarWidthPx;
+      const pillarWidthPx = mode === 'pillar' ? geometryW : splitPillarWidthPx;
       const pillarWidthScene = pillarWidthPx * assetScale;
       const targetWidth = Math.max(pillarWidthScene * 2 + 1, gapLen + pillarWidthScene * 2);
       const groupCenterX = targetWidth / 2;
@@ -755,9 +824,19 @@ export const portalPanelMethods = {
       }
 
       if (mode === 'pillar') {
-        const leftCenterX = pillarWidthScene * 0.5 + offsetXPx;
+        const positions = positionBuildingV2DoorFramePillars({
+          sourceWidth: geometryW,
+          sourceHeight: geometryH,
+          opaqueBounds: frameCfg?.opaqueBounds,
+          assetScale,
+          gapLength: gapLen,
+          targetWidth,
+          offsetX,
+          rotation: rotationRad
+        });
+        const leftCenterX = groupCenterX + positions.left;
         const leftCenterY = heightScene * 0.5 + offsetYPx;
-        const rightCenterX = targetWidth - pillarWidthScene * 0.5 - offsetXPx;
+        const rightCenterX = groupCenterX + positions.right;
         const rightCenterY = heightScene * 0.5 + offsetYPx;
         return [
           {
@@ -768,8 +847,8 @@ export const portalPanelMethods = {
             sh: baseH,
             cx: leftCenterX - groupCenterX,
             cy: leftCenterY - groupCenterY,
-            scaleX: assetScale,
-            scaleY: assetScale,
+            scaleX: (geometryW * assetScale) / baseW,
+            scaleY: (geometryH * assetScale) / baseH,
             rotation: rotationRad,
             z
           },
@@ -781,8 +860,8 @@ export const portalPanelMethods = {
             sh: baseH,
             cx: rightCenterX - groupCenterX,
             cy: rightCenterY - groupCenterY,
-            scaleX: -assetScale,
-            scaleY: assetScale,
+            scaleX: -(geometryW * assetScale) / baseW,
+            scaleY: (geometryH * assetScale) / baseH,
             rotation: -rotationRad,
             z
           }
@@ -854,6 +933,23 @@ export const portalPanelMethods = {
     }
     if (clearedMissing) return;
 
+    const renderHsbcImage = (img, hsbc, target) => {
+      if (!img) return img;
+      const targetCanvas = document.createElement('canvas');
+      targetCanvas.width = img.naturalWidth || img.width;
+      targetCanvas.height = img.naturalHeight || img.height;
+      const targetContext = targetCanvas.getContext('2d', { willReadFrequently: true });
+      if (!targetContext) throw new Error(`Nexus Portal preview could not create the ${target} HSBC canvas.`);
+      targetContext.drawImage(img, 0, 0);
+      const targetPixels = targetContext.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+      if (!isNeutralHsbc(hsbc)) applyHsbcToImageData(targetPixels, hsbc);
+      targetContext.putImageData(targetPixels, 0, 0);
+      return targetCanvas;
+    };
+
+    const renderedDoorImg = renderHsbcImage(doorImg, doorAppearance.hsbc, 'Door leaf');
+    const renderedFrameImg = renderHsbcImage(frameImg, frameConfig.hsbc, 'frame');
+
     const roundToHalf = (value) => {
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) return 0;
@@ -882,10 +978,14 @@ export const portalPanelMethods = {
     if (isDoor) {
       if (doorImg) {
         const desiredW = gapLen;
-        const desiredH = Math.max(1, doorImg.naturalHeight * (gapLen / Math.max(1, doorImg.naturalWidth)));
+        const widthScale = normalizePortalTextureWidthScale(data?.widthScale);
+        const desiredH = Math.max(
+          1,
+          doorImg.naturalHeight * (gapLen / Math.max(1, doorImg.naturalWidth)) * widthScale
+        );
         commands.push(
           ...toCommandsForElement({
-            img: doorImg,
+            img: renderedDoorImg,
             width: desiredW,
             height: desiredH,
             offsetX: 0,
@@ -899,7 +999,7 @@ export const portalPanelMethods = {
       if (frameImg) {
         commands.push(
           ...toCommandsForFrame({
-            img: frameImg,
+            img: renderedFrameImg,
             frameCfg: frameConfig,
             gapLen,
             z: 10
@@ -908,7 +1008,7 @@ export const portalPanelMethods = {
       }
     } else if (isWindow) {
       if (sillImg) {
-        const userScale = clamp(sillConfig?.scale, 0.1, 3, 1);
+        const userScale = normalizePortalTextureWidthScale(sillConfig?.scale);
         const height = Math.max(1, sillImg.naturalHeight * BASE_ASSET_SCALE * userScale);
         const width = gapLen * (isSmallPortalTexturePath(sillPath) ? 2 : 1);
         const offsetX = clamp(sillConfig?.offsetX, -1, 1, 0) * width * 0.5;
@@ -916,7 +1016,7 @@ export const portalPanelMethods = {
         commands.push(...toCommandsForElement({ img: sillImg, width, height, offsetX, offsetY, flipX: false, flipY: false, z: 0 }));
       }
       if (glassImg) {
-        const userScale = clamp(glassConfig?.scale, 0.1, 3, 1);
+        const userScale = normalizePortalTextureWidthScale(glassConfig?.scale);
         const height = Math.max(1, glassImg.naturalHeight * BASE_ASSET_SCALE * userScale);
         const width = gapLen * (isSmallPortalTexturePath(glassPath) ? 2 : 1);
         const offsetX = clamp(glassConfig?.offsetX, -1, 1, 0) * width * 0.5;
@@ -926,7 +1026,7 @@ export const portalPanelMethods = {
       if (frameImg) {
         commands.push(
           ...toCommandsForFrame({
-            img: frameImg,
+            img: renderedFrameImg,
             frameCfg: frameConfig,
             gapLen,
             z: 10
@@ -1009,28 +1109,16 @@ export const portalPanelMethods = {
 
   _openPortalTexturePicker(pickerType) {
     const manager = this._buildingManager;
-    const delegate = manager?._delegate;
-    if (!delegate) {
+    if (!manager?.canHandlePortalPanelActions?.()) {
       ui?.notifications?.warn?.('Start a building session first.');
-      return;
+      return false;
     }
 
-    const pickerMap = {
-      door: '_openDoorTexturePicker',
-      'door-frame': '_openDoorFrameTexturePicker',
-      'window-sill': '_openWindowSillTexturePicker',
-      'window-texture': '_openWindowTexturePicker',
-      'window-frame': '_openWindowFrameTexturePicker'
-    };
-
-    const method = pickerMap[pickerType];
-    if (method && typeof delegate[method] === 'function') {
-      try {
-        delegate[method]();
-      } catch (error) {
-        Logger.warn?.('BuildingsTab.openPortalPicker.failed', { pickerType, error: String(error?.message || error) });
-      }
+    const result = manager.openPortalTexturePicker?.(pickerType);
+    if (result && typeof result.then === 'function') {
+      return result;
     }
+    return result;
   },
 
   _canUsePortals() {

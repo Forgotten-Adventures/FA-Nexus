@@ -1,4 +1,5 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import { resolveCanvasTilePlaceable } from '../canvas/tile-targets.js';
 import {
   applyAssetScatterTile,
   rehydrateAllAssetScatterTiles,
@@ -6,8 +7,11 @@ import {
   clearAssetScatterCache,
   queueRefreshAllAssetScatterViewportLayers
 } from './asset-scatter-geometry.js';
-
-const SCATTER_TILE_APPLY_RETRY_DELAYS = [0, 16, 60, 140, 300];
+import {
+  requestCustomTileRenderRefresh,
+  registerCustomTileRenderLifecycle,
+  scheduleCustomTileRenderApply
+} from '../canvas/custom-tile-render-scheduler.js';
 
 function logScatterHookFailure(hook, error, details = {}) {
   Logger.warn('AssetScatter.hook.failed', {
@@ -15,14 +19,6 @@ function logScatterHookFailure(hook, error, details = {}) {
     error: String(error?.message || error),
     ...details
   });
-}
-
-function resolveTilePlaceable(doc) {
-  const id = doc?.id || doc?._id;
-  if (!id) return null;
-  const placeables = canvas?.tiles?.placeables;
-  if (!Array.isArray(placeables)) return null;
-  return placeables.find((tile) => tile?.document?.id === id) || null;
 }
 
 function docHasScatterFlag(doc) {
@@ -42,50 +38,34 @@ function tileHasScatterOverlay(tile) {
 }
 
 function requestScatterTileRefresh(tile, reason = 'scatter-refresh') {
-  const refresh = () => {
-    try {
-      if (!canvas?.ready || !tile || tile.destroyed) return;
-      try { tile.renderFlags?.set?.({ refreshState: true }); } catch (_) {}
-      try { canvas?.tiles?.setAllRenderFlags?.({ refreshState: true }); } catch (_) {}
-    } catch (error) {
-      logScatterHookFailure('refresh', error, {
-        tileId: tile?.document?.id || '',
-        reason
-      });
-    }
-  };
-  refresh();
-  try { requestAnimationFrame(() => refresh()); } catch (_) {}
-  try { setTimeout(refresh, 80); } catch (_) {}
+  requestCustomTileRenderRefresh(tile, {
+    reason,
+    logger: Logger,
+    logCode: 'AssetScatter.refresh.failed',
+    logLevel: 'warn'
+  });
 }
 
 function scheduleAssetScatterApply(doc, reason = 'tile-change') {
-  const id = doc?.id || doc?._id || '';
-  if (!id) return;
-  const initialTile = resolveTilePlaceable(doc);
-  if (!docHasScatterFlag(doc) && !tileHasScatterOverlay(initialTile)) return;
-  const run = (attempt = 0) => {
-    try {
-      const tile = resolveTilePlaceable(doc);
-      if (tile && !tile.destroyed) {
-        Promise.resolve(applyAssetScatterTile(tile))
-          .then(() => {
-            requestScatterTileRefresh(tile, reason);
-            queueRefreshAllAssetScatterViewportLayers(reason);
-          })
-          .catch((error) => logScatterHookFailure(reason, error, { tileId: id, attempt }));
-        return;
-      }
-      const nextDelay = SCATTER_TILE_APPLY_RETRY_DELAYS[attempt + 1];
-      if (Number.isFinite(nextDelay)) setTimeout(() => run(attempt + 1), nextDelay);
-    } catch (error) {
-      logScatterHookFailure(reason, error, { tileId: id, attempt });
-    }
-  };
-  run(0);
+  scheduleCustomTileRenderApply(doc, {
+    reason,
+    shouldApplyDocument: docHasScatterFlag,
+    hasOverlay: tileHasScatterOverlay,
+    applyTile: applyAssetScatterTile,
+    afterApply: () => queueRefreshAllAssetScatterViewportLayers(reason),
+    logger: Logger,
+    logCode: 'AssetScatter.apply',
+    logLevel: 'warn',
+    refreshLogLevel: 'warn'
+  });
 }
 
 try {
+  registerCustomTileRenderLifecycle({
+    id: 'asset-scatter',
+    callback: applyAssetScatterTile,
+    logCode: 'AssetScatter.lifecycle.failed'
+  });
   Hooks.on('canvasReady', () => {
     try { rehydrateAllAssetScatterTiles(); }
     catch (error) { logScatterHookFailure('canvasReady', error); }
@@ -93,10 +73,6 @@ try {
   Hooks.on('canvasPan', () => {
     try { queueRefreshAllAssetScatterViewportLayers('canvas-pan'); }
     catch (error) { logScatterHookFailure('canvasPan', error); }
-  });
-  Hooks.on('drawTile', (tile) => {
-    try { applyAssetScatterTile(tile); }
-    catch (error) { logScatterHookFailure('drawTile', error, { tileId: tile?.document?.id || '' }); }
   });
   Hooks.on('createTile', (doc) => {
     try {
@@ -110,7 +86,7 @@ try {
   });
   Hooks.on('deleteTile', (doc) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
+      const tile = resolveCanvasTilePlaceable(doc);
       if (tile) cleanupAssetScatterOverlay(tile);
     } catch (error) { logScatterHookFailure('deleteTile', error, { tileId: doc?.id || '' }); }
   });

@@ -35,10 +35,10 @@ const TOOL_HELP_COPY = Object.freeze({
   'building-editor': Object.freeze({
     summary: 'Block out outer walls, inner walls, and portals, then refine shapes, stacking, and appearance in-place.',
     notes: Object.freeze([
-      'Outer walls create closed geometry, while inner walls stay open and use the polygon lasso workflow.',
-      'Edit Shapes lets you retune vertices, arcs, fill elevation, and stacking without starting over.',
-      'In Edit Shapes, right-click a wall segment to target it for per-segment texture, offset, opacity, HSBC, and shadow overrides. Ctrl/Cmd+right-click adds more segments to the selection.',
-      'Use the Portals tab after the wall geometry exists to add doors, windows, and gaps.'
+      'Outer walls are closed shapes (Rectangle, Ellipse, Polygon) that are added to or subtracted from the Building. Inner walls and Fill dividers are open lines, drawn point by point or as smooth splines.',
+      'Edit Geometry moves the vertices and curve handles of what is drawn, without starting over.',
+      'In Edit Geometry, click a wall segment to give that segment its own texture, offset, opacity, HSBC, shadow, and Behavior. Ctrl/Cmd+click adds or removes a segment; Shift+click takes its whole outer loop or inner path.',
+      'Use the Portals workspace once walls exist to add doors, windows, openings, and seamless secret doors. Fill is set room by room in the Fill workspace.'
     ])
   })
 });
@@ -172,7 +172,7 @@ export class ToolHelpWindow extends HandlebarsApplicationMixin(ApplicationV2) {
   static PARTS = foundry.utils.mergeObject(
     foundry.utils.deepClone(super.PARTS ?? {}),
     {
-      body: { template: 'modules/fa-nexus/templates/tool-help-modal.hbs' }
+      body: { template: 'modules/fa-nexus/templates/tool-options/tool-help-modal.hbs' }
     },
     { inplace: false }
   );

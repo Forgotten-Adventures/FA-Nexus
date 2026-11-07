@@ -11,6 +11,8 @@ const DEFAULT_OPTIONS = Object.freeze({
   joinStyle: 'mitre',
   mitreLimit: 4,
   textureRepeatDistance: 1,
+  texturePhaseDistance: 0,
+  texturePhaseDirection: 1,
   maxSegmentLength: DEFAULT_SEGMENT_SUBDIVISION,
   pivot: 'center', // center | left | right (future-proof)
   startJoinDir: null,
@@ -283,10 +285,14 @@ function resolveJoinVectors(points, options, centerOffset = 0) {
     const effectiveJoinStyle = joinStyle;
     const effectiveMitreLimit = mitreLimit;
 
-    const leftOffset = computeJoinOffset(prevDir, nextDir, halfWidth, effectiveJoinStyle, effectiveMitreLimit);
-    const rightOffset = computeJoinOffset(prevDir, nextDir, -halfWidth, effectiveJoinStyle, effectiveMitreLimit);
+    const capNormal = !closed ? normalizeDirection(i === 0 ? options.startCapNormal
+      : i === count - 1 ? options.endCapNormal : null) : null;
+    const leftOffset = capNormal ? scale(capNormal, halfWidth)
+      : computeJoinOffset(prevDir, nextDir, halfWidth, effectiveJoinStyle, effectiveMitreLimit);
+    const rightOffset = capNormal ? scale(capNormal, -halfWidth)
+      : computeJoinOffset(prevDir, nextDir, -halfWidth, effectiveJoinStyle, effectiveMitreLimit);
     const centerShift = hasCenterOffset
-      ? computeCenterCornerOffset(prevDir, nextDir, centerOffset)
+      ? capNormal ? scale(capNormal, centerOffset) : computeCenterCornerOffset(prevDir, nextDir, centerOffset)
       : null;
 
     leftOffsets[i] = leftOffset;
@@ -307,7 +313,11 @@ export function offsetPolygonPoints(points = [], offset = 0, options = {}) {
     width: Math.max(EPSILON, Number(options.width) || 1),
     closed,
     joinStyle: options.joinStyle || 'mitre',
-    mitreLimit: Number.isFinite(options.mitreLimit) ? options.mitreLimit : 4
+    mitreLimit: Number.isFinite(options.mitreLimit) ? options.mitreLimit : 4,
+    startJoinDir: options.startJoinDir || null,
+    startCapNormal: options.startCapNormal || null,
+    endCapNormal: options.endCapNormal || null,
+    endJoinDir: options.endJoinDir || null
   };
   const { centerOffsets } = resolveJoinVectors(normalized, joinOptions, offsetValue);
   const result = new Array(normalized.length);
@@ -329,7 +339,9 @@ function buildVertexDataFromSamples(samples, offsets, options, totalLength = 0) 
     textureRepeatDistance,
     width,
     textureOffset = {},
-    textureFlip = {}
+    textureFlip = {},
+    texturePhaseDistance = 0,
+    texturePhaseDirection = 1
   } = options || {};
   const repeat = textureRepeatDistance || 1;
   const originalCount = samples.length;
@@ -352,6 +364,10 @@ function buildVertexDataFromSamples(samples, offsets, options, totalLength = 0) 
   const offsetY = Number(textureOffset?.y) || 0;
   const flipH = !!textureFlip?.horizontal;
   const flipV = !!textureFlip?.vertical;
+  const phaseDistance = Number.isFinite(Number(texturePhaseDistance))
+    ? Number(texturePhaseDistance)
+    : 0;
+  const phaseDirection = Number(texturePhaseDirection) < 0 ? -1 : 1;
   const centerOffsets = offsets?.centerOffsets;
 
   for (let i = 0; i < count; i++) {
@@ -420,7 +436,8 @@ function buildVertexDataFromSamples(samples, offsets, options, totalLength = 0) 
     const rightVertex = add(add(point, rightOffset), offsetShift);
 
     const distance = sample.distance ?? (i > 0 ? (workingSamples[i - 1].distance ?? 0) : 0);
-    const mappedDistance = (flipH ? -distance : distance) + (offsetX || 0);
+    const traveledDistance = phaseDistance + (phaseDirection * distance);
+    const mappedDistance = (flipH ? -traveledDistance : traveledDistance) + (offsetX || 0);
     const u = repeat ? mappedDistance / repeat : mappedDistance;
     const vTop = flipV ? 1 : 0;
     const vBottom = flipV ? 0 : 1;
@@ -450,6 +467,10 @@ function toPIXIGeometry(data) {
     geometry.addAttribute('aTextureCoord', uvs, 2);
     if (alphas && Array.isArray(alphas) && alphas.length > 0) {
       geometry.addAttribute('aAlpha', alphas, 1);
+    } else if (positions.length === 0 && indices.length === 0) {
+      // Collapsed centerlines still need the shader's complete attribute layout.
+      // The empty index buffer draws nothing; no coverage is synthesized.
+      geometry.addAttribute('aAlpha', [], 1);
     }
     geometry.addIndex(indices);
     return geometry;
@@ -645,6 +666,8 @@ export class BuildingWallMesher {
           mitreLimit: options.mitreLimit,
           width: options.width,
           startJoinDir: options.startJoinDir,
+          startCapNormal: options.startCapNormal,
+          endCapNormal: options.endCapNormal,
           endJoinDir: options.endJoinDir
         })
       : normalizedPoints;
@@ -703,8 +726,13 @@ export class BuildingWallMesher {
 
   static buildGeometry(centerlinePoints, opts = {}) {
     const data = BuildingWallMesher.buildCenterline(centerlinePoints, opts);
-    const geometry = toPIXIGeometry(data);
+    const geometry = BuildingWallMesher.buildGeometryFromCenterline(data);
     return { geometry, data };
+  }
+
+  /** Materialize Pixi buffers from an already compiled centerline result. */
+  static buildGeometryFromCenterline(data) {
+    return toPIXIGeometry(data);
   }
 }
 

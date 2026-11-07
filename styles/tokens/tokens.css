@@ -1,0 +1,961 @@
+.fa-nexus-place-as__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.9em;
+  font-weight: 600;
+}
+
+.fa-nexus-place-as__selection {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  border-radius: 6px;
+  background: var(--fa-nexus-surface, rgba(0, 0, 0, 0.2));
+  color: inherit;
+  padding: 18px 6px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+  font: inherit;
+  text-align: left;
+}
+
+.fa-nexus-place-as__selection:hover,
+.fa-nexus-place-as.is-open .fa-nexus-place-as__selection {
+  background: var(--fa-nexus-panel, rgba(255, 255, 255, 0.08));
+  border-color: var(--fa-nexus-border, rgba(255, 255, 255, 0.32));
+}
+
+.fa-nexus-place-as__selection-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.fa-nexus-place-as__selection-label {
+  font-weight: 600;
+  font-size: 0.95em;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fa-nexus-place-as__selection-subtitle {
+  font-size: 0.78em;
+  opacity: 0.7;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fa-nexus-place-as__chevron {
+  position: relative;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.fa-nexus-place-as__chevron::before,
+.fa-nexus-place-as__chevron::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 2px;
+  background: currentColor;
+  transform-origin: center;
+  transition: transform 120ms ease;
+}
+
+.fa-nexus-place-as__chevron::before {
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.fa-nexus-place-as__chevron::after {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+.fa-nexus-place-as.is-open .fa-nexus-place-as__chevron::before {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+.fa-nexus-place-as.is-open .fa-nexus-place-as__chevron::after {
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.fa-nexus-place-as__panel {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fa-nexus-place-as__actor-type,
+.fa-nexus-place-as__hp {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.fa-nexus-place-as__hp-label {
+  font-size: 0.85em;
+  font-weight: 600;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.fa-nexus-place-as__actor-type-select,
+.fa-nexus-place-as__hp-mode {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  color: inherit;
+  font: inherit;
+}
+
+.fa-theme-light .fa-nexus-place-as__actor-type-select,
+.fa-theme-light .fa-nexus-place-as__hp-mode {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.75));
+}
+
+.fa-nexus-place-as__hp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+}
+
+.fa-nexus-place-as__hp-row-label {
+  flex: 0 0 auto;
+  opacity: 0.75;
+  min-width: 96px;
+}
+
+.fa-nexus-place-as__hp-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  background: var(--fa-nexus-surface, rgba(0, 0, 0, 0.25));
+  color: inherit;
+  font: inherit;
+}
+
+.fa-theme-light .fa-nexus-place-as__hp-input {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.75));
+}
+
+.fa-nexus-place-as__hp-input.has-error {
+  border-color: rgba(248, 113, 113, 0.8);
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.2);
+}
+
+.fa-nexus-place-as__hp-row-suffix {
+  flex: 0 0 auto;
+  opacity: 0.65;
+}
+
+.fa-nexus-place-as__hp-hint {
+  font-size: 0.75em;
+  opacity: 0.7;
+  margin: 0;
+}
+
+.fa-nexus-place-as__search-wrapper {
+  display: flex;
+  align-items: center;
+}
+
+.fa-nexus-place-as__search {
+  flex: 1 1 auto;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  background: var(--fa-nexus-surface, rgba(0, 0, 0, 0.25));
+  color: inherit;
+  font-size: 0.9em;
+}
+
+.fa-nexus-place-as__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  padding: 6px;
+  background: var(--fa-nexus-panel, rgba(0, 0, 0, 0.28));
+}
+
+.fa-nexus-place-as__group {
+  font-size: 0.72em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.65;
+  margin: 6px 0 2px;
+}
+
+.fa-nexus-place-as__option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 120ms ease;
+  font: inherit;
+  min-width: 0;
+}
+
+.fa-nexus-place-as__option:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.fa-nexus-place-as__option.is-selected {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.fa-nexus-place-as__option-label {
+  font-weight: 600;
+  font-size: 0.9em;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+
+.fa-nexus-place-as__option-subtitle {
+  font-size: 0.75em;
+  opacity: 0.55;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+
+.fa-nexus-place-as__empty {
+  font-size: 0.82em;
+  opacity: 0.75;
+  text-align: center;
+  padding: 12px 4px;
+}
+
+.fa-nexus-place-as__error {
+  color: var(--fa-nexus-error, #ff8a80);
+}
+
+.fa-nexus-place-as__linked {
+  margin-top: 6px;
+}
+
+/* ===== Place As Filter Button ===== */
+.fa-nexus-place-as__filter-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: inherit;
+  opacity: 0.6;
+  padding: 4px 6px;
+  cursor: pointer;
+  font-size: 0.8em;
+  transition: all 0.15s ease;
+  position: relative;
+}
+
+.fa-nexus-place-as__filter-button:hover {
+  opacity: 1;
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.08));
+  border-color: var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+}
+
+.fa-nexus-place-as__filter-button.has-excluded {
+  opacity: 1;
+  color: var(--fa-nexus-accent, #5aaaff);
+}
+
+.fa-nexus-place-as__filter-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--fa-nexus-accent, #5aaaff);
+  color: #fff;
+  font-size: 0.75em;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* ===== Compendium Filter Dialog ===== */
+.fa-nexus-compendium-filter-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  height: 100%;
+  overflow: hidden;
+}
+
+.fa-nexus-compendium-filter-header {
+  flex: 0 0 auto;
+}
+
+.fa-nexus-compendium-filter-description {
+  margin: 0 0 8px 0;
+  font-size: 0.9em;
+  opacity: 0.85;
+}
+
+.fa-nexus-compendium-filter-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+}
+
+.fa-nexus-compendium-filter-count {
+  font-weight: 600;
+}
+
+.fa-nexus-compendium-filter-excluded {
+  opacity: 0.7;
+  color: var(--fa-nexus-accent, #5aaaff);
+}
+
+.fa-nexus-compendium-filter-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.fa-nexus-compendium-filter-search {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  border-radius: 4px;
+  background: var(--fa-nexus-surface, rgba(0, 0, 0, 0.2));
+  color: inherit;
+  font: inherit;
+  font-size: 0.9em;
+}
+
+.fa-nexus-compendium-filter-search:focus {
+  outline: none;
+  border-color: var(--fa-nexus-accent, #5aaaff);
+}
+
+.fa-nexus-compendium-filter-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.fa-nexus-compendium-filter-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.18));
+  border-radius: 4px;
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.05));
+  color: inherit;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.fa-nexus-compendium-filter-btn:hover {
+  background: var(--fa-nexus-panel, rgba(255, 255, 255, 0.1));
+  border-color: var(--fa-nexus-accent, #5aaaff);
+}
+
+.fa-nexus-compendium-filter-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 4px;
+}
+
+.fa-nexus-compendium-filter-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.fa-nexus-compendium-filter-item:hover {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.05));
+}
+
+.fa-nexus-compendium-filter-item.is-excluded {
+  opacity: 0.5;
+}
+
+.fa-nexus-compendium-filter-item input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.fa-nexus-compendium-filter-item-label {
+  flex: 1 1 auto;
+  font-size: 0.9em;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fa-nexus-compendium-filter-item-id {
+  flex: 0 0 auto;
+  font-size: 0.75em;
+  opacity: 0.5;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fa-nexus-compendium-filter-empty {
+  padding: 20px;
+  text-align: center;
+  opacity: 0.6;
+  font-size: 0.9em;
+}
+
+.fa-nexus-compendium-filter-group {
+  margin-bottom: 8px;
+}
+
+.fa-nexus-compendium-filter-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: #2a2a35;
+  border-radius: 4px;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--fa-nexus-accent, #5aaaff);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.fa-theme-light .fa-nexus-compendium-filter-group-header {
+  background: #e8e8ec;
+}
+
+.fa-nexus-compendium-filter-group-header i {
+  opacity: 0.7;
+  font-size: 0.9em;
+}
+
+.fa-nexus-compendium-filter-group-count {
+  opacity: 0.6;
+  font-weight: 400;
+  margin-left: auto;
+}
+
+.fa-nexus-compendium-filter-group-items {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 12px;
+  margin-top: 2px;
+}
+
+/* Light theme adjustments */
+.fa-theme-light .fa-nexus-compendium-filter-search {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.75));
+}
+
+.fa-theme-light .fa-nexus-compendium-filter-btn {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.5));
+}
+
+.fa-nexus-grid .fa-nexus-card .token-details {
+  margin-top: 2px;
+  font-size: var(--fa-nexus-details-size, 0.7rem);
+  font-weight: 100;
+  opacity: 0.45;
+  pointer-events: none;
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+}
+
+.fa-nexus-grid .fa-nexus-card .token-details .token-scale {
+  color: #6ad16a;
+}
+
+.fa-nexus-grid .fa-nexus-card .token-details .token-creature-type {
+  color: #e0bd56;
+}
+
+.fa-theme-light .fa-nexus-grid .fa-nexus-card .token-details .token-creature-type {
+  color: #89690a;
+}
+
+/* Token badges */
+/* Removed badges block in favor of status and variant tags */
+
+.locked-token {
+  cursor: not-allowed !important;
+  background: rgba(75, 75, 75, 0.35);
+  opacity: 0.6;
+  filter: grayscale(55%);
+}
+
+.locked-token .card-footer {
+  opacity: 0.6;
+  filter: grayscale(100%);
+}
+
+/* Status icon (top-right) and variant tag (top-left) */
+.fa-nexus-grid .fa-nexus-card .fa-nexus-status-icon {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 15px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  color: #fff;
+  border: none;
+  font-size: calc(var(--fa-nexus-details-size, 0.7rem) - 0.05rem);
+  opacity: 0.45;
+}
+
+.fa-nexus-grid .fa-nexus-card .fa-nexus-status-icon.cached {
+  color: #4caf50;
+  opacity: 0.95;
+}
+
+.fa-nexus-grid .fa-nexus-card .fa-nexus-status-icon.premium {
+  color: #ff4400;
+  opacity: 1;
+  filter: none;
+}
+
+.fa-nexus-grid .fa-nexus-card .fa-nexus-status-icon.cloud-plus {
+  color: #7adeff;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item .fa-nexus-token-status-icon.premium {
+  color: #ff4400;
+  opacity: 1;
+  filter: none;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item .thumb img {
+  width: 120%;
+}
+
+.fa-theme-light .fa-nexus-grid .fa-nexus-card .fa-nexus-status-icon {
+  background: none;
+  color: #111;
+  border: none;
+}
+
+/* ===== Color Variants Panel (Token Browser parity, prefixed) ===== */
+.fa-nexus-color-variants-panel {
+  position: fixed;
+  z-index: 1000;
+  min-width: 280px;
+  max-width: 400px;
+  max-height: 435px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.fa-theme-light .fa-nexus-color-variants-panel {
+  background: var(--fa-nexus-surface, rgba(255, 255, 255, 0.85));
+}
+
+.fa-nexus-color-variants-panel.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-title {
+  font-weight: bold;
+  font-size: 0.9em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-close {
+  background: none;
+  border: none;
+  color: inherit;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-close:hover {
+  background: var(--fa-nexus-card-bg, rgba(0, 0, 0, 0.18));
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-grid {
+  padding: 6px;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: 1fr;
+  gap: 4px;
+  overflow: auto;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item {
+  position: relative;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.08));
+  border-radius: 6px;
+  background: var(--fa-nexus-card-bg, rgba(0, 0, 0, 0.18));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  cursor: pointer;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item:hover {
+  border-color: rgba(90, 170, 255, 0.35);
+  box-shadow: 0 0 0 1px rgba(90, 170, 255, 0.35) inset;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item img {
+  max-width: 100%;
+  max-height: 100px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item[draggable="true"] {
+  cursor: grab;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-item.dragging {
+  cursor: grabbing;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-variant-number {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  font-size: 0.7rem;
+  line-height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  color: inherit;
+  opacity: 0.6;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-token-status-icon {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 15px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  opacity: 0.6;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-token-status-icon.cached {
+  color: #4caf50;
+  opacity: 0.95;
+}
+
+.fa-nexus-color-variants-panel .fa-nexus-token-status-icon.cloud-plus {
+  color: #7adeff;
+}
+
+
+.fa-nexus-grid .fa-nexus-card .fa-nexus-variant-tag {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  font-size: var(--fa-nexus-details-size, 0.7rem);
+  line-height: 18px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  color: #fff;
+  border: none;
+  opacity: 0.55;
+}
+
+.fa-theme-light .fa-nexus-grid .fa-nexus-card .fa-nexus-variant-tag {
+  background: none;
+  color: #111;
+  border: none;
+}
+
+.fa-nexus-grid .fa-nexus-card .fa-nexus-grid-size-tag {
+  position: absolute;
+  bottom: 0px;
+  right: 1px;
+  border-radius: 9px;
+  font-size: var(--fa-nexus-details-size, 0.7rem);
+  line-height: 1;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.75;
+  font-weight: 200;
+  letter-spacing: 0.05rem;
+  pointer-events: none;
+}
+
+/* ===== Actor Drop Target Highlighting ===== */
+.actor-drop-target {
+  background-color: var(--fa-nexus-accent, #4a90e2) !important;
+  opacity: 0.8 !important;
+  border: 2px solid var(--fa-nexus-accent, #4a90e2) !important;
+  border-radius: 4px !important;
+}
+
+/* ===== Actor Update Dialog (Token Browser parity, prefixed) ===== */
+/* Actor Token Update Dialog - Token Browser styling parity */
+.fa-nexus-actor-token-update-dialog {
+  padding: 0;
+  max-width: 500px;
+  color: var(--fa-text-muted, #bbb);
+  border-radius: 8px;
+  backdrop-filter: blur(5px);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-dialog-content {
+  padding: 20px;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-confirmation-message {
+  margin-bottom: 20px;
+  text-align: center;
+  color: var(--fa-text, #fff);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-confirmation-message p {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-token-comparison {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 20px;
+  justify-content: center;
+  background: rgba(115, 115, 115, 0.35);
+  padding: 20px;
+  border-radius: 6px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-token-preview {
+  text-align: center;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-token-label {
+  margin-bottom: 12px;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--fa-text, #fff);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-token-image {
+  width: 128px;
+  height: 128px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-options {
+  margin-bottom: 20px;
+  padding: 15px;
+  border-radius: 6px;
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  text-align: center;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--fa-text-muted, #bbb);
+  user-select: none;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-checkbox-label:hover {
+  color: var(--fa-text, #fff);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-checkbox-label.fa-nexus-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-checkbox-label input[type="checkbox"] {
+  margin: 0;
+  width: 16px;
+  height: 16px;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-token-details {
+  display: contents;
+  font-size: 0.9em;
+  color: var(--fa-text-muted, #bbb);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-detail-row {
+  margin-bottom: 8px;
+  line-height: 1.4;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  hyphens: auto;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-detail-row:last-child {
+  margin-bottom: 0;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-detail-row strong {
+  color: var(--fa-text, #fff);
+  display: inline-block;
+  min-width: 50px;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-dialog-buttons {
+  display: flex;
+  gap: 15px;
+  justify-content: center;
+  margin-top: 25px;
+  padding-top: 15px;
+  border-top: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-dialog-buttons button {
+  padding: 12px 24px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: all 0.2s ease;
+  min-width: 120px;
+  justify-content: center;
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-cancel-btn {
+  background: rgba(115, 115, 115, 0.35);
+  color: var(--fa-text-muted, #bbb);
+  border: 1px solid var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-cancel-btn:hover {
+  background: rgba(115, 115, 115, 0.5);
+  border-color: var(--fa-nexus-border, rgba(255, 255, 255, 0.12));
+  color: var(--fa-text, #fff);
+  transform: translateY(-1px);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-confirm-btn {
+  background: linear-gradient(135deg, #4CAF50, #45a049);
+  color: white;
+  border: 1px solid rgba(76, 175, 80, 0.3);
+  box-shadow: 0 2px 4px rgba(76, 175, 80, 0.2);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-confirm-btn:hover {
+  background: linear-gradient(135deg, #45a049, #3d8b40);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(76, 175, 80, 0.4);
+}
+
+.fa-nexus-actor-token-update-dialog .fa-nexus-confirm-btn:active,
+.fa-nexus-actor-token-update-dialog .fa-nexus-cancel-btn:active {
+  transform: translateY(0);
+}
+
+/* ===== Queued Drag Preview ===== */
+.fa-nexus-queued-drag {
+  position: fixed;
+  z-index: 99999;
+  pointer-events: none;
+  opacity: 0.95;
+  transform: translate(-50%, -50%);
+}
+
+.fa-nexus-queued-drag img {
+  transition: width 0.2s ease-out, height 0.2s ease-out;
+}
+
+.fa-nexus-loading-preview {
+  transition: width 0.2s ease-out, height 0.2s ease-out;
+}

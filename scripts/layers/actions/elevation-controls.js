@@ -240,7 +240,7 @@ export async function applyDocsElevationChange({
   restoreSelectionAfterElevationMove = null
 } = {}) {
   const orderedDocs = orderDocs(docs, orderDocsByIds);
-  if (!orderedDocs.length || !scene?.updateEmbeddedDocuments) return;
+  if (!orderedDocs.length || !scene?.updateEmbeddedDocuments) return { updated: false };
   const blockedDocs = orderedDocs.filter((doc) => !doc?.canUserModify?.(user, 'update'));
   if (blockedDocs.length) {
     throw new Error('You do not have permission to move every targeted layer.');
@@ -257,7 +257,7 @@ export async function applyDocsElevationChange({
       targetKey: elevationGroupKey(nextElevation),
       tileCount: orderedDocs.length
     });
-    return;
+    return { updated: false };
   }
 
   const { groups, movedGroupsBySource, movedDocIds } = buildResolvedMoveState(resolvedMoves, elevationGroupKey);
@@ -271,29 +271,43 @@ export async function applyDocsElevationChange({
       targetKey: elevationGroupKey(nextElevation),
       tileCount: orderedDocs.length
     });
-    return;
+    return { updated: false };
   }
 
+  const state = {
+    updated: false,
+    metadataMoved: false,
+    selectionRestored: false
+  };
   await scene.updateEmbeddedDocuments('Tile', updates);
+  state.updated = true;
 
-  const completeMoves = collectCompleteElevationGroupMoves(movedGroupsBySource, {
-    getFullElevationDocs
-  });
-  if (completeMoves.length) {
-    const metadata = getSceneElevationGroupMetadata(scene);
-    await setSceneElevationGroupMetadata(scene, mergeElevationGroupMetadataOnBulkMove({
-      metadata,
-      moves: completeMoves
-    }));
+  try {
+    const completeMoves = collectCompleteElevationGroupMoves(movedGroupsBySource, {
+      getFullElevationDocs
+    });
+    if (completeMoves.length) {
+      const metadata = getSceneElevationGroupMetadata(scene);
+      await setSceneElevationGroupMetadata(scene, mergeElevationGroupMetadataOnBulkMove({
+        metadata,
+        moves: completeMoves
+      }));
+      state.metadataMoved = true;
+    }
+    await restoreSelectionAfterElevationMove?.(Array.from(movedDocIds), { source: 'context-menu' });
+    state.selectionRestored = true;
+
+    Logger.info('LayerManager.contextMenu.elevation.commit', {
+      sceneId: scene.id || null,
+      targetKeys: Array.from(groups.keys()),
+      tileCount: updates.length,
+      metadataMoves: completeMoves.length
+    });
+    return state;
+  } catch (error) {
+    error.faNexusLayerManagerElevationChangeState = state;
+    throw error;
   }
-  await restoreSelectionAfterElevationMove?.(Array.from(movedDocIds), { source: 'context-menu' });
-
-  Logger.info('LayerManager.contextMenu.elevation.commit', {
-    sceneId: scene.id || null,
-    targetKeys: Array.from(groups.keys()),
-    tileCount: updates.length,
-    metadataMoves: completeMoves.length
-  });
 }
 
 export function resolveElevationStep({
@@ -413,7 +427,6 @@ export function adjustElevationSelection({
 
   for (const doc of orderedDocs) {
     if (!doc?.canUserModify?.(user, 'update')) continue;
-    if (doc?.locked) continue;
     const current = Number(doc?.elevation ?? 0) || 0;
     const move = resolveTileElevationMove({
       doc,

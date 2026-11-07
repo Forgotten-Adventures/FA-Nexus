@@ -3,8 +3,10 @@
  * Extends HoverPreviewManager with token-specific metadata formatting,
  * Patreon gating rules, and token data-service integrations.
  */
-import { HoverPreviewManager } from '../core/hover-preview-manager.js';
+import { HoverPreviewManager } from '../core/ui/hover-preview-manager.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+
+import { hasContentProductAccess } from '../premium/patreon-auth-contract.js';
 
 export class TokenPreviewManager extends HoverPreviewManager {
   /**
@@ -21,11 +23,20 @@ export class TokenPreviewManager extends HoverPreviewManager {
     this._tokenDataService = null;
   }
 
+  _collectCardInfo(cardEl) {
+    const meta = super._collectCardInfo(cardEl);
+    return {
+      ...meta,
+      filename: cardEl?.getAttribute?.('data-filename') || meta.filename
+    };
+  }
+
   async resolveImageSource(cardEl, meta) {
     let url = meta.currentUrl || '';
     const filename = meta.filename;
     try {
-      if (meta.source === 'cloud' && !meta.downloaded) {
+      // A premium card this login's tier cannot download keeps its thumbnail: no signed-URL request on hover.
+      if (meta.source === 'cloud' && !meta.downloaded && !this._premiumLocked(meta)) {
         const svc = this._getContentService();
         if (svc) {
           const item = {
@@ -33,7 +44,7 @@ export class TokenPreviewManager extends HoverPreviewManager {
             filename,
             tier: meta.tier
           };
-          const full = await svc.getFullURL?.('tokens', item, this._getAuthState());
+          const full = await svc.getFullURL?.('tokens', item, this._getAuthState(), { notifyTierRefusal: false });
           if (full) url = full;
           Logger.debug('TokenPreview.resolveImageSource', { url, tier: meta.tier, downloaded: meta.downloaded });
         }
@@ -106,6 +117,15 @@ export class TokenPreviewManager extends HoverPreviewManager {
       return app?._contentService || null;
     } catch (_) {
       return null;
+    }
+  }
+
+  _premiumLocked(meta) {
+    if (String(meta?.tier || '').toLowerCase() !== 'premium') return false;
+    try {
+      return !hasContentProductAccess(game.settings.get('fa-nexus', 'patreon_auth_data'), 'tokens');
+    } catch (_) {
+      return true;
     }
   }
 

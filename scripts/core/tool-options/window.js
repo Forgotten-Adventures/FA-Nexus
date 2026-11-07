@@ -1,4 +1,6 @@
 import { GRID_SNAP_SUBDIV_DEFAULT } from '../grid-snap-utils.js';
+import { ToolOptionsDropShadowControlsWorkflow } from './drop-shadow-controls-workflow.js';
+import { ToolOptionsPlaceAsControlsWorkflow } from './place-as-controls-workflow.js';
 import {
   DEFAULT_WINDOW_TITLE,
   MODULE_ID,
@@ -29,7 +31,7 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
   static PARTS = foundry.utils.mergeObject(
     foundry.utils.deepClone(super.PARTS ?? {}),
     {
-      body: { template: 'modules/fa-nexus/templates/tool-options.hbs' }
+      body: { template: 'modules/fa-nexus/templates/tool-options/tool-options.hbs' }
     },
     { inplace: false }
   );
@@ -58,46 +60,13 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._toolOptionState = toolOptions && typeof toolOptions === 'object' ? toolOptions : {};
     this._activeNormalizedOptions = null;
     this._dropShadowToggle = null;
-    this._dropShadowControlId = '';
     this._boundDropShadowChange = (event) => this._handleDropShadowChange(event);
-    this._dropShadowRoot = null;
-    this._dropShadowScaleSlider = null;
-    this._dropShadowAlphaSlider = null;
-    this._dropShadowDilationSlider = null;
-    this._dropShadowBlurSlider = null;
-    this._dropShadowOffsetSlider = null;
-    this._dropShadowOffsetControl = null;
-    this._dropShadowOffsetCircle = null;
-    this._dropShadowOffsetHandle = null;
-    this._dropShadowPreviewRoot = null;
-    this._dropShadowPreviewImage = null;
-    this._dropShadowOffsetMaxDistance = 40;
-    this._dropShadowOffsetPointerId = null;
-    this._dropShadowOffsetPointerActive = false;
-    this._dropShadowScaleDisplay = null;
-    this._dropShadowAlphaDisplay = null;
     this._resizeObserver = null;
     this._resizeObserverFrame = null;
     this._userResizing = false;
     this._savedHeight = null;
     this._boundResizeObserverStart = (event) => this._handleResizeObserverStart(event);
     this._boundResizeObserverEnd = () => this._handleResizeObserverEnd();
-    this._dropShadowDilationDisplay = null;
-    this._dropShadowBlurDisplay = null;
-    this._dropShadowOffsetDisplay = null;
-    this._dropShadowOffsetDistanceDisplay = null;
-    this._dropShadowOffsetAngleDisplay = null;
-    this._dropShadowOffsetMaxDisplay = null;
-    this._dropShadowCollapseButton = null;
-    this._dropShadowBody = null;
-    this._dropShadowEditRoot = null;
-    this._dropShadowEditToggle = null;
-    this._dropShadowEditResetButton = null;
-    this._dropShadowOnlyRoot = null;
-    this._dropShadowOnlyToggle = null;
-    this._dropShadowPresetsRoot = null;
-    this._dropShadowPresetButtons = [];
-    this._dropShadowResetButton = null;
     this._shortcutsRoot = null;
     this._shortcutsToggle = null;
     this._shortcutsContent = null;
@@ -110,7 +79,7 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._sectionBodies = new Map();
     this._boundSectionToggle = (event) => this._handleSectionToggle(event);
     this._portalSectionCollapsedByKey = new Map();
-    this._portalControlsSyncTimer = null;
+    this._portalControlRuntime = null;
     this._helpButton = null;
     this._helpKeyRoot = null;
     this._boundHelpOpen = (event) => this._handleHelpOpen(event);
@@ -131,9 +100,6 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._boundDropShadowBlurCommit = (event) => this._handleDropShadowSlider(event, 'blur', true);
     this._boundDropShadowOffsetInput = (event) => this._handleDropShadowSlider(event, 'offset', false);
     this._boundDropShadowOffsetCommit = (event) => this._handleDropShadowSlider(event, 'offset', true);
-    this._boundDropShadowOffsetPointerDown = (event) => this._handleDropShadowOffsetPointerDown(event);
-    this._boundDropShadowOffsetPointerMove = (event) => this._handleDropShadowOffsetPointerMove(event);
-    this._boundDropShadowOffsetPointerUp = (event) => this._handleDropShadowOffsetPointerUp(event);
     this._boundDropShadowOffsetContext = (event) => this._handleDropShadowOffsetContext(event);
     this._boundDropShadowOffsetMaxInput = (event) => this._handleDropShadowOffsetMaxSlider(event, false);
     this._boundDropShadowOffsetMaxCommit = (event) => this._handleDropShadowOffsetMaxSlider(event, true);
@@ -144,21 +110,18 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._boundDropShadowPresetClick = (event) => this._handleDropShadowPresetClick(event);
     this._boundDropShadowPresetContext = (event) => this._handleDropShadowPresetContext(event);
     this._boundDropShadowReset = (event) => this._handleDropShadowReset(event);
+    this._dropShadowControlsWorkflow = new ToolOptionsDropShadowControlsWorkflow(this);
     this._boundResettableContext = (event) => this._handleResettableContext(event);
     this._customToggleBindings = new Map();
+    this._declarativeControlRuntime = null;
     this._declarativeSegmentedControls = new Map();
-    this._declarativeToggleControls = new Map();
-    this._declarativeSelectControls = new Map();
     this._declarativeRangeControls = new Map();
     this._declarativeRangePairControls = new Map();
     this._declarativeAxisPairControls = new Map();
-    this._declarativeScalarRandomizedControls = new Map();
     this._declarativeStackOrderControls = new Map();
     this._resettableContextRoot = null;
     this._sliderWheelRoot = null;
     this._boundSliderWheel = (event) => this._handleSliderWheel(event);
-    this._boundDeclarativeToggleChange = (event) => this._handleDeclarativeToggleChange(event);
-    this._boundDeclarativeSelectChange = (event) => this._handleDeclarativeSelectChange(event);
     this._boundDeclarativeRangeInput = (event) => this._handleDeclarativeRangeInput(event, false);
     this._boundDeclarativeRangeCommit = (event) => this._handleDeclarativeRangeInput(event, true);
     this._boundDeclarativeRangeToggle = (event) => this._handleDeclarativeRangeToggle(event);
@@ -166,13 +129,8 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._boundDeclarativeRangePairCommit = (event) => this._handleDeclarativeRangePairInput(event, true);
     this._boundDeclarativeAxisPairToggle = (event) => this._handleDeclarativeAxisPairToggle(event, false);
     this._boundDeclarativeAxisPairRandomToggle = (event) => this._handleDeclarativeAxisPairToggle(event, true);
-    this._boundDeclarativeScalarRandomizedInput = (event) => this._handleDeclarativeScalarRandomizedInput(event, false);
-    this._boundDeclarativeScalarRandomizedCommit = (event) => this._handleDeclarativeScalarRandomizedInput(event, true);
-    this._boundDeclarativeScalarRandomizedStrengthInput = (event) => this._handleDeclarativeScalarRandomizedStrength(event, false);
-    this._boundDeclarativeScalarRandomizedStrengthCommit = (event) => this._handleDeclarativeScalarRandomizedStrength(event, true);
-    this._boundDeclarativeScalarRandomizedMin = (event) => this._handleDeclarativeScalarRandomizedRange(event, 'min');
-    this._boundDeclarativeScalarRandomizedMax = (event) => this._handleDeclarativeScalarRandomizedRange(event, 'max');
-    this._boundDeclarativeScalarRandomizedRandom = (event) => this._handleDeclarativeScalarRandomizedRandom(event);
+    this._boundDeclarativeStackOrderRaise = (event) => this._handleDeclarativeStackOrderAction(event, 'raise');
+    this._boundDeclarativeStackOrderLower = (event) => this._handleDeclarativeStackOrderAction(event, 'lower');
     this._boundDeclarativeStackOrderTop = (event) => this._handleDeclarativeStackOrderAction(event, 'top');
     this._boundDeclarativeStackOrderBottom = (event) => this._handleDeclarativeStackOrderAction(event, 'bottom');
     this._boundDeclarativeSegmentedChange = (event) => this._handleDeclarativeSegmentedChange(event);
@@ -187,6 +145,10 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._boundPlacementPushBottom = (event) => this._handlePlacementPush(event, 'bottom');
     this._declarativeActionRows = new Map();
     this._boundEditorActionClick = (event) => this._handleEditorActionClick(event);
+    this._boundEditorActionPointerEnter = (event) => this._handleEditorActionPreview(event, 'enter');
+    this._boundEditorActionPointerLeave = (event) => this._handleEditorActionPreview(event, 'leave');
+    this._boundEditorActionFocus = (event) => this._handleEditorActionPreview(event, 'focus');
+    this._boundEditorActionBlur = (event) => this._handleEditorActionPreview(event, 'blur');
     this._pathOpacityRoot = null;
     this._pathOpacitySlider = null;
     this._pathOpacityDisplay = null;
@@ -201,6 +163,7 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._placeAsNamingRerenderJob = null;
     this._placeAsNamingRerenderRevision = null;
     this._placeAsNamingRerenderCount = 0;
+    this._placeAsControlsWorkflow = new ToolOptionsPlaceAsControlsWorkflow(this);
     this._pathOffsetRoot = null;
     this._pathOffsetXSlider = null;
     this._pathOffsetYSlider = null;
@@ -223,35 +186,6 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._showWidthTangentsRoot = null;
     this._showWidthTangentsToggle = null;
     this._boundShowWidthTangentsChange = (event) => this._handleShowWidthTangentsChange(event);
-    this._placeAsSearchInput = null;
-    this._placeAsList = null;
-    this._placeAsLinkedToggle = null;
-    this._placeAsActorTypeSelect = null;
-    this._placeAsActorTypeHint = null;
-    this._placeAsAppendNumberToggle = null;
-    this._placeAsPrependAdjectiveToggle = null;
-    this._placeAsToggleButton = null;
-    this._placeAsHpModeSelect = null;
-    this._placeAsHpPercentInput = null;
-    this._placeAsHpStaticInput = null;
-    this._placeAsHpModeHint = null;
-    this._placeAsHpPercentHint = null;
-    this._placeAsHpStaticHint = null;
-    this._placeAsHpStaticError = null;
-    this._placeAsHpPercentRow = null;
-    this._placeAsHpStaticRow = null;
-    this._boundPlaceAsSearch = (event) => this._handlePlaceAsSearch(event);
-    this._boundPlaceAsOptionClick = (event) => this._handlePlaceAsOptionClick(event);
-    this._boundPlaceAsLinkedChange = (event) => this._handlePlaceAsLinked(event);
-    this._boundPlaceAsActorTypeChange = (event) => this._handlePlaceAsActorType(event);
-    this._boundPlaceAsAppendNumberChange = (event) => this._handlePlaceAsAppendNumber(event);
-    this._boundPlaceAsPrependAdjectiveChange = (event) => this._handlePlaceAsPrependAdjective(event);
-    this._boundPlaceAsToggle = (event) => this._handlePlaceAsToggle(event);
-    this._boundPlaceAsFilter = (event) => this._handlePlaceAsFilter(event);
-    this._placeAsFilterButton = null;
-    this._boundPlaceAsHpMode = (event) => this._handlePlaceAsHpMode(event);
-    this._boundPlaceAsHpPercent = (event) => this._handlePlaceAsHpPercent(event);
-    this._boundPlaceAsHpStatic = (event) => this._handlePlaceAsHpStatic(event);
     this._flipRoot = null;
     this._flipDisplay = null;
     this._flipPreviewDisplay = null;
@@ -464,6 +398,8 @@ export class ToolOptionsWindow extends HandlebarsApplicationMixin(ApplicationV2)
     this._cleanupResizeObserver();
     this._persistWindowPosition();
     this._unbindControls();
+    this._portalControlRuntime?.destroy?.();
+    this._portalControlRuntime = null;
     this._setToolPanelActivity(false);
     if (this._placeAsNamingRerenderJob) {
       clearTimeout(this._placeAsNamingRerenderJob);

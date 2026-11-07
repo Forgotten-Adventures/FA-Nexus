@@ -4,7 +4,15 @@
  */
 
 import * as SystemDetection from './system-detection.js';
+import {
+  applyHpOverrideToTokenData,
+  buildTokenDocumentData,
+  resolveTokenDepthFromGridDimensions as resolveTokenDepthFromGridDimensionsData
+} from './token-document-data-builder.js';
 import { getCurrentSceneLevel } from '../canvas/elevation-band-utils.js';
+import { contentFilename } from '../content/cloud-inventory-v2.js';
+import { applyTokenCardCachedState } from './token-card-cache-state.js';
+import { NexusLogger as Logger } from '../core/nexus-logger.js';
 
 /**
  * @typedef {import('../core/fa-nexus-types.js').FaNexusActorData} FaNexusActorData
@@ -14,6 +22,30 @@ import { getCurrentSceneLevel } from '../canvas/elevation-band-utils.js';
  * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenPrototypeData} FaNexusTokenPrototypeData
  * @typedef {import('../core/fa-nexus-types.js').FaNexusTokenSize} FaNexusTokenSize
  */
+
+function tokenScaleRepairWarningContext({
+  actor,
+  tokenDoc,
+  systemId = null,
+  scope,
+  reason,
+  appliedScaleX,
+  appliedScaleY,
+  error
+}) {
+  return {
+    scope,
+    reason,
+    actorName: actor?.name || null,
+    actorId: actor?.id || actor?._id || null,
+    actorType: actor?.type || null,
+    tokenId: tokenDoc?.id || tokenDoc?._id || null,
+    systemId: systemId || null,
+    appliedScaleX,
+    appliedScaleY,
+    error: String(error?.message || error)
+  };
+}
 
 /**
  * Generate a clean actor name from filename
@@ -52,17 +84,12 @@ function generateActorName(filename) {
  * Actor Factory - Main entry point for creating actors from dropped tokens
  */
 export class ActorFactory {
-  static resolveTokenDepthFromGridDimensions(gridWidth, gridHeight, fallbackDepth = null) {
-    const fallback = Number(fallbackDepth);
-    if (Number.isFinite(fallback) && fallback > 0) return fallback;
+  static generateActorName(filename) {
+    return generateActorName(filename);
+  }
 
-    const width = Number(gridWidth);
-    const height = Number(gridHeight);
-    const depth = Math.max(
-      Number.isFinite(width) && width > 0 ? width : 1,
-      Number.isFinite(height) && height > 0 ? height : 1
-    );
-    return Math.round(depth * 100) / 100;
+  static resolveTokenDepthFromGridDimensions(gridWidth, gridHeight, fallbackDepth = null) {
+    return resolveTokenDepthFromGridDimensionsData(gridWidth, gridHeight, fallbackDepth);
   }
 
   static _resolveCurrentTokenPlacementContext(scene = canvas?.scene) {
@@ -102,7 +129,7 @@ export class ActorFactory {
       }
       
       // Generate actor name from filename
-      const actorName = generateActorName(dragData.filename);
+      const actorName = this.generateActorName(dragData.filename);
       
       // Create actor with system-specific logic
       const actor = await this._createActorWithFallback(actorName, dragData, options);
@@ -726,92 +753,19 @@ export class ActorFactory {
    * @returns {Promise<TokenDocument>} Created token document
    */
   static async _createTokenOnCanvas(actor, dragData, dropCoordinates, tokenOptions = {}) {
-    const { world } = dropCoordinates;
-
-    // Use the optimized dimensions from the actor's prototype token data
-    // This ensures we use the optimized dimensions for gargantuan tokens
-    const prototypeToken = actor.prototypeToken;
-    const gridWidth = prototypeToken.width;
-    const gridHeight = prototypeToken.height;
-    const tokenDepth = ActorFactory.resolveTokenDepthFromGridDimensions(
-      gridWidth,
-      gridHeight,
-      prototypeToken.depth
-    );
-    const prototypeScaleX = Number(prototypeToken.texture.scaleX ?? 1) || 1;
-    const prototypeScaleY = Number(prototypeToken.texture.scaleY ?? 1) || 1;
-    const baseScaleX = Math.abs(prototypeScaleX);
-    const baseScaleY = Math.abs(prototypeScaleY);
-    const textureFit = prototypeToken.texture.fit;
-    const textureMirrorX = prototypeScaleX < 0;
-    const textureMirrorY = prototypeScaleY < 0;
-    const tokenRotation = Number.isFinite(dragData?.rotation) ? Number(dragData.rotation) : 0;
     const {
-      levelId: tokenLevelId,
-      elevation: tokenElevation
-    } = ActorFactory._resolveCurrentTokenPlacementContext(canvas.scene);
-
-    // Get grid size for calculating token dimensions
-    const gridSize = canvas.grid.size;
-
-    // Calculate actual token dimensions in pixels using optimized dimensions
-    const tokenWidth = gridWidth * gridSize;
-    const tokenHeight = gridHeight * gridSize;
-    
-    // Center the token on the cursor position
-    // Since Foundry token coordinates are top-left corner, we need to offset by half dimensions
-    const tokenX = world.x - (tokenWidth / 2);
-    const tokenY = world.y - (tokenHeight / 2);
-    
-    // Create base token data with positioning and optimized texture settings
-    const actorLink = tokenOptions?.actorLink ?? prototypeToken?.actorLink ?? false;
-    const hpOverride = tokenOptions?.hpOverride ?? null;
-
-    const requestMirrorX = dragData?.mirrorX !== undefined ? !!dragData.mirrorX : textureMirrorX;
-    const requestMirrorY = dragData?.mirrorY !== undefined ? !!dragData.mirrorY : textureMirrorY;
-    const appliedScaleX = baseScaleX * (requestMirrorX ? -1 : 1);
-    const appliedScaleY = baseScaleY * (requestMirrorY ? -1 : 1);
-
-    const baseTokenData = {
-      name: actor.name,
-      actorId: actor.id,
-      actorLink,
-      x: tokenX,
-      y: tokenY,
-      level: tokenLevelId,
-      elevation: tokenElevation,
-      width: gridWidth,
-      height: gridHeight,
-      depth: tokenDepth,
-      texture: {
-        src: dragData.url,
-        scaleX: appliedScaleX,
-        scaleY: appliedScaleY,
-        fit: textureFit
-      },
-      rotation: tokenRotation,
-      lockRotation: false,
-      randomImg: false,
-      flags: {
-        'fa-nexus': {
-          customScale: true,
-          originalScale: baseScaleX
-        }
-      }
-    };
-
-    if (hpOverride && actorLink === false) {
-      ActorFactory._applyHpOverrideToTokenData(baseTokenData, hpOverride);
-    }
-
-    if (actorLink === false) {
-      if (tokenOptions?.appendNumber !== undefined && tokenOptions.appendNumber !== null) {
-        baseTokenData.appendNumber = !!tokenOptions.appendNumber;
-      }
-      if (tokenOptions?.prependAdjective !== undefined && tokenOptions.prependAdjective !== null) {
-        baseTokenData.prependAdjective = !!tokenOptions.prependAdjective;
-      }
-    }
+      tokenData: baseTokenData,
+      appliedScaleX,
+      appliedScaleY,
+      baseScaleX
+    } = buildTokenDocumentData({
+      actor,
+      dragData,
+      dropCoordinates,
+      tokenOptions,
+      resolvePlacementContext: () => ActorFactory._resolveCurrentTokenPlacementContext(canvas.scene),
+      gridSize: () => canvas.grid.size
+    });
     
     // Create token document
     const tokenDoc = await TokenDocument.create(baseTokenData, { parent: canvas.scene });
@@ -822,12 +776,23 @@ export class ActorFactory {
           'texture.scaleX': appliedScaleX,
           'texture.scaleY': appliedScaleY
         }, { animate: false });
-      } catch (_) {}
+      } catch (error) {
+        Logger.warn('ActorFactory.tokenScaleRepair.mirrorUpdate.failed', tokenScaleRepairWarningContext({
+          actor,
+          tokenDoc,
+          scope: 'mirror-repair',
+          reason: 'post-create mirror scale repair update failed',
+          appliedScaleX,
+          appliedScaleY,
+          error
+        }));
+      }
     }
 
     // Reapply/restore scale for systems that override prototype values
+    let systemId = null;
     try {
-      const systemId = SystemDetection.getCurrentSystemId();
+      systemId = SystemDetection.getCurrentSystemId();
       if (systemId === 'pf2e') {
         // Ensure PF2e doesn't relink size; preserve custom scale
         await tokenDoc.update({
@@ -845,45 +810,40 @@ export class ActorFactory {
               'texture.scaleX': appliedScaleX,
               'texture.scaleY': appliedScaleY
             }, { animate: false });
-          } catch (_) {}
+          } catch (error) {
+            Logger.warn('ActorFactory.tokenScaleRepair.dsa5DelayedUpdate.failed', tokenScaleRepairWarningContext({
+              actor,
+              tokenDoc,
+              systemId,
+              scope: 'dsa5-delayed-repair',
+              reason: 'delayed DSA5 scale repair update failed',
+              appliedScaleX,
+              appliedScaleY,
+              error
+            }));
+          }
         }, 50);
       }
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn('ActorFactory.tokenScaleRepair.systemUpdate.failed', tokenScaleRepairWarningContext({
+        actor,
+        tokenDoc,
+        systemId,
+        scope: systemId ? 'system-scale-repair' : 'system-detection',
+        reason: systemId
+          ? 'system-specific scale repair failed'
+          : 'system id lookup for scale repair failed',
+        appliedScaleX,
+        appliedScaleY,
+        error
+      }));
+    }
 
     return tokenDoc;
   }
 
   static _applyHpOverrideToTokenData(target, override) {
-    if (!target || !override) return false;
-    const utils = foundry?.utils;
-    const hpPath = override.path || 'system.attributes.hp';
-    const valuePath = `actorData.${hpPath}.value`;
-    const maxPath = `actorData.${hpPath}.max`;
-    try {
-      if (utils?.setProperty) {
-        utils.setProperty(target, valuePath, override.value);
-        utils.setProperty(target, maxPath, override.max);
-        return true;
-      }
-    } catch (error) {
-      console.warn('fa-nexus | ActorFactory: Failed to inject HP override into token data', error);
-    }
-
-    const apply = (path, value) => {
-      const parts = String(path).split('.').filter((part) => part.length);
-      if (!parts.length) return;
-      let cursor = target;
-      for (let i = 0; i < parts.length - 1; i += 1) {
-        const key = parts[i];
-        if (cursor[key] === undefined || cursor[key] === null) cursor[key] = {};
-        cursor = cursor[key];
-      }
-      cursor[parts[parts.length - 1]] = value;
-    };
-
-    apply(valuePath, override.value);
-    apply(maxPath, override.max);
-    return true;
+    return applyHpOverrideToTokenData(target, override);
   }
   
   /**
@@ -894,6 +854,21 @@ export class ActorFactory {
    * @param {boolean} [options.preserveSize] - When true, do not update actor size or prototype token dimensions
    * @returns {Promise<void>}
    */
+  /**
+   * True when the artwork's footprint is the single-square size (Medium; "average" in DSA5) and the Actor already has
+   * a size that fits in one square (Tiny, Small or Medium; Fine and Diminutive in PF1): its own size is kept.
+   */
+  static _isSingleSquareSizeOfActor(actor, systemId, sizeCategory) {
+    const single = systemId === 'dsa5' ? 'average' : 'med';
+    if (sizeCategory !== single) return false;
+    const system = actor?.system ?? {};
+    const current = systemId === 'dsa5' ? system.status?.size?.value
+      : systemId === 'pf2e' ? system.traits?.size?.value
+      : system.traits?.size;
+    const oneSquare = systemId === 'dsa5' ? ['tiny', 'small', 'average'] : ['fine', 'dim', 'tiny', 'sm', 'med'];
+    return oneSquare.includes(String(current ?? ''));
+  }
+
   static async updateActorPrototypeToken(actor, dropData, options = {}) {
     const preserveSize = !!options.preserveSize;
     const tokenSize = dropData.tokenSize || { gridWidth: 1, gridHeight: 1, scale: 1 };
@@ -947,6 +922,9 @@ export class ActorFactory {
     // System-specific handling (optional)
     if (!preserveSize) {
       const sizeCategory = SystemDetection.getCreatureSizeFromDimensions(tokenSize.gridWidth, tokenSize.gridHeight);
+      // A one-square artwork cannot tell Tiny, Small and Medium apart: it maps to Medium. An Actor that already is
+      // one of those sizes keeps it (NUX-064: a compendium Rat or Giant Rat became Medium when placed).
+      const keepActorSize = ActorFactory._isSingleSquareSizeOfActor(actor, systemId, sizeCategory);
 
       if (systemId === 'pf2e') {
         // Pathfinder 2nd Edition specific handling
@@ -959,7 +937,7 @@ export class ActorFactory {
         prototypeTokenUpdate.flags.pf2e.linkToActorSize = false;
 
         // Update actor's size trait to match token dimensions
-        await actor.update({
+        if (!keepActorSize) await actor.update({
           'system.traits.size': { value: sizeCategory }
         });
       } else if (systemId === 'pf1') {
@@ -973,12 +951,12 @@ export class ActorFactory {
         prototypeTokenUpdate.flags.pf1.linkToActorSize = false;
 
         // Update actor's size trait (PF1 uses string directly)
-        await actor.update({
+        if (!keepActorSize) await actor.update({
           'system.traits.size': sizeCategory
         });
       } else if (systemId === 'dnd5e') {
         // D&D 5e specific handling
-        await actor.update({
+        if (!keepActorSize) await actor.update({
           'system.traits.size': sizeCategory
         });
       } else if (systemId === 'dsa5') {
@@ -991,7 +969,7 @@ export class ActorFactory {
         prototypeTokenUpdate.flags.dsa5 = prototypeTokenUpdate.flags.dsa5 || {};
         prototypeTokenUpdate.flags.dsa5.linkToActorSize = false;
 
-        await actor.update({
+        if (!keepActorSize) await actor.update({
           'system.status.size': { value: sizeCategory }
         });
       } else if (systemId === 'daggerheart') {
@@ -1036,9 +1014,19 @@ export class ActorFactory {
         const isCloudSource = String(dropData?.originSource || '').toLowerCase() === 'cloud';
         if (!isCloudSource) return; // skip for local source tokens
         // Fire-and-forget; do not block the UI
-        ActorFactory._downloadWildcardVariants(dropData).catch(() => {});
+        ActorFactory._downloadWildcardVariants(dropData).catch((error) => {
+          Logger.warn('ActorFactory.wildcardVariants.backgroundDownload.failed', ActorFactory._wildcardVariantWarningContext({
+            filename: dropData?.filename,
+            error
+          }));
+        });
       }
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn('ActorFactory.wildcardVariants.backgroundStart.failed', ActorFactory._wildcardVariantWarningContext({
+        filename: dropData?.filename,
+        error
+      }));
+    }
   }
 
   /**
@@ -1087,6 +1075,19 @@ export class ActorFactory {
       .replace(/\]/g, '?');
   }
 
+  static _wildcardVariantWarningContext({ base = '', filename = '', phase = '', error }) {
+    const safeFilename = String(filename || '').trim();
+    const match = safeFilename.match(/^(.*)_([0-9]{2})\.[^.]+$/);
+    const context = {
+      base: base || match?.[1] || '',
+      filename: safeFilename,
+      variant: match?.[2] || '',
+      error: String(error?.message || error)
+    };
+    if (phase) context.phase = phase;
+    return context;
+  }
+
   /**
    * Trigger download of all color variants for the dropped token when wildcard is used.
    * Skips variants already cached/downloaded locally.
@@ -1095,14 +1096,16 @@ export class ActorFactory {
    * @private
    */
   static async _downloadWildcardVariants(dropData) {
+    let filename = '';
+    let base = '';
     try {
-      const filename = String(dropData?.filename || '').trim();
+      filename = String(dropData?.filename || '').trim();
       if (!filename) return;
 
       // Extract base name and extension: "Name_01.webp" -> base="Name", ext="webp"
       const m = filename.match(/^(.*)_([0-9]{2})\.(webp|png|jpg|jpeg)$/i);
       if (!m) return; // no color variant pattern detected
-      const base = m[1];
+      base = m[1];
       const ext = m[3];
 
       // Resolve shared services from the main app
@@ -1113,7 +1116,13 @@ export class ActorFactory {
 
       // Pull auth state (if premium is involved)
       let state = null;
-      try { const auth = game.settings.get('fa-nexus', 'patreon_auth_data'); state = auth?.state || null; } catch (_) {}
+      try { const auth = game.settings.get('fa-nexus', 'patreon_auth_data'); state = auth?.state || null; } catch (error) {
+        Logger.warn('ActorFactory.wildcardVariants.authState.failed', ActorFactory._wildcardVariantWarningContext({
+          base,
+          filename,
+          error
+        }));
+      }
 
       // Query cloud DB for candidates with the same base (narrow using text filter)
       // We'll post-filter to exact variant pattern for safety
@@ -1122,11 +1131,11 @@ export class ActorFactory {
 
       // Filter to exact filename pattern and collect variants in order
       const re = new RegExp(`^${base.replace(/[.*+?^${}()|\[\]\\]/g, '\\$&')}_(\\d{2})\\.${ext}$`, 'i');
-      const variants = items.filter(it => re.test(String(it.filename || '')));
+      const variants = items.filter(it => re.test(contentFilename(it)));
       if (!variants.length) return;
       variants.sort((a, b) => {
-        const am = String(a.filename||'').match(/_(\d{2})\.[^.]+$/);
-        const bm = String(b.filename||'').match(/_(\d{2})\.[^.]+$/);
+        const am = contentFilename(a).match(/_(\d{2})\.[^.]+$/);
+        const bm = contentFilename(b).match(/_(\d{2})\.[^.]+$/);
         const av = am ? parseInt(am[1], 10) : 0;
         const bv = bm ? parseInt(bm[1], 10) : 0;
         return av - bv;
@@ -1135,35 +1144,78 @@ export class ActorFactory {
       // Build the worklist: variants not cached and accessible (free or authed)
       const toDownload = [];
       for (const it of variants) {
+        let variantFilename = '';
         try {
-          const already = dl.getLocalPath('tokens', { filename: it.filename, path: it.file_path || it.path });
+          variantFilename = contentFilename(it);
+          const already = dl.getLocalPath('tokens', it);
           const tier = String(it.tier || 'free');
           const canAccess = (tier === 'free') || !!state;
           if (!already && canAccess) toDownload.push(it);
-        } catch (_) {}
+        } catch (error) {
+          Logger.warn('ActorFactory.wildcardVariants.accessCheck.failed', ActorFactory._wildcardVariantWarningContext({
+            base,
+            filename: variantFilename || filename,
+            error
+          }));
+        }
       }
 
       if (!toDownload.length) {
-        try { ui.notifications?.info?.(`All color variants already cached for ${base}`); } catch (_) {}
+        try { ui.notifications?.info?.(`All color variants already cached for ${base}`); } catch (error) {
+          Logger.warn('ActorFactory.wildcardVariants.notification.failed', ActorFactory._wildcardVariantWarningContext({
+            base,
+            filename,
+            phase: 'all-cached',
+            error
+          }));
+        }
         return;
       }
 
-      try { ui.notifications?.info?.(`Downloading ${toDownload.length} color variant(s) for ${base}…`); } catch (_) {}
+      try { ui.notifications?.info?.(`Downloading ${toDownload.length} color variant(s) for ${base}…`); } catch (error) {
+        Logger.warn('ActorFactory.wildcardVariants.notification.failed', ActorFactory._wildcardVariantWarningContext({
+          base,
+          filename,
+          phase: 'start-download',
+          error
+        }));
+      }
 
       // Download missing variants sequentially to avoid overwhelming host
       let success = 0;
       for (const it of toDownload) {
+        let variantFilename = '';
         try {
+          variantFilename = contentFilename(it);
           const url = await svc.getFullURL('tokens', it, state);
           const localPath = await dl.ensureLocal('tokens', it, url);
           // Reflect cached state in main grid cards for this filename
-          try { ActorFactory._updateMainGridVariantCached(it.filename, localPath); } catch (_) {}
+          ActorFactory._updateMainGridVariantCached(variantFilename, localPath);
           success++;
-        } catch (_) { /* skip individual failures */ }
+        } catch (error) {
+          Logger.warn('ActorFactory.wildcardVariants.variantDownload.failed', ActorFactory._wildcardVariantWarningContext({
+            base,
+            filename: variantFilename || filename,
+            error
+          }));
+        }
       }
 
-      try { ui.notifications?.info?.(`Downloaded ${success} of ${toDownload.length} color variant(s) for ${base}`); } catch (_) {}
-    } catch (_) { /* swallow errors to keep UI responsive */ }
+      try { ui.notifications?.info?.(`Downloaded ${success} of ${toDownload.length} color variant(s) for ${base}`); } catch (error) {
+        Logger.warn('ActorFactory.wildcardVariants.notification.failed', ActorFactory._wildcardVariantWarningContext({
+          base,
+          filename,
+          phase: 'download-complete',
+          error
+        }));
+      }
+    } catch (error) {
+      Logger.warn('ActorFactory.wildcardVariants.download.failed', ActorFactory._wildcardVariantWarningContext({
+        base,
+        filename,
+        error
+      }));
+    }
   }
 
   /**
@@ -1179,26 +1231,27 @@ export class ActorFactory {
       const root = app?.element;
       if (!root) return;
       const cards = root.querySelectorAll(`.fa-nexus-grid .fa-nexus-card[data-filename="${CSS.escape(filename)}"], .fa-nexus-card[data-filename="${CSS.escape(filename)}"]`);
-      // Only mark as cached if actually downloaded (not using direct CDN URL)
-      const isDirectUrl = localPath && /^https?:\/\/r2-public\.forgotten-adventures\.net\//i.test(localPath);
       cards.forEach(card => {
         try {
           // Update attributes so subsequent drags use local path
-          card.setAttribute('data-url', localPath);
-          if (!isDirectUrl) {
-            card.setAttribute('data-cached', 'true');
-            card.classList.remove('locked-token');
-            // Update icon
-            const icon = card.querySelector('.fa-nexus-status-icon');
-            if (icon) {
-              icon.classList.remove('cloud-plus', 'cloud');
-              icon.classList.add('cloud', 'cached');
-              icon.title = 'Downloaded';
-              icon.innerHTML = '<i class="fas fa-cloud-check"></i>';
-            }
-          }
-        } catch (_) {}
+          applyTokenCardCachedState(card, localPath, {
+            iconSelector: '.fa-nexus-status-icon',
+            iconClassesToRemove: ['cloud-plus', 'cloud'],
+            setResolvedLocalPath: false,
+            swallowErrors: false
+          });
+        } catch (error) {
+          Logger.warn('ActorFactory.wildcardVariants.cardUpdate.failed', ActorFactory._wildcardVariantWarningContext({
+            filename,
+            error
+          }));
+        }
       });
-    } catch (_) {}
+    } catch (error) {
+      Logger.warn('ActorFactory.wildcardVariants.gridUpdate.failed', ActorFactory._wildcardVariantWarningContext({
+        filename,
+        error
+      }));
+    }
   }
 }

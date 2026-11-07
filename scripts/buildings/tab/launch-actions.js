@@ -1,4 +1,7 @@
 import { NexusLogger as Logger } from '../../core/nexus-logger.js';
+import { isKeyEventForTextEntry } from '../../core/keyboard-text-entry.js';
+import { isSessionExitQuestionOpen } from '../../premium/session-host/cancel-session-dialog.js';
+import { isPremiumAuthFailure, isProTierRefusal, proTierMessage } from '../../premium/session-host/auth-state.js';
 import { resolvePlacementAnchorTile } from '../../canvas/elevation-band-utils.js';
 import { NONE_TEXTURE_KEY } from './constants.js';
 
@@ -20,7 +23,7 @@ export const launchActionMethods = {
     if (this._activeSubtab === 'building') {
       if (this._isPathsItem(item)) {
         if (this._isCardPremiumLocked(item, cardElement)) {
-          ui?.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
+          ui?.notifications?.error?.(this._lockedPremiumAssetMessage());
           return;
         }
         const ready = await this._ensureBuildingAssetReady(cardElement, item, {
@@ -44,7 +47,7 @@ export const launchActionMethods = {
       }
       if (this._isTextureItem(item)) {
         if (!this._isNoneTextureItem(item) && this._isCardPremiumLocked(item, cardElement)) {
-          ui?.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
+          ui?.notifications?.error?.(this._lockedPremiumAssetMessage());
           return;
         }
         if (!this._isNoneTextureItem(item)) {
@@ -65,7 +68,7 @@ export const launchActionMethods = {
   async _ensureBuildingAssetReady(cardElement, item, { triggerEvent = null, label = 'Preparing asset...' } = {}) {
     if (!item || this._isNoneTextureItem(item)) return true;
     if (this._isCardPremiumLocked(item, cardElement)) {
-      ui?.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
+      ui?.notifications?.error?.(this._lockedPremiumAssetMessage());
       return false;
     }
     const ensureLocal = this._cards?.ensureLocalAssetForCard;
@@ -121,13 +124,34 @@ export const launchActionMethods = {
 
   _resolveAssetLocalPath(item, cardElement) {
     if (!item) return '';
-    if (item.cachedLocalPath) return item.cachedLocalPath;
-    const cardUrl = cardElement?.getAttribute?.('data-url');
-    if (cardUrl) {
-      item.cachedLocalPath = cardUrl;
-      return cardUrl;
+    const source = (cardElement?.getAttribute?.('data-source') || item?.source || '').toLowerCase();
+    const isCloud = source === 'cloud';
+    const rawCatalogPath = cardElement?.getAttribute?.('data-content-path') || this._resolveFilePath?.(item) || item?.file_path || item?.path || item?.url || '';
+    const normalize = (value) => String(value || '').replace(/^\/+/, '');
+    const isCatalogPath = (value) => !!value && normalize(value) === normalize(rawCatalogPath);
+    const acceptResolvedPath = (value) => {
+      if (!value || (isCloud && isCatalogPath(value))) return '';
+      item.cachedLocalPath = value;
+      return value;
+    };
+
+    const itemPath = acceptResolvedPath(item.cachedLocalPath);
+    if (itemPath) return itemPath;
+
+    const cardUrl = acceptResolvedPath(cardElement?.getAttribute?.('data-url'));
+    if (cardUrl) return cardUrl;
+
+    if (isCloud) {
+      const localPath = this.downloadManager?.getLocalPath?.('assets', item) || '';
+      if (localPath) {
+        this._cards?._markCardAsCached?.(cardElement, item, localPath);
+        item.cachedLocalPath = item.cachedLocalPath || localPath;
+        return localPath;
+      }
+      return '';
     }
-    const filePath = cardElement?.getAttribute?.('data-file-path') || this._resolveFilePath?.(item) || item?.file_path || item?.path || item?.url || '';
+
+    const filePath = cardElement?.getAttribute?.('data-content-path') || cardElement?.getAttribute?.('data-file-path') || this._resolveFilePath?.(item) || item?.file_path || item?.path || item?.url || '';
     if (filePath) item.cachedLocalPath = filePath;
     return filePath;
   },
@@ -183,9 +207,11 @@ export const launchActionMethods = {
       this._attachEscapeListener();
     } catch (error) {
       Logger.warn?.('BuildingsTab.building.start.failed', { mode, error: String(error?.message || error) });
-      const code = String(error?.code || error?.name || '').toUpperCase();
-      if (code === 'ENTITLEMENT_REQUIRED' || /premium/i.test(String(error?.message || ''))) {
-        ui?.notifications?.warn?.('Building Editor is a premium feature. Please connect Patreon to continue.');
+      if (isProTierRefusal(error)) {
+        ui?.notifications?.warn?.(proTierMessage('The Building Tool'));
+        try { this.app?._syncPremiumDisclaimer?.(); } catch (_) {}
+      } else if (isPremiumAuthFailure(error)) {
+        await this._cards?._handlePremiumAuthFailure?.(error, { featureId: 'building.edit', label: 'Building Editor', source: 'buildings-tab:start' });
       } else {
         ui?.notifications?.error?.(`Failed to start Building Editor: ${error?.message || error}`);
       }
@@ -209,7 +235,7 @@ export const launchActionMethods = {
     }
     const authed = typeof this._hasPremiumAuth === 'function' ? this._hasPremiumAuth() : false;
     if (authed) return true;
-    ui?.notifications?.error?.('Building Editor is a premium feature. Please connect Patreon.');
+    ui?.notifications?.error?.('The Building Tool is a Pro tool. Connect Patreon to use it.');
     return false;
   },
 
@@ -221,6 +247,19 @@ export const launchActionMethods = {
       return;
     }
     if (reason === 'tab-deactivate') {
+      if (manager.isCurrentBuildingEditSessionActive) {
+        // The dev tracer owns its own exit prompt; stopping routes through it.
+        if (manager.isCurrentBuildingEditTracerActive) {
+          this._stopBuildingManager(manager, { reason });
+          return;
+        }
+        // Live WP3 finding (T5): a LIVE bundle Building session is canvas-scoped, not
+        // tab-scoped. Tab deactivation — including the deactivate/activate cycle a same-tab
+        // re-render runs during a wall-card click — must never commit, cancel, or stop it;
+        // the draft stays live and finishes only through an explicit Commit or Cancel.
+        Logger.info?.('BuildingsTab.building.deactivate.keepLiveSession', { reason });
+        return;
+      }
       const hasChanges = typeof manager.hasSessionChanges === 'function'
         ? manager.hasSessionChanges()
         : true;
@@ -258,15 +297,15 @@ export const launchActionMethods = {
     }
     if (reason === 'esc') {
       if (typeof manager.requestCancelSession === 'function') {
-        const cancelPromise = manager.requestCancelSession({ reason });
-        if (cancelPromise?.catch) {
-          cancelPromise.catch((error) => {
+        Promise.resolve()
+          .then(() => manager.requestCancelSession({ reason }))
+          .then(() => {
+            if (!manager.isActive) this._detachEscapeListener();
+          })
+          .catch((error) => {
             Logger.warn?.('BuildingsTab.building.cancel.failed', { reason, error: String(error?.message || error) });
+            ui?.notifications?.error?.(`Building Edit close decision failed: ${String(error?.message || error)}`);
           });
-        }
-        Promise.resolve(cancelPromise).then((cancelled) => {
-          if (cancelled || !manager.isActive) this._detachEscapeListener();
-        });
         return;
       }
     }
@@ -279,14 +318,16 @@ export const launchActionMethods = {
       Promise.resolve(stopPromise)
         .catch((error) => {
           Logger.warn?.('BuildingsTab.building.stop.failed', { reason, error: String(error?.message || error) });
+          ui?.notifications?.error?.(`Building Edit close decision failed: ${String(error?.message || error)}`);
         })
-        .finally(() => {
-          this._detachEscapeListener();
+        .then(() => {
+          if (!manager?.isActive) this._detachEscapeListener();
         });
       return stopPromise;
     } catch (error) {
       Logger.warn?.('BuildingsTab.building.stop.failed', { reason, error: String(error?.message || error) });
-      this._detachEscapeListener();
+      ui?.notifications?.error?.(`Building Edit close decision failed: ${String(error?.message || error)}`);
+      if (!manager?.isActive) this._detachEscapeListener();
       return null;
     }
   },
@@ -312,6 +353,10 @@ export const launchActionMethods = {
   _handleGlobalKeydown(event) {
     if (!event || event.key !== 'Escape') return;
     if (!this._buildingManager?.isActive) return;
+    // Escape in a search or number box clears or leaves that box. It does not cancel the Building.
+    if (isKeyEventForTextEntry(event)) return;
+    // Escape in the Commit / Discard / Continue Editing question answers that question only.
+    if (isSessionExitQuestionOpen()) return;
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation?.();

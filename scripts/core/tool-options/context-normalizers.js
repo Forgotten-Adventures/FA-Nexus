@@ -220,6 +220,8 @@ export function prepareShapeStackingContext(raw) {
         hasSelection: !!shapeStackingRaw.hasSelection,
         orderLabel: typeof shapeStackingRaw.orderLabel === 'string' ? shapeStackingRaw.orderLabel : '',
         elevationLabel: typeof shapeStackingRaw.elevationLabel === 'string' ? shapeStackingRaw.elevationLabel : '',
+        raiseDisabled: !!shapeStackingRaw.raiseDisabled,
+        lowerDisabled: !!shapeStackingRaw.lowerDisabled,
         pushTopDisabled: !!shapeStackingRaw.pushTopDisabled,
         pushBottomDisabled: !!shapeStackingRaw.pushBottomDisabled,
         hint: typeof shapeStackingRaw.hint === 'string' ? shapeStackingRaw.hint : ''

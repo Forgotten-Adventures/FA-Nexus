@@ -10,35 +10,17 @@ import {
   migrateLegacyPathTileDocument,
   migrateLegacyPathTilesInScene
 } from './legacy-path-migration.js';
+import { registerCustomTileRenderLifecycle } from '../canvas/custom-tile-render-scheduler.js';
+import { shouldSkipLinkedTileCleanup } from '../canvas/linked-tile-cleanup-guard.js';
+import { resolveCanvasTilePlaceable } from '../canvas/tile-targets.js';
+import { shouldIgnoreSceneGroupNativeDeletion } from '../composition/scene-group-native-deletion-policy.js';
+
+const localDeletes = new WeakSet();
 
 export { applyPathTile, rehydrateAllPathTiles, cleanupPathOverlay };
 
-const PRESERVE_LINKED_TILE_CLEANUP_OPTION = 'faNexusPreserveLinkedTileCleanup';
-
-function shouldSkipPathWallCleanup(doc = null, options = {}) {
-  try {
-    if (options?.[PRESERVE_LINKED_TILE_CLEANUP_OPTION]) return true;
-    if (globalThis?.FA_NEXUS_SUPPRESS_LINKED_TILE_DELETE) return true;
-    const suppressedIds = globalThis?.FA_NEXUS_SUPPRESS_LINKED_TILE_DELETE_IDS;
-    const docId = doc?.id || doc?._id || null;
-    return !!(docId && suppressedIds instanceof Set && suppressedIds.has(docId));
-  } catch (_) {
-    return false;
-  }
-}
-
 function stringifyError(error) {
   return String(error?.message || error);
-}
-
-function findTileForDocument(doc) {
-  try {
-    const tileId = doc?.id || doc?._id || null;
-    if (!tileId) return null;
-    return canvas?.tiles?.placeables?.find((tile) => tile?.document?.id === tileId) || null;
-  } catch (_) {
-    return null;
-  }
 }
 
 async function migrateAndApplyPathTile(doc, reason) {
@@ -51,11 +33,16 @@ async function migrateAndApplyPathTile(doc, reason) {
       error: stringifyError(error)
     });
   }
-  const tile = findTileForDocument(doc);
+  const tile = resolveCanvasTilePlaceable(doc);
   if (tile) await applyPathTile(tile);
 }
 
 try {
+  registerCustomTileRenderLifecycle({
+    id: 'path-tiles',
+    callback: applyPathTile,
+    logCode: 'PathTiles.lifecycle.failed'
+  });
   Hooks.on('canvasReady', () => {
     void (async () => {
       await migrateLegacyPathTilesInScene(canvas?.scene, { reason: 'canvasReady' });
@@ -63,9 +50,6 @@ try {
     })().catch((error) => {
       Logger.error?.('LegacyPathMigration.canvasReady.failed', { error: stringifyError(error) });
     });
-  });
-  Hooks.on('drawTile', (tile) => {
-    try { applyPathTile(tile); } catch (_) {}
   });
   Hooks.on('createTile', (doc) => {
     void migrateAndApplyPathTile(doc, 'createTile').catch((error) => {
@@ -83,12 +67,19 @@ try {
       });
     });
   });
+  Hooks.on('preDeleteTile', (doc) => { localDeletes.add(doc); });
   Hooks.on('deleteTile', (doc, options) => {
     try {
-      const tile = canvas.tiles?.placeables?.find((t) => t?.document?.id === doc.id);
+      const tile = resolveCanvasTilePlaceable(doc);
       if (tile) cleanupPathOverlay(tile);
     } catch (_) {}
-    if (!shouldSkipPathWallCleanup(doc, options)) {
+    const initiatedHere = localDeletes.delete(doc);
+    const registeredOwner = doc.parent?.getFlag?.('fa-nexus', 'compositionRegistry')?.relationships?.some(
+      relation => relation.ownerUuid === doc.uuid && relation.type === 'generated-by' && relation.generator === 'path-v2');
+    // Registered ownership and atomic group commands have their own complete
+    // cascade. This older hook must never become a second destructive writer.
+    if (initiatedHere && !registeredOwner && !shouldIgnoreSceneGroupNativeDeletion(options)
+      && !options?.faNexusSceneGroupCommand && !shouldSkipLinkedTileCleanup(doc, options)) {
       Promise.resolve(cleanupPathWallsForTile(doc)).catch((error) => {
         Logger.warn?.('PathTiles.deleteTile.cleanup.failed', {
           tileId: doc?.id || null,

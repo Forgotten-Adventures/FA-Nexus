@@ -125,7 +125,8 @@ export function syncLayerManagerCollapsedStateFromSettings() {
 
 export function reconcileLayerManagerCollapsedState({
   sessionState = null,
-  hierarchy = null
+  hierarchy = null,
+  extraVisibleKeys = null
 } = {}) {
   if (!sessionState) {
     return {
@@ -138,13 +139,14 @@ export function reconcileLayerManagerCollapsedState({
     sessionState.collapsedElevations = new Set();
   }
   const visibleKeys = hierarchy?.visibleKeys instanceof Set ? hierarchy.visibleKeys : new Set();
+  const additionalVisibleKeys = extraVisibleKeys instanceof Set ? extraVisibleKeys : new Set(extraVisibleKeys || []);
   const staleSyntheticKeys = [];
   const collapsedKeys = Array.from(new Set(Array.from(sessionState.collapsedElevations)
     .map((key) => normalizeCollapsedElevationKey(key))
     .filter((key) => {
       if (!key) return false;
       if (!isSyntheticCollapsedElevationKey(key)) return true;
-      if (visibleKeys.has(key)) return true;
+      if (visibleKeys.has(key) || additionalVisibleKeys.has(key)) return true;
       staleSyntheticKeys.push(key);
       return false;
     })))

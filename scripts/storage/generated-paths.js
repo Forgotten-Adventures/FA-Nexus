@@ -3,6 +3,7 @@ import {
   sanitizeGeneratedPathSegment,
   sanitizeStoragePathSegments
 } from './path-utils.js';
+import { getContentKindDescriptor } from '../content/content-kind-descriptors.js';
 
 const MODULE_ID = 'fa-nexus';
 const GENERATED_ROOT_SEGMENT = '__generated';
@@ -16,10 +17,11 @@ export {
 };
 
 export function getConfiguredAssetsDir({ moduleId = MODULE_ID } = {}) {
+  const defaultDir = getContentKindDescriptor('assets').downloadDirDefault;
   try {
-    return String(game?.settings?.get?.(moduleId, 'cloudDownloadDirAssets') || 'fa-nexus-assets').trim() || 'fa-nexus-assets';
+    return String(game?.settings?.get?.(moduleId, 'cloudDownloadDirAssets') || defaultDir).trim() || defaultDir;
   } catch (_) {
-    return 'fa-nexus-assets';
+    return defaultDir;
   }
 }
 
@@ -69,5 +71,32 @@ export function resolveGeneratedSceneFolder(kind, { root, assetsDir, worldId, sc
     worldId: sanitizeGeneratedPathSegment(worldId || getCurrentWorldId(), ''),
     sceneId: sanitizeGeneratedPathSegment(sceneId || getSceneId(), ''),
     folder: buildSceneGeneratedFolder(generatedRoot, { worldId, sceneId })
+  };
+}
+
+export function resolveGeneratedMaskSlotPath({
+  root,
+  assetsDir,
+  worldId,
+  sceneId,
+  family = 'mask',
+  slotId = '',
+  slot = 'a',
+  extension = 'webp'
+} = {}) {
+  const generatedPath = resolveGeneratedSceneFolder('masks', { root, assetsDir, worldId, sceneId });
+  const safeFamily = sanitizeGeneratedPathSegment(family, 'mask');
+  const safeSlotId = sanitizeGeneratedPathSegment(slotId, 'mask');
+  const safeSlot = sanitizeGeneratedPathSegment(slot, 'a').toLowerCase() === 'b' ? 'b' : 'a';
+  const safeExtension = sanitizeGeneratedPathSegment(String(extension || 'webp').replace(/^\.+/, ''), 'webp').toLowerCase();
+  const filename = `${safeFamily}-${safeSlotId}-${safeSlot}.${safeExtension}`;
+  return {
+    ...generatedPath,
+    family: safeFamily,
+    slotId: safeSlotId,
+    slot: safeSlot,
+    extension: safeExtension,
+    filename,
+    path: appendStoragePath(generatedPath.folder, filename)
   };
 }

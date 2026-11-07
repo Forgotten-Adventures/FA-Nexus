@@ -85,6 +85,7 @@ function buildCustomRenderFeatures({
   hasBuildingFill = false,
   hasBuildingDoorFrame = false,
   hasBuildingComposite = false,
+  hasBuildingSills = false,
   runtimeOverlayFeatures = []
 } = {}) {
   const features = [];
@@ -98,78 +99,9 @@ function buildCustomRenderFeatures({
   if (hasBuildingFill) pushUnique(features, 'buildingFill');
   if (hasBuildingDoorFrame) pushUnique(features, 'buildingDoorFrame');
   if (hasBuildingComposite) pushUnique(features, 'buildingComposite');
+  if (hasBuildingSills) pushUnique(features, 'buildingSills');
   for (const feature of runtimeOverlayFeatures) pushUnique(features, feature);
   return features;
-}
-
-function resolveTransformHandleSupport({
-  isCustomRendered = false,
-  hasFlattened = false,
-  hasMaskedTiling = false,
-  hasStandardTileMask = false,
-  hasAssetScatter = false,
-  hasBuilding = false,
-  hasBuildingFill = false,
-  hasBuildingDoorFrame = false,
-  hasBuildingComposite = false,
-  hasLegacyPath = false,
-  hasPathV2 = false,
-  hasPathsV2 = false,
-  runtimeOverlayFeatures = []
-} = {}) {
-  if (!isCustomRendered) {
-    return {
-      enabled: true,
-      reason: 'plain-tile'
-    };
-  }
-
-  if (hasLegacyPath || hasPathV2 || hasPathsV2) {
-    return {
-      enabled: false,
-      reason: 'path-runtime'
-    };
-  }
-
-  if (hasAssetScatter) {
-    return {
-      enabled: false,
-      reason: 'scatter-runtime'
-    };
-  }
-
-  if (hasBuilding || hasBuildingFill || hasBuildingDoorFrame || hasBuildingComposite) {
-    return {
-      enabled: false,
-      reason: 'building-runtime'
-    };
-  }
-
-  if (hasFlattened && (hasMaskedTiling || hasStandardTileMask)) {
-    return {
-      enabled: false,
-      reason: 'flattened-texture-runtime'
-    };
-  }
-
-  if (hasMaskedTiling || hasStandardTileMask) {
-    return {
-      enabled: true,
-      reason: 'texture-runtime'
-    };
-  }
-
-  if (runtimeOverlayFeatures.length) {
-    return {
-      enabled: false,
-      reason: 'unknown-runtime-overlay'
-    };
-  }
-
-  return {
-    enabled: false,
-    reason: 'custom-render-tile'
-  };
 }
 
 export function getFaNexusTileCapabilities(target) {
@@ -186,6 +118,7 @@ export function getFaNexusTileCapabilities(target) {
   const buildingFill = readModuleFlag(document, 'buildingFill');
   const buildingDoorFrame = readModuleFlag(document, 'buildingDoorFrame');
   const buildingComposite = readModuleFlag(document, 'buildingComposite');
+  const buildingSills = readModuleFlag(document, 'buildingSills');
   const flattened = readModuleFlag(document, 'flattened');
 
   const hasLegacyPath = hasControlPoints(legacyPath);
@@ -198,6 +131,7 @@ export function getFaNexusTileCapabilities(target) {
   const hasBuildingFill = isObjectLike(buildingFill);
   const hasBuildingDoorFrame = isObjectLike(buildingDoorFrame);
   const hasBuildingComposite = isObjectLike(buildingComposite);
+  const hasBuildingSills = isObjectLike(buildingSills);
   const hasFlattened = isObjectLike(flattened);
 
   const runtimeOverlayFeatures = detectRuntimeOverlayFeatures(tile);
@@ -212,12 +146,14 @@ export function getFaNexusTileCapabilities(target) {
     hasBuildingFill,
     hasBuildingDoorFrame,
     hasBuildingComposite,
+    hasBuildingSills,
     runtimeOverlayFeatures
   });
 
   const hasPathData = hasLegacyPath || hasPathV2 || hasPathsV2;
   const hasMaskData = hasMaskedTiling || hasStandardTileMask;
-  const isBuildingRelated = hasBuilding || hasBuildingFill || hasBuildingDoorFrame || hasBuildingComposite;
+  const isBuildingRelated = hasBuilding || hasBuildingFill || hasBuildingDoorFrame
+    || hasBuildingComposite || hasBuildingSills;
   const isCustomRendered = customRenderFeatures.length > 0;
 
   const textureSrc = String(document?.texture?.src || '').trim();
@@ -229,7 +165,10 @@ export function getFaNexusTileCapabilities(target) {
   if (hasPathData) editMode = 'paths';
   else if (hasMaskedTiling) editMode = 'textures';
   else if (isBuildingRelated) editMode = 'buildings';
-  else if (hasAssetScatter || hasTexture || hasFlattened) editMode = 'assets';
+  // A flattened picture has no editor of its own: the asset editor would replace the section's picture with one
+  // asset. Its actions are Apply Mask and Deconstruct.
+  else if (hasFlattened) editMode = null;
+  else if (hasAssetScatter || hasTexture) editMode = 'assets';
 
   const preferredPathEditor = hasPathV2 || hasPathsV2
     ? 'v2'
@@ -239,22 +178,6 @@ export function getFaNexusTileCapabilities(target) {
     && hasLegacyPath
     && !hasPathV2
     && !hasPathsV2;
-
-  const transformHandlePolicy = resolveTransformHandleSupport({
-    isCustomRendered,
-    hasFlattened,
-    hasMaskedTiling,
-    hasStandardTileMask,
-    hasAssetScatter,
-    hasBuilding,
-    hasBuildingFill,
-    hasBuildingDoorFrame,
-    hasBuildingComposite,
-    hasLegacyPath,
-    hasPathV2,
-    hasPathsV2,
-    runtimeOverlayFeatures
-  });
 
   return {
     document,
@@ -268,8 +191,6 @@ export function getFaNexusTileCapabilities(target) {
     hasMaskData,
     isBuildingRelated,
     isCustomRendered,
-    supportsTransformHandles: transformHandlePolicy.enabled,
-    transformHandlePolicyReason: transformHandlePolicy.reason,
     requiresLegacyPathMigration,
     customRenderFeatures,
     runtimeOverlayFeatures,
@@ -283,6 +204,7 @@ export function getFaNexusTileCapabilities(target) {
     hasBuildingFill,
     hasBuildingDoorFrame,
     hasBuildingComposite,
+    hasBuildingSills,
     hasFlattened
   };
 }

@@ -3,6 +3,7 @@ import {
   getGroundBandLocalOffset,
   getGroundBandRenderSort,
   getSceneLevelElevationRanges,
+  getTileRenderElevation,
   isKeepTokensAboveTileElevationsEnabled
 } from './elevation-band-utils.js';
 import { getRawLevelIds } from './tile-level-membership.js';
@@ -75,7 +76,7 @@ function buildBandCandidates(elevation, ranges = []) {
   for (let index = 0; index < ranges.length; index += 1) {
     const range = ranges[index];
     if (!range) continue;
-    if (isInBand(elevation, range.bottom)) {
+    if (isInBand(elevation, range.base ?? range.bottom)) {
       candidates.push({
         kind: 'ground',
         placementLevelId: normalizeId(range.levelId),
@@ -125,13 +126,15 @@ export function resolveTilePlacementLevelId(target, {
   placementLevelId = null,
   visibleLevelIds = null,
   allowSingleLevelInference = true,
-  requireVisibleMembership = true
+  requireVisibleMembership = false
 } = {}) {
   const ranges = getSceneLevelElevationRanges(scene);
   const visibleIds = Array.isArray(visibleLevelIds) ? visibleLevelIds.slice() : getTileVisibleLevelIds(target);
   const explicit = normalizeId(placementLevelId) || getTileExplicitPlacementLevelId(target);
   if (explicit) {
     const range = getSceneRangeById(explicit, { scene, ranges });
+    // Parent chooses artwork ordering; native memberships govern visibility.
+    // They may deliberately differ, so membership validation is opt-in.
     const visible = !visibleIds.length || visibleIds.includes(explicit);
     if (range && (!requireVisibleMembership || visible)) {
       return { levelId: explicit, range, source: 'explicit' };
@@ -171,7 +174,7 @@ export function analyzeTileBandState(target, {
   visibleLevelIds = null,
   placementLevelId = null,
   allowSingleLevelInference = true,
-  requireVisibleMembership = true,
+  requireVisibleMembership = false,
   allowCurrentLevelFallback = false
 } = {}) {
   const doc = target?.document || target || null;
@@ -248,7 +251,7 @@ export function analyzeTileBandState(target, {
 
   if (matchingCandidate.kind === 'ground') {
     const renderSort = getGroundBandRenderSort(documentElevation, documentSort, { enabled: true, scene });
-    const renderElevation = Number(matchingCandidate?.placementRange?.bottom);
+    const renderElevation = Number(matchingCandidate.placementRange.base ?? matchingCandidate.placementRange.bottom);
     const renderOrder = renderSort === null ? null : {
       elevation: Number.isFinite(renderElevation) ? renderElevation : documentElevation,
       sortLayer: sortLayers.TILES,
@@ -334,5 +337,31 @@ export function resolveTileRenderOrder(target, options = {}) {
     sortLayer: sortLayers.TILES,
     sort,
     zIndex: 0
+  };
+}
+
+export function resolvePreviewTileRenderOrdering(baseSort, elevation, {
+  fallbackZIndex = baseSort,
+  placementLevelId = null
+} = {}) {
+  const numericBaseSort = Number(baseSort);
+  const resolvedBaseSort = Number.isFinite(numericBaseSort) ? numericBaseSort : 0;
+  const numericElevation = Number(elevation ?? 0);
+  const resolvedElevation = Number.isFinite(numericElevation) ? numericElevation : 0;
+  const normalizedPlacementLevelId = String(placementLevelId || getDefaultTilePlacementLevelId() || '').trim() || null;
+  const renderOrder = resolveTileRenderOrder({ elevation: resolvedElevation, sort: resolvedBaseSort }, {
+    elevation: resolvedElevation,
+    sort: resolvedBaseSort,
+    placementLevelId: normalizedPlacementLevelId,
+    allowCurrentLevelFallback: true
+  });
+  const groundBandSort = getGroundBandRenderSort(resolvedElevation, resolvedBaseSort);
+  return {
+    sort: Number.isFinite(Number(renderOrder?.sort)) ? Number(renderOrder.sort) : (groundBandSort ?? resolvedBaseSort),
+    zIndex: renderOrder?.kind === 'normal' ? fallbackZIndex : resolvedBaseSort,
+    renderElevation: Number.isFinite(Number(renderOrder?.elevation)) ? Number(renderOrder.elevation) : getTileRenderElevation(resolvedElevation),
+    sortLayer: Number.isFinite(Number(renderOrder?.sortLayer)) ? Number(renderOrder.sortLayer) : null,
+    kind: renderOrder?.kind || 'normal',
+    placementLevelId: renderOrder?.placementLevelId || normalizedPlacementLevelId
   };
 }

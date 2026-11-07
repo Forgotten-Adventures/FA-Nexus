@@ -3,8 +3,8 @@ import {
   mapTileOcclusionElevation,
   tileUsesSurfaceTileOcclusion
 } from './tile-occlusion.js';
-import { getFaNexusTileCapabilities } from './tile-capabilities.js';
-import { getCachedPixiTexture } from '../core/foundry-texture-loader-patch.js';
+import { TileControlledInteractionRefresh } from './tile-controlled-interaction-refresh.js';
+import { getCachedFoundryTexture } from '../core/foundry-texture-cache.js';
 import { encodeTexturePath } from '../textures/texture-runtime-core.js';
 
 const DEFAULT_ALPHA_THRESHOLD = 1 / 255;
@@ -29,14 +29,14 @@ const INTERACTION_PRIORITY_KEYS = Object.freeze([
 ]);
 const MODULE_ID = 'fa-nexus';
 const TILE_SELECTION_SETTING = 'tilePixelSelection';
+const TILE_ALPHA_HIT_AREA_FALLBACK_WARNED_TILES = new WeakSet();
 
 const _tempPointA = new PIXI.Point();
 const _tempPointB = new PIXI.Point();
+const _tempTilingPoint = new PIXI.Point();
 const _tempPointHandle = new PIXI.Point();
 const _tempScenePoint = new PIXI.Point();
 const V14_TILE_CONTROL_HANDLE_NAMES = new Set(['translate', 'scale', 'scaleX', 'scaleY', 'rotate']);
-const V14_TILE_RESIZE_HANDLE_NAMES = new Set(['scale', 'scaleX', 'scaleY', 'rotate']);
-const CONTROLLED_TILE_REFRESH_DELAYS_MS = [0, 16, 80, 180];
 const SURFACE_OCCLUSION_ISSUES = new Set();
 
 class TileAlphaHitArea {
@@ -56,13 +56,63 @@ class TileAlphaHitArea {
       if (!TilePixelSelection._pointHasVisibleAlpha(tile, world.x, world.y)) return false;
       return !TilePixelSelection._pointOccludedByHigherTile(tile, world.x, world.y);
     } catch (err) {
-      Logger.debug('TileAlphaHitArea.contains failed', err);
-      return true; // fall back to default behaviour on error
+      const tileId = tile?.id ?? null;
+      const documentId = tile?.document?.id ?? null;
+      const context = {
+        tileId,
+        documentId,
+        error: String(err)
+      };
+      if (Number.isFinite(localX)) context.localX = localX;
+      if (Number.isFinite(localY)) context.localY = localY;
+
+      const tileObject = tile && (typeof tile === 'object' || typeof tile === 'function') ? tile : null;
+      if (!tileObject || !TILE_ALPHA_HIT_AREA_FALLBACK_WARNED_TILES.has(tileObject)) {
+        if (tileObject) TILE_ALPHA_HIT_AREA_FALLBACK_WARNED_TILES.add(tileObject);
+        Logger.warn('TileAlphaHitArea.contains.fallback', context);
+      }
+
+      const originalHitArea = tile?._faNexusOriginalHitArea;
+      if (originalHitArea && typeof originalHitArea.contains === 'function') {
+        try {
+          return originalHitArea.contains(localX, localY);
+        } catch (_) {
+          return false;
+        }
+      }
+      return false;
     }
   }
 }
 
 export class TilePixelSelection {
+  static pointHasVisibleAlphaAtPoint(tile, worldX, worldY) {
+    const x = Number(worldX);
+    const y = Number(worldY);
+    if (![x, y].every(Number.isFinite)) {
+      throw new Error('Tile alpha hit testing requires finite renderer coordinates.');
+    }
+    return this._isTileInteractionCandidate(tile)
+      && this._pointWithinTileBounds(tile, x, y)
+      && this._pointHasVisibleAlpha(tile, x, y);
+  }
+
+  static resolveTopmostOpaqueTileAtPoint(worldX, worldY, { tiles = null } = {}) {
+    const x = Number(worldX);
+    const y = Number(worldY);
+    if (![x, y].every(Number.isFinite)) {
+      throw new Error('Tile pixel hit resolution requires finite renderer coordinates.');
+    }
+    const candidates = (Array.isArray(tiles) ? tiles : canvas?.tiles?.placeables || [])
+      .filter((tile) => this._isTileInteractionCandidate(tile))
+      .sort((left, right) => this._compareTileInteractionPriority(right, left));
+    for (const tile of candidates) {
+      if (!this._pointWithinTileBounds(tile, x, y)) continue;
+      if (this._pointHasVisibleAlpha(tile, x, y)) return tile;
+    }
+    return null;
+  }
+
   static install() {
     if (this._installed) return;
     this._installed = true;
@@ -70,7 +120,7 @@ export class TilePixelSelection {
     this._canvasReady = !!globalThis.canvas?.ready;
     this._settingEnabled = this._getSettingEnabled();
     this._alphaCache = new WeakMap();
-    this._controlledTileRefreshBatch = null;
+    this._controlledInteractionRefresh = this._createControlledInteractionRefresh();
     this._interactiveHandleOwnerCache = null;
     this._interactiveHandleCacheVersion = 0;
     this._active = false;
@@ -81,7 +131,6 @@ export class TilePixelSelection {
       this._clearControlledInteractionRefreshBatch();
       this._invalidateInteractiveHandleOwnerCache();
       this._applyActivation({ rebindAll: true });
-      this._updateAllResizeHandles();
     });
 
     Hooks.on('canvasTearDown', () => {
@@ -106,7 +155,6 @@ export class TilePixelSelection {
     });
     Hooks.on('controlTile', (tile) => {
       this._handleTileLifecycle(tile);
-      this._updateResizeHandleState(tile);
       this._invalidateInteractiveHandleOwnerCache();
       this._scheduleControlledInteractionRefresh(tile, 'controlTile');
     });
@@ -115,13 +163,11 @@ export class TilePixelSelection {
       if (data.key === TILE_SELECTION_SETTING) {
         this._settingEnabled = this._getSettingEnabled();
         this._applyActivation({ rebindAll: true });
-        this._updateAllResizeHandles();
         this._invalidateInteractiveHandleOwnerCache();
       }
     });
 
     this._applyActivation({ rebindAll: true });
-    this._updateAllResizeHandles();
   }
 
   static _bindAllTiles() {
@@ -129,10 +175,7 @@ export class TilePixelSelection {
     try {
       const tiles = canvas.tiles?.placeables;
       if (!Array.isArray(tiles)) return;
-      for (const tile of tiles) {
-        this._updateResizeHandleState(tile);
-        this._bindTile(tile);
-      }
+      for (const tile of tiles) this._bindTile(tile);
     } catch (err) {
       Logger.debug('TilePixelSelection._bindAllTiles failed', err);
     }
@@ -150,370 +193,63 @@ export class TilePixelSelection {
 
   static _handleTileLifecycle(tile) {
     if (!tile || tile.destroyed) return;
-    this._updateResizeHandleState(tile);
     if (this._active) this._bindTile(tile);
     else this._unbindTile(tile);
   }
 
   static _scheduleControlledInteractionRefresh(tile, reason = 'unknown') {
-    try {
-      if (!tile || tile.destroyed || !tile.controlled) return;
-      if (!this._controlledTileRefreshBatch) {
-        this._controlledTileRefreshBatch = {
-          tiles: new Set(),
-          timers: new Map(),
-          reasons: new Set()
-        };
-      }
-      const batch = this._controlledTileRefreshBatch;
-      batch.tiles.add(tile);
-      batch.reasons.add(String(reason || 'unknown'));
-      for (const delayMs of CONTROLLED_TILE_REFRESH_DELAYS_MS) {
-        if (batch.timers.has(delayMs)) continue;
-        const timeoutId = setTimeout(() => {
-          try {
-            this._refreshControlledTileInteractionBatch(delayMs);
-          } finally {
-            const active = this._controlledTileRefreshBatch;
-            if (!active?.timers) return;
-            active.timers.delete(delayMs);
-            if (!active.timers.size) this._controlledTileRefreshBatch = null;
-          }
-        }, delayMs);
-        batch.timers.set(delayMs, timeoutId);
-      }
-    } catch (err) {
-      Logger.debug('TilePixelSelection._scheduleControlledInteractionRefresh failed', err);
-    }
+    return this._getControlledInteractionRefresh().schedule(tile, reason);
   }
 
   static _clearControlledInteractionRefreshBatch() {
-    try {
-      const batch = this._controlledTileRefreshBatch;
-      if (batch?.timers instanceof Map) {
-        for (const timeoutId of batch.timers.values()) {
-          try { clearTimeout(timeoutId); } catch (_) {}
-        }
-      }
-    } catch (_) {}
-    this._controlledTileRefreshBatch = null;
+    return this._getControlledInteractionRefresh().clear();
   }
 
   static _refreshControlledTileInteractionBatch(delayMs = 0) {
-    try {
-      const batch = this._controlledTileRefreshBatch;
-      if (!batch?.tiles?.size) return;
-      const tiles = Array.from(batch.tiles).filter((tile) => tile && !tile.destroyed && tile.controlled);
-      if (!tiles.length) return;
-
-      const reasons = Array.from(batch.reasons || []).slice(0, 8);
-      for (const tile of tiles) this._handleTileLifecycle(tile);
-
-      const manager = tiles.find((tile) => tile?.mouseInteractionManager)?.mouseInteractionManager || null;
-      const state = Number(manager?.state ?? 0) || 0;
-      const dragging = !!manager?.isDragging;
-      if (dragging || state > 1) {
-        Logger.trace('tileSelection', 'TilePixelSelection.controlledInteractionBatch.defer', {
-          tileCount: tiles.length,
-          delayMs,
-          reasons,
-          managerState: state,
-          dragging
-        });
-        return;
-      }
-
-      const mouseManager = globalThis?.foundry?.canvas?.interaction?.MouseInteractionManager || globalThis?.MouseInteractionManager;
-      try { mouseManager?.emulateMoveEvent?.(); } catch (_) {}
-      Logger.trace('tileSelection', 'TilePixelSelection.controlledInteractionBatch.refresh', {
-        tileCount: tiles.length,
-        delayMs,
-        reasons,
-        managerStateBefore: state,
-        dragging
-      });
-
-      const finalDelay = CONTROLLED_TILE_REFRESH_DELAYS_MS[CONTROLLED_TILE_REFRESH_DELAYS_MS.length - 1];
-      if (delayMs !== finalDelay) return;
-      const recovery = this._getControlledTileHoverRecoveryCandidate(tiles);
-      if (!recovery?.tile || !recovery.expectation?.shouldHoverTile) return;
-
-      const recovered = this._forceControlledTileHover(recovery.tile);
-      const recoveredState = Number(recovery.tile?.mouseInteractionManager?.state ?? 0) || 0;
-      const recoveredHovered = !!recovery.tile?.hover;
-      if (recovered && (recoveredState > 0 || recoveredHovered)) {
-        Logger.trace('tileSelection', 'TilePixelSelection.controlledInteractionBatch.hoverRearmed', {
-          tileId: recovery.tile?.document?.id || recovery.tile?.id || null,
-          tileCount: tiles.length,
-          delayMs,
-          managerStateAfterRecovery: recoveredState,
-          hovered: recoveredHovered
-        });
-      } else {
-        Logger.warn('TilePixelSelection.controlledInteractionBatch.hoverNotRearmed', {
-          tileId: recovery.tile?.document?.id || recovery.tile?.id || null,
-          tileCount: tiles.length,
-          delayMs,
-          managerStateAfterRecovery: recoveredState,
-          hovered: recoveredHovered,
-          pointerOnBoard: recovery.expectation.onBoard,
-          pointerWithinBounds: recovery.expectation.withinBounds,
-          pointerVisibleAlpha: recovery.expectation.visibleAlpha,
-          pointerHitsResizeHandle: recovery.expectation.hitsResizeHandle,
-          pointerOverTileTarget: recovery.expectation.overTileTarget,
-          pointerOverHandleTarget: recovery.expectation.overHandleTarget
-        });
-      }
-    } catch (err) {
-      Logger.debug('TilePixelSelection._refreshControlledTileInteractionBatch failed', err);
-    }
+    return this._getControlledInteractionRefresh().refreshBatch(delayMs);
   }
 
   static _getControlledTileHoverRecoveryCandidate(tiles = []) {
-    try {
-      const candidates = Array.isArray(tiles)
-        ? tiles.filter((tile) => tile && !tile.destroyed && tile.controlled)
-        : [];
-      if (!candidates.length) return null;
-
-      const pointer = this._getRootPointerContext();
-      if (!pointer.onBoard || !Number.isFinite(pointer.globalX) || !Number.isFinite(pointer.globalY)) return null;
-      const prioritized = candidates.slice().sort((left, right) => this._compareTileInteractionPriority(right, left));
-      for (const tile of prioritized) {
-        const expectation = this._getControlledTileHoverExpectationForPointer(tile, pointer);
-        if (expectation.shouldHoverTile) return { tile, expectation };
-      }
-      return null;
-    } catch (err) {
-      Logger.debug('TilePixelSelection._getControlledTileHoverRecoveryCandidate failed', err);
-      return null;
-    }
+    return this._getControlledInteractionRefresh().getHoverRecoveryCandidate(tiles);
   }
 
   static _refreshControlledTileInteraction(tile, reason = 'unknown') {
-    try {
-      if (!tile || tile.destroyed || !tile.controlled) return;
-      this._handleTileLifecycle(tile);
-
-      const manager = tile.mouseInteractionManager;
-      const state = Number(manager?.state ?? 0) || 0;
-      const dragging = !!manager?.isDragging;
-      if (dragging || state > 1) {
-        Logger.trace('tileSelection', 'TilePixelSelection.controlledInteraction.defer', {
-          tileId: tile?.document?.id || tile?.id || null,
-          reason,
-          managerState: state,
-          dragging
-        });
-        return;
-      }
-
-      const mouseManager = globalThis?.foundry?.canvas?.interaction?.MouseInteractionManager || globalThis?.MouseInteractionManager;
-      const beforeState = Number(manager?.state ?? 0) || 0;
-      try { mouseManager?.emulateMoveEvent?.(); } catch (_) {}
-      const afterState = Number(manager?.state ?? 0) || 0;
-      Logger.trace('tileSelection', 'TilePixelSelection.controlledInteraction.refresh', {
-        tileId: tile?.document?.id || tile?.id || null,
-        reason,
-        managerStateBefore: beforeState,
-        managerStateAfter: afterState,
-        hovered: !!tile?.hover,
-        eventMode: tile?.eventMode ?? null,
-        dragging
-      });
-      if ((afterState === 0) && /:180$/.test(String(reason || ''))) {
-        const hoverExpectation = this._getControlledTileHoverExpectation(tile);
-        if (hoverExpectation.shouldHoverTile) {
-          const recovered = this._forceControlledTileHover(tile);
-          const recoveredState = Number(manager?.state ?? 0) || 0;
-          const recoveredHovered = !!tile?.hover;
-          if (recovered && (recoveredState > 0 || recoveredHovered)) {
-            Logger.trace('tileSelection', 'TilePixelSelection.controlledInteraction.hoverRearmed', {
-              tileId: tile?.document?.id || tile?.id || null,
-              reason,
-              managerStateAfterRecovery: recoveredState,
-              hovered: recoveredHovered,
-              eventMode: tile?.eventMode ?? null,
-              interactiveChildren: tile?.interactiveChildren ?? null,
-              pointerOnBoard: hoverExpectation.onBoard,
-              pointerWithinBounds: hoverExpectation.withinBounds,
-              pointerVisibleAlpha: hoverExpectation.visibleAlpha,
-              pointerHitsResizeHandle: hoverExpectation.hitsResizeHandle,
-              pointerOverTileTarget: hoverExpectation.overTileTarget,
-              pointerOverHandleTarget: hoverExpectation.overHandleTarget
-            });
-          } else {
-            Logger.warn('TilePixelSelection.controlledInteraction.hoverNotRearmed', {
-              tileId: tile?.document?.id || tile?.id || null,
-              reason,
-              hovered: recoveredHovered,
-              eventMode: tile?.eventMode ?? null,
-              interactiveChildren: tile?.interactiveChildren ?? null,
-              managerStateAfterRecovery: recoveredState,
-              pointerOnBoard: hoverExpectation.onBoard,
-              pointerWithinBounds: hoverExpectation.withinBounds,
-              pointerVisibleAlpha: hoverExpectation.visibleAlpha,
-              pointerHitsResizeHandle: hoverExpectation.hitsResizeHandle,
-              pointerOverTileTarget: hoverExpectation.overTileTarget,
-              pointerOverHandleTarget: hoverExpectation.overHandleTarget
-            });
-          }
-        } else {
-          Logger.trace('tileSelection', 'TilePixelSelection.controlledInteraction.idleOffTile', {
-            tileId: tile?.document?.id || tile?.id || null,
-            reason,
-            hovered: !!tile?.hover,
-            eventMode: tile?.eventMode ?? null,
-            interactiveChildren: tile?.interactiveChildren ?? null,
-            pointerOnBoard: hoverExpectation.onBoard,
-            pointerWithinBounds: hoverExpectation.withinBounds,
-            pointerVisibleAlpha: hoverExpectation.visibleAlpha,
-            pointerHitsResizeHandle: hoverExpectation.hitsResizeHandle,
-            pointerOverTileTarget: hoverExpectation.overTileTarget,
-            pointerOverHandleTarget: hoverExpectation.overHandleTarget
-          });
-        }
-      }
-    } catch (err) {
-      Logger.debug('TilePixelSelection._refreshControlledTileInteraction failed', err);
-    }
+    return this._getControlledInteractionRefresh().refreshTile(tile, reason);
   }
 
   static _getRootPointerContext() {
-    try {
-      const eventSystem = canvas?.app?.renderer?.events;
-      const rootPointerEvent = eventSystem?.rootPointerEvent;
-      const clientX = Number(rootPointerEvent?.clientX);
-      const clientY = Number(rootPointerEvent?.clientY);
-      const context = {
-        onBoard: false,
-        clientX: Number.isFinite(clientX) ? clientX : null,
-        clientY: Number.isFinite(clientY) ? clientY : null,
-        globalX: null,
-        globalY: null,
-        overTargets: []
-      };
-
-      const pointerId = rootPointerEvent?.pointerId;
-      const tracking = (pointerId == null) ? null : eventSystem?.rootBoundary?.trackingData?.(pointerId);
-      if (Array.isArray(tracking?.overTargets)) context.overTargets = tracking.overTargets;
-
-      if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return context;
-      const board = canvas?.app?.view || document.querySelector('canvas#board');
-      const boardRect = board?.getBoundingClientRect?.();
-      const hoverElement = document.elementFromPoint(clientX, clientY);
-      context.onBoard = hoverElement?.id === 'board';
-      if (!context.onBoard || !boardRect) return context;
-
-      context.globalX = clientX - boardRect.left;
-      context.globalY = clientY - boardRect.top;
-      return context;
-    } catch (err) {
-      Logger.debug('TilePixelSelection._getRootPointerContext failed', err);
-      return {
-        onBoard: false,
-        clientX: null,
-        clientY: null,
-        globalX: null,
-        globalY: null,
-        overTargets: []
-      };
-    }
+    return this._getControlledInteractionRefresh().getRootPointerContext();
   }
 
   static _forceControlledTileHover(tile) {
-    try {
-      const manager = tile?.mouseInteractionManager;
-      const eventSystem = canvas?.app?.renderer?.events;
-      const rootBoundary = eventSystem?.rootBoundary;
-      if (!tile || !manager || !eventSystem || !rootBoundary) return false;
-
-      const event = rootBoundary.createPointerEvent(eventSystem.pointer, 'pointerover', tile);
-      try {
-        event.defaultPrevented = false;
-        if (!event.nativeEvent) event.nativeEvent = eventSystem.rootPointerEvent;
-        if (!event.target) event.target = tile;
-        manager.handleEvent(event);
-      } finally {
-        rootBoundary.freeEvent(event);
-      }
-
-      return !!tile?.hover || ((Number(manager?.state ?? 0) || 0) > 0);
-    } catch (err) {
-      Logger.debug('TilePixelSelection._forceControlledTileHover failed', err);
-      return false;
-    }
+    return this._getControlledInteractionRefresh().forceControlledTileHover(tile);
   }
 
   static _pointerTargetsTileHandle(tile, target) {
-    try {
-      if (!tile || !target) return false;
-      const handles = tile?.controls?.handles;
-      if (!handles) return false;
-      if (target === handles) return true;
-      const children = Array.isArray(handles.children) ? handles.children : [];
-      return children.includes(target);
-    } catch (err) {
-      Logger.debug('TilePixelSelection._pointerTargetsTileHandle failed', err);
-      return false;
-    }
+    return this._getControlledInteractionRefresh().pointerTargetsTileHandle(tile, target);
   }
 
   static _getControlledTileHoverExpectation(tile) {
-    try {
-      const pointer = this._getRootPointerContext();
-      return this._getControlledTileHoverExpectationForPointer(tile, pointer);
-    } catch (err) {
-      Logger.debug('TilePixelSelection._getControlledTileHoverExpectation failed', err);
-      return {
-        onBoard: false,
-        withinBounds: false,
-        visibleAlpha: false,
-        hitsResizeHandle: false,
-        overTileTarget: false,
-        overHandleTarget: false,
-        shouldHoverTile: false
-      };
-    }
+    return this._getControlledInteractionRefresh().getHoverExpectation(tile);
   }
 
   static _getControlledTileHoverExpectationForPointer(tile, pointer = null) {
-    try {
-      const context = pointer || this._getRootPointerContext();
-      const overTargets = Array.isArray(context.overTargets) ? context.overTargets : [];
-      const overHandleTarget = !!tile?._hoveredHandle || overTargets.some((target) => this._pointerTargetsTileHandle(tile, target));
-      const overTileTarget = overTargets.some((target) => target === tile);
+    return this._getControlledInteractionRefresh().getHoverExpectationForPointer(tile, pointer);
+  }
 
-      let withinBounds = false;
-      let visibleAlpha = false;
-      let hitsResizeHandle = false;
-      if (context.onBoard && Number.isFinite(context.globalX) && Number.isFinite(context.globalY)) {
-        withinBounds = this._pointWithinTileBounds(tile, context.globalX, context.globalY);
-        if (withinBounds) visibleAlpha = this._pointHasVisibleAlpha(tile, context.globalX, context.globalY);
-        hitsResizeHandle = this._pointHitsResizeHandle(tile, context.globalX, context.globalY);
-      }
+  static _getControlledInteractionRefresh() {
+    if (!this._controlledInteractionRefresh) this._controlledInteractionRefresh = this._createControlledInteractionRefresh();
+    return this._controlledInteractionRefresh;
+  }
 
-      return {
-        onBoard: context.onBoard,
-        withinBounds,
-        visibleAlpha,
-        hitsResizeHandle,
-        overTileTarget,
-        overHandleTarget,
-        shouldHoverTile: !!(context.onBoard && withinBounds && visibleAlpha && !hitsResizeHandle && !overHandleTarget)
-      };
-    } catch (err) {
-      Logger.debug('TilePixelSelection._getControlledTileHoverExpectation failed', err);
-      return {
-        onBoard: false,
-        withinBounds: false,
-        visibleAlpha: false,
-        hitsResizeHandle: false,
-        overTileTarget: false,
-        overHandleTarget: false,
-        shouldHoverTile: false
-      };
-    }
+  static _createControlledInteractionRefresh() {
+    return new TileControlledInteractionRefresh({
+      handleTileLifecycle: (tile) => this._handleTileLifecycle(tile),
+      compareTileInteractionPriority: (left, right) => this._compareTileInteractionPriority(left, right),
+      pointWithinTileBounds: (tile, worldX, worldY) => this._pointWithinTileBounds(tile, worldX, worldY),
+      pointHasVisibleAlpha: (tile, worldX, worldY) => this._pointHasVisibleAlpha(tile, worldX, worldY),
+      pointHitsResizeHandle: (tile, worldX, worldY) => this._pointHitsResizeHandle(tile, worldX, worldY)
+    });
   }
 
   static _bindTile(tile) {
@@ -602,8 +338,17 @@ export class TilePixelSelection {
 
       const maskContainer = mesh.faNexusMaskContainer
         || tile.faNexusMaskContainer;
+      const buildingFill = tile.document?.getFlag?.(MODULE_ID, 'buildingFill')
+        ?? tile.document?.flags?.[MODULE_ID]?.buildingFill;
+      const useFillGeometry = !!buildingFill?.wallTileId;
+      if (Array.isArray(maskContainer?.faNexusCompositeRegions)) {
+        return this._compositeFillHasVisibleAlpha(maskContainer, worldX, worldY, { useFillGeometry });
+      }
       if (maskContainer?.faNexusMaskSprite) {
         const maskSprite = maskContainer.faNexusMaskSprite;
+        if (useFillGeometry && maskSprite.faNexusMaskGeometry) {
+          return this._maskGeometryContainsPoint(maskSprite, worldX, worldY);
+        }
         const maskAlpha = this._sampleSpriteAlpha(maskSprite, worldX, worldY, { useLumaWhenOpaque: true });
         if (maskAlpha === null) return true; // if we cannot sample, allow interaction
         return maskAlpha >= MASK_ALPHA_THRESHOLD;
@@ -704,6 +449,63 @@ export class TilePixelSelection {
       Logger.debug('TilePixelSelection._pointHasVisibleAlpha failed', err);
       return true;
     }
+  }
+
+  static _maskGeometryContainsPoint(mask, worldX, worldY) {
+    const geometry = mask.faNexusMaskGeometry;
+    // Hover/control refresh can mount a new mask before Pixi's next render.
+    // toLocal updates the ancestor chain instead of reading a stale matrix.
+    const local = mask.toLocal({ x: worldX, y: worldY }, undefined, _tempPointB);
+    const width = mask.texture.orig?.width ?? mask.texture.width;
+    const height = mask.texture.orig?.height ?? mask.texture.height;
+    const x = (local.x + (mask.anchor?.x || 0) * width) * geometry.width / width;
+    const y = (local.y + (mask.anchor?.y || 0) * height) * geometry.height / height;
+    if (x < 0 || y < 0 || x > geometry.width || y > geometry.height) return false;
+    let filled = false;
+    for (const entry of geometry.shapes) {
+      if (entry.shape?.contains(x, y)) filled = entry.operation !== 'subtract';
+    }
+    return filled;
+  }
+
+  static _compositeFillHasVisibleAlpha(container, worldX, worldY, { useFillGeometry = false } = {}) {
+    if (container.destroyed || container.visible === false || container.renderable === false) return false;
+    for (const region of container.faNexusCompositeRegions) {
+      const child = region.container, sprite = child?.faNexusTilingSprite;
+      if (!child || child.destroyed || child.visible === false || child.renderable === false
+        || !sprite || sprite.destroyed || sprite.visible === false || sprite.renderable === false) continue;
+      if (Number(sprite.alpha ?? 1) < DEFAULT_ALPHA_THRESHOLD) continue;
+      const opacity = Number(sprite.worldAlpha ?? sprite.alpha ?? 1);
+      if (opacity < DEFAULT_ALPHA_THRESHOLD) continue;
+      if (useFillGeometry && child.faNexusMaskSprite?.faNexusMaskGeometry) {
+        if (this._maskGeometryContainsPoint(child.faNexusMaskSprite, worldX, worldY)) return true;
+        continue;
+      }
+      const maskAlpha = this._sampleSpriteAlpha(child.faNexusMaskSprite, worldX, worldY, { useLumaWhenOpaque: true });
+      if (maskAlpha !== null && maskAlpha < MASK_ALPHA_THRESHOLD) continue;
+      const artworkAlpha = this._sampleTilingSpriteAlpha(sprite, worldX, worldY);
+      // Match existing selection behavior when a texture cannot be sampled,
+      // while a known transparent mask or artwork pixel still clicks through.
+      if ((maskAlpha ?? 1) * (artworkAlpha ?? 1) * opacity >= DEFAULT_ALPHA_THRESHOLD) return true;
+    }
+    return false;
+  }
+
+  static _sampleTilingSpriteAlpha(sprite, worldX, worldY) {
+    const texture = sprite?.texture;
+    if (!texture?.valid) return null;
+    const local = sprite.worldTransform.applyInverse({ x: worldX, y: worldY }, _tempPointB);
+    const width = sprite.width, height = sprite.height;
+    const anchor = sprite.anchor || { x: 0, y: 0 };
+    const x = local.x + anchor.x * width, y = local.y + anchor.y * height;
+    if (x < 0 || y < 0 || x >= width || y >= height) return 0;
+    // Pixi v7 repeats in tileTransform space; uvRespectAnchor controls whether
+    // the sprite's anchor changes the texture phase as well as its bounds.
+    sprite.tileTransform.updateLocalTransform();
+    const sample = sprite.tileTransform.localTransform.applyInverse(
+      sprite.uvRespectAnchor ? local : { x, y }, _tempTilingPoint);
+    const repeat = (value, size) => ((value % size) + size) % size;
+    return this._sampleTextureAlpha(texture, repeat(sample.x, texture.width), repeat(sample.y, texture.height));
   }
 
   static _sampleScatterContainerAlpha(scatterContainer, worldX, worldY) {
@@ -862,10 +664,10 @@ export class TilePixelSelection {
   static _getCachedScatterTexture(src) {
     try {
       if (!src) return null;
-      const direct = getCachedPixiTexture(src);
+      const direct = getCachedFoundryTexture(src);
       if (direct) return direct;
       const encoded = encodeTexturePath(src);
-      if (encoded && encoded !== src) return getCachedPixiTexture(encoded);
+      if (encoded && encoded !== src) return getCachedFoundryTexture(encoded);
     } catch (err) {
       Logger.debug('TilePixelSelection._getCachedScatterTexture failed', err);
     }
@@ -1087,6 +889,17 @@ export class TilePixelSelection {
     } catch (_) {}
   }
 
+  static _resolveScenePoint(worldX, worldY) {
+    const transform = (canvas?.stage ?? canvas?.app?.stage)?.worldTransform;
+    if (typeof transform?.applyInverse !== 'function') return { x: worldX, y: worldY };
+    const memo = this._scenePointMemo;
+    if (memo && memo.worldX === worldX && memo.worldY === worldY && memo.a === transform.a && memo.b === transform.b
+      && memo.c === transform.c && memo.d === transform.d && memo.tx === transform.tx && memo.ty === transform.ty) return memo;
+    const point = transform.applyInverse({ x: worldX, y: worldY }, _tempPointB);
+    this._scenePointMemo = { worldX, worldY, a: transform.a, b: transform.b, c: transform.c, d: transform.d, tx: transform.tx, ty: transform.ty, x: point.x, y: point.y };
+    return this._scenePointMemo;
+  }
+
   static _pointWithinTileBounds(tile, worldX, worldY) {
     try {
       const doc = tile?.document;
@@ -1103,17 +916,22 @@ export class TilePixelSelection {
       const anchorY = Number(texture?.anchorY);
       const resolvedAnchorX = Number.isFinite(anchorX) ? anchorX : 0.5;
       const resolvedAnchorY = Number.isFinite(anchorY) ? anchorY : 0.5;
-      const stage = canvas?.stage ?? canvas?.app?.stage;
-      const scenePoint = stage?.worldTransform?.applyInverse?.({ x: worldX, y: worldY }, _tempPointB) ?? { x: worldX, y: worldY };
+      // One pointer position is tested against every Tile: its Scene point is worked out once per position and view.
+      const scenePoint = this._resolveScenePoint(worldX, worldY);
       const anchorWorldX = Number(doc?.x) || 0;
       const anchorWorldY = Number(doc?.y) || 0;
-      const rotation = Math.toRadians(Number(doc?.rotation || 0) || 0);
-      const cos = Math.cos(rotation);
-      const sin = Math.sin(rotation);
       const deltaX = scenePoint.x - anchorWorldX;
       const deltaY = scenePoint.y - anchorWorldY;
-      const unrotatedX = (deltaX * cos) + (deltaY * sin);
-      const unrotatedY = (-deltaX * sin) + (deltaY * cos);
+      const degrees = Number(doc?.rotation || 0) || 0;
+      let unrotatedX = deltaX;
+      let unrotatedY = deltaY;
+      if (degrees) {
+        const rotation = Math.toRadians(degrees);
+        const cos = Math.cos(rotation);
+        const sin = Math.sin(rotation);
+        unrotatedX = (deltaX * cos) + (deltaY * sin);
+        unrotatedY = (-deltaX * sin) + (deltaY * cos);
+      }
       const localX = (unrotatedX / resolvedScaleX) + (width * resolvedAnchorX);
       const localY = (unrotatedY / resolvedScaleY) + (height * resolvedAnchorY);
       const epsilon = 1e-4;
@@ -1204,13 +1022,16 @@ export class TilePixelSelection {
     try {
       const tiles = Array.isArray(canvas?.tiles?.placeables) ? canvas.tiles.placeables : [];
       if (tiles.length <= 1) return false;
-      const tileOrder = this._getTileInteractionRenderOrder(tile);
+      let tileOrder = null;
       for (const candidate of tiles) {
         if (!candidate || candidate === tile || candidate.destroyed) continue;
         if (!this._isTileInteractionCandidate(candidate)) continue;
+        // The cheap test first: a Tile's place in the draw order costs a search through the canvas' children, so it
+        // is worked out only for the few Tiles the pointer is inside.
+        if (!this._pointWithinTileBounds(candidate, worldX, worldY)) continue;
+        tileOrder ??= this._getTileInteractionRenderOrder(tile);
         const candidateOrder = this._getTileInteractionRenderOrder(candidate);
         if (this._compareTileInteractionOrder(candidateOrder, tileOrder) <= INTERACTION_PRIORITY_EPSILON) continue;
-        if (!this._pointWithinTileBounds(candidate, worldX, worldY)) continue;
         if (this._pointHasVisibleAlpha(candidate, worldX, worldY)) return true;
       }
       return false;
@@ -1276,6 +1097,9 @@ export class TilePixelSelection {
 
   static _getInteractiveHandleOwnerAtPoint(worldX, worldY) {
     try {
+      // Handles belong to controlled Tiles: with none controlled there is nothing to look up. This is asked for
+      // every Tile on every pointer move.
+      if (!canvas?.tiles?.controlled?.length) return null;
       const cacheVersion = Number(this._interactiveHandleCacheVersion || 0) || 0;
       const transform = canvas?.stage?.worldTransform || null;
       const transformKey = transform
@@ -1327,90 +1151,12 @@ export class TilePixelSelection {
   static _isInteractiveTileControlHandle(tile, handle) {
     try {
       if (!handle || handle.destroyed) return false;
+      if (tile?.controls?.visible === false || tile?.controls?.handles?.visible === false) return false;
       if (!handle.visible || handle.worldAlpha <= 0 || handle.eventMode === 'none') return false;
-      if (!this._tileSupportsResizeHandle(tile) && this._isResizeLikeControlHandle(handle)) return false;
       return true;
     } catch (err) {
       Logger.debug('TilePixelSelection._isInteractiveTileControlHandle failed', err);
       return false;
-    }
-  }
-
-  static _isResizeLikeControlHandle(handle) {
-    const name = String(handle?.name || '').trim();
-    if (V14_TILE_RESIZE_HANDLE_NAMES.has(name)) return true;
-    return !name;
-  }
-
-  static _isFaNexusCustomRenderTile(tile) {
-    try {
-      return !!getFaNexusTileCapabilities(tile)?.isCustomRendered;
-    } catch (err) {
-      Logger.debug('TilePixelSelection._isFaNexusCustomRenderTile failed', err);
-      return false;
-    }
-  }
-
-  static _tileSupportsResizeHandle(tile) {
-    try {
-      return getFaNexusTileCapabilities(tile)?.supportsTransformHandles !== false;
-    } catch (err) {
-      Logger.debug('TilePixelSelection._tileSupportsResizeHandle failed', err);
-    }
-    return true;
-  }
-
-  static _updateAllResizeHandles() {
-    try {
-      const tiles = canvas.tiles?.placeables;
-      if (!Array.isArray(tiles)) return;
-      for (const tile of tiles) this._updateResizeHandleState(tile);
-    } catch (err) {
-      Logger.debug('TilePixelSelection._updateAllResizeHandles failed', err);
-    }
-  }
-
-  static _updateResizeHandleState(tile) {
-    try {
-      const supported = this._tileSupportsResizeHandle(tile);
-      const handles = this._getTileControlHandles(tile);
-      if (!handles.length) {
-        if (tile?.controlled) {
-          Logger.debug('TilePixelSelection.controlHandles.missing', {
-            tileId: tile?.document?.id || tile?.id || null,
-            controlled: !!tile?.controlled
-          });
-        }
-        return;
-      }
-
-      const handlesVisible = tile?.controls?.handles?.visible !== false;
-      const locked = !!tile?.document?.locked;
-      for (const handle of handles) {
-        if (!handle || handle.destroyed) continue;
-        if (!handle._faNexusHandleDefaults) {
-          handle._faNexusHandleDefaults = {
-            alpha: typeof handle.alpha === 'number' ? handle.alpha : 1,
-            eventMode: handle.eventMode ?? 'static',
-            cursor: handle.cursor ?? 'pointer'
-          };
-        }
-
-        const defaults = handle._faNexusHandleDefaults;
-        const isResizeLike = this._isResizeLikeControlHandle(handle);
-        const controlVisible = tile?.controls?.shape?.controlHandles?.[handle.name]?.visible;
-        const shouldDisable = isResizeLike && handlesVisible && !locked && !supported;
-        const shouldEnable = !shouldDisable && handlesVisible && (controlVisible !== false);
-
-        handle._faNexusHandleUnsupported = shouldDisable;
-        handle.alpha = shouldEnable ? (defaults.alpha ?? 1) : 0;
-        handle.cursor = shouldEnable ? (defaults.cursor ?? 'pointer') : 'default';
-        handle.eventMode = shouldEnable ? (defaults.eventMode ?? 'static') : 'none';
-        handle.visible = shouldEnable;
-        if (!shouldEnable) handle.scale?.set?.(1, 1);
-      }
-    } catch (err) {
-      Logger.debug('TilePixelSelection._updateResizeHandleState failed', err);
     }
   }
 
@@ -1672,42 +1418,47 @@ export class TilePixelSelection {
       const y = local.y + (anchor.y * height);
       if (x < 0 || y < 0 || x >= width || y >= height) return 0;
 
-      const alphaData = this._getAlphaData(texture, options);
-      if (!alphaData) return null;
-
-      const scaleX = alphaData.width / width;
-      const scaleY = alphaData.height / height;
-      const sx = x * scaleX;
-      const sy = y * scaleY;
-      const px = Math.floor(sx);
-      const py = Math.floor(sy);
-      const minX = alphaData.minX ?? 0;
-      const minY = alphaData.minY ?? 0;
-      const maxX = alphaData.maxX ?? alphaData.width;
-      const maxY = alphaData.maxY ?? alphaData.height;
-      if (px < minX || px >= maxX || py < minY || py >= maxY) return 0;
-      const alphaWidth = Math.max(1, alphaData.width || 1);
-      const alphaHeight = Math.max(1, alphaData.height || 1);
-      if (px < 0 || px >= alphaWidth || py < 0 || py >= alphaHeight) return 0;
-      // Alpha buffers keep the full texture stride; index with actual width to avoid skewed samples.
-      const index = (py * alphaWidth) + px;
-      const alphaArray = alphaData.alpha;
-      if (!alphaArray) return null;
-      const lumaArray = alphaData.luma;
-      const alphaByte = alphaArray ? alphaArray[index] : 0;
-      let value = Number.isFinite(alphaByte) ? alphaByte / 255 : 0;
-      if (options.useLumaWhenOpaque && lumaArray) {
-        const lumaByte = lumaArray[index];
-        const luma = Number.isFinite(lumaByte) ? lumaByte / 255 : 0;
-        value *= luma;
-      }
-      if (value <= 0) return 0;
-      if (value >= 1) return 1;
-      return value;
+      return this._sampleTextureAlpha(texture, x, y, options);
     } catch (err) {
       Logger.debug('TilePixelSelection._sampleSpriteAlpha failed', err);
       return null;
     }
+  }
+
+  static _sampleTextureAlpha(texture, x, y, options = {}) {
+    const width = texture.width, height = texture.height;
+    const alphaData = this._getAlphaData(texture, options);
+    if (!alphaData) return null;
+
+    const scaleX = alphaData.width / width;
+    const scaleY = alphaData.height / height;
+    const sx = x * scaleX;
+    const sy = y * scaleY;
+    const px = Math.floor(sx);
+    const py = Math.floor(sy);
+    const minX = alphaData.minX ?? 0;
+    const minY = alphaData.minY ?? 0;
+    const maxX = alphaData.maxX ?? alphaData.width;
+    const maxY = alphaData.maxY ?? alphaData.height;
+    if (px < minX || px >= maxX || py < minY || py >= maxY) return 0;
+    const alphaWidth = Math.max(1, alphaData.width || 1);
+    const alphaHeight = Math.max(1, alphaData.height || 1);
+    if (px < 0 || px >= alphaWidth || py < 0 || py >= alphaHeight) return 0;
+    // Alpha buffers keep the full texture stride; index with actual width to avoid skewed samples.
+    const index = (py * alphaWidth) + px;
+    const alphaArray = alphaData.alpha;
+    if (!alphaArray) return null;
+    const lumaArray = alphaData.luma;
+    const alphaByte = alphaArray ? alphaArray[index] : 0;
+    let value = Number.isFinite(alphaByte) ? alphaByte / 255 : 0;
+    if (options.useLumaWhenOpaque && lumaArray) {
+      const lumaByte = lumaArray[index];
+      const luma = Number.isFinite(lumaByte) ? lumaByte / 255 : 0;
+      value *= luma;
+    }
+    if (value <= 0) return 0;
+    if (value >= 1) return 1;
+    return value;
   }
 
   static _sampleStandardMaskBaseAlpha(maskContainer, worldX, worldY) {

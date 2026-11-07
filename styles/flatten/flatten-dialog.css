@@ -1,0 +1,210 @@
+.fa-nexus-tile-flatten {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.fa-nexus-tile-flatten > .fa-nexus-dialog-header,
+.fa-nexus-tile-flatten > .fa-nexus-dialog-footer {
+  flex: 0 0 auto;
+}
+
+.fa-nexus-tile-flatten > .fa-nexus-dialog-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.fa-nexus-dialog-header>h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.fa-nexus-dialog-header>p {
+  margin: 0.25rem 0 0;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+.fa-nexus-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.fa-nexus-height-debug {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.fa-nexus-height-debug__controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.fa-nexus-height-debug__color {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9em;
+}
+
+.fa-nexus-height-debug__color input[type="color"] {
+  width: 28px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  background: transparent;
+}
+
+.fa-nexus-height-debug__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9em;
+}
+
+.fa-nexus-height-debug__preview {
+  padding: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: #19790b;
+}
+
+.fa-nexus-height-debug__image {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.fa-nexus-tile-flatten .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.fa-nexus-tile-flatten .form-group label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-weight: 600;
+}
+
+.fa-nexus-tile-flatten .form-group label.fa-nexus-checkbox-label {
+  justify-content: flex-start;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.fa-nexus-tile-flatten .form-group label.fa-nexus-checkbox-label input[type="checkbox"] {
+  margin: 0;
+}
+
+.fa-nexus-tile-flatten .fa-nexus-range-value {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-dark-secondary, #7a7a7a);
+}
+
+.fa-nexus-tile-flatten input[type="range"] {
+  width: 100%;
+}
+
+.fa-nexus-tile-flatten .form-group .hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--color-text-dark-secondary, #7a7a7a);
+}
+
+.fa-nexus-tile-flatten .form-group .hint.fa-nexus-tile-flatten__left-out {
+  color: var(--fa-error, #ff7676);
+}
+
+.fa-nexus-tile-flatten__output-status.is-checking {
+  color: var(--color-text-dark-secondary, #7a7a7a);
+}
+
+.fa-nexus-tile-flatten__output-status.is-warning {
+  color: var(--fa-error, #ff7676) !important;
+}
+
+.fa-nexus-tile-flatten__effective-folder {
+  font-family: var(--font-monospace, monospace);
+  word-break: break-all;
+}
+
+.fa-nexus-tile-flatten input.is-warning {
+  outline-color: var(--fa-error, #ff7676);
+  border-color: var(--fa-error, #ff7676);
+  box-shadow: 0 0 0 1px rgba(255, 118, 118, 0.35);
+}
+
+.fa-nexus-tile-flatten__field-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.fa-nexus-tile-flatten__field-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.fa-nexus-tile-flatten__browse {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.fa-nexus-dialog-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--color-text-dark-secondary, #7a7a7a);
+}
+
+.fa-nexus-dialog-meta .meta-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.fa-nexus-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.fa-nexus-flatten-overlay__bar-fill {
+  display: block;
+  position: relative;
+  will-change: transform;
+  background-size: 200% 100%;
+}
+
+.fa-nexus-flatten-overlay__bar.is-active .fa-nexus-flatten-overlay__bar-fill {
+  animation: fa-nexus-progress-flow 1.4s linear infinite;
+}
+
+.fa-nexus-flatten-overlay__bar.is-indeterminate .fa-nexus-flatten-overlay__bar-fill {
+  animation: fa-nexus-progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes fa-nexus-progress-flow {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+@keyframes fa-nexus-progress-indeterminate {
+  0% { transform: translateX(-80%); }
+  100% { transform: translateX(180%); }
+}

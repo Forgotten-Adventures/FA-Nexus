@@ -150,6 +150,7 @@
 
 /**
  * @typedef {object} FaNexusBookmark
+ * @property {{id: string|null, includeChildren: boolean}} [collectionScope] Collection scope; absent bookmarks use source folders.
  * @property {string} id
  * @property {string} title
  * @property {string} searchQuery
@@ -165,6 +166,7 @@
 
 /**
  * @typedef {object} FaNexusFolderSelection
+ * @property {boolean} [includeSubfolders=true] False restricts included folders to their direct contents.
  * @property {'all'|'folder'|'folders'|'multi'|'multifolder'|'unassigned'} type
  * @property {string[]} [includePaths]
  * @property {string[]} [includePathLowers]
@@ -303,6 +305,7 @@
 
 /**
  * @typedef {object} NexusSyncOptions
+ * @property {boolean} [forceFull]
  * @property {(info:SyncManifestProgressInfo) => void} [onManifestProgress]
  * @property {number} [progressBatch]
  * @property {AbortSignal} [signal]

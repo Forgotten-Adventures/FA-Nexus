@@ -12,11 +12,17 @@ export const SUBTAB_LABELS = Object.freeze({
 export const PORTAL_TYPES = Object.freeze({
   door: { id: 'door', label: 'Add Door', icon: 'fa-door-closed', tooltip: 'Insert animated Foundry doors' },
   window: { id: 'window', label: 'Add Window', icon: 'fa-border-all', tooltip: 'Insert windows with sill, glass, and frame' },
-  gap: { id: 'gap', label: 'Add Gap', icon: 'fa-expand', tooltip: 'Insert gaps in walls' }
+  seamlessSecretDoor: {
+    id: 'seamlessSecretDoor',
+    label: 'Seamless Secret Door',
+    icon: 'fa-user-secret',
+    tooltip: 'Insert a native Secret Door derived from the effective wall surface'
+  }
 });
 export const GAP_KIND_GAP = 'gap';
 export const GAP_KIND_DOOR = 'door';
 export const GAP_KIND_WINDOW = 'window';
+export const GAP_KIND_SEAMLESS_SECRET_DOOR = 'seamlessSecretDoor';
 export const WALL_BIAS_QUERY = 'wall';
 export const TEXTURE_DEPRIORITIZED_PATH_TOKEN = '!wilderness';
 export const TEXTURE_DEPRIORITIZED_NAME_TOKENS = Object.freeze(['roof', 'grate', 'overlay']);

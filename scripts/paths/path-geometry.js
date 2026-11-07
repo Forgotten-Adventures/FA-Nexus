@@ -1,6 +1,6 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import BuildingWallMesher from '../buildings/building-wall-mesher.js';
-import { getOrCreatePixiTexture } from '../core/foundry-texture-loader-patch.js';
+import { loadFoundryTexture } from '../core/foundry-texture-cache.js';
 import {
   applyHsbcToDisplayObject,
   cloneHsbc,
@@ -23,6 +23,12 @@ import {
   isShadowOnlyStateActive,
   syncShadowOnlyDisplayObject
 } from '../assets/shadow-only-runtime.js';
+import {
+  ensureMeshTransparent as ensureTextureRuntimeMeshTransparent,
+  getTransparentTexture as getTextureRuntimeTransparentTexture,
+  getTransparentTextureSrc as getTextureRuntimeTransparentTextureSrc,
+  restoreMeshTexture as restoreTextureRuntimeMeshTexture
+} from '../textures/texture-runtime-core.js';
 
 export const DEFAULT_SEGMENT_SAMPLES = 200;
 export const MIN_POINTS_TO_RENDER = 2;
@@ -32,9 +38,7 @@ const FEATHER_GROW_MULTIPLIER = 1.5;
 const EPSILON = 1e-6;
 const CORNER_DOT_THRESHOLD = Math.cos(Math.PI / 12); // ~15°
 
-let TRANSPARENT_TEXTURE = null;
 let PATH_PROGRAM = null;
-const TRANSPARENT_TEXTURE_SRC = 'modules/fa-nexus/images/transparent.png';
 const VISIBLE_ALPHA_THRESHOLD = 10;
 const LINEAR_TENSION_THRESHOLD = 0.999;
 const WIDTH_MULTIPLIER_EPSILON = 1e-3;
@@ -42,6 +46,7 @@ const EDITING_TILES_KEY = '__faNexusPathEditingTiles';
 const PATH_WALL_DELETE_QUEUE = new Map();
 const SHARED_PATH_TEXTURE_CACHE = new Map();
 const PATH_HSBC_SLOT = 'path-runtime';
+const PATH_ORIGINAL_TEXTURE_KEY = 'faNexusPathOriginalTexture';
 const LEGACY_PATH_RUNTIME_WARNED_TILE_IDS = new Set();
 
 function resolveLiveSceneDocument(scene = null) {
@@ -937,22 +942,16 @@ export async function waitForBaseTexture(baseTexture, timeout = 5000) {
 
 export async function loadPathTexture(src, options = {}) {
   if (!src) throw new Error('Missing texture source');
-  const { attempts = 4, timeout = 5000, bustCacheOnRetry = true } = options;
+  const { attempts = 4, timeout = 5000 } = options;
   const encoded = encodePath(src);
   let lastError = null;
   for (let attempt = 1; attempt <= Math.max(1, attempts); attempt++) {
     try {
-      const canBust = bustCacheOnRetry && attempt > 1 && !/^data:/i.test(encoded);
-      const key = canBust ? `${encoded}${encoded.includes('?') ? '&' : '?'}v=${Date.now()}` : encoded;
-      let texture = null;
-      if (canBust) {
-        texture = getOrCreatePixiTexture(key);
-      } else {
-        texture = SHARED_PATH_TEXTURE_CACHE.get(encoded);
-        if (!texture || texture.destroyed || texture.baseTexture?.destroyed) {
-          texture = getOrCreatePixiTexture(encoded);
-          SHARED_PATH_TEXTURE_CACHE.set(encoded, texture);
-        }
+      let texture = SHARED_PATH_TEXTURE_CACHE.get(encoded);
+      if (!texture || texture.destroyed || texture.baseTexture?.destroyed) {
+        SHARED_PATH_TEXTURE_CACHE.delete(encoded);
+        texture = await loadFoundryTexture(encoded);
+        SHARED_PATH_TEXTURE_CACHE.set(encoded, texture);
       }
       const ok = await waitForBaseTexture(texture?.baseTexture, timeout);
       if (ok) {
@@ -1018,40 +1017,19 @@ export function computeBoundsFromSamples(samples, pathWidth) {
 }
 
 export function getTransparentTextureSrc() {
-  return TRANSPARENT_TEXTURE_SRC;
+  return getTextureRuntimeTransparentTextureSrc();
 }
 
 export function getTransparentTexture() {
-  try {
-    if (!TRANSPARENT_TEXTURE || TRANSPARENT_TEXTURE.destroyed) {
-      TRANSPARENT_TEXTURE = PIXI.Texture.from(getTransparentTextureSrc());
-      TRANSPARENT_TEXTURE.baseTexture.wrapMode = PIXI.WRAP_MODES.CLAMP;
-    }
-    return TRANSPARENT_TEXTURE;
-  } catch (_) {
-    return PIXI.Texture.EMPTY;
-  }
+  return getTextureRuntimeTransparentTexture();
 }
 
 export function ensureMeshTransparent(mesh) {
-  try {
-    if (!mesh || mesh.destroyed) return;
-    if (!mesh.faNexusPathOriginalTexture) mesh.faNexusPathOriginalTexture = mesh.texture;
-    const placeholder = getTransparentTexture();
-    if (mesh.texture !== placeholder) mesh.texture = placeholder;
-    mesh.alpha = 1;
-    mesh.renderable = true;
-  } catch (_) {}
+  ensureTextureRuntimeMeshTransparent(mesh, PATH_ORIGINAL_TEXTURE_KEY);
 }
 
 export function restoreMeshTexture(mesh) {
-  try {
-    if (!mesh || mesh.destroyed) return;
-    if (mesh.faNexusPathOriginalTexture) {
-      mesh.texture = mesh.faNexusPathOriginalTexture;
-      mesh.faNexusPathOriginalTexture = null;
-    }
-  } catch (_) {}
+  restoreTextureRuntimeMeshTexture(mesh, PATH_ORIGINAL_TEXTURE_KEY);
 }
 
 export function cleanupPathOverlay(tile) {
@@ -1082,8 +1060,8 @@ async function deletePathWallsRobustly(scene, wallIds = []) {
     const collection = targetScene?.walls;
     return (Array.isArray(ids) ? ids : []).filter((wallId) => {
       if (!wallId) return false;
-      const doc = collection?.get?.(wallId);
-      return !!doc && !doc._destroyed;
+      // Collection membership is existence; Foundry's `_destroyed` survives canvas redraws.
+      return !!collection?.get?.(wallId);
     });
   };
   const normalizeDeletedIds = (deleted) => Array.from(new Set(
@@ -1121,13 +1099,17 @@ async function deletePathWallsRobustly(scene, wallIds = []) {
   });
 
   try {
-    const deleted = await liveScene.deleteEmbeddedDocuments('Wall', requestedIds);
+    const deleted = await liveScene.deleteEmbeddedDocuments('Wall', requestedIds, {
+      faNexusPathEditorWallWrite: true
+    });
     for (const wallId of normalizeDeletedIds(deleted)) deletedIds.add(wallId);
   } catch (error) {
     const message = String(error?.message || error);
     if (message.includes('does not exist') && existingIds.length) {
       try {
-        const deleted = await liveScene.deleteEmbeddedDocuments('Wall', existingIds);
+        const deleted = await liveScene.deleteEmbeddedDocuments('Wall', existingIds, {
+          faNexusPathEditorWallWrite: true
+        });
         for (const wallId of normalizeDeletedIds(deleted)) deletedIds.add(wallId);
       } catch (retryError) {
         const retryMessage = String(retryError?.message || retryError);
@@ -1153,7 +1135,10 @@ async function deletePathWallsRobustly(scene, wallIds = []) {
       survivingIds
     });
     try {
-      const retried = await liveScene.deleteEmbeddedDocuments('Wall', survivingIds, { noHook: true });
+      const retried = await liveScene.deleteEmbeddedDocuments('Wall', survivingIds, {
+        noHook: true,
+        faNexusPathEditorWallWrite: true
+      });
       for (const wallId of normalizeDeletedIds(retried)) deletedIds.add(wallId);
     } catch (error) {
       const message = String(error?.message || error);
@@ -1256,7 +1241,7 @@ function collectLinkedPathWallIds(doc, scene) {
     const foundryWalls = payload?.foundryWalls || null;
     if (Array.isArray(foundryWalls?.wallIds)) {
       for (const wallId of foundryWalls.wallIds) {
-        if (wallId) ids.add(wallId);
+        if (wallId && readPathWallFlag(walls?.get?.(wallId))?.tileId === tileId) ids.add(wallId);
       }
     }
     if (foundryWalls?.groupId) groupIds.add(foundryWalls.groupId);
@@ -1265,7 +1250,7 @@ function collectLinkedPathWallIds(doc, scene) {
     for (const wall of walls) {
       if (!wall?.id) continue;
       const flag = readPathWallFlag(wall);
-      if (flag?.groupId && groupIds.has(flag.groupId)) ids.add(wall.id);
+      if (flag?.tileId === tileId && flag?.groupId && groupIds.has(flag.groupId)) ids.add(wall.id);
     }
   }
   return [...ids];
@@ -1453,20 +1438,56 @@ function buildRenderKey(payloads = []) {
   }
 }
 
-function syncPathContainerTransform(container, mesh, doc) {
+const PATH_SCENE_GROUP_PREVIEW_SLOT = Symbol.for('fa-nexus.path-scene-group-preview');
+const DISPLAY_TRANSFORM_PREVIEW_SLOT = Symbol.for('fa-nexus.scene-group-display-transform-preview');
+const PATH_APPLY_REQUEST_SLOT = Symbol('path-apply-request');
+
+function syncPathContainerTransform(container, mesh, doc, tile = null) {
   if (!container || container.destroyed || !mesh || mesh.destroyed) return;
+  // The shared composition preview holds the original geometry under the
+  // native mesh's full affine transform, including reflection. Counter-scaling
+  // here would cancel its flip while leaving generated Walls and shadows flipped.
+  if (container[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return;
   const docWidth = Math.max(1, Number(doc?.width) || 0) || Math.max(1, Number(mesh?.width) || 1);
   const docHeight = Math.max(1, Number(doc?.height) || 0) || Math.max(1, Number(mesh?.height) || 1);
+  const originalDoc = tile?._previewType === 'controls' && !tile?.faNexusPathSemanticNativePreview
+    ? tile?._original?.document
+    : null;
+  const sceneGroupPreview = tile?.[PATH_SCENE_GROUP_PREVIEW_SLOT] || null;
+  const currentRenderKey = sceneGroupPreview
+    ? buildRenderKey(resolvePathPayloads(doc).payloads)
+    : null;
+  const sceneGroupUsesStaleGeometry = !!(
+    sceneGroupPreview
+    && container.faNexusPathRenderKey !== currentRenderKey
+  );
+  const normalizationWidth = originalDoc
+    ? (Math.max(1, Number(originalDoc.width) || 0) || docWidth)
+    : (sceneGroupUsesStaleGeometry
+      ? (Math.max(1, Number(sceneGroupPreview.width) || 0) || docWidth)
+      : docWidth);
+  const normalizationHeight = originalDoc
+    ? (Math.max(1, Number(originalDoc.height) || 0) || docHeight)
+    : (sceneGroupUsesStaleGeometry
+      ? (Math.max(1, Number(sceneGroupPreview.height) || 0) || docHeight)
+      : docHeight);
   const rawSx = Number(mesh?.scale?.x ?? 1) || 1;
   const rawSy = Number(mesh?.scale?.y ?? 1) || 1;
-  const sx = Math.abs(rawSx) > 1.001 ? rawSx : (Math.sign(rawSx || 1) || 1) * docWidth;
-  const sy = Math.abs(rawSy) > 1.001 ? rawSy : (Math.sign(rawSy || 1) || 1) * docHeight;
+  // A native handle renders a cloned controls-preview Tile whose document
+  // already has the tentative dimensions while its Path flags still contain
+  // the committed local geometry. Normalize that clone against the original
+  // Tile so the temporary mesh delta scales the Path before mouse-up.
+  const sx = (Math.sign(rawSx || 1) || 1) * normalizationWidth;
+  const sy = (Math.sign(rawSy || 1) || 1) * normalizationHeight;
   const anchorX = Number(doc?.texture?.anchorX);
   const anchorY = Number(doc?.texture?.anchorY);
   const ax = Number.isFinite(anchorX) ? anchorX : 0.5;
   const ay = Number.isFinite(anchorY) ? anchorY : 0.5;
   container.scale?.set?.(1 / sx, 1 / sy);
-  container.position?.set?.(-(docWidth * ax) / (sx || 1), -(docHeight * ay) / (sy || 1));
+  container.position?.set?.(
+    -(normalizationWidth * ax) / (sx || 1),
+    -(normalizationHeight * ay) / (sy || 1)
+  );
 }
 
 function resolvePathMeshes(container) {
@@ -1487,6 +1508,8 @@ function resolvePathMeshes(container) {
 export async function applyPathTile(tile) {
   try {
     if (!tile || tile.destroyed) return;
+    if (tile[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return;
+    const request = tile[PATH_APPLY_REQUEST_SLOT] = Symbol('path-apply');
     const doc = tile.document;
     if (shouldBlockLegacyPathRuntime(doc)) {
       warnLegacyPathRuntimeBlocked(doc, 'applyPathTile');
@@ -1505,7 +1528,8 @@ export async function applyPathTile(tile) {
 
     let mesh = tile.mesh;
     if (!mesh || mesh.destroyed) mesh = await ensureTileMesh(tile);
-    if (!mesh || mesh.destroyed) return;
+    if (!mesh || mesh.destroyed || tile.mesh !== mesh
+      || tile[PATH_APPLY_REQUEST_SLOT] !== request || tile[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return;
 
     ensureMeshTransparent(mesh);
 
@@ -1532,7 +1556,11 @@ export async function applyPathTile(tile) {
         if (!Number.isFinite(entryAlpha)) entryAlpha = 1;
         entryAlpha = Math.min(1, Math.max(0, entryAlpha));
         applyMeshOpacity(meshPath, containerAlpha * entryAlpha);
-        const payload = payloads.find((entry) => entry?.id && entry.id === meshPath?.faNexusPathId) || null;
+        // A mesh belongs to the path it was built for: by id where the path has one, and by its place in the Tile
+        // otherwise (saved paths carry no id, and "Shadow only" of one path was lost on every redraw).
+        const payload = payloads.find((entry) => entry?.id && entry.id === meshPath?.faNexusPathId)
+          || (Number.isInteger(meshPath?.faNexusPathIndex) ? payloads[meshPath.faNexusPathIndex] : null)
+          || null;
         syncShadowOnlyDisplayObject(meshPath, tileShadowOnly || isShadowOnlyStateActive(payload?.shadow));
         if (!Number.isFinite(meshPath?.faNexusPathAlpha)) {
           try { meshPath.faNexusPathAlpha = entryAlpha; } catch (_) {}
@@ -1541,6 +1569,21 @@ export async function applyPathTile(tile) {
       container.faNexusPathContainerAlpha = containerAlpha;
       mesh.faNexusPathContainer = container;
     } else {
+      // Keep the complete old artwork visible until every texture is ready.
+      // Replacing children across awaits exposes partial Paths during a commit.
+      const textureCache = new Map();
+      await Promise.all([...new Set(payloads.map(data => data?.baseSrc).filter(Boolean))].map(async baseSrc => {
+        try {
+          const texture = await loadPathTexture(baseSrc);
+          texture.baseTexture.wrapMode = PIXI.WRAP_MODES.REPEAT;
+          textureCache.set(baseSrc, texture);
+        } catch (err) {
+          Logger.warn('PathGeometry.apply.loadFailed', { error: String(err?.message || err), tileId: doc?.id });
+        }
+      }));
+      if (tile.destroyed || mesh.destroyed || tile.mesh !== mesh
+        || tile[PATH_APPLY_REQUEST_SLOT] !== request || tile[DISPLAY_TRANSFORM_PREVIEW_SLOT]) return;
+      if (buildRenderKey(resolvePathPayloads(doc).payloads) !== renderKey) return applyPathTile(tile);
       if (!container || container.destroyed) {
         container = new PIXI.Container();
         container.eventMode = 'none';
@@ -1559,25 +1602,14 @@ export async function applyPathTile(tile) {
         try { child.destroy?.({ children: true, texture: false, baseTexture: false }); } catch (_) {}
       }
       const meshPaths = [];
-      const textureCache = new Map();
       const visibleCache = new Map();
       const useVisibleRows = kind === 'v2';
       const tileHsbc = readDocumentHsbc(doc, { nullIfMissing: true, nullIfNeutral: true });
       for (const data of payloads) {
         const baseSrc = data?.baseSrc;
         if (!baseSrc) continue;
-        let texture = textureCache.get(baseSrc);
-        if (!texture) {
-          try {
-            texture = await loadPathTexture(baseSrc);
-            try { texture.baseTexture.wrapMode = PIXI.WRAP_MODES.REPEAT; }
-            catch (_) {}
-            textureCache.set(baseSrc, texture);
-          } catch (err) {
-            Logger.warn('PathGeometry.apply.loadFailed', { error: String(err?.message || err), tileId: doc?.id });
-            continue;
-          }
-        }
+        const texture = textureCache.get(baseSrc);
+        if (!texture) continue;
 
         const controlPoints = normalizeControlPoints(data.controlPoints);
         if (controlPoints.length < MIN_POINTS_TO_RENDER) continue;
@@ -1627,6 +1659,7 @@ export async function applyPathTile(tile) {
         applyMeshOpacity(meshPath, containerAlpha * entryAlpha);
         try { meshPath.faNexusPathAlpha = entryAlpha; } catch (_) {}
         try { meshPath.faNexusPathId = data?.id || null; } catch (_) {}
+        try { meshPath.faNexusPathIndex = payloads.indexOf(data); } catch (_) {}
         syncShadowOnlyDisplayObject(meshPath, tileShadowOnly || isShadowOnlyStateActive(data?.shadow));
         container.addChild(meshPath);
         meshPaths.push(meshPath);
@@ -1639,6 +1672,9 @@ export async function applyPathTile(tile) {
       if (meshPaths.length > 1) container.faNexusPathMeshes = meshPaths;
       else container.faNexusPathMeshes = null;
       container.faNexusPathRenderKey = renderKey;
+      // New local geometry and its normalization must take over in the same
+      // turn, rather than holding the old scale until unrelated shadows settle.
+      delete container[DISPLAY_TRANSFORM_PREVIEW_SLOT];
       container.faNexusPathContainerAlpha = containerAlpha;
       mesh.faNexusPathContainer = container;
     }
@@ -1647,13 +1683,13 @@ export async function applyPathTile(tile) {
       cleanupPathOverlay(tile);
       return;
     }
-    syncPathContainerTransform(container, mesh, doc);
+    syncPathContainerTransform(container, mesh, doc, tile);
     attachCustomTileOverhead(tile, {
       kind: 'path',
       contentContainer: container,
       proxyFactory: createDisplayProxyFactory(container),
       syncContent: ({ tile: currentTile, mesh: currentMesh, entry }) => {
-        syncPathContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document);
+        syncPathContainerTransform(entry?.contentContainer, currentMesh, currentTile?.document, currentTile);
       }
     });
     try {

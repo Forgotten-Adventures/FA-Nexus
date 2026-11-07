@@ -50,6 +50,21 @@ export function resolveTileId(target) {
   }
 }
 
+function matchesDocumentScene(tile, doc) {
+  const sceneId = doc?.parent?.id;
+  return !sceneId || tile?.document?.parent?.id === sceneId;
+}
+
+// Embedded Tile IDs are only unique within their owning Scene. Document hooks
+// also arrive for Scenes this client is not viewing (including duplicated Scenes).
+export function resolveCanvasTilePlaceable(doc, tileId = null) {
+  const id = tileId || doc?.id || doc?._id;
+  if (!id) return null;
+  return globalThis.canvas?.tiles?.placeables?.find((tile) =>
+    !tile?.destroyed && tile?.document?.id === id && matchesDocumentScene(tile, doc)
+  ) || null;
+}
+
 export function resolveTilePlaceable(target, tileId = null) {
   try {
     if (target?.document && target?.mesh) return target;
@@ -57,7 +72,7 @@ export function resolveTilePlaceable(target, tileId = null) {
     if (doc?.object) return doc.object;
     const id = tileId || doc?.id || doc?._id;
     if (!id) return null;
-    return canvas?.tiles?.placeables?.find((tile) => tile?.document?.id === id) || null;
+    return resolveCanvasTilePlaceable(doc, id);
   } catch (_) {
     return null;
   }
@@ -94,6 +109,7 @@ export function resolveTilePlaceableForDocument(doc, {
   if (!tile && id && typeof resolveTilePlaceableById === 'function') {
     try { tile = resolveTilePlaceableById(id) || null; } catch (_) {}
   }
+  if (tile && !matchesDocumentScene(tile, doc)) return null;
   if (!includeDestroyed && tile?.destroyed) return null;
   return tile || null;
 }

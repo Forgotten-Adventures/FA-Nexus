@@ -1,16 +1,25 @@
+import { createFolderSelectionPredicate } from '../content/content-sources/content-sources-utils.js';
 import { GridBrowseTab } from '../core/ui/grid-browse-tab.js';
+import { applyGridDensityStyles } from '../core/ui/grid-density-styles.js';
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
 import { AssetPreviewManager } from './assets-preview-manager.js';
-import { NexusContentService } from '../content/nexus-content-service.js';
+import { NexusContentService, getEnabledFolders } from '../content/nexus-content-service.js';
 import {
   applyFolderBrowserSelectionChange,
   createEmptyFolderBrowserStats,
   readFolderBrowserSelection
 } from '../core/folder-browser-state.js';
 import { AssetsTabController } from './assets-tab-controller.js';
+import {
+  contentFilename,
+  contentFolder,
+  contentGrid,
+  contentPath
+} from '../content/cloud-inventory-v2.js';
 import { AssetsTabSelectionHelper } from './assets-selection-helper.js';
 import { AssetsTabProbeHelper } from './assets-probe-helper.js';
 import { AssetsTabCardHelper } from './assets-card-helper.js';
+import { hasContentProductAccess, lockedPremiumContentMessage } from '../premium/patreon-auth-contract.js';
 
 const SOLID_TEXTURE_ITEM_ID = '__fa-nexus-solid-color';
 const SOLID_TEXTURE_DEFAULT_COLOR = '#808080';
@@ -146,6 +155,21 @@ export class AssetsTab extends GridBrowseTab {
     return this._sanitizeThumbSize(stored);
   }
 
+  _reportAssetPlacementFailure(scope, error, details = {}) {
+    if (error && typeof error === 'object' && error.__faNexusAssetPlacementReported) return;
+    if (error && typeof error === 'object') {
+      try {
+        Object.defineProperty(error, '__faNexusAssetPlacementReported', {
+          value: true,
+          configurable: true
+        });
+      } catch (_) {}
+    }
+    const message = String(error?.message || error || 'Unknown asset placement error');
+    Logger.error(scope, { ...details, error: message });
+    try { ui.notifications?.error?.(`Unable to start asset placement: ${message}`); } catch (_) {}
+  }
+
   _usesWidePathThumbs() {
     return this.isPathsMode;
   }
@@ -228,6 +252,7 @@ export class AssetsTab extends GridBrowseTab {
       logger: Logger,
       loggerLabel: 'AssetsTab.selection.normalize',
       enabled: this.supportsFolderBrowser(),
+      getSelection: () => this._activeFolderSelection,
       setSelection: (nextSelection) => {
         this._activeFolderSelection = nextSelection;
       },
@@ -352,7 +377,11 @@ export class AssetsTab extends GridBrowseTab {
 
     // Initial data: unified local/cloud pipeline
     const sharedCatalog = this._controller.sharedCatalog;
-    const needsInitialLoad = !Array.isArray(this._items) || this._items.length === 0;
+    const hasOnlySolidTexture = this.isTexturesMode
+      && Array.isArray(this._items)
+      && this._items.length === 1
+      && this._items[0]?.id === '__fa-nexus-solid-color';
+    const needsInitialLoad = !Array.isArray(this._items) || this._items.length === 0 || hasOnlySolidTexture;
     const shouldForceReload = this._needsReload || sharedCatalog.dirty;
     if (needsInitialLoad || shouldForceReload) {
       const reason = needsInitialLoad ? 'initial' : 'forced';
@@ -447,10 +476,49 @@ export class AssetsTab extends GridBrowseTab {
     } catch (_) {}
   }
 
+  /**
+   * Closing the window leaves the tab, and leaving the tab saves an open Texture or Path
+   * session that has changes. The save needs the window that hosts the session: it is
+   * done and awaited here, before the window goes. A failed save rejects, and the
+   * window stays open.
+   */
+  async saveSessionBeforeApplicationClose() {
+    const manager = this.isTexturesMode ? this.texturePaintManager : (this.isPathsMode ? this.pathManagerV2 : null);
+    if (!manager?.isActive) return;
+    const hasChanges = typeof manager.hasSessionChanges === 'function' ? manager.hasSessionChanges() : true;
+    if (!hasChanges) {
+      manager.stop?.({ reason: 'app-close' });
+      return;
+    }
+    if (this.isTexturesMode) await manager.save();
+    else await (manager.savePath?.() ?? manager.save?.());
+  }
+
   /** Cleanup listeners and transient UI when leaving the tab */
   onDeactivate() {
     if (this._didDeactivate) return;
     this._didDeactivate = true;
+    const reportSaveFailure = (mode, editor, error) => {
+      const message = String(error?.message || error || 'Unknown save error');
+      Logger.error('AssetsTab.deactivateSave.failed', {
+        tab: this.id,
+        mode,
+        editor,
+        reason: 'tab-deactivate',
+        error: message
+      });
+      try {
+        globalThis.ui?.notifications?.error?.(`Unable to save ${editor} changes: ${message}`);
+      } catch (notificationError) {
+        Logger.warn('AssetsTab.deactivateSave.notificationFailed', {
+          tab: this.id,
+          mode,
+          editor,
+          reason: 'tab-deactivate',
+          error: String(notificationError?.message || notificationError)
+        });
+      }
+    };
     if (this._deferredActivationTimeout) {
       try { clearTimeout(this._deferredActivationTimeout); } catch (_) {}
       this._deferredActivationTimeout = null;
@@ -464,12 +532,18 @@ export class AssetsTab extends GridBrowseTab {
             : true;
           if (hasChanges) {
             const result = this.texturePaintManager?.save?.();
-            if (result?.catch) result.catch(() => {});
+            if (result?.catch) {
+              result.catch((error) => {
+                reportSaveFailure('textures', 'texture editor', error);
+              });
+            }
           } else {
             this.texturePaintManager?.stop?.({ reason: 'tab-deactivate' });
           }
         }
-      } catch (_) {}
+      } catch (error) {
+        reportSaveFailure('textures', 'texture editor', error);
+      }
     } else if (this.isPathsMode) {
       try {
         if (this.pathManagerV2?.isActive) {
@@ -478,12 +552,18 @@ export class AssetsTab extends GridBrowseTab {
             : true;
           if (hasChanges) {
             const result = this.pathManagerV2?.savePath?.() ?? this.pathManagerV2?.save?.();
-            if (result?.catch) result.catch(() => {});
+            if (result?.catch) {
+              result.catch((error) => {
+                reportSaveFailure('paths', 'path editor', error);
+              });
+            }
           } else {
             this.pathManagerV2?.stop?.({ reason: 'tab-deactivate' });
           }
         }
-      } catch (_) {}
+      } catch (error) {
+        reportSaveFailure('paths', 'path editor', error);
+      }
     } else {
       // Cancel any active placement when leaving assets tab
       try { this.placementManager?.cancelPlacement?.('tab-switch'); } catch (_) {}
@@ -549,62 +629,9 @@ export class AssetsTab extends GridBrowseTab {
 
     filtered = filtered.filter((asset) => this._matchesMode(asset));
 
-    if (this.supportsFolderBrowser()) {
-      const selection = this._activeFolderSelection || { type: 'all', includePaths: [], includePathLowers: [] };
-      if (selection.type === 'folder') {
-        const target = String(selection.pathLower || selection.path || '').toLowerCase();
-        if (target) {
-          filtered = filtered.filter((asset) => {
-            const folderPath = this._getNormalizedFolderPath(asset);
-            if (!folderPath) return false;
-            if (folderPath === target) return true;
-            return folderPath.startsWith(`${target}/`);
-          });
-        }
-      } else if (selection.type === 'folders') {
-        const lowers = Array.isArray(selection.pathLowers) ? selection.pathLowers : [];
-        const normalized = lowers.length ? lowers : (Array.isArray(selection.paths) ? selection.paths.map((p) => this._normalizeFolderPath(p)) : []);
-        const targets = Array.from(new Set(normalized.filter(Boolean).map((p) => String(p).toLowerCase())));
-        if (targets.length) {
-          filtered = filtered.filter((asset) => {
-            const folderPath = this._getNormalizedFolderPath(asset);
-            if (!folderPath) return false;
-            for (const target of targets) {
-              if (folderPath === target || folderPath.startsWith(`${target}/`)) return true;
-            }
-            return false;
-          });
-        } else {
-          filtered = [];
-        }
-      } else if (selection.type === 'unassigned') {
-        filtered = filtered.filter((asset) => !this._getNormalizedFolderPath(asset));
-      }
-
-      const excludeTargets = new Set();
-      if (Array.isArray(selection.excludePathLowers)) {
-        for (const lower of selection.excludePathLowers) {
-          const key = String(lower || '').toLowerCase();
-          if (key) excludeTargets.add(key);
-        }
-      }
-      if (!excludeTargets.size && Array.isArray(selection.excludePaths)) {
-        for (const path of selection.excludePaths) {
-          const lower = this._normalizeFolderPath(path)?.toLowerCase();
-          if (lower) excludeTargets.add(lower);
-        }
-      }
-
-      if (excludeTargets.size) {
-        filtered = filtered.filter((asset) => {
-          const folderPath = this._getNormalizedFolderPath(asset);
-          if (!folderPath) return true;
-          for (const target of excludeTargets) {
-            if (folderPath === target || folderPath.startsWith(`${target}/`)) return false;
-          }
-          return true;
-        });
-      }
+    if (this.supportsFolderBrowser() && !this.app._collections?.active) {
+      const matchesFolder = createFolderSelectionPredicate(this._activeFolderSelection);
+      filtered = filtered.filter((asset) => matchesFolder(this._getNormalizedFolderPath(asset)));
     }
 
     return filtered;
@@ -612,6 +639,13 @@ export class AssetsTab extends GridBrowseTab {
 
   _isCloudEnabled() {
     return this._controller.isCloudEnabled();
+  }
+
+  describeEmptyState() {
+    if (!this._isCloudEnabled() && !getEnabledFolders('assetFolders').length) {
+      return 'No asset source is enabled. Enable FA Cloud Assets or a local folder in Configure Settings, FA Nexus, Asset Sources.';
+    }
+    return super.describeEmptyState();
   }
 
   destroy() {
@@ -776,9 +810,9 @@ export class AssetsTab extends GridBrowseTab {
   }
 
   async _beginAssetPlacement(cardElement, it, isStickyMode = true, pointerEvent = null) {
-    const folderPath = cardElement.getAttribute('data-path') || '';
-    const filePathAttr = cardElement.getAttribute('data-file-path') || this._resolveFilePath(it);
-    const filename = cardElement.getAttribute('data-filename') || '';
+    const folderPath = cardElement.getAttribute('data-folder') || this._resolveFolderPath(it) || '';
+    const filePathAttr = cardElement.getAttribute('data-content-path') || this._resolveFilePath(it);
+    const filename = contentFilename(it);
     const isCloud = (cardElement.getAttribute('data-source') === 'cloud');
     const tier = cardElement.getAttribute('data-tier') || '';
     const dataUrlAttr = cardElement.getAttribute('data-url') || '';
@@ -786,7 +820,10 @@ export class AssetsTab extends GridBrowseTab {
     let dimensionsReady = false;
 
     try { await this._controller.ensureServices(); }
-    catch (error) { Logger.warn('AssetsTab.place.ensure.failed', { error: String(error?.message || error) }); }
+    catch (error) {
+      this._reportAssetPlacementFailure('AssetsTab.place.ensure.failed', error);
+      throw error;
+    }
     const download = this.downloadManager;
 
     if (isCloud) {
@@ -798,7 +835,7 @@ export class AssetsTab extends GridBrowseTab {
       if (!cachedLocalPath && it?.cachedLocalPath) cachedLocalPath = it.cachedLocalPath;
       if (!cachedLocalPath) {
         try {
-          cachedLocalPath = download?.getLocalPath?.('assets', { filename, file_path: filePathAttr, path: folderPath }) || '';
+          cachedLocalPath = download?.getLocalPath?.('assets', it) || '';
         } catch (_) { cachedLocalPath = ''; }
       }
       if (cachedLocalPath) {
@@ -826,20 +863,21 @@ export class AssetsTab extends GridBrowseTab {
       try { dimensionsReady = await this._cards.ensureAccurateDimensions(it, cardElement); } catch (_) {}
     }
 
-    const gridWidthVal = Number(cardElement.getAttribute('data-grid-w') || it?.grid_width || 1) || 1;
-    const gridHeightVal = Number(cardElement.getAttribute('data-grid-h') || it?.grid_height || 1) || 1;
-    const widthPx = Number(cardElement.getAttribute('data-width') || it?.width || (gridWidthVal * 200)) || (gridWidthVal * 200);
-    const heightPx = Number(cardElement.getAttribute('data-height') || it?.height || (gridHeightVal * 200)) || (gridHeightVal * 200);
+    const [gridWidthVal, gridHeightVal] = contentGrid(it);
+    const widthPx = Math.round(gridWidthVal * 200);
+    const heightPx = Math.round(gridHeightVal * 200);
 
     const assetData = {
+      ...it,
       source: isCloud ? 'cloud' : (it?.source || 'local'),
       tier: tier || it?.tier || 'free',
-      file_path: filePathAttr,
-      folder_path: folderPath,
       cachedLocalPath,
-      path: cachedLocalPath || filePathAttr || folderPath,
+      file_path: filePathAttr,
       filename,
+      folder_path: folderPath,
+      path: cachedLocalPath || filePathAttr || folderPath,
       url: cachedLocalPath || '',
+      grid: [gridWidthVal, gridHeightVal],
       grid_width: gridWidthVal,
       grid_height: gridHeightVal,
       width: widthPx,
@@ -852,9 +890,22 @@ export class AssetsTab extends GridBrowseTab {
       try {
         const updated = await placement.updatePlacementAssets(assetData, { pointerEvent });
         if (updated) return;
-      } catch (_) {}
+      } catch (error) {
+        this._reportAssetPlacementFailure('AssetsTab.place.update.failed', error, { filename });
+        throw error;
+      }
     }
-    try { placement?.startPlacement?.(assetData, isStickyMode, { pointerEvent }); } catch (_) {}
+    if (typeof placement?.startPlacement !== 'function') {
+      const error = new Error('Asset placement manager is unavailable.');
+      this._reportAssetPlacementFailure('AssetsTab.place.start.missingManager', error, { filename });
+      throw error;
+    }
+    try {
+      placement.startPlacement(assetData, isStickyMode, { pointerEvent });
+    } catch (error) {
+      this._reportAssetPlacementFailure('AssetsTab.place.start.failed', error, { filename });
+      throw error;
+    }
   }
 
   async _handleTextureCardClick(cardElement, item) {
@@ -897,7 +948,10 @@ export class AssetsTab extends GridBrowseTab {
   async _startPlacementFromSelection() {
     if (this.isTexturesMode) return;
     try { await this._selection.startPlacementFromSelection(); }
-    catch (_) {}
+    catch (error) {
+      this._reportAssetPlacementFailure('AssetsTab.place.selection.failed', error);
+      throw error;
+    }
   }
 
   _updateCardGridBadge(cardElement, item = null) {
@@ -906,13 +960,7 @@ export class AssetsTab extends GridBrowseTab {
 
   _resolveFilePath(item) {
     if (!item) return '';
-    const direct = String(item.file_path || '');
-    if (direct) return direct;
-    const folder = this._resolveFolderPath(item);
-    const filename = String(item.filename || '');
-    if (folder && filename) return `${folder.replace(/\/$/, '')}/${filename}`;
-    if (!folder && filename) return filename;
-    return folder || '';
+    return contentPath(item);
   }
 
   _isSolidTextureItem(item) {
@@ -1016,12 +1064,7 @@ export class AssetsTab extends GridBrowseTab {
     item.cachedLocalPath = dataUrl;
     item.thumbnail_url = dataUrl;
     item.url = dataUrl;
-    item.width = SOLID_TEXTURE_SIZE;
-    item.height = SOLID_TEXTURE_SIZE;
-    item.actual_width = SOLID_TEXTURE_SIZE;
-    item.actual_height = SOLID_TEXTURE_SIZE;
-    item.grid_width = 1;
-    item.grid_height = 1;
+    item.grid = [1, 1];
     return item;
   }
 
@@ -1030,13 +1073,13 @@ export class AssetsTab extends GridBrowseTab {
     if (!this._solidTextureItem) {
       const item = {
         id: SOLID_TEXTURE_ITEM_ID,
-        file_path: SOLID_TEXTURE_ITEM_ID,
-        path: '',
-        filename: 'Solid Color',
-        display_name: 'Solid Color',
+        folder: '',
+        name: 'Solid Color',
         source: 'local',
         tier: 'free',
-        type: 'texture',
+        kind: 'asset',
+        asset_class: 'texture',
+        selected_source: { format: 'webp', ext: '.webp', size: 0, mtime: new Date().toISOString() },
         isSolidTexture: true,
         tags: ['solid', 'color', 'paint']
       };
@@ -1065,7 +1108,7 @@ export class AssetsTab extends GridBrowseTab {
   }
 
   _resolveFolderPath(item) {
-    return this._controller.resolveFolderPath(item);
+    return contentFolder(item) || this._controller.resolveFolderPath(item);
   }
 
   _hasPremiumAuth() {
@@ -1075,6 +1118,22 @@ export class AssetsTab extends GridBrowseTab {
     } catch (_) {
       return false;
     }
+  }
+
+  /** Whether the stored Patreon login's tier includes premium assets (see patreon-auth-contract.js). */
+  _hasPremiumContentAccess() {
+    try {
+      return hasContentProductAccess(game.settings.get('fa-nexus', 'patreon_auth_data'), 'assets');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** The message for a click on a locked premium asset card. */
+  _lockedPremiumAssetMessage() {
+    let authData = null;
+    try { authData = game.settings.get('fa-nexus', 'patreon_auth_data'); } catch (_) {}
+    return lockedPremiumContentMessage(authData, 'premium assets');
   }
 
   _isAssetLocked(item, cardElement = null, { authed } = {}) {
@@ -1112,7 +1171,7 @@ export class AssetsTab extends GridBrowseTab {
         return false;
       }
 
-      if (hasAuth) {
+      if (hasAuth && this._hasPremiumContentAccess()) {
         if (el) {
           try { el.removeAttribute('data-locked'); } catch (_) {}
         }
@@ -1121,11 +1180,8 @@ export class AssetsTab extends GridBrowseTab {
 
       const download = this.downloadManager;
       if (download && item) {
-        const filename = el?.getAttribute?.('data-filename') || item?.filename || '';
-        const filePath = el?.getAttribute?.('data-file-path') || item?.file_path || this._resolveFilePath(item) || '';
-        const folderPath = el?.getAttribute?.('data-path') || item?.path || this._resolveFolderPath(item) || '';
         try {
-          const localPath = download.getLocalPath?.('assets', { filename, file_path: filePath, path: folderPath });
+          const localPath = download.getLocalPath?.('assets', item);
           if (localPath) {
             if (item && !item.cachedLocalPath) item.cachedLocalPath = localPath;
             if (el) {
@@ -1169,6 +1225,7 @@ export class AssetsTab extends GridBrowseTab {
   _isTextureItem(item) {
     if (!item) return false;
     if (this._isSolidTextureItem(item)) return true;
+    if (item.asset_class) return String(item.asset_class).toLowerCase() === 'texture';
     const filePath = String(this._resolveFilePath(item) || '').toLowerCase();
     const folderPath = String(this._resolveFolderPath(item) || '').toLowerCase();
     if (/\/textures\//.test(filePath)) return true;
@@ -1186,7 +1243,8 @@ export class AssetsTab extends GridBrowseTab {
 
   _isPathsItem(item) {
     if (!item) return false;
-    const filename = String(item.filename || '').toLowerCase();
+    if (item.asset_class) return String(item.asset_class).toLowerCase() === 'path';
+    const filename = contentFilename(item).toLowerCase();
     if (filename.includes('path')) return true;
     const filePath = this._resolveFilePath(item);
     const folderPath = this._resolveFolderPath(item);
@@ -1284,12 +1342,7 @@ export class AssetsTab extends GridBrowseTab {
       const dims = this._computeThumbDimensions(clamped);
       const t = Math.max(0, Math.min(1, (clamped - min) / (max - min)));
       try { app._grid.setCardSize(dims.width, dims.height); } catch (_) {}
-      if (gridContainer) {
-        gridContainer.style.setProperty('--fa-nexus-card-pad', `${2 + (6 - 2) * t}px`);
-        gridContainer.style.setProperty('--fa-nexus-title-size', `${0.68 + (0.78 - 0.68) * t}rem`);
-        gridContainer.style.setProperty('--fa-nexus-details-size', `${0.58 + (0.68 - 0.58) * t}rem`);
-        gridContainer.style.setProperty('--fa-nexus-footer-pt', `${0 + (4 - 0) * t}px`);
-      }
+      applyGridDensityStyles(gridContainer, t);
       try { this.app?.updateGridPlaceholderSize?.({ tab: this.id, width: dims.width, height: dims.height, gap: this.getGridOptions?.()?.card?.gap ?? 4 }); } catch (_) {}
       try { this._updateFooterStats(); } catch (_) {}
     };

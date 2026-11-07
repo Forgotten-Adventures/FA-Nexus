@@ -1,42 +1,173 @@
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 import { EventManager } from './core/event-manager.js';
 import { PatreonAuthService, warmPremiumFeatureBundles } from './premium/patreon-auth-service.js';
-import { TokensTab } from './tokens/tokens-tab.js';
 import { NexusLogger as Logger } from './core/nexus-logger.js';
 import { NexusContentService } from './content/nexus-content-service.js';
 import { NexusDownloadManager } from './content/nexus-download-manager.js';
-import { BookmarkManager } from './core/bookmarks/bookmark-manager.js';
-import { BookmarkToolbar } from './core/bookmarks/bookmark-toolbar.js';
-import { SearchController } from './core/search/search-controller.js';
+import { BookmarkManager } from './core/ui/bookmarks/bookmark-manager.js';
+import { CollectionsController } from './content/collections-controller.js';
+import { CONTENT_COLLECTIONS_ENABLED } from './content/collections-availability.js';
+import { BookmarkToolbar } from './core/ui/bookmarks/bookmark-toolbar.js';
+import { SearchController } from './core/ui/search/search-controller.js';
 import { GridManager } from './core/ui/grid-manager.js';
-import { TabManager } from './core/tab-manager.js';
-import { FolderFilterController } from './core/folder-filter/folder-filter-controller.js';
-import { initializeNexusLauncher, applyThemeToElement } from './core/nexus-launcher.js';
+import { TabManager } from './core/application/tab-manager.js';
+import { FolderFilterController } from './core/ui/folder-filter/folder-filter-controller.js';
+import { initializeNexusLauncher, applyThemeToElement } from './core/application/nexus-launcher.js';
 import { renderPatreonAuthHeader } from './premium/patreon-auth-header.js';
 import {
   setPremiumDevBridgeEnabled,
   shouldRefreshPremiumHeaderForSetting
 } from './premium/premium-runtime-config.js';
-import { FooterController } from './core/footer-controller.js';
-import { scheduleAssetCloudWarmup } from './assets/assets-tab-controller.js';
-import './tokens/token-elevation-offset.js';
-import './scene-import/scene-asset-import-helper.js';
-import './canvas/scene-transition-readiness.js';
-import './canvas/active-session-level-switch-guard.js';
-import './canvas/tile-placement-level.js';
-import './canvas/region-surface-invalidation.js';
-import './canvas/region-perception-refresh.js';
-import './canvas/tile-config.js';
+import { FooterController } from './core/application/footer-controller.js';
+import { onFoundryBoot } from './core/foundry-boot-hooks.js';
+import { isMapmakingEnabled, isPrefabsEnabled, isTokensEnabled } from './core/feature-areas.js';
+import { insertLayerManagerSidebarSlot } from './layers/layer-manager-sidebar-slot.js';
+import './core/mapmaking-off-notice.js';
 import {
   clearNexusTileSelectionContext,
   installNexusTileSelectionContextHooks,
   preserveCurrentTileSelectionForNexus
 } from './canvas/tile-selection-context.js';
+import {
+  isUsableExpandedNexusPosition,
+  resolvePersistableNexusPosition,
+  resolveRestorableNexusPosition
+} from './core/application/nexus-window-position-state.js';
+import { premiumEntitlementsService } from './premium/premium-entitlements-service.js';
 
-const PREMIUM_DISCLAIMER_TABS = new Set(['textures', 'paths', 'buildings']);
+const TOKENS_ENABLED = isTokensEnabled();
+const MAPMAKING_ENABLED = isMapmakingEnabled();
+
+let TokensTab = null;
+let scheduleAssetCloudWarmup = null;
+const NEXUS_TAB_DEFINITIONS = [];
+
+if (TOKENS_ENABLED) {
+  ({ TokensTab } = await import('./tokens/tokens-tab.js'));
+  NEXUS_TAB_DEFINITIONS.push(Object.freeze({
+    id: 'tokens',
+    label: 'Tokens',
+    TabClass: TokensTab,
+    folderFilterLabels: Object.freeze({ label: 'Token Folders', allLabel: 'All Tokens', unassignedLabel: 'Unsorted' })
+  }));
+}
+
+// The Layer Manager's sidebar slot is set here, before the await below: Foundry builds its sidebar from Sidebar.TABS
+// and may do so before layer-manager-tab.js has loaded (see core/foundry-boot-hooks.js).
+if (MAPMAKING_ENABLED) Hooks.once('init', insertLayerManagerSidebarSlot);
+
+if (MAPMAKING_ENABLED) {
+  const [
+    { AssetsTab },
+    { BuildingsTab },
+    assetsTabController
+  ] = await Promise.all([
+    import('./assets/assets-tab.js'),
+    import('./buildings/tab/buildings-tab.js'),
+    import('./assets/assets-tab-controller.js'),
+    import('./tokens/token-elevation-offset.js'),
+    import('./scene-import/scene-asset-import-helper.js'),
+    import('./canvas/scene-transition-readiness.js'),
+    import('./canvas/active-session-level-switch-guard.js'),
+    import('./canvas/tile-placement-level.js'),
+    import('./canvas/tile-config.js'),
+    import('./canvas/tile-selection.js'),
+    import('./canvas/tile-flag-undo-history.js'),
+    import('./textures/masked-tiling-native-resize.js'),
+    import('./textures/mask-file-undo-guard.js'),
+    import('./paths/path-native-tile-transform.js'),
+    import('./paths/path-generated-wall-runtime.js'),
+    import('./buildings/building-native-tile-transform.js'),
+    import('./buildings/building-generated-document-runtime.js'),
+    import('./assets/asset-shadow-native-tile-preview-runtime.js'),
+    import('./assets/asset-scatter-native-tile-transform.js'),
+    import('./flatten/flatten-native-tile-transform.js'),
+    import('./portals/door-transform-native-tile-preview-runtime.js'),
+    import('./canvas/custom-tile-overhead.js'),
+    import('./flatten/tile-flatten-chunks.js'),
+    import('./cleanup/generated-cleanup-delete-hook.js'),
+    import('./canvas/tile-hud-edit.js'),
+    import('./textures/texture-paint-manager.js'),
+    import('./portals/seamless-secret-door-runtime.js'),
+    import('./portals/portal-texture-flip-runtime.js'),
+    import('./portals/door-visual-proxy-manager.js'),
+    import('./portals/door-shadow-manager.js'),
+    import('./layers/layer-manager-tab.js'),
+    import('./composition/scene-group-runtime.js'),
+    Promise.all([
+      import('./composition/scene-group-native-history-runtime.js'),
+      import('./composition/scene-group-overlay-runtime.js')
+    ]).then(([{initializeSceneGroupNativeHistoryRuntime}, {sceneGroupOverlayRuntime}]) =>
+      initializeSceneGroupNativeHistoryRuntime({
+        getPendingOverlayTransform: () => sceneGroupOverlayRuntime.pendingTransform
+      })),
+    import('./composition/scene-group-interaction-runtime.js'),
+    import('./composition/placeable-scene-group-drag-runtime.js')
+  ]);
+  scheduleAssetCloudWarmup = assetsTabController.scheduleAssetCloudWarmup;
+  const PrefabsTab = isPrefabsEnabled() ? (await import('./composition/prefabs-tab.js')).PrefabsTab : null;
+  NEXUS_TAB_DEFINITIONS.push(Object.freeze({
+    id: 'assets',
+    label: 'Assets',
+    TabClass: AssetsTab,
+    folderFilterLabels: Object.freeze({ label: 'Asset Folders', allLabel: 'All Assets', unassignedLabel: 'Unsorted' })
+  }),
+  Object.freeze({
+    id: 'textures',
+    label: 'Textures',
+    TabClass: AssetsTab,
+    constructorOptions: Object.freeze({ mode: 'textures' }),
+    premium: true,
+    folderFilterLabels: Object.freeze({ label: 'Texture Folders', allLabel: 'All Textures', unassignedLabel: 'Unsorted' })
+  }),
+  Object.freeze({
+    id: 'paths',
+    label: 'Paths',
+    TabClass: AssetsTab,
+    constructorOptions: Object.freeze({ mode: 'paths' }),
+    premium: true,
+    folderFilterLabels: Object.freeze({ label: 'Path Folders', allLabel: 'All Paths', unassignedLabel: 'Unsorted' })
+  }),
+  Object.freeze({
+    id: 'buildings',
+    label: 'Building Tool',
+    TabClass: BuildingsTab,
+    premium: true,
+    folderFilterLabels: Object.freeze({ label: 'Asset Folders', allLabel: 'All Assets', unassignedLabel: 'Unsorted' }),
+    bookmarkFolderScope: 'paths',
+    searchApplyOptions: Object.freeze({ refreshTextures: false })
+  }));
+  if (PrefabsTab) NEXUS_TAB_DEFINITIONS.push(Object.freeze({
+    id: 'prefabs',
+    label: 'Prefabs',
+    experimental: true,
+    TabClass: PrefabsTab
+  }));
+}
+
+Object.freeze(NEXUS_TAB_DEFINITIONS);
+const DEFAULT_TAB_ID = NEXUS_TAB_DEFINITIONS[0]?.id || 'tokens';
+const PREMIUM_DISCLAIMER_TABS = new Set(NEXUS_TAB_DEFINITIONS
+  .filter((definition) => definition.premium)
+  .map((definition) => definition.id));
 
 function logAppLifecycleFailure(scope, error, details = {}) {
   Logger.warn(scope, { ...details, error });
+}
+
+function buildNexusTabContext(activeTabId = DEFAULT_TAB_ID) {
+  const active = String(activeTabId || DEFAULT_TAB_ID);
+  return NEXUS_TAB_DEFINITIONS.map((definition) => {
+    const selected = definition.id === active;
+    return {
+      id: definition.id,
+      label: definition.label || definition.id,
+      experimental: definition.experimental === true,
+      active: selected,
+      activeClass: selected ? ' active' : '',
+      ariaSelected: selected ? 'true' : 'false'
+    };
+  });
 }
 
 /**
@@ -56,12 +187,15 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
   };
 
   static PARTS = {
-    body: { template: 'modules/fa-nexus/templates/nexus-app.hbs' }
+    body: { template: 'modules/fa-nexus/templates/application/nexus-app.hbs' }
   };
 
   constructor(...args) {
     super(...args);
-    this._folderFilterController = new FolderFilterController(this);
+    this._lastExpandedPosition = resolvePersistableNexusPosition(this.position, null);
+    this._folderFilterController = new FolderFilterController(this, {
+      tabDefinitions: NEXUS_TAB_DEFINITIONS
+    });
 
     Object.defineProperty(this, '_activeTab', {
       get: () => this._tabManager?.getActiveTabId() || null,
@@ -72,17 +206,33 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
       configurable: true
     });
     this._bookmarkManager = new BookmarkManager();
-    this._searchController = new SearchController(this);
+    this._collections = CONTENT_COLLECTIONS_ENABLED ? new CollectionsController(this) : null;
+    this._searchController = new SearchController(this, {
+      tabDefinitions: NEXUS_TAB_DEFINITIONS,
+      defaultTabId: DEFAULT_TAB_ID
+    });
     this._gridManager = new GridManager(this);
-    this._tabManager = new TabManager(this);
+    this._tabManager = new TabManager(this, {
+      tabDefinitions: NEXUS_TAB_DEFINITIONS,
+      defaultTabId: DEFAULT_TAB_ID
+    });
     this._footerController = new FooterController({ app: this });
     this._bookmarkToolbar = new BookmarkToolbar({
       app: this,
       bookmarkManager: this._bookmarkManager,
       tabManager: this._tabManager,
       searchController: this._searchController,
-      folderController: this._folderFilterController
+      folderController: this._folderFilterController,
+      tabDefinitions: NEXUS_TAB_DEFINITIONS,
+      defaultTabId: DEFAULT_TAB_ID
     });
+  }
+
+  async _prepareContext() {
+    const activeTabId = this._tabManager?.getActiveTabId?.() || DEFAULT_TAB_ID;
+    return {
+      nexusTabs: buildNexusTabContext(activeTabId)
+    };
   }
 
   /**
@@ -93,8 +243,13 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     const result = super.setPosition(position);
     try {
       const p = this.position || position || {};
-      const state = { left: p.left, top: p.top, width: p.width, height: p.height };
-      this._saveWindowPosition(state);
+      const state = isUsableExpandedNexusPosition(p)
+        ? resolvePersistableNexusPosition(p, null)
+        : null;
+      if (state) {
+        this._lastExpandedPosition = state;
+        this._saveWindowPosition(state);
+      }
     } catch (error) {
       logAppLifecycleFailure('App.windowPos.scheduleSaveFailed', error);
     }
@@ -110,8 +265,11 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
    */
   _onRender(initial, context) {
     super._onRender(initial, context);
-    try { preserveCurrentTileSelectionForNexus('app-render'); }
-    catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveRenderFailed', error); }
+    this._installResizePointerCapture();
+    if (MAPMAKING_ENABLED) {
+      try { preserveCurrentTileSelectionForNexus('app-render'); }
+      catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveRenderFailed', error); }
+    }
     try { applyThemeToElement(this.element); }
     catch (error) { logAppLifecycleFailure('App.theme.applyFailed', error); }
     Logger.info('App._onRender', { initial: !!initial });
@@ -135,12 +293,11 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     try {
       const pos = game.settings.get('fa-nexus', 'windowPos') || {};
       if (pos && typeof pos === 'object') {
-        const { left, top, width, height } = pos;
-        const p = Object.assign({}, this.position);
-        if (Number.isFinite(left)) p.left = left;
-        if (Number.isFinite(top)) p.top = top;
-        if (Number.isFinite(width)) p.width = width;
-        if (Number.isFinite(height)) p.height = height;
+        const p = resolveRestorableNexusPosition(pos, this.position);
+        if (Object.keys(pos).length && !isUsableExpandedNexusPosition(pos)) {
+          Logger.warn('App.windowPos.recoveredCollapsedState', { saved: pos, restored: p });
+        }
+        this._lastExpandedPosition = p;
         this.setPosition(p);
       }
     } catch (error) {
@@ -150,12 +307,19 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     if (!this._events) this._events = new EventManager();
     this._searchController.initialize(this._events);
     this._bookmarkToolbar.initialize(this._events);
+    this._collections?.bindGrid();
     this._footerController.initialize(this._events);
     try { this._folderFilterController.onAppRender(); } catch (e) { Logger.warn('FolderFilter.onRender failed', e); }
 
     // Initialize/rebind grid to current DOM container on render
     const gridContainer = this.element.querySelector('#fa-nexus-grid');
-    try { this._tabManager.initializeTabs(); Logger.info('App.ensureTabs'); } catch (e) { Logger.warn('App.ensureTabs failed', e); }
+    try {
+      this._tabManager.initializeTabs();
+      Logger.info('App.ensureTabs');
+    } catch (error) {
+      Logger.error('App.ensureTabs failed', error);
+      throw error;
+    }
 
     // Ensure we have an active tab
     let activeTabId = this._tabManager.getActiveTabId();
@@ -205,6 +369,10 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
           } catch (err) { Logger.warn('Auth header refresh failed', err); }
         };
         Hooks.on('updateSetting', this._authSettingHook);
+      }
+      // A Pro-tier refusal changes the tool tabs' notice without any setting change.
+      if (!this._stopEntitlementWatch) {
+        this._stopEntitlementWatch = premiumEntitlementsService.onChange(() => this._syncPremiumDisclaimer());
       }
     } catch (error) {
       logAppLifecycleFailure('App.authHeader.hookInstallFailed', error);
@@ -267,8 +435,57 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this._setPatreonHeaderVisibility(true);
   }
 
+  async close(options = {}) {
+    const buildingTab = this._tabManager?.getTabs?.()?.buildings || null;
+    const manager = buildingTab?._buildingManager || null;
+    if (manager) {
+      try {
+        const outcome = await manager.requestApplicationClose({ reason: 'closing FA Nexus' });
+        if (['continued', 'blocked'].includes(outcome?.kind)) return this;
+      } catch (error) {
+        ui?.notifications?.error?.(`FA Nexus could not finish Building Edit before closing: ${String(error?.message || error)}`);
+        throw error;
+      }
+    }
+    // A Texture or Path session with changes is saved while its window still exists. Saved after the
+    // window is gone, the session has no host and is torn down in the middle of the save.
+    try {
+      await this._tabManager?.getActiveTab?.()?.saveSessionBeforeApplicationClose?.();
+    } catch (error) {
+      manager?.cancelApplicationClose?.();
+      Logger.error('App.close.sessionSaveFailed', { tab: this._tabManager?.getActiveTabId?.() || null, error: String(error?.message || error) });
+      ui?.notifications?.error?.(`FA Nexus stays open: the open session could not be saved (${String(error?.message || error)}). Commit or cancel it, then close.`);
+      return this;
+    }
+    try {
+      // From here on this window gives up its search, grid and tabs. It is not drawn again: a window asked for
+      // while it closes is a new one that waits for this promise (renderFaNexus).
+      this._closePromise = super.close(options);
+      return await this._closePromise;
+    } catch (error) {
+      this._closePromise = null;
+      manager?.cancelApplicationClose?.();
+      ui?.notifications?.error?.(`FA Nexus close failed: ${String(error?.message || error)}`);
+      throw error;
+    }
+  }
+
+  /** A window opened while the one before it is still closing waits for that close: both carry the same id. */
+  async render(options, _options) {
+    if (this._renderAfter) {
+      await Promise.resolve(this._renderAfter).catch(() => {});
+      this._renderAfter = null;
+      const other = foundry.applications.instances.get('fa-nexus-app');
+      if (other && other !== this) throw new Error('FA Nexus is still open: its window did not close.');
+    }
+    return super.render(options, _options);
+  }
+
   /** Cleanup tabs, timers, grid and listeners; persist UI state */
   _onClose(options = {}) {
+    this._resizePointerCaptureAbort?.abort?.();
+    this._resizePointerCaptureAbort = null;
+    this._resizePointerCaptureHandle = null;
     try {
       Logger.info('App._onClose');
       try { this._footerController?.destroy?.(); }
@@ -282,12 +499,13 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
       // Persist window position/size
       try {
         const p = this.position || {};
-        const state = { left: p.left, top: p.top, width: p.width, height: p.height };
-        this._saveWindowPosition(state);
+        const state = resolvePersistableNexusPosition(p, this._lastExpandedPosition);
+        if (state) this._saveWindowPosition(state);
+        else Logger.warn('App.close.windowPos.noExpandedState', { position: p });
       } catch (error) {
         logAppLifecycleFailure('App.close.windowPos.scheduleSaveFailed', error);
       }
-      try { this._tabManager.saveActiveTabToSettings(this._tabManager.getActiveTabId() || 'tokens'); }
+      try { this._tabManager.saveActiveTabToSettings(this._tabManager.getActiveTabId() || DEFAULT_TAB_ID); }
       catch (error) { logAppLifecycleFailure('App.close.saveActiveTabFailed', error); }
       if (this._tokenPreview) {
         this._tokenPreview.hidePreview?.();
@@ -312,6 +530,11 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
         catch (error) { logAppLifecycleFailure('App.close.authHookRemoveFailed', error); }
         this._authSettingHook = null;
       }
+      if (this._stopEntitlementWatch) {
+        this._stopEntitlementWatch();
+        this._stopEntitlementWatch = null;
+      }
+      this._collections?.destroy();
       try { this._folderFilterController.cleanup(); }
       catch (error) { logAppLifecycleFailure('App.close.folderFilterCleanupFailed', error); }
       try { this._bookmarkToolbar.cleanup(); }
@@ -328,12 +551,41 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
         this._tabManager.cleanup();
         this._tabManager = null;
       }
-      try { clearNexusTileSelectionContext('app-close'); }
-      catch (error) { logAppLifecycleFailure('App.close.tileSelectionContextClearFailed', error); }
+      if (MAPMAKING_ENABLED) {
+        try { clearNexusTileSelectionContext('app-close'); }
+        catch (error) { logAppLifecycleFailure('App.close.tileSelectionContextClearFailed', error); }
+      }
     } catch (error) {
       logAppLifecycleFailure('App.close.failed', error);
+    } finally {
+      if (this._contentService) {
+        try { this._contentService.destroy?.(); }
+        catch (error) { logAppLifecycleFailure('App.close.contentServiceDestroyFailed', error); }
+        finally { this._contentService = null; }
+      }
     }
     super._onClose(options);
+  }
+
+  _installResizePointerCapture() {
+    const handle = this.element?.querySelector?.('.window-resize-handle');
+    if (!handle || this._resizePointerCaptureHandle === handle) return;
+    this._resizePointerCaptureAbort?.abort?.();
+    const controller = new AbortController();
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      try {
+        // Foundry normally waits for the first move before capturing. A fast
+        // resize can leave this tiny handle before that move is delivered.
+        handle.setPointerCapture(event.pointerId);
+      } catch (error) {
+        logAppLifecycleFailure('App.windowResize.pointerCaptureFailed', error, {
+          pointerId: event.pointerId
+        });
+      }
+    }, { capture: true, signal: controller.signal });
+    this._resizePointerCaptureHandle = handle;
+    this._resizePointerCaptureAbort = controller;
   }
 
   setFolderFilterData(tabId, data) {
@@ -378,15 +630,61 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   _syncPremiumDisclaimer() {
     try {
-      const notice = this.element?.querySelector('.fa-nexus-premium-disclaimer');
+      const notice = this.element?.querySelector('.fa-nexus-premium-disclaimer:not(.fa-nexus-experimental-notice)');
       if (!notice) return;
       const activeTab = this._tabManager?.getActiveTabId?.() || null;
-      const visible = PREMIUM_DISCLAIMER_TABS.has(activeTab) && !this._hasPremiumAuth();
+      // Signed out: connect Patreon. Signed in, but the tools endpoint refused the tier: the Pro tier is needed.
+      const signedIn = this._hasPremiumAuth();
+      const proRefused = signedIn && !!premiumEntitlementsService.proTierRefusal;
+      const visible = PREMIUM_DISCLAIMER_TABS.has(activeTab) && (!signedIn || proRefused);
       notice.hidden = !visible;
       notice.setAttribute('aria-hidden', visible ? 'false' : 'true');
+      notice.dataset.reason = proRefused ? 'pro-tier' : 'signed-out';
+      for (const line of notice.querySelectorAll('[data-premium-reason]')) line.hidden = line.dataset.premiumReason !== notice.dataset.reason;
+      const experimental = this.element?.querySelector('.fa-nexus-experimental-notice');
+      if (experimental) {
+        const shown = NEXUS_TAB_DEFINITIONS.find((definition) => definition.id === activeTab)?.experimental === true;
+        experimental.hidden = !shown;
+        experimental.setAttribute('aria-hidden', shown ? 'false' : 'true');
+      }
     } catch (error) {
       logAppLifecycleFailure('App.premiumDisclaimer.syncFailed', error);
     }
+  }
+
+  /**
+   * Re-materialize the visible browse grid after Patreon access changes.
+   * Setting hooks can arrive before entitlement state settles, so auth completion
+   * owns one authoritative refresh instead of relying on incidental tab changes.
+   */
+  async refreshActiveGridAfterAuthenticationChange() {
+    this._syncPremiumDisclaimer();
+    if (!this.rendered || !this.element) {
+      return { refreshed: false, reason: 'app-not-rendered' };
+    }
+    const activeTab = this._tabManager?.getActiveTab?.() || null;
+    if (!activeTab) {
+      throw new Error('Nexus has no active tab to refresh after authentication changed.');
+    }
+    if (typeof activeTab.applySearchAsync !== 'function') {
+      Logger.info('App.authGridRefresh:skipped', {
+        tab: this._tabManager?.getActiveTabId?.() || null,
+        reason: 'active-tab-has-no-grid-search'
+      });
+      return { refreshed: false, reason: 'active-tab-has-no-grid-search' };
+    }
+    if (!this._grid) {
+      throw new Error('The active Nexus browse tab has no mounted grid to refresh.');
+    }
+    const query = typeof activeTab.getCurrentSearchValue === 'function'
+      ? activeTab.getCurrentSearchValue()
+      : '';
+    await activeTab.applySearchAsync(query);
+    this._syncPremiumDisclaimer();
+    Logger.info('App.authGridRefresh:complete', {
+      tab: this._tabManager?.getActiveTabId?.() || null
+    });
+    return { refreshed: true, reason: 'active-grid-rematerialized' };
   }
 
   showGridLoader(message = '', { owner = null } = {}) {
@@ -476,6 +774,9 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
 }
 
+// The window that will open once the one that is closing is gone.
+let reopeningApp = null;
+
 /**
  * Open or focus FA Nexus application
  * @returns {FaNexusApp|null}
@@ -483,17 +784,34 @@ class FaNexusApp extends HandlebarsApplicationMixin(ApplicationV2) {
 function renderFaNexus() {
   // Only GMs can access the module
   if (!game?.user?.isGM) return null;
-  try { preserveCurrentTileSelectionForNexus('app-open'); }
-  catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveOpenFailed', error); }
+  if (MAPMAKING_ENABLED) {
+    try { preserveCurrentTileSelectionForNexus('app-open'); }
+    catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveOpenFailed', error); }
+  }
 
   try {
     const existing = foundry.applications.instances.get('fa-nexus-app');
+    if (existing?._closePromise) {
+      // The window is closing and has given up, or is giving up, its controllers: drawn again it was an empty
+      // shell. A fresh window takes its place as soon as it is gone; every caller within that time gets the same one.
+      if (!reopeningApp) {
+        const app = new FaNexusApp();
+        app._renderAfter = existing._closePromise;
+        reopeningApp = app;
+        app.render(true)
+          .catch((error) => logAppLifecycleFailure('App.render.afterCloseFailed', error))
+          .finally(() => { if (reopeningApp === app) reopeningApp = null; });
+      }
+      return reopeningApp;
+    }
     if (existing) {
       // If already rendered, just bring to front; avoid duplicate _onRender triggers mid-layout
       if (!existing.rendered) existing.render(true);
       else existing.bringToFront?.();
-      try { preserveCurrentTileSelectionForNexus('app-focus-existing'); }
-      catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveExistingFailed', error); }
+      if (MAPMAKING_ENABLED) {
+        try { preserveCurrentTileSelectionForNexus('app-focus-existing'); }
+        catch (error) { logAppLifecycleFailure('App.tileSelectionContext.preserveExistingFailed', error); }
+      }
       return existing;
     }
   } catch (error) {
@@ -504,7 +822,9 @@ function renderFaNexus() {
   return app;
 }
 
-initializeNexusLauncher({ onOpen: renderFaNexus });
+if (NEXUS_TAB_DEFINITIONS.length) {
+  initializeNexusLauncher({ onOpen: renderFaNexus, preserveTileSelection: MAPMAKING_ENABLED });
+}
 
 async function enablePremiumDevBridge(options = {}) {
   const enabled = await setPremiumDevBridgeEnabled(true, options);
@@ -521,15 +841,14 @@ async function disablePremiumDevBridge(options = {}) {
   return await setPremiumDevBridgeEnabled(false, options);
 }
 
-Hooks.once('ready', () => {
-  try { installNexusTileSelectionContextHooks(); }
-  catch (error) { logAppLifecycleFailure('App.ready.tileSelectionContextInstallFailed', error); }
-  // Register drag/drop globally via TokensTab (tokens-only feature)
-  try { TokensTab.registerGlobalDragDrop?.(); }
-  catch (error) { logAppLifecycleFailure('App.ready.registerGlobalDragDropFailed', error); }
-
+// Registered after the runtime imports above have finished, which on a slow host can be after ready.
+onFoundryBoot('ready', () => {
+  if (MAPMAKING_ENABLED) {
+    try { installNexusTileSelectionContextHooks(); }
+    catch (error) { logAppLifecycleFailure('App.ready.tileSelectionContextInstallFailed', error); }
+  }
   // Preload templates for synchronous rendering
-  try {
+  if (TOKENS_ENABLED) try {
     const templates = [
       'modules/fa-nexus/templates/tokens/token-card.hbs',
       'modules/fa-nexus/templates/tokens/actor-update-dialog.hbs'
@@ -547,7 +866,7 @@ Hooks.once('ready', () => {
     logAppLifecycleFailure('App.ready.scheduleTemplatePreloadFailed', error);
   }
 
-  try {
+  if (NEXUS_TAB_DEFINITIONS.length) try {
     warmPremiumFeatureBundles({ reason: 'startup' }).catch((error) => {
       Logger.warn('FaNexusApp.premiumWarmup.failed', { error: String(error?.message || error) });
     });
@@ -555,7 +874,7 @@ Hooks.once('ready', () => {
     logAppLifecycleFailure('App.ready.schedulePremiumWarmupFailed', error);
   }
 
-  try {
+  if (MAPMAKING_ENABLED) try {
     scheduleAssetCloudWarmup({ reason: 'startup' });
   } catch (error) {
     Logger.warn('FaNexusApp.assetWarmup.scheduleFailed', { error: String(error?.message || error) });

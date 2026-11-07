@@ -1,7 +1,16 @@
 import { NexusLogger as Logger } from '../core/nexus-logger.js';
+import {
+  contentDimensions,
+  contentFilename,
+  contentFolder,
+  contentGrid,
+  contentPath,
+  inventoryItemKey
+} from '../content/cloud-inventory-v2.js';
 import { premiumFeatureBroker } from '../premium/premium-feature-broker.js';
 import { ensurePremiumFeaturesRegistered } from '../premium/premium-feature-registry.js';
 import { premiumEntitlementsService } from '../premium/premium-entitlements-service.js';
+import { isPremiumAuthFailure, isProTierRefusal, proTierMessage } from '../premium/session-host/auth-state.js';
 import { PlacementOverlay, createPlacementSpinner } from '../core/placement/placement-overlay.js';
 
 function clearLockedCardState(cardElement) {
@@ -72,10 +81,10 @@ export class AssetsTabCardHelper {
         return '';
       }
       try {
-        const full = await contentSvc.getFullURL('assets', {
-          file_path: filePathAttr || item?.file_path || '',
-          filename: item?.filename || cardElement.getAttribute('data-filename') || '',
-          tier: item?.tier || (normalizedTier || 'free')
+        const full = await contentSvc.getFullURL('assets', item || {
+          id: cardElement.getAttribute('data-content-id') || '',
+          selected_source: { ext: '.webp' },
+          tier: normalizedTier || 'free'
         }, state);
         if (full) src = full;
       } catch (error) {
@@ -134,17 +143,18 @@ export class AssetsTabCardHelper {
         code,
         message: String(error?.message || error)
       });
-      if (this._isAuthFailure(error)) {
+      if (this._isAuthFailure(error) && code !== 'STATE_MISSING') {
+        // An expired login: _handlePremiumAuthFailure signs out and says so.
         await this._handlePremiumAuthFailure(error, {
           featureId,
           label,
           source: 'assets-card:require'
         });
-      }
-      if (code === 'ENTITLEMENT_REQUIRED') {
-        ui.notifications?.warn?.(`${label} is a premium feature. Please connect Patreon to unlock it.`);
+      } else if (isProTierRefusal(error)) {
+        ui.notifications?.warn?.(proTierMessage(label));
+        try { this.tab?.app?._syncPremiumDisclaimer?.(); } catch (_) {}
       } else if (code === 'STATE_MISSING') {
-        ui.notifications?.error?.(`Authentication required for ${label}. Please connect Patreon.`);
+        ui.notifications?.error?.(`${label} is a Pro tool. Connect Patreon to use it.`);
       } else if (code === 'MODULE_UPDATE_REQUIRED') {
         ui.notifications?.error?.(`Update FA Nexus to the latest version to use ${label}.`);
       } else if (code === 'MODULE_TOO_NEW') {
@@ -174,8 +184,11 @@ export class AssetsTabCardHelper {
       };
       let gridW = parseDimension(cardElement.getAttribute('data-grid-w'));
       let gridH = parseDimension(cardElement.getAttribute('data-grid-h'));
-      if (gridW == null && item) gridW = parseDimension(item.grid_width);
-      if (gridH == null && item) gridH = parseDimension(item.grid_height);
+      if ((gridW == null || gridH == null) && item) {
+        const [itemGridW, itemGridH] = contentGrid(item);
+        if (gridW == null) gridW = parseDimension(itemGridW);
+        if (gridH == null) gridH = parseDimension(itemGridH);
+      }
 
       let pending = false;
       if (item) {
@@ -212,7 +225,8 @@ export class AssetsTabCardHelper {
 
   needsActualDimensions(item) {
     if (!item) return false;
-    const filename = String(item.filename || '').toLowerCase();
+    if (String(item.source || '').toLowerCase() === 'cloud') return false;
+    const filename = contentFilename(item).toLowerCase();
     const hasPattern = /(?:^|[_\-\s])\d+x\d+$/.test(filename.replace(/\.[^/.]+$/, ''));
     if (hasPattern) return false;
     const tab = this.tab;
@@ -237,10 +251,11 @@ export class AssetsTabCardHelper {
     try {
       if (item?._dimsResolved) {
         if (cardElement && cardElement.isConnected) {
-          try { cardElement.setAttribute('data-width', String(item.width ?? '')); } catch (_) {}
-          try { cardElement.setAttribute('data-height', String(item.height ?? '')); } catch (_) {}
-          try { cardElement.setAttribute('data-grid-w', String(item.grid_width ?? '')); } catch (_) {}
-          try { cardElement.setAttribute('data-grid-h', String(item.grid_height ?? '')); } catch (_) {}
+          const dims = contentDimensions(item);
+          try { cardElement.setAttribute('data-width', String(dims.width)); } catch (_) {}
+          try { cardElement.setAttribute('data-height', String(dims.height)); } catch (_) {}
+          try { cardElement.setAttribute('data-grid-w', String(dims.gridWidth)); } catch (_) {}
+          try { cardElement.setAttribute('data-grid-h', String(dims.gridHeight)); } catch (_) {}
           this.updateCardGridBadge(cardElement, item);
         }
         return true;
@@ -256,12 +271,9 @@ export class AssetsTabCardHelper {
       const heightPx = Math.max(1, Math.round(dims.height));
       const gridWidth = Math.max(0.01, Math.round((widthPx / base) * 100) / 100);
       const gridHeight = Math.max(0.01, Math.round((heightPx / base) * 100) / 100);
-      item.width = widthPx;
-      item.height = heightPx;
       item.actual_width = widthPx;
       item.actual_height = heightPx;
-      item.grid_width = gridWidth;
-      item.grid_height = gridHeight;
+      item.grid = [gridWidth, gridHeight];
       item._dimsResolved = true;
       if (cardElement && cardElement.isConnected) {
         try { cardElement.setAttribute('data-width', String(widthPx)); } catch (_) {}
@@ -282,24 +294,26 @@ export class AssetsTabCardHelper {
     const card = document.createElement('div');
     card.className = 'fa-nexus-card';
     const isSolid = tab?._isSolidTextureItem?.(item);
-    if (isSolid) {
-      card.classList.add('fa-nexus-solid-texture');
-      card.title = item?.display_name || item?.filename || 'Solid Color';
-    }
+    const filename = contentFilename(item);
     const filePath = tab._resolveFilePath(item);
     const folderPath = tab._resolveFolderPath(item);
-    const cachedPath = item.cachedLocalPath || '';
+    const [gridWidth, gridHeight] = contentGrid(item);
+    const dims = contentDimensions(item);
+    const fileSize = Number(item?.selected_source?.size || 0);
+    if (isSolid) {
+      card.classList.add('fa-nexus-solid-texture');
+    }
+    const cachedPath = item?.cachedLocalPath || '';
     try { card.setAttribute('data-key', tab._computeItemKey(item)); } catch (_) {}
-    card.setAttribute('data-filename', item.filename || '');
-    card.setAttribute('data-file-path', filePath);
-    card.setAttribute('data-path', folderPath || '');
-    const initialGridW = Number(item?.grid_width);
-    const initialGridH = Number(item?.grid_height);
-    if (Number.isFinite(initialGridW) && initialGridW > 0) card.setAttribute('data-grid-w', String(initialGridW));
-    if (Number.isFinite(initialGridH) && initialGridH > 0) card.setAttribute('data-grid-h', String(initialGridH));
-    if (item.width != null) card.setAttribute('data-width', String(item.width));
-    if (item.height != null) card.setAttribute('data-height', String(item.height));
-    if (item.file_size != null) card.setAttribute('data-file-size', String(item.file_size));
+    card.setAttribute('data-content-id', inventoryItemKey(item));
+    card.setAttribute('data-content-path', filePath);
+    card.setAttribute('data-folder', folderPath || '');
+    card.setAttribute('data-name', item?.name || filename || '');
+    card.setAttribute('data-grid-w', String(gridWidth));
+    card.setAttribute('data-grid-h', String(gridHeight));
+    card.setAttribute('data-width', String(item?.actual_width || dims.width));
+    card.setAttribute('data-height', String(item?.actual_height || dims.height));
+    if (fileSize > 0) card.setAttribute('data-file-size', String(fileSize));
     const isCloud = (item && item.source === 'cloud');
     const dataSource = isCloud ? 'cloud' : (item?.source || 'local');
     card.setAttribute('data-source', dataSource);
@@ -310,7 +324,7 @@ export class AssetsTabCardHelper {
     } else if (filePath) {
       card.setAttribute('data-url', filePath);
     }
-    const isVideoAsset = this._isVideoFilename(item?.filename) || this._isVideoFilename(cachedPath) || this._isVideoFilename(filePath);
+    const isVideoAsset = this._isVideoFilename(filename) || this._isVideoFilename(cachedPath) || this._isVideoFilename(filePath);
     const tier = String(item?.tier || '').toLowerCase();
     const canInlineCloudVideo = !isCloud || cachedPath || tier === 'free';
     const useVideo = isVideoAsset && canInlineCloudVideo;
@@ -320,25 +334,40 @@ export class AssetsTabCardHelper {
       try { card.setAttribute('data-media-type', 'image'); } catch (_) {}
     }
     const initialVideoSrc = useVideo && (!isCloud || cachedPath) ? (cachedPath || filePath || '') : '';
-    const media = useVideo
-      ? `<video src="${initialVideoSrc}" muted playsinline preload="metadata" style="max-width:100%;max-height:100%;object-fit:contain"></video>`
-      : `<img alt="${item.filename || ''}" style="max-width:100%;max-height:100%;object-fit:contain"/>`;
-    const colorPicker = isSolid
-      ? `
-        <label class="fa-nexus-solid-color-picker" title="Pick solid color" aria-label="Pick solid color">
-          <input type="color" data-fa-nexus-solid-color-input aria-label="Pick solid color">
-          <i class="fas fa-palette"></i>
-        </label>
-      `
-      : '';
-    card.innerHTML = `
-      <div class="thumb ${isSolid ? 'fa-nexus-solid-texture-thumb' : 'fa-nexus-thumb-placeholder'}">
-        ${media}
-        ${colorPicker}
-        <div class="fa-nexus-status-icon" title=""></div>
-        <div class="fa-nexus-grid-size-tag"></div>
-      </div>
-      `;
+    const thumb = document.createElement('div');
+    thumb.className = `thumb ${isSolid ? 'fa-nexus-solid-texture-thumb' : 'fa-nexus-thumb-placeholder'}`;
+    const media = useVideo ? this._createThumbVideoElement() : document.createElement('img');
+    if (useVideo) {
+      media.src = initialVideoSrc;
+    } else {
+      media.alt = item?.name || filename || '';
+      media.style.maxWidth = '100%';
+      media.style.maxHeight = '100%';
+      media.style.objectFit = 'contain';
+    }
+    thumb.appendChild(media);
+    if (isSolid) {
+      const colorPicker = document.createElement('label');
+      colorPicker.className = 'fa-nexus-solid-color-picker';
+      colorPicker.title = 'Pick solid color';
+      colorPicker.setAttribute('aria-label', 'Pick solid color');
+      const colorInput = document.createElement('input');
+      colorInput.type = 'color';
+      colorInput.setAttribute('data-fa-nexus-solid-color-input', '');
+      colorInput.setAttribute('aria-label', 'Pick solid color');
+      const colorIcon = document.createElement('i');
+      colorIcon.className = 'fas fa-palette';
+      colorPicker.append(colorInput, colorIcon);
+      thumb.appendChild(colorPicker);
+    }
+    const statusIcon = document.createElement('div');
+    statusIcon.className = 'fa-nexus-status-icon';
+    statusIcon.title = '';
+    const gridTag = document.createElement('div');
+    gridTag.className = 'fa-nexus-grid-size-tag';
+    thumb.append(statusIcon, gridTag);
+    card.appendChild(thumb);
+    tab.app._collections?.decorate(card, item, tab.id);
     return card;
   }
 
@@ -360,7 +389,7 @@ export class AssetsTabCardHelper {
     cardElement.style.setProperty('--fa-nexus-solid-color', color);
     if (img) {
       img.src = url;
-      img.alt = resolvedItem.filename || 'Solid Color';
+      img.alt = resolvedItem.name || contentFilename(resolvedItem) || 'Solid Color';
     }
     if (input) {
       input.value = color;
@@ -431,20 +460,19 @@ export class AssetsTabCardHelper {
       try { cardElement.setAttribute('data-url', url); } catch (_) {}
       try { cardElement.setAttribute('data-cached', 'true'); } catch (_) {}
     }
-    if (resolvedItem.file_path) {
-      try { cardElement.setAttribute('data-file-path', resolvedItem.file_path); } catch (_) {}
-    }
-    if (resolvedItem.filename) {
-      try { cardElement.setAttribute('data-filename', resolvedItem.filename); } catch (_) {}
-    }
-    const size = Number(resolvedItem.width || 200) || 200;
-    try { cardElement.setAttribute('data-width', String(size)); } catch (_) {}
-    try { cardElement.setAttribute('data-height', String(size)); } catch (_) {}
-    try { cardElement.setAttribute('data-grid-w', String(resolvedItem.grid_width || 1)); } catch (_) {}
-    try { cardElement.setAttribute('data-grid-h', String(resolvedItem.grid_height || 1)); } catch (_) {}
+    try { cardElement.setAttribute('data-content-id', inventoryItemKey(resolvedItem)); } catch (_) {}
+    try { cardElement.setAttribute('data-content-path', contentPath(resolvedItem)); } catch (_) {}
+    try { cardElement.setAttribute('data-folder', contentFolder(resolvedItem)); } catch (_) {}
+    try { cardElement.setAttribute('data-name', resolvedItem.name || contentFilename(resolvedItem) || 'Solid Color'); } catch (_) {}
+    const dims = contentDimensions(resolvedItem);
+    try { cardElement.setAttribute('data-width', String(dims.width)); } catch (_) {}
+    try { cardElement.setAttribute('data-height', String(dims.height)); } catch (_) {}
+    try { cardElement.setAttribute('data-grid-w', String(dims.gridWidth)); } catch (_) {}
+    try { cardElement.setAttribute('data-grid-h', String(dims.gridHeight)); } catch (_) {}
 
     this.updateCardGridBadge(cardElement, resolvedItem);
     try { cardElement._assetItem = resolvedItem; } catch (_) {}
+    tab.app._collections?.decorate(cardElement, resolvedItem, tab.id);
 
     const key = tab._keyFromCard(cardElement);
     const selected = key && tab._selection.selectedKeys.has(key);
@@ -459,29 +487,38 @@ export class AssetsTabCardHelper {
       return;
     }
     try {
-      if (item && item.width != null) cardElement.setAttribute('data-width', String(item.width)); else cardElement.removeAttribute('data-width');
-      if (item && item.height != null) cardElement.setAttribute('data-height', String(item.height)); else cardElement.removeAttribute('data-height');
-      if (item && item.grid_width != null) cardElement.setAttribute('data-grid-w', String(item.grid_width)); else cardElement.removeAttribute('data-grid-w');
-      if (item && item.grid_height != null) cardElement.setAttribute('data-grid-h', String(item.grid_height)); else cardElement.removeAttribute('data-grid-h');
-      if (item && item.file_size != null) cardElement.setAttribute('data-file-size', String(item.file_size)); else cardElement.removeAttribute('data-file-size');
+      if (item) {
+        const dims = contentDimensions(item);
+        cardElement.setAttribute('data-width', String(item.actual_width || dims.width));
+        cardElement.setAttribute('data-height', String(item.actual_height || dims.height));
+        cardElement.setAttribute('data-grid-w', String(dims.gridWidth));
+        cardElement.setAttribute('data-grid-h', String(dims.gridHeight));
+        const fileSize = Number(item?.selected_source?.size || 0);
+        if (fileSize > 0) cardElement.setAttribute('data-file-size', String(fileSize));
+        else cardElement.removeAttribute('data-file-size');
+        cardElement.setAttribute('data-content-id', inventoryItemKey(item));
+        cardElement.setAttribute('data-content-path', tab._resolveFilePath(item));
+        cardElement.setAttribute('data-folder', tab._resolveFolderPath(item) || '');
+        cardElement.setAttribute('data-name', item.name || contentFilename(item) || '');
+      }
       const thumb = cardElement.querySelector('.thumb');
       let img = cardElement.querySelector('img');
       let video = cardElement.querySelector('video');
       const statusIcon = cardElement.querySelector('.fa-nexus-status-icon');
       const isCloud = (item && item.source === 'cloud') || (cardElement.getAttribute('data-source') === 'cloud');
       const tier = item?.tier || cardElement.getAttribute('data-tier') || '';
-      const folderPathAttr = cardElement.getAttribute('data-path') || tab._resolveFolderPath(item);
-      const filePathAttr = cardElement.getAttribute('data-file-path') || tab._resolveFilePath(item);
-      if (filePathAttr && !cardElement.getAttribute('data-file-path')) cardElement.setAttribute('data-file-path', filePathAttr);
-      if (folderPathAttr && cardElement.getAttribute('data-path') !== folderPathAttr) cardElement.setAttribute('data-path', folderPathAttr || '');
+      const folderPathAttr = cardElement.getAttribute('data-folder') || tab._resolveFolderPath(item);
+      const filePathAttr = cardElement.getAttribute('data-content-path') || tab._resolveFilePath(item);
+      if (filePathAttr && !cardElement.getAttribute('data-content-path')) cardElement.setAttribute('data-content-path', filePathAttr);
+      if (folderPathAttr && cardElement.getAttribute('data-folder') !== folderPathAttr) cardElement.setAttribute('data-folder', folderPathAttr || '');
       let cachedLocalPath = item?.cachedLocalPath || '';
       try {
         if (!cachedLocalPath && isCloud) {
           const download = tab.downloadManager;
           if (download && typeof download.getLocalPath === 'function') {
             cachedLocalPath = download.getLocalPath('assets', item || {
-              file_path: filePathAttr,
-              filename: cardElement.getAttribute('data-filename') || '',
+              id: cardElement.getAttribute('data-content-id') || '',
+              selected_source: { ext: '.webp' },
               tier
             }) || '';
           }
@@ -496,7 +533,7 @@ export class AssetsTabCardHelper {
       if (isCloud && !cachedLocalPath) tab._enqueueCacheProbe(cardElement, item);
 
       const contentSvc = tab.contentService;
-      const mediaTypeAttr = cardElement.getAttribute('data-media-type') || (this._isVideoFilename(item?.filename) ? 'video' : 'image');
+      const mediaTypeAttr = cardElement.getAttribute('data-media-type') || (this._isVideoFilename(contentFilename(item)) ? 'video' : 'image');
       if (!cardElement.getAttribute('data-media-type') && mediaTypeAttr) {
         try { cardElement.setAttribute('data-media-type', mediaTypeAttr); } catch (_) {}
       }
@@ -553,7 +590,7 @@ export class AssetsTabCardHelper {
             try { cardElement.removeAttribute('data-enhanced-thumbnail'); } catch (_) {}
           }
         } else {
-          src = filePathAttr || cardElement.getAttribute('data-url') || cardElement.getAttribute('data-file-path') || '';
+          src = filePathAttr || cardElement.getAttribute('data-url') || cardElement.getAttribute('data-content-path') || '';
           try { cardElement.removeAttribute('data-enhanced-thumbnail'); } catch (_) {}
         }
         tab._queueImageLoad(cardElement, img, src, () => {
@@ -637,6 +674,7 @@ export class AssetsTabCardHelper {
     try { const v = cardElement.querySelector('video'); if (v) { v.src = ''; } } catch(_) {}
     try { if (cardElement?._assetItem) delete cardElement._assetItem; } catch (_) {}
     try { if (cardElement?._probeJob) { cardElement._probeJob.cancelled = true; delete cardElement._probeJob; } } catch (_) {}
+    try { if (cardElement?._faNexusEnsureLocalError) delete cardElement._faNexusEnsureLocalError; } catch (_) {}
   }
 
   async ensureLocalAssetForCard(cardElement, item, { triggerEvent = null, label = 'Downloading asset...' } = {}) {
@@ -644,9 +682,9 @@ export class AssetsTabCardHelper {
     if (!tab) return '';
     const resolvedItem = item || cardElement?._assetItem || null;
     const getAttr = (key) => cardElement?.getAttribute?.(key) || '';
-    const filename = getAttr('data-filename') || resolvedItem?.filename || '';
-    const filePathAttr = getAttr('data-file-path') || tab._resolveFilePath?.(resolvedItem) || '';
-    const folderPath = getAttr('data-path') || tab._resolveFolderPath?.(resolvedItem) || '';
+    const filename = contentFilename(resolvedItem) || (getAttr('data-content-path').split('/').pop() || '');
+    const filePathAttr = getAttr('data-content-path') || tab._resolveFilePath?.(resolvedItem) || '';
+    const folderPath = getAttr('data-folder') || tab._resolveFolderPath?.(resolvedItem) || '';
     const tier = getAttr('data-tier') || resolvedItem?.tier || '';
     const sourceAttr = (getAttr('data-source') || resolvedItem?.source || '').toLowerCase();
     const isCloud = sourceAttr === 'cloud';
@@ -655,16 +693,22 @@ export class AssetsTabCardHelper {
     const content = tab.contentService;
     let localPath = '';
     let overlayHandle = null;
+    try { if (cardElement?._faNexusEnsureLocalError) delete cardElement._faNexusEnsureLocalError; } catch (_) {}
 
     try {
       const isCached = getAttr('data-cached') === 'true';
       if (isCached) localPath = getAttr('data-url') || '';
       if (!localPath && resolvedItem?.cachedLocalPath) localPath = resolvedItem.cachedLocalPath;
       if (!localPath && !isCloud) {
-        localPath = resolvedItem?.file_path || resolvedItem?.path || resolvedItem?.url || filePathAttr || '';
+        localPath = resolvedItem?.cachedLocalPath || contentPath(resolvedItem) || resolvedItem?.url || filePathAttr || '';
       }
       if (!localPath && isCloud && download?.getLocalPath) {
-        localPath = download.getLocalPath('assets', { filename, file_path: filePathAttr, path: folderPath }) || '';
+        localPath = download.getLocalPath('assets', resolvedItem || {
+          id: getAttr('data-content-id') || '',
+          selected_source: { ext: '.webp' },
+          tier: tier || 'free'
+        }) || '';
+        if (localPath) this._markCardAsCached(cardElement, resolvedItem, localPath);
       }
       if (!localPath && isCloud && content?.getFullURL && download?.ensureLocal) {
         if (cardElement) {
@@ -672,15 +716,24 @@ export class AssetsTabCardHelper {
         }
         const auth = this._readPatreonAuthData();
         const state = auth && auth.authenticated && auth.state ? auth.state : undefined;
-        const downloadItem = { file_path: filePathAttr, filename, tier: tier || 'free' };
+        const downloadItem = resolvedItem || {
+          id: getAttr('data-content-id') || filePathAttr.replace(/\.[^/.]+$/, ''),
+          selected_source: { ext: '.webp' },
+          tier: tier || 'free'
+        };
         const fullUrl = await content.getFullURL('assets', downloadItem, state);
         localPath = await download.ensureLocal('assets', downloadItem, fullUrl);
         if (localPath) this._markCardAsCached(cardElement, resolvedItem, localPath);
       }
     } catch (error) {
+      try { if (cardElement) cardElement._faNexusEnsureLocalError = error; } catch (_) {}
       Logger.warn('AssetsTab.ensureLocal.failed', { label, error: String(error?.message || error) });
-      if ((error && error.message === 'AUTH') || /auth/i.test(String(error?.message || ''))) {
+      if (error?.faNexusNotified) {
+        // The content service already said why (a tier without premium downloads).
+      } else if ((error && error.message === 'AUTH') || /auth/i.test(String(error?.message || ''))) {
         ui.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
+      } else if (this._isCloudFileMissingError(error)) {
+        ui.notifications?.warn?.(error?.userMessage || `Cloud file is listed in the manifest but is missing from R2: ${filename || 'asset'} (404)`);
       } else {
         ui.notifications?.error?.(`Failed to prepare asset: ${error?.message || error}`);
       }
@@ -724,7 +777,7 @@ export class AssetsTabCardHelper {
       Logger.warn('AssetsTab.select.toolSession.keyMissing', {
         tab: tab?.id || null,
         reason,
-        filename: item?.filename || cardElement.getAttribute?.('data-filename') || ''
+        filename: contentFilename(item) || cardElement.getAttribute?.('data-content-path') || ''
       });
       return;
     }
@@ -762,7 +815,7 @@ export class AssetsTabCardHelper {
       return;
     }
 
-    const filename = cardElement.getAttribute('data-filename') || item?.filename || '';
+    const filename = contentFilename(item) || cardElement.getAttribute('data-content-path')?.split('/').pop() || '';
     const isSolid = tab?._isSolidTextureItem?.(item);
     let solidColor = null;
     const requestId = (this._textureRequestId = (this._textureRequestId || 0) + 1);
@@ -780,10 +833,12 @@ export class AssetsTabCardHelper {
       }
     } catch (e) {
       Logger.warn('AssetsTab.texture.paint.download.failed', { error: String(e?.message || e) });
-      if ((e && e.message === 'AUTH') || /auth/i.test(String(e?.message))) {
+      if (e?.faNexusNotified) {
+        // The content service already said why (a tier without premium downloads).
+      } else if ((e && e.message === 'AUTH') || /auth/i.test(String(e?.message))) {
         ui.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
       } else {
-        ui.notifications?.error?.(`Failed to prepare texture: ${e?.message || e}`);
+        ui.notifications?.error?.(`Failed to prepare texture: ${e?.userMessage || e?.message || e}`);
       }
       return;
     }
@@ -804,7 +859,10 @@ export class AssetsTabCardHelper {
     }
 
     if (!localPath) {
-      ui.notifications?.warn?.('Texture not available locally yet. Please try again.');
+      const ensureError = cardElement?._faNexusEnsureLocalError || null;
+      if (!this._isCloudFileMissingError(ensureError)) {
+        ui.notifications?.warn?.('Texture not available locally yet. Please try again.');
+      }
       return;
     }
 
@@ -824,6 +882,8 @@ export class AssetsTabCardHelper {
           label: 'Texture Painting',
           source: 'assets-card:texture:start'
         });
+      } else if (isProTierRefusal(error)) {
+        ui.notifications?.warn?.(proTierMessage('Texture Painting'));
       } else {
         ui.notifications?.error?.(`Failed to start Texture Painting: ${error?.message || error}`);
       }
@@ -844,7 +904,7 @@ export class AssetsTabCardHelper {
       return;
     }
 
-    const filename = cardElement.getAttribute('data-filename') || item?.filename || '';
+    const filename = contentFilename(item) || cardElement.getAttribute('data-content-path')?.split('/').pop() || '';
     const requestId = (this._pathRequestId = (this._pathRequestId || 0) + 1);
 
     let localPath = '';
@@ -864,10 +924,12 @@ export class AssetsTabCardHelper {
       });
     } catch (e) {
       Logger.warn('AssetsTab.path.manager.download.failed', { error: String(e?.message || e) });
-      if ((e && e.message === 'AUTH') || /auth/i.test(String(e?.message))) {
+      if (e?.faNexusNotified) {
+        // The content service already said why (a tier without premium downloads).
+      } else if ((e && e.message === 'AUTH') || /auth/i.test(String(e?.message))) {
         ui.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
       } else {
-        ui.notifications?.error?.(`Failed to prepare path texture: ${e?.message || e}`);
+        ui.notifications?.error?.(`Failed to prepare path texture: ${e?.userMessage || e?.message || e}`);
       }
       return;
     }
@@ -877,7 +939,10 @@ export class AssetsTabCardHelper {
     }
 
     if (!localPath) {
-      ui.notifications?.warn?.('Path texture not available locally yet. Please try again.');
+      const ensureError = cardElement?._faNexusEnsureLocalError || null;
+      if (!this._isCloudFileMissingError(ensureError)) {
+        ui.notifications?.warn?.('Path texture not available locally yet. Please try again.');
+      }
       return;
     }
 
@@ -900,6 +965,8 @@ export class AssetsTabCardHelper {
           label,
           source: 'assets-card:path:start'
         });
+      } else if (isProTierRefusal(error)) {
+        ui.notifications?.warn?.(proTierMessage(label));
       } else {
         ui.notifications?.error?.(`Failed to start ${label}: ${error?.message || error}`);
       }
@@ -973,13 +1040,15 @@ export class AssetsTabCardHelper {
   }
 
   _isAuthFailure(error) {
-    if (!error) return false;
-    const code = String(error?.code || error?.name || '').toUpperCase();
-    if (code && (/AUTH/.test(code) || ['STATE_MISSING', 'ENTITLEMENT_REQUIRED', 'HTTP_401', 'HTTP_403', 'SESSION_EXPIRED', 'STATE_INVALID'].includes(code))) {
-      return true;
-    }
-    const message = String(error?.message || '').toLowerCase();
-    return message.includes('auth') || message.includes('state');
+    return isPremiumAuthFailure(error);
+  }
+
+  _isCloudFileMissingError(error) {
+    return !!error && (
+      error.faNexusCloudFileMissing === true ||
+      error.code === 'FA_NEXUS_CLOUD_FILE_MISSING' ||
+      Number(error.status) === 404
+    );
   }
 
   async _handlePremiumAuthFailure(error, { featureId, label, source }) {
@@ -1054,7 +1123,7 @@ export class AssetsTabCardHelper {
 
     if (typeof tab._isAssetLocked === 'function' && tab._isAssetLocked(item, cardElement, { authed })) {
       Logger.info('AssetsTab.select.blocked.locked', { key, mode: ctrl ? (shift ? 'range-add' : 'toggle') : (shift ? 'range' : 'single') });
-      ui.notifications?.error?.('Authentication required for premium assets. Please connect Patreon.');
+      ui.notifications?.error?.(tab._lockedPremiumAssetMessage?.() || 'Authentication required for premium assets. Please connect Patreon.');
       try { tab._selection.selectedKeys.delete(key); } catch (_) {}
       try { tab._selection.lastClickedIndex = -1; } catch (_) {}
       try { tab._setCardSelectionUI(cardElement, false); } catch (_) {}
@@ -1085,7 +1154,9 @@ export class AssetsTabCardHelper {
         tab._selection.lastClickedIndex = visibleIndex;
         tab._refreshSelectionUIInView();
       } catch (_) {}
-      await tab._startPlacementFromSelection().catch(() => {});
+      await tab._startPlacementFromSelection().catch((error) => {
+        tab._reportAssetPlacementFailure?.('AssetsTab.place.selection.clickFailed', error);
+      });
       return;
     }
 
@@ -1097,7 +1168,9 @@ export class AssetsTabCardHelper {
       tab._refreshSelectionUIInView();
     } catch (_) {}
 
-    return tab._beginAssetPlacement(cardElement, item, isStickyMode, event).catch(() => {});
+    return tab._beginAssetPlacement(cardElement, item, isStickyMode, event).catch((error) => {
+      tab._reportAssetPlacementFailure?.('AssetsTab.place.clickFailed', error);
+    });
   }
 
 }

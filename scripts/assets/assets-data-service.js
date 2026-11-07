@@ -1,15 +1,21 @@
 import { localToAssetInventoryRecord } from '../content/inventory-utils.js';
+import { contentPath } from '../content/cloud-inventory-v2.js';
 import { NexusIndexDB } from '../content/cache-index.js';
-import { forgeIntegration } from '../core/forge-integration.js';
-import { NexusLogger as Logger } from '../core/nexus-logger.js';
-import {
-  requireFilePickerMethod,
-  wrapOperationalError
-} from '../content/nexus-content-service.js';
+import { streamLocalContent } from '../content/local-content-scanner.js';
+import { forgeIntegration } from '../storage/forge-integration.js';
 
 /**
  * @typedef {import('../core/fa-nexus-types.js').FaNexusInventoryRecord} FaNexusInventoryRecord
  */
+
+const ASSET_LOCAL_CONTENT_EXTENSIONS = Object.freeze([
+  '.png',
+  '.webp',
+  '.jpg',
+  '.jpeg',
+  '.webm',
+  '.mp4'
+]);
 
 export class AssetsDataService {
   /** Create a new assets data service */
@@ -37,146 +43,16 @@ export class AssetsDataService {
    * @returns {Promise<number>} total files discovered
    */
   async streamLocalAssets(folder, onBatch, options = {}) {
-    if (!folder) return 0;
-    try {
-      await forgeIntegration.initialize();
-    } catch (error) {
-      throw wrapOperationalError(error, {
-        code: 'LOCAL_STREAM_INIT_FAILED',
-        source: 'AssetsDataService.streamLocalAssets',
-        operation: 'initialize-local-asset-stream',
-        folder,
-        kind: 'assets',
-        userMessage: `FA Nexus could not initialize local asset scanning for "${folder}".`
-      });
-    }
-    const FilePickerImpl = requireFilePickerMethod('browse', {
-      source: 'AssetsDataService.streamLocalAssets',
-      operation: 'stream-local-assets',
+    return await streamLocalContent({
       folder,
-      kind: 'assets',
-      userMessage: `FA Nexus could not scan "${folder}" because the Foundry FilePicker runtime is unavailable.`
+      contentKind: 'assets',
+      itemLabel: 'asset',
+      owner: 'AssetsDataService.streamLocalAssets',
+      supportedExtensions: ASSET_LOCAL_CONTENT_EXTENSIONS,
+      mapRecord: localToAssetInventoryRecord,
+      onBatch,
+      options
     });
-    const { source: resolvedSource, target: initialTarget, options: resolvedOptions, fallbacks } =
-      forgeIntegration.resolveFilePickerContext(folder);
-    const primarySource = resolvedSource || (forgeIntegration.isRunningOnForge() ? 'forgevtt' : 'data');
-    const baseOptions = Object.assign({}, resolvedOptions || {});
-    const fallbackSources = Array.isArray(fallbacks) ? fallbacks.slice() : [];
-    const allowedExtensions = new Set(['.png', '.webp', '.jpg', '.jpeg', '.webm', '.mp4']);
-    const batchSize = Math.max(25, Math.min(500, Number(options.batchSize) || 200));
-    const sleepMs = Math.max(0, Math.min(50, Number(options.sleepMs) || 8));
-    const signal = options.signal || null;
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const abortError = () => {
-      try { return new DOMException(signal?.reason || 'Cancelled', 'AbortError'); }
-      catch (_) {
-        const err = new Error(signal?.reason || 'Cancelled');
-        err.name = 'AbortError';
-        return err;
-      }
-    };
-    const checkAbort = () => {
-      if (signal?.aborted) throw abortError();
-    };
-
-    const queue = [forgeIntegration.normalizeFilePickerTarget(primarySource, initialTarget || '')];
-    const visited = new Set();
-    let batch = [];
-    let total = 0;
-
-    const browseWithFallback = async (targetPath) => {
-      const attempts = [];
-      attempts.push({ source: primarySource, options: baseOptions });
-      for (const fb of fallbackSources) {
-        if (!fb || fb === primarySource) continue;
-        const opts = fb === 'forgevtt' ? baseOptions : {};
-        attempts.push({ source: fb, options: opts });
-      }
-      let lastError = null;
-      for (const attempt of attempts) {
-        try {
-          const opts = Object.keys(attempt.options || {}).length ? Object.assign({}, attempt.options) : {};
-          return await FilePickerImpl.browse(attempt.source, targetPath, opts);
-        } catch (error) {
-          lastError = error;
-        }
-      }
-      throw wrapOperationalError(lastError, {
-        code: 'LOCAL_FOLDER_BROWSE_FAILED',
-        source: 'AssetsDataService.streamLocalAssets',
-        operation: 'browse-local-asset-folder',
-        folder,
-        kind: 'assets',
-        userMessage: `FA Nexus could not browse the asset folder "${folder}".`,
-        details: { targetPath }
-      });
-    };
-
-    while (queue.length) {
-      checkAbort();
-      const nextTarget = String(queue.shift() ?? '');
-      if (visited.has(nextTarget)) continue;
-      visited.add(nextTarget);
-      let listing;
-      try {
-        listing = await browseWithFallback(nextTarget);
-      } catch (error) {
-        throw wrapOperationalError(error, {
-          code: 'LOCAL_FOLDER_BROWSE_FAILED',
-          source: 'AssetsDataService.streamLocalAssets',
-          operation: 'scan-local-asset-folder',
-          folder,
-          kind: 'assets',
-          userMessage: `FA Nexus could not scan the asset folder "${folder}".`,
-          details: { targetPath: nextTarget }
-        });
-      }
-      checkAbort();
-      for (const filePath of listing.files) {
-        checkAbort();
-        const dotIndex = filePath.lastIndexOf('.');
-        const ext = dotIndex !== -1 ? filePath.slice(dotIndex).toLowerCase() : '';
-        if (!ext || !allowedExtensions.has(ext)) continue;
-        const filename = filePath.split('/').pop();
-        try {
-          const record = localToAssetInventoryRecord({ path: filePath, url: filePath, filename });
-          if (forgeIntegration.isRunningOnForge()) {
-            if (record.path) record.path = forgeIntegration.optimizeCacheURL(record.path);
-            if (record.url) record.url = forgeIntegration.optimizeCacheURL(record.url);
-            if (record.cachedLocalPath) record.cachedLocalPath = forgeIntegration.optimizeCacheURL(record.cachedLocalPath);
-          }
-          batch.push(record);
-        } catch (error) {
-          Logger.warn('AssetsDataService.localRecord.failed', {
-            folder,
-            filePath,
-            filename,
-            error: String(error?.message || error)
-          });
-        }
-        if (batch.length >= batchSize) {
-          const emitBatch = batch.slice();
-          await onBatch?.(emitBatch);
-          total += batch.length;
-          batch = [];
-          if (sleepMs) {
-            await sleep(sleepMs);
-            checkAbort();
-          }
-        }
-      }
-      for (const dir of listing.dirs || []) {
-        checkAbort();
-        const normalized = forgeIntegration.normalizeFilePickerTarget(primarySource, dir);
-        queue.push(normalized);
-      }
-    }
-    if (batch.length) {
-      const emitBatch = batch.slice();
-      await onBatch?.(emitBatch);
-      total += batch.length;
-    }
-    return total;
   }
 
   async getActualDimensions(asset) {
@@ -195,7 +71,7 @@ export class AssetsDataService {
   _dimensionKey(asset) {
     const local = asset?.cachedLocalPath || asset?.cached || asset?.localPath;
     if (local) return String(local);
-    const fallback = asset?.file_path || asset?.path || '';
+    const fallback = contentPath(asset) || asset?.file_path || asset?.path || '';
     return fallback ? String(fallback) : null;
   }
 
@@ -253,7 +129,7 @@ export class AssetsDataService {
   }
 
   _dimensionSource(asset) {
-    let local = asset?.cachedLocalPath || asset?.file_path || asset?.path || '';
+    let local = asset?.cachedLocalPath || contentPath(asset) || asset?.file_path || asset?.path || '';
     if (!local) return null;
     if (/^https?:/i.test(local)) return local;
     if (forgeIntegration.isRunningOnForge() && !/^modules\//i.test(local) && !/^systems\//i.test(local) && !/^worlds\//i.test(local) && !/^data:/i.test(local)) {
